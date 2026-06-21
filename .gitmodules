@@ -1,3 +1,4 @@
 [submodule "AgentGym"]
 	path = AgentGym
-	url = https://github.com/WooooDyy/AgentGym
+	url = https://github.com/liruiluo/AgentGym.git
+	branch = feat/agentmemory-env-v0
