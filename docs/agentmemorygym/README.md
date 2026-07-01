@@ -10,7 +10,7 @@
 - Memory 工具：参考 AgeMem/Agentic Memory，把 `ADD / UPDATE / DELETE / RETRIEVE / SUMMARY / FILTER` 做成 policy 可选动作。
 - 奖励：最终任务成功 + 子任务进度 + 兼容约束满足，扣除过度 memory/tool 操作成本。
 - 执行顺序：**先改本地文档与 Notion 文档，再改代码**。这只是优先级/验收顺序，不等于撤回已有代码草稿；当前 `agentenv-agentmemory` skeleton 可以保留在工作树，但在正式收口前必须重新验证并明确标注为草稿。
-- 资源边界：当前 Mac/ZBMac 是 0 卡机器，只能做静态、数据、schema、server API 级别检查；这不算单卡验证。真正的单卡 smoke 需要在有 GPU 且装好 torch/AgentGym/verl 依赖的干净 lane 上做；8 卡机器当前给 continual-reasoning gym，AgentMemoryGym 等明天新 8 卡机器。
+- 资源边界：Mac/ZBMac 仍只做 0 卡静态/数据/schema/API 检查；大 MemoryArena product DB 和 SQLite/FTS 搜索索引都放 Jingyan 共享盘，不落开发机本地盘。Jingyan 1×B200 已用于真实单卡 smoke；8 卡机器当前给 continual-reasoning gym，AgentMemoryGym 等新 8 卡再做正式后训练。
 
 ## 文件
 
@@ -22,7 +22,8 @@
 - `evidence/20260701-single-gpu-smoke.md`：Jingyan 1×B200 上的真实单卡 GPU/env/client/init smoke 证据。
 - `evidence/20260701-latest-observation-rollout.md`：latest-observation rollout context 与 per-action PPO 样本展开证据。
 - `evidence/20260701-latest-observation-policy-smoke.md`：latest-observation scripted-policy rollout smoke；验证 memory tool contract，不冒充 LLM rollout。
-- `evidence/20260701-memoryarena-converter.md`：MemoryArena bundled-shopping converter smoke；全量 150 条可转为 AgentMemoryGym JSONL，并记录 12/900 个 target-match 歧义。
+- `evidence/20260701-memoryarena-converter.md`：MemoryArena bundled-shopping converter / freeze / full product DB / SEARCH index 证据；当前 frozen train/dev/test 为 `120/15/15`，target match 已 `asin_catalog=900 / ambiguous=0`。
+- `evidence/20260702-qwen3-4b-rollout-smoke.md`：Qwen3-4B 真单卡 rollout、enriched metadata diagnostic、SEARCH-aware prompt smoke；均是链路/接口证据，不是 RL 提升结果。
 
 ## 当前 Notion 页面
 

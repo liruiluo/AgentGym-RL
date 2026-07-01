@@ -3,10 +3,10 @@
 ## 0. State card
 
 - **研究目标**：构建一个面向 agent memory policy 的 RL 后训练 Gym，把长程、多会话、依赖历史状态的 agent 任务改写成可训练、可评测、可归因的环境。
-- **当前阶段**：从旧的 MemoryAgentBench-first 启动包，切换到 **MemoryArena/e-commerce-first 的 Agentic RL Memory Gym**。本阶段先完成设计对齐和最小可运行环境骨架，不声称已经完成训练。
+- **当前阶段**：MemoryArena / e-commerce bundled-shopping data and interface bring-up. Target freeze, full product DB mirror on Jingyan shared disk, SQLite/FTS `SEARCH` index, and Qwen3-4B single-GPU smoke are done; the next step is a scripted SEARCH baseline / heuristic memory manager before formal 8-GPU RL.
 - **已有人类决定**：以电商捆绑/序列购物作为 hero environment；复用 AgentGym-RL / verl 作为训练后端；memory action space 参考 AgeMem/Agentic Memory 工具语义；v0 不把新算法写成主贡献。
 - **已有材料**：本仓 `AgentGym-RL` fork 与 `AgentGym` submodule fork；旧 Notion 备份；MemoryArena、AgeMem、AgentGym-RL、MemoryAgentBench 等参考源。
-- **本轮交付物**：本设计文档 + `agentenv-agentmemory` 最小环境 skeleton + AgentGym-RL client 注册入口。
+- **本轮交付物**：本设计文档 + `agentenv-agentmemory` 环境 skeleton + MemoryArena bundled-shopping converter/freeze + shared-disk product-catalog `SEARCH` draft + AgentGym-RL client 注册入口。
 
 ## 1. Positioning
 
@@ -95,7 +95,7 @@ v0 采用可解析的文本/JSON action，后续可映射到 function calling：
 | STM | `RETRIEVE {query, top_k}` | 从 LTM 中检索相关记忆并加入 active context。 |
 | STM | `SUMMARY {text}` | 将长上下文压缩为可复用摘要，加入 active context 或 LTM。 |
 | STM | `FILTER {query}` | 从 active context 中移除与当前任务无关的信息。 |
-| Task | `BUY {product_id}` / `PLAN` / `SEARCH` / `ANSWER` | 环境特定动作。hero env 先实现 `BUY`。 |
+| Task | `BUY {product_id}` / `SEARCH {query, top_k}` / `PLAN` / `ANSWER` | 环境特定动作。hero env 已实现 `BUY` 和 product-catalog `SEARCH`; SEARCH returns public catalog metadata and hides ASIN/source path/target labels. |
 
 关键点：memory tool 是 policy 的 action，不是外部 harness 自动替 policy 做的事。Harness baseline 可以使用相同工具，但工具触发规则固定。
 
@@ -179,14 +179,15 @@ AgentGym-RL/                         # main training fork
 5. Add split-aware dataset loading and server `/metadata` so the trainer can see real task counts instead of a hard-coded `data_len=1`.
 6. Add a fail-fast raw-history guard for `task_name=agentmemory`; full-history vLLM rollout is diagnostic-only until a latest-observation rollout path is implemented.
 7. Add data converters for real MemoryArena/WebShop-style bundled shopping tasks.
-8. Replace the smoke split files with real train/dev/test item-id files after MemoryArena/WebShop conversion.
-9. Add a bounded GRPO smoke config.
-8. Only after baseline behavior analysis, decide whether a new method beyond standard GRPO/PPO is needed.
+8. Freeze real train/dev/test item-id files after MemoryArena conversion (`120/15/15`, `asin_catalog=900`, `ambiguous=0`).
+9. Keep the full MemoryArena product DB and derived SQLite/FTS SEARCH index on the Jingyan shared disk, not on the Mac/devbox.
+10. Add a scripted SEARCH baseline / heuristic memory manager to prove environment solvability under the fair SEARCH interface.
+11. Add a bounded GRPO smoke config only after baseline behavior analysis; decide whether a new method beyond standard GRPO/PPO is needed after that.
 
 ## 7. Claim guardrails
 
 - Do not claim AgentMemoryGym is the first RL memory method.
-- Do not claim MemoryArena is fully implemented until real converted tasks, splits, and evaluation scripts exist.
+- Do not claim MemoryArena is fully implemented until converted tasks, splits, SEARCH/fair-info surface, evaluation scripts, and baseline behavior checks are all closed. Current target freeze and SEARCH smoke are interface evidence, not a final environment claim.
 - Do not claim Qwen3.6-4B as a public model name in outward-facing docs without fresh source verification; internally it can be a placeholder for the target 4B backbone.
 - Do not report success from smoke-only scripted runs as evidence of RL improvement.
 - Do not run final evaluation on intermediate checkpoints unless explicitly marked diagnostic.

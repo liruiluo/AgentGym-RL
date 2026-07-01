@@ -23,7 +23,10 @@
 12. 正式 train/dev/test item-id 已冻结：`memoryarena_formal_freeze_20260701-234045`，`120/15/15`，`asin_catalog=900 / ambiguous=0`。
 13. 已接上 leakage-safe candidate metadata enrichment：同一 subtask 必须所有候选都匹配达标才暴露 `average_rating / price_usd / total_reviews`，避免 target-only leakage。严格 enriched freeze：`memoryarena_enriched_freeze_20260702-014308`，`candidate_metadata_full_steps=285/900`。
 14. 已重跑 Qwen3-4B enriched dev：普通 prompt 仍 `RETRIEVE highest rated` loop；metadata-aware diagnostic prompt 能在第 1 个 dev episode 买对首个商品并达到 `progress_score=0.1667`，但没有完成任务。
-15. 下一步：补齐剩余 615/900 step 的公平信息面。优先二选一：提高 all-candidate metadata matching 覆盖与可信度，或加 product-catalog `SEARCH` tool。
+15. 已用全量 product_catalog 67 个 shard 复跑 strict enriched freeze：`memoryarena_fullcatalog_enriched_freeze_20260702-024824`，`catalog_paths=67` 但 `candidate_metadata_full_steps` 仍为 `285/900`；因此不能再把缺口归因于“没有全量下载”。
+16. Product-catalog `SEARCH` tool 路线已打通：代码草稿新增 `SEARCH {"query":"...","top_k":3}` 与 SQLite/FTS index builder；全量 index 已在 Jingyan 共享盘构建完成，`products=1,031,654`、约 `479M`，不放开发机。
+17. 已跑 SEARCH-aware Qwen3-4B smoke：24 个 parsed/env steps 均有效，但模型重复 `SEARCH {"query":"visible candidate title"}`，没有 `ADD/BUY`，`progress_score=0.0,0.0`。
+18. 下一步：实现 scripted SEARCH baseline / heuristic memory manager，先证明 fair SEARCH 接口下 dev item 可解，再开始 RL 训练配置。
 
 ## 0 卡本地检查边界
 
@@ -31,7 +34,7 @@ Mac/ZBMac 上的 compile、data validator、direct env、server API、stubbed cl
 
 ## 单卡测试边界
 
-真正单卡 smoke 需要有 GPU、torch、AgentGym/verl 依赖和干净资源 lane。本轮已获准使用释放出的 Jingyan 1×B200，完成 env/client/init smoke 和 Qwen3-4B latest-observation rollout smoke；但该 smoke 只证明真实模型链路可跑，尚未证明 frozen MemoryArena 任务能成功。AgentMemoryGym 明天拿新 8 卡后再启动正式训练。
+真正单卡 smoke 需要有 GPU、torch、AgentGym/verl 依赖和干净资源 lane。本轮已获准使用释放出的 Jingyan 1×B200，完成 env/client/init、Qwen3-4B latest-observation rollout 和 SEARCH-aware prompt smoke；但这些只证明真实模型/工具链路可跑，尚未证明 frozen MemoryArena 任务能成功。AgentMemoryGym 拿到新 8 卡后再启动正式训练。
 
 ## 代码完成前不得声称
 

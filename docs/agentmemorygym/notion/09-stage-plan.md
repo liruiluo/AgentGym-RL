@@ -26,7 +26,7 @@
 - candidate product id 不直接泄漏关键尺寸答案。
 - server `/metadata` 返回 task_count / task_ids / splits。
 - AgentGym-RL raw-history guard 通过：`AGENTMEMORY_CONTEXT_POLICY_SMOKE_OK`。
-- 明确当前限制：完整 AgentGym/verl rollout 未在 GPU/torch 单卡环境验证。
+- Stage 1a 自身只证明 0 卡代码/schema/API；GPU/torch 单卡验证已在 Stage 1b 另行完成。
 
 ## Stage 1b：真实单卡 GPU smoke
 
@@ -40,7 +40,7 @@
 - diagnostic rollout 若显式允许 raw-history，必须标记不可计入正式结果。
 - latest-observation rollout context 已实现并通过 smoke：`AGENTMEMORY_LATEST_OBSERVATION_PROMPT_SMOKE_OK`、`AGENTMEMORY_ROLLOUT_CONTEXT_ALIGNMENT_SMOKE_OK`。
 - formal rollout 不再走 raw-history；多轮 episode 展平成每个 action 一条 PPO 样本，trainer 用 `rollout_parent_indices` 对齐原 batch。
-- Qwen3-4B / Transformers 小模型 rollout 已在 Jingyan 1×B200 上跑通真实模型→action parser→env step 链路，证据 marker 为 `AGENTMEMORY_QWEN3_4B_LATEST_OBSERVATION_PROGRESS_ROLLOUT_SMOKE_OK`；但 frozen MemoryArena dev 样本 `progress_score=0.0`，还不是任务成功或训练收益证据。
+- Qwen3-4B / Transformers 小模型 rollout 已在 Jingyan 1×B200 上跑通真实模型→action parser→env step 链路，证据 marker 为 `AGENTMEMORY_QWEN3_4B_LATEST_OBSERVATION_PROGRESS_ROLLOUT_SMOKE_OK`。SEARCH-aware prompt smoke 也已跑通 `SEARCH` 动作链路，但模型反复查询占位文本 `visible candidate title`，frozen dev 仍 `progress_score=0.0`；这不是任务成功或训练收益证据。
 
 ## Stage 2：MemoryArena 电商数据转换
 
@@ -55,7 +55,9 @@
 - MemoryArena product DB 已全量镜像到 Jingyan 共享盘：`/home/ai-jingyan-train/luolirui.1/post-train/data/memoryarena-product-db/`，不落开发机本地盘；最终校验为 `135 files / 13,517,161,526 bytes`，extra/missing/mismatch/part 均为 0。
 - 正式 freeze 已完成：`memoryarena_formal_freeze_20260701-234045`，`train/dev/test=120/15/15`，`rows=900 / ambiguous=0 / asin_catalog=900 / catalog_paths=11`，source sha256 为 `4411a2da528a33dc6aca519b49cc225895363f18b2d19b191fddb501200134ef`。
 - Qwen3-4B frozen dev rollout 暴露下一层代码缺口：未增强版 observation 只含候选标题和 source-option，不含所有候选的 rating/price/review 等 product DB 字段，也没有 product-catalog `SEARCH` 工具；因此 highest-rated / highest-priced / budget 类任务对模型不公平，不能直接进入正式训练结果口径。
-- 已接入 leakage-safe candidate metadata enrichment：只有同一 subtask 的所有候选都能匹配 catalog 且分数达标，才暴露 `average_rating / price_usd / total_reviews`；严格阈值 90 的 enriched freeze 为 `memoryarena_enriched_freeze_20260702-014308`，`candidate_metadata_full_steps=285/900`。
+- 已接入 leakage-safe candidate metadata enrichment：只有同一 subtask 的所有候选都能匹配 catalog 且分数达标，才暴露 `average_rating / price_usd / total_reviews`；严格阈值 90 的 enriched freeze 为 `memoryarena_enriched_freeze_20260702-014308`，`candidate_metadata_full_steps=285/900`。随后按你的纠偏用 Jingyan 共享盘全量 product_catalog 67 个 shard 重跑 full-catalog freeze：`memoryarena_fullcatalog_enriched_freeze_20260702-024824`，结果仍是 `candidate_metadata_full_steps=285/900`，说明缺口不是“没下载全量 DB”，而是 option 文本与 catalog title 的可靠对齐/缺字段问题。
+- 已新增 product-catalog `SEARCH {"query":"...","top_k":3}` 工具草稿和 SQLite/FTS index builder。`SEARCH` 返回 title + `average_rating / price_usd / total_reviews / match_score`，不把 ASIN/source path 暴露给 observation；全量 index 已在 Jingyan 共享盘构建完成：`agentmemory_catalog_search.sqlite`，约 `1,031,654` products / `479M`。
+- SEARCH env smoke 已通过：在正式 freeze + shared-disk index 上 `RESET_OK`、`SEARCH_OK reward=-0.01 done=False`。Qwen3-4B SEARCH-aware prompt 也跑通 24 个 parsed/env steps，但全部为 `SEARCH {"query":"visible candidate title"}`，无 `ADD/BUY`、`progress_score=0.0,0.0`。因此当前结论是 SEARCH 工具链路可用，基础 Qwen prompt 不会自动正确使用 SEARCH。
 - metadata-aware Qwen3-4B diagnostic prompt 在 enriched dev 上产生了非零进度：第 1 个 dev episode 买对首个商品，`progress_score=0.1667`；但普通 prompt 仍 loop `RETRIEVE highest rated`，第 2 个 episode 仍失败。因此这只是接口/链路证据，不是 RL 或 memory 能力结果。
 
 完成标准：
@@ -66,7 +68,7 @@
 - reward decomposition。
 - normalized trajectory info。
 - WebShop catalog / ASIN map 或官方 option-to-ASIN 对齐源消掉 ambiguous target matches；正式 freeze 已做到 `asin_catalog=900 / ambiguous=0`。
-- 下一步需补齐剩余 615/900 step：要么提高 all-candidate metadata matching 的可靠覆盖，要么加 product-catalog `SEARCH` 工具；之后再进入正式 RL train/eval。
+- 下一步不再纠结存储/全量下载：product DB 与 SEARCH index 已在 Jingyan 共享盘。先做 scripted SEARCH baseline / heuristic memory manager，证明 fair SEARCH 接口下环境可解，再等新 8 卡进入正式 RL train/eval。
 
 ## Stage 3：基线 smoke
 
@@ -79,7 +81,7 @@
 
 ## Stage 4：正式后训练
 
-目标：等明天新 8 卡机器后启动正式训练。当前 8 卡机器不占用，因为正在给 continual-reasoning gym 项目使用。
+目标：等新的 8 卡机器到位后启动正式训练。当前 8 卡机器不占用，因为正在给 continual-reasoning gym 项目使用。
 
 完成标准：
 

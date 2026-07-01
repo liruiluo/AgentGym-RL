@@ -22,7 +22,7 @@
 
 1. 文档与 Notion 对齐。
 2. 0 卡本地检查：compile、data/schema、direct env、server API、rollout guard；这只证明代码/schema 基本可跑，不算单卡测试。
-3. 真正单卡 smoke：在有 GPU 且装好 torch/AgentGym/verl 的干净 lane 上跑环境、client、rollout 小样本。
-4. 基线 smoke：no-memory、full-context、fixed-RAG、heuristic memory manager。
+3. 真正单卡 smoke：Jingyan 1×B200 已跑通环境、client、Qwen3-4B rollout、SEARCH-aware prompt smoke；这些只算链路/接口证据。
+4. 基线 smoke：先做 scripted SEARCH baseline / heuristic memory manager，证明 fair SEARCH 接口下环境可解，再补 no-memory、full-context、fixed-RAG。
 5. 8 卡正式后训练：等新机器，不占用 continual-reasoning gym 的 8 卡。
 6. 第一轮行为分析后，再决定是否需要新优化目标或 credit assignment 机制。

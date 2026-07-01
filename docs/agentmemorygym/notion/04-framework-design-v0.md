@@ -31,7 +31,7 @@ reward r_t = task_success/progress - memory/tool cost - violation penalty
 - `RETRIEVE {query, top_k}`：取回相关长期记忆。
 - `SUMMARY {text}`：压缩冗长上下文。
 - `FILTER {query}`：过滤短期上下文噪声。
-- 环境动作：购物先用 `BUY {product_id}`，后续扩展 `PLAN / SEARCH / ANSWER`。
+- 环境动作：购物使用 `BUY {product_id}` 和 product-catalog `SEARCH {query, top_k}`；`SEARCH` 返回公开商品 metadata，不暴露 ASIN/source path/target。其它环境后续扩展 `PLAN / ANSWER`。
 
 ## 第一环境：bundled web shopping
 

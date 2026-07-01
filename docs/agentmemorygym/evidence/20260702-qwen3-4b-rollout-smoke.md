@@ -152,3 +152,63 @@ improved memory ability.
 Current closure bar before formal training/eval: strict candidate metadata only
 covers 285/900 steps, so the environment still needs either better all-candidate
 metadata matching or an explicit product-catalog `SEARCH` tool.
+
+## Product-catalog SEARCH tool smoke
+
+A product-catalog `SEARCH` tool was added after the strict candidate-metadata
+route plateaued at `285/900` fully enriched steps even with all 67 product
+catalog shards. The full SQLite/FTS index was built on the Jingyan shared disk,
+not on the Mac/devbox local disk:
+
+```text
+/home/ai-jingyan-train/luolirui.1/post-train/data/memoryarena-product-db/agentmemory_catalog_search.sqlite
+AGENTMEMORY_CATALOG_SEARCH_INDEX_OK products=1031654
+index size ~= 479M
+```
+
+A remote env smoke on the formal freeze confirmed that `SEARCH` can be called
+through the environment with `AGENTMEMORY_CATALOG_INDEX_PATH` configured:
+
+```text
+RESET_OK memoryarena_bundled_shopping_i True
+SEARCH_OK reward -0.01 done False
+```
+
+Example result for a visible candidate title:
+
+```text
+SEARCH query: A gluten-free carrot cake mix...
+- Gluten-Free Carrot Cake Mix (average_rating=4.5, price_usd=14.99, total_reviews=59, match_score=111)
+```
+
+## SEARCH-aware Qwen3-4B prompt smoke
+
+Evidence directory:
+
+```text
+/home/ai-jingyan-train/luolirui.1/post-train/agentmemorygym-smoke-evidence/qwen3_4b_search_prompt_rollout_20260702-043335
+```
+
+Marker / summary:
+
+```text
+AGENTMEMORY_QWEN3_4B_LATEST_OBSERVATION_PROGRESS_ROLLOUT_SMOKE_OK
+env_steps=24 / parse_successes=24 / any_episode_success=False
+progress_score=0.0,0.0
+```
+
+Transcript inspection shows both dev episodes executed valid environment steps,
+but every parsed action was the placeholder query:
+
+```text
+SEARCH {"query":"visible candidate title","top_k":3}
+```
+
+The resulting catalog hit was unrelated (`LIPSTICK QUEEN Visible Lip Liner...`),
+and the model never transitioned to `ADD` or `BUY`. This is still useful
+plumbing evidence: the environment/action parser/model loop can execute SEARCH
+on the real shared-disk index. It is not a task-success result. The next useful
+engineering step is a scripted SEARCH baseline / heuristic memory manager that
+queries actual visible candidate titles, stores the retrieved metadata, and
+then buys, so we can separate environment solvability from untrained Qwen prompt
+behavior before RL.

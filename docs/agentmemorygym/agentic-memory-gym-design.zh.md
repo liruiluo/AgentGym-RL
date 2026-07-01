@@ -3,9 +3,9 @@
 ## 0. 当前状态卡
 
 - **研究目标**：构建一个面向 agent memory policy 的 RL 后训练 Gym，把长程、多会话、依赖历史状态的 agent 任务改写成可训练、可评测、可归因的环境。
-- **当前阶段**：方向重定位 + 文档/Notion 对齐 + 最小代码 skeleton 整理。旧文档是 MemoryAgentBench-first，现在调整为 MemoryArena / 电商捆绑购物优先。
+- **当前阶段**：MemoryArena / 电商捆绑购物数据与接口打通。已完成 target freeze、全量 product DB 共享盘镜像、SQLite/FTS `SEARCH` 索引和 Qwen3-4B 单卡 smoke；下一步是 scripted SEARCH baseline / heuristic memory manager，再等 8 卡做正式 RL。
 - **已确定边界**：复用 AgentGym-RL / verl；memory 工具参考 AgeMem；v0 先做 Gym、基线、评测和行为分析，不声称第一个 RL-memory 方法。
-- **资源边界**：当前 Mac/ZBMac 是 0 卡机器，只能做静态、数据、schema、server API 级别检查；这些检查不能算单卡 smoke。真正单卡 smoke 需要在有 GPU 且装好 torch/AgentGym/verl 依赖的干净 lane 上做。8 卡机器暂给 continual-reasoning gym，AgentMemoryGym 明天再配新的 8 卡。
+- **资源边界**：Mac/ZBMac 只做 0 卡检查；MemoryArena product DB 与 SQLite/FTS index 放 Jingyan 共享盘。Jingyan 1×B200 已跑真单卡 smoke；现有 8 卡仍给 continual-reasoning gym，AgentMemoryGym 等新 8 卡再跑正式后训练。
 - **本阶段完成标准**：本地文档和 Notion 页面不再把 MemoryAgentBench AR/CR 写成第一主线；电商捆绑购物成为 hero environment；已有代码草稿保留为 `agentenv-agentmemory` skeleton，并通过 compile/direct/server-client smoke 后仍只标注为草稿。
 
 ## 1. 为什么做 Agentic RL Memory 后训练
@@ -76,7 +76,7 @@ v0 memory 工具：
 - `RETRIEVE {query, top_k}`：把相关长期记忆拉回 active context。
 - `SUMMARY {text}`：把冗长上下文压缩成摘要。
 - `FILTER {query}`：剔除与当前任务无关的短期上下文。
-- 环境动作：购物先用 `BUY {product_id}`；其它环境后续扩展 `PLAN / SEARCH / ANSWER`。
+- 环境动作：购物使用 `BUY {product_id}` 和 product-catalog `SEARCH {query, top_k}`；其它环境后续扩展 `PLAN / ANSWER`。`SEARCH` 只返回公开商品 metadata，不暴露 ASIN/source path 或 target。
 
 关键点：memory tool 是 policy 的 action，不是外部 harness 自动替 policy 做的事。Harness baseline 可以使用同样工具，但触发规则固定。
 
@@ -155,8 +155,9 @@ AgentGym-RL/                         # 主训练 fork
 6. 当前 0 卡本地检查只作为代码/schema 快速验证，不写成单卡结果。
 7. 真单卡 GPU 依赖环境已完成 env/client/init smoke：B200 + torch CUDA、real AgentGym adapter import、server metadata、`init_env_client` metadata path 均通过。
 8. rollout 数据路径已推进：AgentMemory 默认 latest-observation，只把当前 observation 给 policy；多轮 episode 展平成每个 action 一条 PPO 样本，并用 `rollout_parent_indices` 对齐原 batch，避免 actor/ref logprob 重算时读到完整历史。
-9. 剩余单卡缺口是小模型/API rollout smoke；不得用 raw-history override 当正式证据。
-10. 明天拿到新 8 卡后，再考虑正式后训练。
+9. Qwen3-4B / Transformers 真单卡 rollout 已跑通真实模型→parser→env step；SEARCH-aware prompt 也能调用 `SEARCH`，但当前会反复用占位 query，没有任务进度。
+10. 全量 product DB 已在 Jingyan 共享盘构建 SQLite/FTS index；严格 all-candidate metadata 仍只有 `285/900`，说明缺口不是存储/下载范围，而是可靠 option-to-catalog 对齐与 policy 使用 SEARCH。
+11. 下一步先做 scripted SEARCH baseline / heuristic memory manager，证明 fair SEARCH 接口下环境可解；拿到新 8 卡后再进入正式后训练。
 
 ## 8. 声明边界
 

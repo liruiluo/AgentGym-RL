@@ -259,15 +259,47 @@ candidate_metadata_status_counts={"full":285,"partial":605,"none":10}
 
 Interpretation: target alignment remains fully frozen (`asin_catalog=900 /
 ambiguous=0`), and strict metadata enrichment gives a leakage-safe observation
-for 285/900 subtasks. The remaining 615 subtasks still need either lower-risk
-metadata matching improvements or a product-catalog `SEARCH` tool before formal
-RL train/eval can be called fair for all MemoryArena shopping steps.
+for 285/900 subtasks. A follow-up full-catalog scan over all 67 product_catalog
+shards on the Jingyan shared disk produced the same `285/900` coverage, so the
+remaining 615-subtask gap is not a storage/download-range problem. It needs a
+safer option-to-catalog alignment method or, now preferred, a product-catalog
+`SEARCH` tool before formal RL train/eval can be called fair for all
+MemoryArena shopping steps.
 
 Follow-up Qwen3-4B single-GPU rollout evidence is recorded separately in
 `docs/agentmemorygym/evidence/20260702-qwen3-4b-rollout-smoke.md`. That run
 confirmed the true model→action parser→env step chain on Jingyan 1×B200, but it
 also exposed that the converted MemoryArena observation still lacks product DB
 metadata / SEARCH access for rating- and price-driven instructions.
+
+## Full product-catalog SEARCH index
+
+Because all-candidate strict metadata enrichment stayed at `285/900` even after
+scanning all 67 product-catalog shards, the preferred fairness route is now an
+explicit product-catalog `SEARCH` tool rather than lowering match thresholds or
+copying more DB files to the devbox.
+
+The SEARCH index was built from the full MemoryArena product DB on the Jingyan
+shared disk:
+
+```text
+/home/ai-jingyan-train/luolirui.1/post-train/data/memoryarena-product-db/agentmemory_catalog_search.sqlite
+/home/ai-jingyan-train/luolirui.1/post-train/data/memoryarena-product-db/agentmemory_catalog_search_build.log
+AGENTMEMORY_CATALOG_SEARCH_INDEX_OK products=1031654
+index size ~= 479M
+```
+
+The environment action is:
+
+```text
+SEARCH {"query":"...","top_k":3}
+```
+
+It returns only public metadata (`title`, `average_rating`, `price_usd`,
+`total_reviews`, `match_score`). It does not expose ASIN, source path, or target
+labels in the observation. A remote smoke on the formal freeze confirmed
+`RESET_OK` and `SEARCH_OK`; the follow-up Qwen3-4B SEARCH-aware smoke is recorded
+in `docs/agentmemorygym/evidence/20260702-qwen3-4b-rollout-smoke.md`.
 
 ## Jingyan 1×B200 container verification
 
