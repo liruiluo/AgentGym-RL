@@ -21,8 +21,9 @@
 10. MemoryArena bundled-shopping converter 已有入口和全量 smoke；catalog / ASIN resolver 已接入，Jingyan 共享盘 4 个相关 catalog shard 验证后把 12/900 个 target-match 歧义降到 0/900。
 11. Product DB 已全量镜像到 Jingyan 共享盘 `/home/ai-jingyan-train/luolirui.1/post-train/data/memoryarena-product-db/`，最终校验 `135 files / 13,517,161,526 bytes`，extra/missing/mismatch/part 均为 0；不放开发机本地盘。
 12. 正式 train/dev/test item-id 已冻结：`memoryarena_formal_freeze_20260701-234045`，`120/15/15`，`asin_catalog=900 / ambiguous=0`。
-13. 下一步：修 converted MemoryArena observation/action space。当前 frozen dev 模型 rollout 只反复 `RETRIEVE highest rated`，因为 observation 没有所有候选的 rating/price/review，也没有 product-catalog `SEARCH` 工具。
-14. 接上 product DB metadata 或 SEARCH 后，重跑 Qwen3-4B frozen dev rollout；目标不是先追成功率，而是至少验证 BUY / memory / feedback loop 在真实数据上有非零进度。
+13. 已接上 leakage-safe candidate metadata enrichment：同一 subtask 必须所有候选都匹配达标才暴露 `average_rating / price_usd / total_reviews`，避免 target-only leakage。严格 enriched freeze：`memoryarena_enriched_freeze_20260702-014308`，`candidate_metadata_full_steps=285/900`。
+14. 已重跑 Qwen3-4B enriched dev：普通 prompt 仍 `RETRIEVE highest rated` loop；metadata-aware diagnostic prompt 能在第 1 个 dev episode 买对首个商品并达到 `progress_score=0.1667`，但没有完成任务。
+15. 下一步：补齐剩余 615/900 step 的公平信息面。优先二选一：提高 all-candidate metadata matching 覆盖与可信度，或加 product-catalog `SEARCH` tool。
 
 ## 0 卡本地检查边界
 

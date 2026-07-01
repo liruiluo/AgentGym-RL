@@ -99,3 +99,56 @@ shopping environment needs one of these interfaces:
 The frozen item-id split and target resolver are usable, but the current
 converted observation is not yet a fair train/eval surface for
 rating/price-driven MemoryArena shopping tasks.
+
+## Enriched metadata freeze + Qwen3-4B rerun
+
+Strict metadata-enriched freeze data:
+
+```text
+/home/ai-jingyan-train/luolirui.1/post-train/agentmemorygym-smoke-evidence/memoryarena_enriched_freeze_20260702-014308
+```
+
+Freeze summary:
+
+```text
+AGENTMEMORY_MEMORYARENA_FORMAL_FREEZE_OK
+tasks=150 / rows=900 / train:120,dev:15,test:15
+resolver_counts={"asin_catalog": 900}
+ambiguous=0
+candidate_metadata_status_counts={"full":285,"partial":605,"none":10}
+candidate_metadata_full_steps=285/900
+```
+
+Two Qwen3-4B reruns were made on the enriched dev split:
+
+```text
+/home/ai-jingyan-train/luolirui.1/post-train/agentmemorygym-smoke-evidence/qwen3_4b_enriched_metadata_rollout_20260702-023225
+AGENTMEMORY_QWEN3_4B_LATEST_OBSERVATION_PROGRESS_ROLLOUT_SMOKE_OK
+env_steps=20 / parse_successes=20 / any_episode_success=False / progress_score=0.0,0.0
+```
+
+With the old generic prompt, Qwen3-4B still looped on
+`RETRIEVE {"query":"highest rated"}` despite the first dev observation exposing
+`average_rating / price_usd / total_reviews`. This means metadata exposure alone
+does not solve the policy behavior.
+
+A second diagnostic prompt explicitly told the model to compare visible
+`average_rating / price_usd / total_reviews` and that `RETRIEVE` cannot fetch
+product-catalog metadata:
+
+```text
+/home/ai-jingyan-train/luolirui.1/post-train/agentmemorygym-smoke-evidence/qwen3_4b_metadata_prompt_rollout_20260702-023436
+AGENTMEMORY_QWEN3_4B_LATEST_OBSERVATION_PROGRESS_ROLLOUT_SMOKE_OK
+env_steps=20 / parse_successes=20 / any_episode_success=False
+progress_score=0.16666666666666666,0.0
+```
+
+This second run bought the correct first item on dev episode 0 (`ma_i_a_b`) and
+then failed on later subtasks. It is useful plumbing/interface evidence: the
+metadata-enriched observation can induce at least one real `BUY`/reward/progress
+step on frozen MemoryArena dev. It is still not an RL result and not evidence of
+improved memory ability.
+
+Current closure bar before formal training/eval: strict candidate metadata only
+covers 285/900 steps, so the environment still needs either better all-candidate
+metadata matching or an explicit product-catalog `SEARCH` tool.

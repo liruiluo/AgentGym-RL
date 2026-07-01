@@ -217,6 +217,52 @@ The formal freeze now resolves all 900 step-level targets through the catalog
 shopping data artifact for the next single-GPU model/API rollout smoke; it is
 still not an RL training result or evidence of improved memory ability.
 
+
+## Candidate metadata enrichment freeze
+
+The converter now also supports candidate-side catalog metadata via:
+
+```text
+--enrich-candidate-metadata
+--candidate-metadata-min-score 90
+--candidate-metadata-catalog-scope target-shards|full
+```
+
+Design boundary: metadata is attached to visible candidates only when **every**
+candidate in the same subtask has a catalog-title match above the threshold. If
+one candidate is missing or below threshold, no candidate in that subtask gets
+metadata. This prevents target-only leakage. The observation exposes only
+comparable fields needed by the shopping goals:
+
+```text
+average_rating, price_usd, total_reviews
+```
+
+ASINs and catalog source paths stay in `report.jsonl` / `freeze_manifest.json`,
+not in the candidate observation. The product DB remains on the Jingyan shared
+disk; no product catalog files are copied to the Mac/devbox repo.
+
+Strict enriched freeze evidence:
+
+```text
+/home/ai-jingyan-train/luolirui.1/post-train/agentmemorygym-smoke-evidence/memoryarena_enriched_freeze_20260702-014308
+```
+
+Markers / manifest summary:
+
+```text
+AGENTMEMORY_MEMORYARENA_CONVERT_OK tasks=150 splits=train:120,dev:15,test:15 min_match_score=31 ambiguous_matches=0 candidate_metadata_full_steps=285/900
+AGENTMEMORY_DATA_VALIDATE_OK tasks=150 splits=train:120,dev:15,test:15
+AGENTMEMORY_MEMORYARENA_FORMAL_FREEZE_OK tasks=150 rows=900 splits=train:120,dev:15,test:15 ambiguous=0 resolvers={"asin_catalog": 900} catalog_paths=11 candidate_metadata_full_steps=285/900
+candidate_metadata_status_counts={"full":285,"partial":605,"none":10}
+```
+
+Interpretation: target alignment remains fully frozen (`asin_catalog=900 /
+ambiguous=0`), and strict metadata enrichment gives a leakage-safe observation
+for 285/900 subtasks. The remaining 615 subtasks still need either lower-risk
+metadata matching improvements or a product-catalog `SEARCH` tool before formal
+RL train/eval can be called fair for all MemoryArena shopping steps.
+
 Follow-up Qwen3-4B single-GPU rollout evidence is recorded separately in
 `docs/agentmemorygym/evidence/20260702-qwen3-4b-rollout-smoke.md`. That run
 confirmed the true model→action parser→env step chain on Jingyan 1×B200, but it

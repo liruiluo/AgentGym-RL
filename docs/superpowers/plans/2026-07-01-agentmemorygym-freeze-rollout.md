@@ -59,3 +59,24 @@
 - [x] Commit submodule first if code changed; then main repo docs/pointer.
 - [x] Sync Notion pages 09/10/11/12 again after Qwen3-4B rollout smoke and verify markers.
 - [ ] Commit rollout docs and memory.
+
+### Task 5: Candidate metadata enrichment before formal RL
+
+**Files:**
+- Modify: `AgentGym/agentenv-agentmemory/agentenv_agentmemory/memoryarena_converter.py`
+- Modify: `AgentGym/agentenv-agentmemory/scripts/convert_memoryarena_bundled_shopping.py`
+- Modify: `AgentGym/agentenv-agentmemory/scripts/freeze_memoryarena_bundled_shopping.py`
+- Modify: `AgentGym/agentenv-agentmemory/scripts/smoke_memoryarena_converter.py`
+- Modify after evidence: `docs/agentmemorygym/evidence/20260702-qwen3-4b-rollout-smoke.md`
+- Modify after evidence: `docs/agentmemorygym/notion/{09-stage-plan.md,10-next-actions.md,11-code-readme.md,12-evidence-ledger.md}`
+
+- [x] Add converter flags `--enrich-candidate-metadata` and `--candidate-metadata-min-score`.
+- [x] During enriched conversion, scan the product DB from the Jingyan shared disk; do not copy product DB files into Mac/devbox or commit them.
+- [x] Attach comparable metadata only when every visible candidate in a subtask has a catalog match above the threshold, so target-only leakage is impossible.
+- [x] Expose only task-relevant comparable fields in observations: `average_rating`, `price_usd`, and `total_reviews`; keep ASIN/source paths in report/manifest only.
+- [x] Extend report/manifest with metadata coverage and match-score audit fields.
+- [x] Add smoke tests covering full metadata enrichment and unmatched no-partial-leak behavior.
+- [x] Run compileall and converter smoke locally as 0-card validation.
+- [x] Run enriched formal freeze on Jingyan shared disk using the Jingyan shared-disk product DB root and explicit relevant catalog shards.
+- [ ] Rerun Qwen3-4B true single-GPU rollout smoke on the enriched dev split and record it as plumbing/interface evidence, not RL improvement.
+- [x] Sync Notion pages 09/10/11/12 from local markdown after evidence is written.
