@@ -106,7 +106,7 @@ matching is ambiguous but the ASIN catalog title selects the correct option.
 
 ## Jingyan shared-disk product DB mirror
 
-Per the storage boundary, large MemoryArena product DB files are being mirrored
+Per the storage boundary, large MemoryArena product DB files have been mirrored
 to the Jingyan shared disk, not to the devbox local disk:
 
 ```text
@@ -120,7 +120,14 @@ https://huggingface.co/datasets/ai-hyz/MemoryArena-product-db
 ```
 
 The full repository contains 135 files / 13,517,161,526 expected bytes. The
-mirror job streams Mac network downloads directly into the Jingyan shared disk.
+mirror job streamed Mac network downloads directly into the Jingyan shared disk.
+Final mirror verification at 2026-07-01 22:45 CST:
+
+```text
+STATUS complete file_count=135 expected_bytes=13517161526
+REMOTE_EXACT_VERIFY api_files=135 api_bytes=13517161526 remote_files=135 remote_bytes=13517161526 extra=0 missing=0 mismatch=0 parts=0
+```
+
 Four catalog shards were priority-mirrored first for converter validation:
 
 ```text

@@ -52,7 +52,7 @@
 - 全量 150 条 public bundled-shopping smoke 已可转换为 `train/dev/test = 120/15/15`，并通过 data validator。
 - converter 会生成 target-match audit report；无 catalog 时 heuristic 在 900 个 step 中有 12 个 tied/ambiguous match。
 - 已新增 catalog / ASIN resolver；在 Jingyan 共享盘的 4 个相关 product-catalog shard 上重跑 public conversion，900 个 step 的 ambiguous match 已降为 0。当前 summary：`catalog=450 / fallback=450 / ambiguous=0`。
-- MemoryArena product DB 正在全量镜像到 Jingyan 共享盘：`/home/ai-jingyan-train/luolirui.1/post-train/data/memoryarena-product-db/`，不落开发机本地盘。
+- MemoryArena product DB 已全量镜像到 Jingyan 共享盘：`/home/ai-jingyan-train/luolirui.1/post-train/data/memoryarena-product-db/`，不落开发机本地盘；最终校验为 `135 files / 13,517,161,526 bytes`，extra/missing/mismatch/part 均为 0。
 
 完成标准：
 

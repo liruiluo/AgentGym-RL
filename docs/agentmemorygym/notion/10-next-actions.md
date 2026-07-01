@@ -18,8 +18,9 @@
 7. 记录 0 卡本地检查结果，不写成单卡测试结果。
 8. 已用 Jingyan 1×B200 记录真实单卡 env/client/init smoke 结果。
 9. latest-observation scripted-policy rollout smoke 已通过；下一步仍需补真正小模型/API rollout smoke，不把 raw-history override 计入正式结果。
-10. MemoryArena bundled-shopping converter 已有入口和全量 smoke；catalog / ASIN resolver 已接入，Jingyan 共享盘 4 个相关 catalog shard 验证后把 12/900 个 target-match 歧义降到 0/900。下一步是等 product DB 全量镜像完成后冻结正式 train/dev/test item-id。
-11. Product DB 存储边界：大文件放 Jingyan 共享盘 `/home/ai-jingyan-train/luolirui.1/post-train/data/memoryarena-product-db/`，不放开发机本地盘。
+10. MemoryArena bundled-shopping converter 已有入口和全量 smoke；catalog / ASIN resolver 已接入，Jingyan 共享盘 4 个相关 catalog shard 验证后把 12/900 个 target-match 歧义降到 0/900。
+11. Product DB 已全量镜像到 Jingyan 共享盘 `/home/ai-jingyan-train/luolirui.1/post-train/data/memoryarena-product-db/`，最终校验 `135 files / 13,517,161,526 bytes`，extra/missing/mismatch/part 均为 0；不放开发机本地盘。
+12. 下一步：用完整 product DB 冻结正式 train/dev/test item-id，并在 Jingyan 1×B200 上跑真正小模型/API rollout smoke。
 
 ## 0 卡本地检查边界
 

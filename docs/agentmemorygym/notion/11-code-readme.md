@@ -37,5 +37,5 @@ Skeleton 当前只覆盖 handcrafted MemoryArena/WebShop-style bundled shopping 
 - MemoryArena bundled-shopping converter 已新增：`memoryarena_converter.py`、`convert_memoryarena_bundled_shopping.py`、`smoke_memoryarena_converter.py`；public 150 条转换 smoke 为 `train/dev/test=120/15/15`，validator 通过。
 - converter 现在支持 `--catalog-path` 传入 MemoryArena product DB JSON 文件或目录：优先用 `target_asin -> catalog title` 消歧，再 fallback 到属性匹配。
 - 无 catalog 时 full data 有 12/900 个 ambiguous matches；Jingyan 共享盘 4 个相关 catalog shard 验证后 summary 为 `rows=900 / ambiguous=0 / catalog=450 / fallback=450 / min_match=7`。
-- 大 product DB 镜像位置：`/home/ai-jingyan-train/luolirui.1/post-train/data/memoryarena-product-db/`；不落开发机本地盘。
+- 大 product DB 镜像位置：`/home/ai-jingyan-train/luolirui.1/post-train/data/memoryarena-product-db/`；不落开发机本地盘。当前全量镜像已校验完成：`135 files / 13,517,161,526 bytes`，extra/missing/mismatch/part 均为 0。
 - 仍不代表完整 LLM/vLLM rollout 或 RL 训练结果；下一层需要真实小模型/API rollout smoke。
