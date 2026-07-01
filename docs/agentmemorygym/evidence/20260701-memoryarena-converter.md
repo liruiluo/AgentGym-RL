@@ -177,6 +177,46 @@ Interpretation:
   is still data-conversion evidence, not a formal RL result or proof of improved
   memory ability.
 
+
+## Formal freeze with full product DB
+
+After the full product DB mirror completed, the formal bundled-shopping freeze was
+rerun on Jingyan with the repo-side freeze helper. The helper scans the full
+product DB by target ASIN first, selects only the relevant catalog shards, then
+runs converter + validator and writes a manifest. This avoids parsing unrelated
+5GB catalog JSON before conversion.
+
+Run directory:
+
+```text
+/home/ai-jingyan-train/luolirui.1/post-train/agentmemorygym-smoke-evidence/memoryarena_formal_freeze_20260701-234045
+```
+
+Markers / manifest summary:
+
+```text
+AGENTMEMORY_MEMORYARENA_CONVERT_OK tasks=150 splits=train:120,dev:15,test:15 min_match_score=31 ambiguous_matches=0
+AGENTMEMORY_DATA_VALIDATE_OK tasks=150 splits=train:120,dev:15,test:15
+AGENTMEMORY_MEMORYARENA_FORMAL_FREEZE_OK tasks=150 rows=900 splits=train:120,dev:15,test:15 ambiguous=0 resolvers={"asin_catalog": 900} catalog_paths=11
+source_sha256=4411a2da528a33dc6aca519b49cc225895363f18b2d19b191fddb501200134ef
+```
+
+Freeze artifacts:
+
+```text
+freeze_manifest.json
+memoryarena_agentmemory.jsonl
+report.jsonl
+splits/train.txt
+splits/dev.txt
+splits/test.txt
+```
+
+The formal freeze now resolves all 900 step-level targets through the catalog
+(`asin_catalog=900`) with no tied/ambiguous target matches. This is the frozen
+shopping data artifact for the next single-GPU model/API rollout smoke; it is
+still not an RL training result or evidence of improved memory ability.
+
 ## Jingyan 1×B200 container verification
 
 The Jingyan container could not fetch HuggingFace directly in this run because

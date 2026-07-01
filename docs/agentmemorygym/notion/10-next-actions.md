@@ -20,7 +20,8 @@
 9. latest-observation scripted-policy rollout smoke 已通过；下一步仍需补真正小模型/API rollout smoke，不把 raw-history override 计入正式结果。
 10. MemoryArena bundled-shopping converter 已有入口和全量 smoke；catalog / ASIN resolver 已接入，Jingyan 共享盘 4 个相关 catalog shard 验证后把 12/900 个 target-match 歧义降到 0/900。
 11. Product DB 已全量镜像到 Jingyan 共享盘 `/home/ai-jingyan-train/luolirui.1/post-train/data/memoryarena-product-db/`，最终校验 `135 files / 13,517,161,526 bytes`，extra/missing/mismatch/part 均为 0；不放开发机本地盘。
-12. 下一步：用完整 product DB 冻结正式 train/dev/test item-id，并在 Jingyan 1×B200 上跑真正小模型/API rollout smoke。
+12. 正式 train/dev/test item-id 已冻结：`memoryarena_formal_freeze_20260701-234045`，`120/15/15`，`asin_catalog=900 / ambiguous=0`。
+13. 下一步：在 Jingyan 1×B200 上跑真正小模型/API rollout smoke；不要把 scripted-policy 或 raw-history diagnostic 当正式 rollout 结果。
 
 ## 0 卡本地检查边界
 
