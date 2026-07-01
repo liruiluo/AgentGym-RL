@@ -217,6 +217,12 @@ The formal freeze now resolves all 900 step-level targets through the catalog
 shopping data artifact for the next single-GPU model/API rollout smoke; it is
 still not an RL training result or evidence of improved memory ability.
 
+Follow-up Qwen3-4B single-GPU rollout evidence is recorded separately in
+`docs/agentmemorygym/evidence/20260702-qwen3-4b-rollout-smoke.md`. That run
+confirmed the true model→action parser→env step chain on Jingyan 1×B200, but it
+also exposed that the converted MemoryArena observation still lacks product DB
+metadata / SEARCH access for rating- and price-driven instructions.
+
 ## Jingyan 1×B200 container verification
 
 The Jingyan container could not fetch HuggingFace directly in this run because

@@ -38,9 +38,11 @@
 - Remote repo: `/home/ai-jingyan-train/luolirui.1/post-train/code/AgentGym-RL-agentmemory-smoke`
 - Evidence: `/home/ai-jingyan-train/luolirui.1/post-train/agentmemorygym-smoke-evidence/<rollout-run>/`
 
-- [ ] Confirm Jingyan 1×B200 lane is usable and not the 8-card continual-reasoning lane.
-- [ ] Run a bounded true rollout path using the frozen data or a small sampled subset.
-- [ ] Record exact command, logs, marker, and whether this is model/API rollout or scripted policy.
+- [x] Confirm Jingyan 1×B200 lane is usable and not the 8-card continual-reasoning lane.
+- [x] Run a bounded true rollout path using frozen MemoryArena dev data with Transformers Qwen3-4B.
+- [x] Record exact command, logs, marker, and whether this is model/API rollout or scripted policy.
+- [x] Record negative result honestly: frozen dev rollout produced valid env steps but `progress_score=0.0`; handcrafted smoke progressed to `1/3` but did not finish.
+- [x] Identify next code gap: converted MemoryArena observation needs product DB metadata for all candidates or a product-catalog `SEARCH` tool before formal training/eval claims.
 
 ### Task 4: Docs, Notion, commits, memory
 
@@ -52,6 +54,8 @@
 - Modify: `docs/agentmemorygym/notion/12-evidence-ledger.md`
 - Modify: `docs/agentmemorygym/notion-local-map.md`
 
-- [ ] Record freeze path and markers.
-- [ ] Sync Notion pages 09/10/11/12 and verify markers.
-- [ ] Commit submodule first if code changed; then main repo docs/pointer; then memory.
+- [x] Record freeze path and markers.
+- [x] Sync Notion pages 09/10/11/12 and verify formal-freeze markers.
+- [x] Commit submodule first if code changed; then main repo docs/pointer.
+- [x] Sync Notion pages 09/10/11/12 again after Qwen3-4B rollout smoke and verify markers.
+- [ ] Commit rollout docs and memory.
