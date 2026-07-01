@@ -15,12 +15,14 @@ def load_context_policy_module():
     return module
 
 
-assert_rollout_context_supported = load_context_policy_module().assert_rollout_context_supported
+context_policy_module = load_context_policy_module()
+assert_rollout_context_supported = context_policy_module.assert_rollout_context_supported
+rollout_context_policy = context_policy_module.rollout_context_policy
 
 
 def expect_blocked() -> None:
     try:
-        assert_rollout_context_supported({"task_name": "agentmemory"})
+        assert_rollout_context_supported({"task_name": "agentmemory", "rollout_context_policy": "raw_history"})
     except RuntimeError as exc:
         assert "full raw conversation history" in str(exc)
         return
@@ -28,6 +30,9 @@ def expect_blocked() -> None:
 
 
 def expect_allowed_by_config() -> None:
+    assert rollout_context_policy(
+        {"task_name": "agentmemory", "allow_raw_history_for_agentmemory": True}
+    ) == "raw_history"
     assert_rollout_context_supported(
         {"task_name": "agentmemory", "allow_raw_history_for_agentmemory": True}
     )
@@ -47,6 +52,8 @@ def expect_allowed_by_env() -> None:
 
 def main() -> None:
     assert_rollout_context_supported({"task_name": "webshop"})
+    assert rollout_context_policy({"task_name": "agentmemory"}) == "latest_observation_only"
+    assert_rollout_context_supported({"task_name": "agentmemory"})
     expect_blocked()
     expect_allowed_by_config()
     expect_allowed_by_env()

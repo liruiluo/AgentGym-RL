@@ -154,8 +154,9 @@ AgentGym-RL/                         # 主训练 fork
 5. AgentGym-RL vLLM rollout 已加 raw-history guard：`task_name=agentmemory` 默认阻止全历史拼接式 rollout；只有显式 `allow_raw_history_for_agentmemory` / `AGENTMEMORY_ALLOW_RAW_HISTORY=1` 才允许 diagnostic smoke，不得用于正式训练。
 6. 当前 0 卡本地检查只作为代码/schema 快速验证，不写成单卡结果。
 7. 真单卡 GPU 依赖环境已完成 env/client/init smoke：B200 + torch CUDA、real AgentGym adapter import、server metadata、`init_env_client` metadata path 均通过。
-8. 剩余单卡缺口是小模型/API rollout smoke；该步骤必须等 latest-observation / ephemeral-context rollout 路径，不使用 raw-history guard override 当正式证据。
-9. 明天拿到新 8 卡后，再考虑正式后训练。
+8. rollout 数据路径已推进：AgentMemory 默认 latest-observation，只把当前 observation 给 policy；多轮 episode 展平成每个 action 一条 PPO 样本，并用 `rollout_parent_indices` 对齐原 batch，避免 actor/ref logprob 重算时读到完整历史。
+9. 剩余单卡缺口是小模型/API rollout smoke；不得用 raw-history override 当正式证据。
+10. 明天拿到新 8 卡后，再考虑正式后训练。
 
 ## 8. 声明边界
 

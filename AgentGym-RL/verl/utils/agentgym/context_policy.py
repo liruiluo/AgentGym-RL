@@ -19,9 +19,23 @@ def assert_rollout_context_supported(agentgym_config: Any) -> None:
     task_name = str(read_config(agentgym_config, "task_name", "")).lower()
     if task_name != "agentmemory":
         return
+    if rollout_context_policy(agentgym_config) == "latest_observation_only":
+        return
     if allow_raw_history_for_agentmemory(agentgym_config):
         return
     raise RuntimeError(AGENTMEMORY_RAW_HISTORY_ERROR)
+
+
+def rollout_context_policy(agentgym_config: Any) -> str:
+    task_name = str(read_config(agentgym_config, "task_name", "")).lower()
+    policy = str(read_config(agentgym_config, "rollout_context_policy", "")).strip().lower()
+    if policy:
+        return policy
+    if task_name == "agentmemory" and allow_raw_history_for_agentmemory(agentgym_config):
+        return "raw_history"
+    if task_name == "agentmemory":
+        return "latest_observation_only"
+    return "raw_history"
 
 
 def allow_raw_history_for_agentmemory(agentgym_config: Any) -> bool:

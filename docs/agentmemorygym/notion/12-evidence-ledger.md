@@ -33,3 +33,4 @@
 - Mac/ZBMac 是 0 卡机器；本地 compile/data/server/stub smoke 只能证明代码/schema/API 基本可跑，不能记作单卡 smoke。
 - Mac 本机缺少 `torch`，本地 import probe 仍记录为 `AGENTGYM_ADAPTER_IMPORT_FAIL ModuleNotFoundError No module named 'torch'`；该限制已通过 Jingyan 1×B200 的真实 GPU 环境补掉 adapter/client/import 层，但完整模型 rollout 仍需后续验证。
 - `docs/agentmemorygym/evidence/20260701-single-gpu-smoke.md` 记录 Jingyan 1×B200 真单卡 smoke：`TORCH_CUDA_OK`、`AGENTMEMORY_REAL_ADAPTER_IMPORT_OK`、`SERVER_METADATA_SINGLE_GPU_OK`、`AGENTMEMORY_REAL_CLIENT_METADATA_SINGLE_GPU_OK`、`VERL_INIT_ENV_CLIENT_AGENTMEMORY_SINGLE_GPU_OK`。这证明 GPU/env/client/init 路径可跑，但不证明完整模型 rollout、正式 RL 训练或 MemoryArena 转换。
+- `docs/agentmemorygym/evidence/20260701-latest-observation-rollout.md` 记录 latest-observation rollout context：`AGENTMEMORY_LATEST_OBSERVATION_PROMPT_SMOKE_OK`、`AGENTMEMORY_ROLLOUT_CONTEXT_ALIGNMENT_SMOKE_OK`。这证明训练数据路径不再把 raw history 暴露给 actor/ref logprob 重算，但仍不等于完整模型 rollout 或 RL 训练结果。

@@ -35,6 +35,7 @@ from verl.agent_trainer.ppo import core_algos
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.agent_dataset.rl_dataset import RLHFDataset, collate_fn
+from verl.utils.agentgym.rollout_context import align_batch_to_rollout
 from abc import ABC, abstractmethod
 
 WorkerType = Type[Worker]
@@ -795,8 +796,14 @@ class RayPPOTrainer(object):
 
                     batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
                                                              dtype=object)
-                    # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    # Align source samples with rollout outputs. Standard tasks repeat each
+                    # source n times; AgentMemoryGym can return one independent training
+                    # sample per agent action and provides rollout_parent_indices.
+                    batch = align_batch_to_rollout(
+                        batch,
+                        gen_batch_output,
+                        repeat_times=self.config.actor_rollout_ref.rollout.n,
+                    )
                     batch = batch.union(gen_batch_output)
 
                     # balance the number of valid tokens on each dp rank.

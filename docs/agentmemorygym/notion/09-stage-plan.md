@@ -38,7 +38,8 @@
 - 已在 Jingyan 1×B200 上通过 torch CUDA、real AgentGym adapter import、server metadata、real client metadata、`init_env_client` metadata smoke。
 - 证据：`TORCH_CUDA_OK`、`AGENTMEMORY_REAL_ADAPTER_IMPORT_OK`、`SERVER_METADATA_SINGLE_GPU_OK`、`AGENTMEMORY_REAL_CLIENT_METADATA_SINGLE_GPU_OK`、`VERL_INIT_ENV_CLIENT_AGENTMEMORY_SINGLE_GPU_OK`。
 - diagnostic rollout 若显式允许 raw-history，必须标记不可计入正式结果。
-- formal rollout 在 latest-observation 实现前应被 guard 阻止。
+- latest-observation rollout context 已实现并通过 smoke：`AGENTMEMORY_LATEST_OBSERVATION_PROMPT_SMOKE_OK`、`AGENTMEMORY_ROLLOUT_CONTEXT_ALIGNMENT_SMOKE_OK`。
+- formal rollout 不再走 raw-history；多轮 episode 展平成每个 action 一条 PPO 样本，trainer 用 `rollout_parent_indices` 对齐原 batch。
 - 小模型或 API rollout smoke 有独立日志和证据。
 
 ## Stage 2：MemoryArena 电商数据转换

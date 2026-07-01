@@ -78,6 +78,19 @@ class RolloutHandler:
             msg.to_dict() for msg in self.messages
         ]
         return tokenizer.apply_chat_template(conversations, add_generation_prompt=True, tokenize=True)
+
+    def get_latest_observation_prompt(self, tokenizer: PreTrainedTokenizer) -> List[int]:
+        assert self.messages, "RolloutHandler has no messages."
+        latest_user_message = self.messages[-1]
+        assert latest_user_message.role == "user", (
+            f"Latest-observation rollout expects the last message to be a user "
+            f"observation, got role={latest_user_message.role!r}."
+        )
+        return tokenizer.apply_chat_template(
+            [latest_user_message.to_dict()],
+            add_generation_prompt=True,
+            tokenize=True,
+        )
     
     
     def add_assistant_message(
