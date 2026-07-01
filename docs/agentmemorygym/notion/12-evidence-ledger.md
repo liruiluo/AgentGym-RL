@@ -12,12 +12,18 @@
 | 代码草稿应保留为 skeleton，不因“先文档再代码”而撤回。 | 新增 | 用户 2026-07-01 纠偏 + 当前 worktree | 支撑执行边界。 |
 | 最小购物环境不能让 product_id 直接泄漏关键尺寸答案。 | 新增 | 当前 smoke 代码审查 | 支撑环境可训练性边界。 |
 
-## 后续需补的一手证据
+## 已核的一手证据
 
-- MemoryArena 任务细节与数据/代码可用性。
-- AgentGym-RL 当前版本算法支持和训练入口。
-- AgeMem 工具定义与训练流程。
-- 可复现 RL-memory baseline 的代码可用性。
+- MemoryArena 项目页：确认其核心评估思想是多会话 Memory-Agent-Environment 交互、显式相互依赖子任务，以及 `bundled_shopping` / `progressive_search` / `group_travel_planner` / `formal_reasoning_math/phys` 等任务配置。
+- AgentGym-RL GitHub：确认其定位是 multi-turn interactive decision-making RL 框架，采用 environment / agent / training 模块化设计，并列出 PPO、GRPO、RLOO、REINFORCE++ 等算法。
+- AgeMem ACL PDF：确认其 memory tool taxonomy 为 LTM `ADD/UPDATE/DELETE` 与 STM `RETRIEVE/SUMMARY/FILTER`，与当前 AgentMemoryGym action 设计一致。
+- 本地记录：`docs/agentmemorygym/evidence/20260701-source-check.md`。
+
+## 后续仍需补的证据
+
+- MemoryArena/WebShop 真实数据转换代码与 item-id 冻结。
+- 可复现 RL-memory baseline 的代码可用性与公平比较协议。
+- 用户提到的 `Qwen3.6-4B` 模型名和可用 checkpoint，需要在实际训练前单独核验。
 
 ## 本地 smoke 证据
 
