@@ -26,7 +26,7 @@ code/AgentGym-RL/docs/agentmemorygym/  # 当前文档与 Notion 同步源
 2. 先实现 bundled shopping smoke 环境。
 3. 再注册 `AgentMemoryEnvClient` 和 `task_name=agentmemory`。
 4. Mac/ZBMac 只做 0 卡本地检查：compile、data/schema、direct env、server API；不能写成单卡测试。
-5. 大 MemoryArena product DB、catalog scan 和 SQLite/FTS index 都放 Jingyan 共享盘，不放开发机本地盘。
+5. 大 MemoryArena product DB、catalog scan 和 SQLite/FTS index 都放 Jingyan 共享盘，不放开发机/Mac 本地盘。共享盘容量不是限制，可以全量下载、全量建索引；不要因为本机 0 卡或本机无 DB 而降级成“本机最小依赖”。
 6. Jingyan 1×B200 已用于 direct env / client / Qwen3-4B rollout smoke 和 scripted SEARCH baseline；baseline no-retry `5/15`、retry5 diagnostic `10/15`、soft-fallback verifier diagnostic `15/15`，只算接口/可解性证据。
 7. 新 8 卡机器到位后再考虑正式后训练。
 

@@ -10,7 +10,7 @@
 - Memory 工具：参考 AgeMem/Agentic Memory，把 `ADD / UPDATE / DELETE / RETRIEVE / SUMMARY / FILTER` 做成 policy 可选动作。
 - 奖励：最终任务成功 + 子任务进度 + 兼容约束满足，扣除过度 memory/tool 操作成本。
 - 执行顺序：**先改本地文档与 Notion 文档，再改代码**。这只是优先级/验收顺序，不等于撤回已有代码草稿；当前 `agentenv-agentmemory` skeleton 可以保留在工作树，但在正式收口前必须重新验证并明确标注为草稿。
-- 资源边界：Mac/ZBMac 仍只做 0 卡静态/数据/schema/API 检查；大 MemoryArena product DB 和 SQLite/FTS 搜索索引都放 Jingyan 共享盘，不落开发机本地盘。Jingyan 1×B200 已用于真实单卡 smoke 和 scripted SEARCH dev baseline；8 卡机器当前给 continual-reasoning gym，AgentMemoryGym 等新 8 卡再做正式后训练。
+- 资源边界：Mac/ZBMac 仍只做 0 卡静态/数据/schema/API 检查；大 MemoryArena product DB 和 SQLite/FTS 搜索索引都放 Jingyan 共享盘，不落开发机/Mac 本地盘。共享盘容量不是限制，可以全量下载、全量建索引；不要因为本机 0 卡或本机无 DB 而降级成“本机最小依赖”。Jingyan 1×B200 已用于真实单卡 smoke 和 scripted SEARCH dev baseline；8 卡机器当前给 continual-reasoning gym，AgentMemoryGym 等新 8 卡再做正式后训练。
 
 ## 文件
 
