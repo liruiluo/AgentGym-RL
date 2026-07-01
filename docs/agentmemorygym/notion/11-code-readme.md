@@ -34,4 +34,6 @@ Skeleton 当前只覆盖 handcrafted MemoryArena/WebShop-style bundled shopping 
 - Jingyan 1×B200 已通过真实单卡 env/client/init smoke：torch CUDA、real AgentGym adapter import、server metadata、real client metadata、`init_env_client` metadata path。
 - latest-observation rollout context 已实现：`agentmemory` 默认只用当前 observation 生成 action，多轮 episode 展平成 per-action PPO 样本，`rollout_parent_indices` 负责 trainer batch 对齐。
 - latest-observation scripted-policy rollout smoke 已通过：`AGENTMEMORY_LATEST_OBSERVATION_POLICY_SMOKE_OK`。
-- 仍不代表完整 MemoryArena 数据转换或完整 LLM/vLLM rollout；下一层需要 real MemoryArena/WebShop converter 和真实小模型/API rollout smoke。
+- MemoryArena bundled-shopping converter 已新增：`memoryarena_converter.py`、`convert_memoryarena_bundled_shopping.py`、`smoke_memoryarena_converter.py`；public 150 条转换 smoke 为 `train/dev/test=120/15/15`，validator 通过。
+- 当前 converter 仍是 heuristic target-option matching：full data 有 12/900 个 ambiguous matches，必须用 WebShop catalog / ASIN map 消歧后才可作为 formal frozen dataset。
+- 仍不代表完整 LLM/vLLM rollout 或 RL 训练结果；下一层需要真实小模型/API rollout smoke。

@@ -22,6 +22,7 @@
 - `evidence/20260701-single-gpu-smoke.md`：Jingyan 1×B200 上的真实单卡 GPU/env/client/init smoke 证据。
 - `evidence/20260701-latest-observation-rollout.md`：latest-observation rollout context 与 per-action PPO 样本展开证据。
 - `evidence/20260701-latest-observation-policy-smoke.md`：latest-observation scripted-policy rollout smoke；验证 memory tool contract，不冒充 LLM rollout。
+- `evidence/20260701-memoryarena-converter.md`：MemoryArena bundled-shopping converter smoke；全量 150 条可转为 AgentMemoryGym JSONL，并记录 12/900 个 target-match 歧义。
 
 ## 当前 Notion 页面
 

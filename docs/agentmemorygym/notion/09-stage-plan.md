@@ -46,6 +46,12 @@
 
 目标：把 bundled web shopping 任务改成可训练 item。
 
+当前进展：
+
+- 已新增 MemoryArena bundled-shopping converter 入口，可把 public `bundled_shopping/data.jsonl` 转成 AgentMemoryGym JSONL。
+- 全量 150 条 public bundled-shopping smoke 已可转换为 `train/dev/test = 120/15/15`，并通过 data validator。
+- converter 会生成 target-match audit report；当前 heuristic 在 900 个 step 中有 12 个 tied/ambiguous match，不能直接当 formal frozen label。
+
 完成标准：
 
 - item schema。
@@ -53,6 +59,7 @@
 - accept-reject / compatibility map。
 - reward decomposition。
 - normalized trajectory info。
+- WebShop catalog / ASIN map 或官方 option-to-ASIN 对齐源消掉 ambiguous target matches。
 
 ## Stage 3：基线 smoke
 

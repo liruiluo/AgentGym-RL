@@ -18,6 +18,7 @@
 7. 记录 0 卡本地检查结果，不写成单卡测试结果。
 8. 已用 Jingyan 1×B200 记录真实单卡 env/client/init smoke 结果。
 9. latest-observation scripted-policy rollout smoke 已通过；下一步仍需补真正小模型/API rollout smoke，不把 raw-history override 计入正式结果。
+10. MemoryArena bundled-shopping converter 已有入口和全量 smoke；下一步要接 WebShop catalog / ASIN map 消除 12/900 个 target-match 歧义，然后冻结正式 train/dev/test item-id。
 
 ## 0 卡本地检查边界
 
