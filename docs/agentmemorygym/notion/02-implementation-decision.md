@@ -25,13 +25,14 @@ code/AgentGym-RL/docs/agentmemorygym/  # 当前文档与 Notion 同步源
 1. 新增 `agentenv-agentmemory` package。
 2. 先实现 bundled shopping smoke 环境。
 3. 再注册 `AgentMemoryEnvClient` 和 `task_name=agentmemory`。
-4. 单卡上做 direct env smoke / server-client smoke。
-5. 再做小模型或 API rollout smoke。
+4. 当前 Mac/ZBMac 只做 0 卡本地检查：compile、data/schema、direct env、server API；不能写成单卡测试。
+5. 真正单卡上再做 direct env smoke / server-client smoke / 小模型或 API rollout smoke。
 6. 明天新 8 卡机器到位后再考虑正式后训练。
 
 ## 资源边界
 
-- 现在可以用单卡测试 AgentMemoryGym smoke。
+- 当前 0 卡本地检查不等于单卡 smoke。
+- 现在可以在干净单卡 GPU lane 上测试 AgentMemoryGym smoke，但不能占用用户已划给 continual-reasoning gym / Jingyan / CRL eval 的现有 lane。
 - 现有 8 卡机器当前给 continual-reasoning gym 项目用。
 - AgentMemoryGym 的新 8 卡机器等明天再配。
 

@@ -20,6 +20,8 @@ Skeleton 当前只覆盖 handcrafted MemoryArena/WebShop-style bundled shopping 
 
 - 默认数据入口：`agentenv_agentmemory/data/bundled_shopping_smoke.jsonl`。
 - 默认 split 文件：`agentenv_agentmemory/data/splits/{train,dev,test}.txt`，当前各一个 smoke item。
+- dataset/split 配置：`AGENTMEMORY_DATA_PATH`、`AGENTMEMORY_SPLIT`、`AGENTMEMORY_SPLIT_DIR`。
+- server metadata：`/metadata` 返回 `task_count`、`task_ids`、`splits`、`source`。
 - 中性 product_id，例如 `tv_b`、`mount_b`、`console_b`，避免直接把 `75` / `large` 写进 ID。
 - `info` 记录 `task_id`、`split`、`source`、`difficulty`、`memory_dependency`、`progress_score`、`episode_success`、`memory_ops`、`memory_state_diff`、`compatibility_violations`、`purchase_history`。
 - AgentGym client 侧保留 server 返回的 `env_info`，后续可用于 rollout 日志和 behavior analysis。
@@ -27,4 +29,6 @@ Skeleton 当前只覆盖 handcrafted MemoryArena/WebShop-style bundled shopping 
 - direct smoke helper：`PYTHONPATH=agentenv-agentmemory python3 agentenv-agentmemory/scripts/smoke_agentmemory.py`。
 - JSONL loader smoke marker：`JSONL_LOADER_SMOKE_OK`。
 - validator marker：`AGENTMEMORY_DATA_VALIDATE_OK`。
-- 仍不代表完整 MemoryArena 数据转换；下一层需要 real MemoryArena/WebShop converter、train/dev/test split、raw-history leakage guard 和小模型/API rollout smoke。
+- rollout guard marker：`AGENTMEMORY_CONTEXT_POLICY_SMOKE_OK`。`task_name=agentmemory` 在当前全历史拼接式 vLLM rollout 中默认 fail-fast，防止正式训练绕过 memory tools；显式 raw-history override 只能用于 diagnostic smoke。
+- 当前 Mac/ZBMac 上的检查是 0 卡本地检查，不是单卡 smoke。
+- 仍不代表完整 MemoryArena 数据转换；下一层需要 real MemoryArena/WebShop converter、真实单卡 GPU rollout smoke、以及 latest-observation rollout 实现。

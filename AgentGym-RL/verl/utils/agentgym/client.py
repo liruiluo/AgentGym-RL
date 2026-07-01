@@ -47,7 +47,10 @@ def init_env_client(args):
     retry = 0
     while True:
         try:
-            env_client = envclient_class(env_server_base=args.env_addr, data_len=1, timeout=2400)
+            data_len = getattr(args, "data_len", 1)
+            if args.task_name.lower() == "agentmemory" and not hasattr(args, "data_len"):
+                data_len = None
+            env_client = envclient_class(env_server_base=args.env_addr, data_len=data_len, timeout=2400)
             break
         except Exception as e:
             retry += 1

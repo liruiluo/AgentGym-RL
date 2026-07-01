@@ -49,6 +49,7 @@ from copy import deepcopy
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.torch_functional import get_eos_mask, pad_sequence_to_length
 from verl.utils.agentgym.client import init_env_client
+from verl.utils.agentgym.context_policy import assert_rollout_context_supported
 from verl.workers.rollout.schemas import RolloutHandler, Message, _pre_process_inputs
 
 # TODO
@@ -210,6 +211,7 @@ class vLLMRollout(BaseRollout):
         batch_size = prompts.batch['input_ids'].size(0)
         batch_size *= self.config.n
         rollout_handler_ls = self.preprocess_prompt_to_rollout_handler(prompts, n=self.config.n)
+        assert_rollout_context_supported(self.agentgym_config)
         env_clients = [init_env_client(self.agentgym_config) for _ in range(batch_size)]
         time.sleep(self.config.send_interval) # take a break before sendng request
         all_done_flag = False

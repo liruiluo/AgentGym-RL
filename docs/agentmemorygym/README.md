@@ -10,7 +10,7 @@
 - Memory 工具：参考 AgeMem/Agentic Memory，把 `ADD / UPDATE / DELETE / RETRIEVE / SUMMARY / FILTER` 做成 policy 可选动作。
 - 奖励：最终任务成功 + 子任务进度 + 兼容约束满足，扣除过度 memory/tool 操作成本。
 - 执行顺序：**先改本地文档与 Notion 文档，再改代码**。这只是优先级/验收顺序，不等于撤回已有代码草稿；当前 `agentenv-agentmemory` skeleton 可以保留在工作树，但在正式收口前必须重新验证并明确标注为草稿。
-- 资源边界：现在可用单卡做 smoke；8 卡机器当前给 continual-reasoning gym，AgentMemoryGym 等明天新 8 卡机器。
+- 资源边界：当前 Mac/ZBMac 是 0 卡机器，只能做静态、数据、schema、server API 级别检查；这不算单卡验证。真正的单卡 smoke 需要在有 GPU 且装好 torch/AgentGym/verl 依赖的干净 lane 上做；8 卡机器当前给 continual-reasoning gym，AgentMemoryGym 等明天新 8 卡机器。
 
 ## 文件
 
@@ -18,6 +18,7 @@
 - `agentic-memory-gym-design.zh.md`：中文主设计文档。
 - `notion/`：同步到 Notion 分页面版的本地源文件。
 - `evidence/20260701-skeleton-smoke.md`：当前 skeleton compile/direct/server-client smoke 证据。
+- `evidence/20260701-rollout-guard-smoke.md`：dataset/split metadata 与 raw-history rollout guard 证据。
 
 ## 当前 Notion 页面
 

@@ -30,4 +30,5 @@
 - `docs/agentmemorygym/evidence/20260701-skeleton-smoke.md` 记录了 compile/direct/server-client smoke。
 - JSONL loader 已验证，marker 为 `JSONL_LOADER_SMOKE_OK`；data validator marker 为 `AGENTMEMORY_DATA_VALIDATE_OK`；server-client JSONL/split 路径 marker 为 `SERVER_CLIENT_JSONL_SMOKE_OK` / `SERVER_CLIENT_SPLIT_SMOKE_OK`。
 - 当前 smoke 只证明最小环境 skeleton 可跑，不证明完整 MemoryArena 转换或 RL 提升。
-- 本机缺少 `torch`，完整 AgentGym adapter import / verl rollout 需在单卡依赖环境中验证；当前本地 import probe 记录为 `AGENTGYM_ADAPTER_IMPORT_FAIL ModuleNotFoundError No module named 'torch'`。
+- Mac/ZBMac 是 0 卡机器；本地 compile/data/server/stub smoke 只能证明代码/schema/API 基本可跑，不能记作单卡 smoke。
+- 本机缺少 `torch`，完整 AgentGym adapter import / verl rollout 需在真正单卡 GPU 依赖环境中验证；当前本地 import probe 记录为 `AGENTGYM_ADAPTER_IMPORT_FAIL ModuleNotFoundError No module named 'torch'`。

@@ -36,7 +36,7 @@ AGENTMEMORY_DATA_VALIDATE_OK tasks=3 splits=train:1,dev:1,test:1
 AGENTMEMORY_DIRECT_SMOKE_OK tv_bundle_75 laptop_bundle_14 monitor_bundle_27
 ```
 
-Server-client smoke used the temporary local venv at `/tmp/agentmemorygym-smoke-venv` with FastAPI/Uvicorn/Requests and the updated TV plan:
+Server-client smoke used the temporary local venv at `/tmp/agentmemorygym-smoke-venv` with FastAPI/Uvicorn/Requests and the updated TV plan. This is a 0-card local API check, not a single-GPU smoke:
 
 ```text
 CREATE 0 False
@@ -71,10 +71,10 @@ SERVER_CLIENT_SPLIT_SMOKE_OK monitor_bundle_27 test
 
 ## Known local limitation
 
-Full AgentGym adapter import was not run successfully on this Mac because the local smoke venv lacks `torch`:
+Full AgentGym adapter import was not run successfully on this 0-card Mac because the local smoke venv lacks `torch`:
 
 ```text
 AGENTGYM_ADAPTER_IMPORT_FAIL ModuleNotFoundError No module named 'torch'
 ```
 
-This is an environment dependency limitation, not yet evidence of an adapter code failure. Full AgentGym/verl import and rollout should be tested on the approved single-card environment with AgentGym dependencies installed.
+This is an environment dependency limitation, not yet evidence of an adapter code failure. It also means the local checks above must not be counted as single-card validation. Full AgentGym/verl import and rollout should be tested on an approved single-GPU environment with AgentGym dependencies installed.

@@ -5,7 +5,7 @@
 - **研究目标**：构建一个面向 agent memory policy 的 RL 后训练 Gym，把长程、多会话、依赖历史状态的 agent 任务改写成可训练、可评测、可归因的环境。
 - **当前阶段**：方向重定位 + 文档/Notion 对齐 + 最小代码 skeleton 整理。旧文档是 MemoryAgentBench-first，现在调整为 MemoryArena / 电商捆绑购物优先。
 - **已确定边界**：复用 AgentGym-RL / verl；memory 工具参考 AgeMem；v0 先做 Gym、基线、评测和行为分析，不声称第一个 RL-memory 方法。
-- **资源边界**：当前只做文档与单卡 smoke；8 卡机器暂给 continual-reasoning gym，AgentMemoryGym 明天再配新的 8 卡。
+- **资源边界**：当前 Mac/ZBMac 是 0 卡机器，只能做静态、数据、schema、server API 级别检查；这些检查不能算单卡 smoke。真正单卡 smoke 需要在有 GPU 且装好 torch/AgentGym/verl 依赖的干净 lane 上做。8 卡机器暂给 continual-reasoning gym，AgentMemoryGym 明天再配新的 8 卡。
 - **本阶段完成标准**：本地文档和 Notion 页面不再把 MemoryAgentBench AR/CR 写成第一主线；电商捆绑购物成为 hero environment；已有代码草稿保留为 `agentenv-agentmemory` skeleton，并通过 compile/direct/server-client smoke 后仍只标注为草稿。
 
 ## 1. 为什么做 Agentic RL Memory 后训练
@@ -150,8 +150,11 @@ AgentGym-RL/                         # 主训练 fork
 1. 先改本地文档和 Notion 文档。
 2. 保留并整理已有代码 skeleton，不撤草稿。
 3. 用 JSONL item schema 和 train/dev/test split 文件承载 smoke 任务，作为后续 MemoryArena/WebShop 转换入口。
-4. 在单卡上做环境 smoke / 小模型或 API rollout smoke。
-5. 明天拿到新 8 卡后，再考虑正式后训练。
+4. server 支持 dataset/split 配置和 `/metadata`，client 可读真实 `task_count`，避免 trainer 继续硬编码 `data_len=1`。
+5. AgentGym-RL vLLM rollout 已加 raw-history guard：`task_name=agentmemory` 默认阻止全历史拼接式 rollout；只有显式 `allow_raw_history_for_agentmemory` / `AGENTMEMORY_ALLOW_RAW_HISTORY=1` 才允许 diagnostic smoke，不得用于正式训练。
+6. 当前 0 卡本地检查只作为代码/schema 快速验证，不写成单卡结果。
+7. 在真正单卡 GPU 依赖环境上做环境 smoke / 小模型或 API rollout smoke。
+8. 明天拿到新 8 卡后，再考虑正式后训练。
 
 ## 8. 声明边界
 

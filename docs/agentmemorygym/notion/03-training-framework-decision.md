@@ -21,7 +21,8 @@
 ## 训练阶段安排
 
 1. 文档与 Notion 对齐。
-2. 单卡 smoke：环境、client、rollout 小样本；当前已完成 compile/direct/server-client smoke，完整 AgentGym/verl rollout 仍需单卡依赖环境。
-3. 基线 smoke：no-memory、full-context、fixed-RAG、heuristic memory manager。
-4. 8 卡正式后训练：等新机器，不占用 continual-reasoning gym 的 8 卡。
-5. 第一轮行为分析后，再决定是否需要新优化目标或 credit assignment 机制。
+2. 0 卡本地检查：compile、data/schema、direct env、server API、rollout guard；这只证明代码/schema 基本可跑，不算单卡测试。
+3. 真正单卡 smoke：在有 GPU 且装好 torch/AgentGym/verl 的干净 lane 上跑环境、client、rollout 小样本。
+4. 基线 smoke：no-memory、full-context、fixed-RAG、heuristic memory manager。
+5. 8 卡正式后训练：等新机器，不占用 continual-reasoning gym 的 8 卡。
+6. 第一轮行为分析后，再决定是否需要新优化目标或 credit assignment 机制。

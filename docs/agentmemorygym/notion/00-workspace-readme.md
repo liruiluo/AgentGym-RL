@@ -17,8 +17,9 @@ code/AgentGym-RL/docs/agentmemorygym/  当前文档与 Notion 同步源
 1. 文档和 Notion 先对齐。
 2. 代码草稿可以保留在工作树；“先文档再代码”是优先级，不是撤回草稿。
 3. 当前整理并验证 `agentenv-agentmemory` skeleton。
-4. 先单卡 compile/direct/server-client smoke。
-5. 明天新 8 卡到位后再跑正式后训练。
+4. 当前 Mac/ZBMac 只能做 0 卡本地检查：compile、data/schema、direct env、server API；这些不算单卡结果。
+5. 真正单卡 smoke 需要在有 GPU 且装好 torch/AgentGym/verl 依赖的干净 lane 上做。
+6. 明天新 8 卡到位后再跑正式后训练。
 
 ## 关键边界
 

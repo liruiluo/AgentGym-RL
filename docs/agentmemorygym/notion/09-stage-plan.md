@@ -11,9 +11,9 @@
 - 父页短结论不再写 MemoryAgentBench AR/CR first。
 - 阶段计划明确“先文档与 Notion，再代码”。
 
-## Stage 1：单卡环境 smoke
+## Stage 1a：0 卡本地代码/schema/server 检查
 
-目标：在单卡上验证 `agentenv-agentmemory` 最小环境、server-client、AgentGym-RL client registry。
+目标：在 Mac/ZBMac 这种 0 卡机器上，只验证 `agentenv-agentmemory` 最小环境的静态、数据、schema、server API 和 guard 逻辑。此阶段不算单卡 smoke。
 
 完成标准：
 
@@ -24,7 +24,21 @@
 - smoke split 文件存在：`train/dev/test` 各一个 item。
 - 数据 validator 通过：`AGENTMEMORY_DATA_VALIDATE_OK`。
 - candidate product id 不直接泄漏关键尺寸答案。
-- 记录当前限制：AgentGym-RL 原始 rollout 可能仍保留完整历史，需要后续处理 raw-history leakage。
+- server `/metadata` 返回 task_count / task_ids / splits。
+- AgentGym-RL raw-history guard 通过：`AGENTMEMORY_CONTEXT_POLICY_SMOKE_OK`。
+- 明确当前限制：完整 AgentGym/verl rollout 未在 GPU/torch 单卡环境验证。
+
+## Stage 1b：真实单卡 GPU smoke
+
+目标：在有 GPU 且装好 torch/AgentGym/verl 的干净 lane 上验证 client import、rollout 小样本和 guard 行为。
+
+完成标准：
+
+- 不占用用户已分配给 continual-reasoning gym、Jingyan 或 CRL eval 的现有 lane。
+- AgentGym adapter import 不再是 `torch` 缺失。
+- diagnostic rollout 若显式允许 raw-history，必须标记不可计入正式结果。
+- formal rollout 在 latest-observation 实现前应被 guard 阻止。
+- 小模型或 API rollout smoke 有独立日志和证据。
 
 ## Stage 2：MemoryArena 电商数据转换
 

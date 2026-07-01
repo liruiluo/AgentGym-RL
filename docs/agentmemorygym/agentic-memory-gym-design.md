@@ -176,9 +176,11 @@ AgentGym-RL/                         # main training fork
 2. Add `AgentMemoryEnvClient` and register task name `agentmemory`.
 3. Run direct environment smoke with scripted memory policy.
 4. Add a JSONL item schema for bundled shopping smoke tasks.
-5. Add data converters for real MemoryArena/WebShop-style bundled shopping tasks.
-6. Replace the smoke split files with real train/dev/test item-id files after MemoryArena/WebShop conversion.
-7. Add a bounded GRPO smoke config.
+5. Add split-aware dataset loading and server `/metadata` so the trainer can see real task counts instead of a hard-coded `data_len=1`.
+6. Add a fail-fast raw-history guard for `task_name=agentmemory`; full-history vLLM rollout is diagnostic-only until a latest-observation rollout path is implemented.
+7. Add data converters for real MemoryArena/WebShop-style bundled shopping tasks.
+8. Replace the smoke split files with real train/dev/test item-id files after MemoryArena/WebShop conversion.
+9. Add a bounded GRPO smoke config.
 8. Only after baseline behavior analysis, decide whether a new method beyond standard GRPO/PPO is needed.
 
 ## 7. Claim guardrails
