@@ -5,7 +5,7 @@
 1. No-memory agent：只看当前 observation。
 2. Budgeted full-context：有限窗口保留历史。
 3. Fixed RAG memory：固定写入和相似度检索。
-4. Heuristic memory manager：规则触发 ADD/UPDATE/RETRIEVE，并可在电商环境中调用公开 product-catalog `SEARCH`。当前 scripted SEARCH baseline 已在 dev split 得到 no-retry `5/15`、retry diagnostic `10/15`，只作为接口/可解性 baseline。
+4. Heuristic memory manager：规则触发 ADD/UPDATE/RETRIEVE，并可在电商环境中调用公开 product-catalog `SEARCH`。当前 scripted SEARCH baseline 已在 dev split 得到 no-retry `5/15`、retry5 diagnostic `10/15`、soft-fallback verifier diagnostic `15/15`，只作为接口/可解性 baseline。
 5. Engineering memory systems：MemGPT、Mem0、HippoRAG 等作为系统参考。
 6. Existing RL-memory methods：AgeMem、Memory-R1、MemAct、MEM1、MemAgent、UMA 等。
 7. Learned AgentMemoryGym policy：在同一环境、奖励、split 和 tool schema 下训练。

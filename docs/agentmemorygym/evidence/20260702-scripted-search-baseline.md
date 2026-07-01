@@ -137,6 +137,92 @@ Interpretation:
 - This still does not justify any claim about RL improving memory. It is an
   interface and solvability probe before formal training.
 
+
+## Failure audit of retry diagnostic
+
+The retry5 failure audit is stored at:
+
+```text
+/home/ai-jingyan-train/luolirui.1/post-train/agentmemorygym-smoke-evidence/scripted_search_failure_audit_retry5_20260702-055120
+AGENTMEMORY_SCRIPTED_SEARCH_FAILURE_AUDIT_OK
+failure_type_counts={"compatibility_filter_excluded_target": 5}
+```
+
+All five remaining retry5 failures were caused by the strict compatibility
+label filter excluding the target candidate from the ranked pool:
+
+```text
+aw step2 target ma_aw_c_e excluded by allowed=Niacinamide
+bq step5 target ma_bq_f_b excluded by allowed=6 Outlet
+ck step1 target ma_ck_b_e excluded by allowed=Compact
+cu step2 target ma_cu_c_b excluded by allowed=Raisin
+do step4 target ma_do_e_c excluded by allowed=Lemon
+```
+
+This means the main blocker is not the hidden target freeze or the shared-disk
+SEARCH index. It is the brittle text-level compatibility parser: MemoryArena
+rules often name a compatibility label that the correct visible option does not
+repeat verbatim in its title/SEARCH result.
+
+## Soft-fallback verifier diagnostic
+
+A third diagnostic run kept the same visible candidate titles and public SEARCH
+metadata, but changed the scripted heuristic from strict compatibility filtering
+to explicit soft fallback:
+
+```text
+--compatibility-fallback ranked-all-after-compatible
+--max-buy-attempts 7
+```
+
+The policy first tries candidates that match the parsed compatibility label; if
+those are rejected by the environment verifier, it tries the remaining visible
+candidates ranked by the same SEARCH metadata. This is an **exhaustive
+verifier-feedback diagnostic**, not a deployable one-shot policy and not a
+learned policy result.
+
+Evidence directory:
+
+```text
+/home/ai-jingyan-train/luolirui.1/post-train/agentmemorygym-smoke-evidence/scripted_search_baseline_dev_softretry7_20260702-055137
+```
+
+Marker / summary:
+
+```text
+AGENTMEMORY_SCRIPTED_SEARCH_BASELINE_OK
+episodes=15
+successes=15
+success_rate=1.0000
+mean_progress_score=1.0000
+total_env_steps=679
+search_calls=420
+buy_calls=109
+rejected_buys=19
+max_buy_attempts=7
+compatibility_fallback=ranked-all-after-compatible
+```
+
+Combined failure audit:
+
+```text
+/home/ai-jingyan-train/luolirui.1/post-train/agentmemorygym-smoke-evidence/scripted_search_failure_audit_softretry7_20260702-055940
+AGENTMEMORY_SCRIPTED_SEARCH_FAILURE_AUDIT_OK
+retry5 failure_type_counts={"compatibility_filter_excluded_target": 5}
+softretry7 failure_type_counts={}
+```
+
+Interpretation:
+
+- The frozen MemoryArena dev items are completable through the fair environment
+  action surface when the policy can use SEARCH plus verifier feedback.
+- Strict title-level compatibility filtering is too brittle to be the final
+  heuristic memory manager.
+- RL training should learn when to trust compatibility labels, when to broaden
+  candidate search, and how much verifier-feedback exploration is worth; the
+  soft-fallback diagnostic only proves that the environment/tool interface can
+  support that behavior.
+
 ## Next closure bar
 
 Before 8-card RL, keep this baseline as a reproducible reference and use its

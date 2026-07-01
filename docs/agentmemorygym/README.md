@@ -24,7 +24,7 @@
 - `evidence/20260701-latest-observation-policy-smoke.md`：latest-observation scripted-policy rollout smoke；验证 memory tool contract，不冒充 LLM rollout。
 - `evidence/20260701-memoryarena-converter.md`：MemoryArena bundled-shopping converter / freeze / full product DB / SEARCH index 证据；当前 frozen train/dev/test 为 `120/15/15`，target match 已 `asin_catalog=900 / ambiguous=0`。
 - `evidence/20260702-qwen3-4b-rollout-smoke.md`：Qwen3-4B 真单卡 rollout、enriched metadata diagnostic、SEARCH-aware prompt smoke；均是链路/接口证据，不是 RL 提升结果。
-- `evidence/20260702-scripted-search-baseline.md`：scripted SEARCH baseline / heuristic memory manager；full dev no-retry 为 `5/15`、retry diagnostic 为 `10/15`，证明 SEARCH 接口有可解性但不是 RL/memory 提升结果。
+- `evidence/20260702-scripted-search-baseline.md`：scripted SEARCH baseline / heuristic memory manager；full dev no-retry 为 `5/15`、retry5 为 `10/15`、soft-fallback verifier diagnostic 为 `15/15`，证明 SEARCH+verifier 接口有可解性但不是 RL/memory 提升结果。
 
 ## 当前 Notion 页面
 

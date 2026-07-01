@@ -26,8 +26,9 @@
 15. 已用全量 product_catalog 67 个 shard 复跑 strict enriched freeze：`memoryarena_fullcatalog_enriched_freeze_20260702-024824`，`catalog_paths=67` 但 `candidate_metadata_full_steps` 仍为 `285/900`；因此不能再把缺口归因于“没有全量下载”。
 16. Product-catalog `SEARCH` tool 路线已打通：代码草稿新增 `SEARCH {"query":"...","top_k":3}` 与 SQLite/FTS index builder；全量 index 已在 Jingyan 共享盘构建完成，`products=1,031,654`、约 `479M`，不放开发机。
 17. 已跑 SEARCH-aware Qwen3-4B smoke：24 个 parsed/env steps 均有效，但模型重复 `SEARCH {"query":"visible candidate title"}`，没有 `ADD/BUY`，`progress_score=0.0,0.0`。
-18. scripted SEARCH baseline / heuristic memory manager 已实现并在 Jingyan dev split 跑完：no-retry `5/15`、`mean_progress=0.5444`；SEARCH + verifier-feedback retry diagnostic `10/15`、`mean_progress=0.8222`。
-19. 下一步：把 scripted baseline 失败例转成接口/数据修复清单，优先处理 option-to-catalog variant mismatch、缺 rating/price 字段、兼容 label 无法从 title-level metadata 恢复等问题；新 8 卡到位后再开始 RL 训练配置。
+18. scripted SEARCH baseline / heuristic memory manager 已实现并在 Jingyan dev split 跑完：no-retry `5/15`、`mean_progress=0.5444`；retry5 diagnostic `10/15`、`mean_progress=0.8222`；failure audit 确认残余 5 个失败全是 strict compatibility filter 排除了 target。
+19. soft-fallback verifier diagnostic 已跑到 `15/15`、`mean_progress=1.0`，说明当前 frozen dev 可由 fair SEARCH + verifier feedback 完成；但这是 exhaustive diagnostic，不是 learned policy。
+20. 下一步：把 scripted baseline 失败例转成接口/数据修复清单，优先处理 option-to-catalog variant mismatch、缺 rating/price 字段、兼容 label 无法从 title-level metadata 恢复等问题；新 8 卡到位后再开始 RL 训练配置。
 
 ## 0 卡本地检查边界
 

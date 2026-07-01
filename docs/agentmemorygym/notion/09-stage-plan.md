@@ -68,7 +68,7 @@
 - reward decomposition。
 - normalized trajectory info。
 - WebShop catalog / ASIN map 或官方 option-to-ASIN 对齐源消掉 ambiguous target matches；正式 freeze 已做到 `asin_catalog=900 / ambiguous=0`。
-- 下一步不再纠结存储/全量下载：product DB 与 SEARCH index 已在 Jingyan 共享盘。scripted SEARCH baseline / heuristic memory manager 已在 dev split 跑完：no-retry `5/15`、`mean_progress=0.5444`；SEARCH + verifier-feedback retry diagnostic `10/15`、`mean_progress=0.8222`。这证明 fair SEARCH 接口有可解性，但不代表 RL/memory 能力提升；后续先修失败例，再等新 8 卡进入正式 RL train/eval。
+- 下一步不再纠结存储/全量下载：product DB 与 SEARCH index 已在 Jingyan 共享盘。scripted SEARCH baseline / heuristic memory manager 已在 dev split 跑完：no-retry `5/15`、`mean_progress=0.5444`；retry5 diagnostic `10/15`、`mean_progress=0.8222`；failure audit 显示 retry5 残余 5 个失败全是 `compatibility_filter_excluded_target`；soft-fallback verifier diagnostic 达到 `15/15`、`mean_progress=1.0`。这证明 fair SEARCH + verifier feedback 接口有可解性，但不代表 RL/memory 能力提升；后续先修失败例，再等新 8 卡进入正式 RL train/eval。
 
 ## Stage 3：基线 smoke
 
@@ -79,6 +79,8 @@
 - scripted SEARCH baseline / heuristic memory manager 已新增并在 Jingyan 共享盘正式 dev split 上跑完。
 - one-shot/no-retry：`15 episodes / 5 successes / success_rate=0.3333 / mean_progress=0.5444 / search_calls=265`。
 - SEARCH + verifier-feedback retry diagnostic（`max_buy_attempts=5`）：`15 episodes / 10 successes / success_rate=0.6667 / mean_progress=0.8222 / search_calls=365 / rejected_buys=14`。
+- retry5 failure audit：`AGENTMEMORY_SCRIPTED_SEARCH_FAILURE_AUDIT_OK`，残余失败类型全是 `compatibility_filter_excluded_target`。
+- soft-fallback verifier diagnostic（`--compatibility-fallback ranked-all-after-compatible --max-buy-attempts 7`）：`15 episodes / 15 successes / success_rate=1.0 / mean_progress=1.0 / search_calls=420 / rejected_buys=19`。
 - 该 baseline 只证明 `SEARCH + ADD/RETRIEVE + BUY` 接口可推进任务，不是 RL 训练、不代表 memory ability improvement。
 
 完成标准：
