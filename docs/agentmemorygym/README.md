@@ -19,6 +19,7 @@
 - `notion/`：同步到 Notion 分页面版的本地源文件。
 - `evidence/20260701-skeleton-smoke.md`：当前 skeleton compile/direct/server-client smoke 证据。
 - `evidence/20260701-rollout-guard-smoke.md`：dataset/split metadata 与 raw-history rollout guard 证据。
+- `evidence/20260701-single-gpu-smoke.md`：Jingyan 1×B200 上的真实单卡 GPU/env/client/init smoke 证据。
 
 ## 当前 Notion 页面
 

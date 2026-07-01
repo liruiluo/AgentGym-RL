@@ -16,7 +16,8 @@
 5. 跑 data validator、`compileall` 和 direct env smoke。
 6. 启 server 做 client smoke。
 7. 记录 0 卡本地检查结果，不写成单卡测试结果。
-8. 等有干净单卡 GPU lane 后，再记录真实单卡 smoke 结果。
+8. 已用 Jingyan 1×B200 记录真实单卡 env/client/init smoke 结果。
+9. 下一步补小模型/API rollout smoke，但必须走 latest-observation / ephemeral-context 路径，不把 raw-history override 计入正式结果。
 
 ## 0 卡本地检查边界
 
@@ -24,7 +25,7 @@ Mac/ZBMac 上的 compile、data validator、direct env、server API、stubbed cl
 
 ## 单卡测试边界
 
-真正单卡 smoke 需要有 GPU、torch、AgentGym/verl 依赖和干净资源 lane。不占用当前给 continual-reasoning gym 的 8 卡，也不占用已有 Jingyan / CRL eval lane。AgentMemoryGym 明天拿新 8 卡后再启动正式训练。
+真正单卡 smoke 需要有 GPU、torch、AgentGym/verl 依赖和干净资源 lane。本轮已获准使用释放出的 Jingyan 1×B200，完成 env/client/init smoke；仍未完成小模型/API rollout smoke。AgentMemoryGym 明天拿新 8 卡后再启动正式训练。
 
 ## 代码完成前不得声称
 

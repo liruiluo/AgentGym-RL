@@ -153,8 +153,9 @@ AgentGym-RL/                         # 主训练 fork
 4. server 支持 dataset/split 配置和 `/metadata`，client 可读真实 `task_count`，避免 trainer 继续硬编码 `data_len=1`。
 5. AgentGym-RL vLLM rollout 已加 raw-history guard：`task_name=agentmemory` 默认阻止全历史拼接式 rollout；只有显式 `allow_raw_history_for_agentmemory` / `AGENTMEMORY_ALLOW_RAW_HISTORY=1` 才允许 diagnostic smoke，不得用于正式训练。
 6. 当前 0 卡本地检查只作为代码/schema 快速验证，不写成单卡结果。
-7. 在真正单卡 GPU 依赖环境上做环境 smoke / 小模型或 API rollout smoke。
-8. 明天拿到新 8 卡后，再考虑正式后训练。
+7. 真单卡 GPU 依赖环境已完成 env/client/init smoke：B200 + torch CUDA、real AgentGym adapter import、server metadata、`init_env_client` metadata path 均通过。
+8. 剩余单卡缺口是小模型/API rollout smoke；该步骤必须等 latest-observation / ephemeral-context rollout 路径，不使用 raw-history guard override 当正式证据。
+9. 明天拿到新 8 卡后，再考虑正式后训练。
 
 ## 8. 声明边界
 

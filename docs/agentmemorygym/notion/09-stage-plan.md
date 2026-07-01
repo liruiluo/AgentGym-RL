@@ -34,8 +34,9 @@
 
 完成标准：
 
-- 不占用用户已分配给 continual-reasoning gym、Jingyan 或 CRL eval 的现有 lane。
-- AgentGym adapter import 不再是 `torch` 缺失。
+- 默认不占用用户已分配给 continual-reasoning gym、Jingyan 或 CRL eval 的现有 lane；本轮 Jingyan 1×B200 已由用户明确释放并授权用于 AgentMemoryGym smoke。
+- 已在 Jingyan 1×B200 上通过 torch CUDA、real AgentGym adapter import、server metadata、real client metadata、`init_env_client` metadata smoke。
+- 证据：`TORCH_CUDA_OK`、`AGENTMEMORY_REAL_ADAPTER_IMPORT_OK`、`SERVER_METADATA_SINGLE_GPU_OK`、`AGENTMEMORY_REAL_CLIENT_METADATA_SINGLE_GPU_OK`、`VERL_INIT_ENV_CLIENT_AGENTMEMORY_SINGLE_GPU_OK`。
 - diagnostic rollout 若显式允许 raw-history，必须标记不可计入正式结果。
 - formal rollout 在 latest-observation 实现前应被 guard 阻止。
 - 小模型或 API rollout smoke 有独立日志和证据。

@@ -31,4 +31,5 @@
 - JSONL loader 已验证，marker 为 `JSONL_LOADER_SMOKE_OK`；data validator marker 为 `AGENTMEMORY_DATA_VALIDATE_OK`；server-client JSONL/split 路径 marker 为 `SERVER_CLIENT_JSONL_SMOKE_OK` / `SERVER_CLIENT_SPLIT_SMOKE_OK`。
 - 当前 smoke 只证明最小环境 skeleton 可跑，不证明完整 MemoryArena 转换或 RL 提升。
 - Mac/ZBMac 是 0 卡机器；本地 compile/data/server/stub smoke 只能证明代码/schema/API 基本可跑，不能记作单卡 smoke。
-- 本机缺少 `torch`，完整 AgentGym adapter import / verl rollout 需在真正单卡 GPU 依赖环境中验证；当前本地 import probe 记录为 `AGENTGYM_ADAPTER_IMPORT_FAIL ModuleNotFoundError No module named 'torch'`。
+- Mac 本机缺少 `torch`，本地 import probe 仍记录为 `AGENTGYM_ADAPTER_IMPORT_FAIL ModuleNotFoundError No module named 'torch'`；该限制已通过 Jingyan 1×B200 的真实 GPU 环境补掉 adapter/client/import 层，但完整模型 rollout 仍需后续验证。
+- `docs/agentmemorygym/evidence/20260701-single-gpu-smoke.md` 记录 Jingyan 1×B200 真单卡 smoke：`TORCH_CUDA_OK`、`AGENTMEMORY_REAL_ADAPTER_IMPORT_OK`、`SERVER_METADATA_SINGLE_GPU_OK`、`AGENTMEMORY_REAL_CLIENT_METADATA_SINGLE_GPU_OK`、`VERL_INIT_ENV_CLIENT_AGENTMEMORY_SINGLE_GPU_OK`。这证明 GPU/env/client/init 路径可跑，但不证明完整模型 rollout、正式 RL 训练或 MemoryArena 转换。

@@ -31,4 +31,5 @@ Skeleton 当前只覆盖 handcrafted MemoryArena/WebShop-style bundled shopping 
 - validator marker：`AGENTMEMORY_DATA_VALIDATE_OK`。
 - rollout guard marker：`AGENTMEMORY_CONTEXT_POLICY_SMOKE_OK`。`task_name=agentmemory` 在当前全历史拼接式 vLLM rollout 中默认 fail-fast，防止正式训练绕过 memory tools；显式 raw-history override 只能用于 diagnostic smoke。
 - 当前 Mac/ZBMac 上的检查是 0 卡本地检查，不是单卡 smoke。
-- 仍不代表完整 MemoryArena 数据转换；下一层需要 real MemoryArena/WebShop converter、真实单卡 GPU rollout smoke、以及 latest-observation rollout 实现。
+- Jingyan 1×B200 已通过真实单卡 env/client/init smoke：torch CUDA、real AgentGym adapter import、server metadata、real client metadata、`init_env_client` metadata path。
+- 仍不代表完整 MemoryArena 数据转换或完整模型 rollout；下一层需要 real MemoryArena/WebShop converter、真实小模型/API rollout smoke、以及 latest-observation rollout 实现。
