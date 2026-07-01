@@ -87,6 +87,89 @@ formal frozen training/evaluation dataset. Before formal results, the ambiguous
 rows should be resolved with a WebShop catalog / ASIN map or a stronger official
 option-to-ASIN alignment source.
 
+## Catalog / ASIN resolver update
+
+The converter now supports optional product-catalog inputs via repeated
+`--catalog-path`. It builds a `target_asin -> catalog title` index, ranks prompt
+options by catalog-title similarity with attribute overlap as tie-breaker, and
+falls back to the old attribute heuristic when the target ASIN is not present in
+the provided catalog shards.
+
+New local fixture marker remains:
+
+```text
+AGENTMEMORY_MEMORYARENA_CONVERTER_SMOKE_OK
+```
+
+The smoke now includes a small catalog tiebreak case where attribute-only
+matching is ambiguous but the ASIN catalog title selects the correct option.
+
+## Jingyan shared-disk product DB mirror
+
+Per the storage boundary, large MemoryArena product DB files are being mirrored
+to the Jingyan shared disk, not to the devbox local disk:
+
+```text
+/home/ai-jingyan-train/luolirui.1/post-train/data/memoryarena-product-db/
+```
+
+The full source is:
+
+```text
+https://huggingface.co/datasets/ai-hyz/MemoryArena-product-db
+```
+
+The full repository contains 135 files / 13,517,161,526 expected bytes. The
+mirror job streams Mac network downloads directly into the Jingyan shared disk.
+Four catalog shards were priority-mirrored first for converter validation:
+
+```text
+product_catalog/electronics_accessories_supplies.json
+product_catalog/electronics_television_video.json
+product_catalog/grocery_gourmet_food_pantry_staples.json
+product_catalog/grocery_gourmet_food_snacks_sweets.json
+```
+
+Remote priority-catalog conversion:
+
+```bash
+PYTHONPATH=AgentGym/agentenv-agentmemory \
+  python3 AgentGym/agentenv-agentmemory/scripts/convert_memoryarena_bundled_shopping.py \
+  --input /home/ai-jingyan-train/luolirui.1/post-train/agentmemorygym-smoke-evidence/memoryarena_bundled_shopping_data_20260701.jsonl \
+  --output "$RUN/memoryarena_agentmemory.jsonl" \
+  --split-dir "$RUN/splits" \
+  --report "$RUN/report.jsonl" \
+  --catalog-path "$ROOT/product_catalog/electronics_accessories_supplies.json" \
+  --catalog-path "$ROOT/product_catalog/electronics_television_video.json" \
+  --catalog-path "$ROOT/product_catalog/grocery_gourmet_food_pantry_staples.json" \
+  --catalog-path "$ROOT/product_catalog/grocery_gourmet_food_snacks_sweets.json"
+```
+
+Remote evidence directory:
+
+```text
+/home/ai-jingyan-train/luolirui.1/post-train/agentmemorygym-smoke-evidence/memoryarena_catalog_priority_convert_20260701-221648
+```
+
+Markers / summary:
+
+```text
+AGENTMEMORY_MEMORYARENA_CONVERT_OK tasks=150 splits=train:120,dev:15,test:15 min_match_score=7 ambiguous_matches=0
+AGENTMEMORY_DATA_VALIDATE_OK tasks=150 splits=train:120,dev:15,test:15
+SUMMARY rows 900 ambiguous 0 catalog 450 found 450 missing 450 min_match 7
+```
+
+Interpretation:
+
+- The previous 12/900 heuristic ties are eliminated under the catalog-assisted
+  converter on the public bundled-shopping file.
+- 450/900 steps are resolved through `asin_catalog`; 450/900 still fall back to
+  attribute matching because the priority shard subset does not cover every
+  target ASIN.
+- This closes the target-match ambiguity in the current conversion smoke, but it
+  is still data-conversion evidence, not a formal RL result or proof of improved
+  memory ability.
+
 ## Jingyan 1×B200 container verification
 
 The Jingyan container could not fetch HuggingFace directly in this run because

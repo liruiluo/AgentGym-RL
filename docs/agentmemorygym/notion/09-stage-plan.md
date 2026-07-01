@@ -50,7 +50,9 @@
 
 - 已新增 MemoryArena bundled-shopping converter 入口，可把 public `bundled_shopping/data.jsonl` 转成 AgentMemoryGym JSONL。
 - 全量 150 条 public bundled-shopping smoke 已可转换为 `train/dev/test = 120/15/15`，并通过 data validator。
-- converter 会生成 target-match audit report；当前 heuristic 在 900 个 step 中有 12 个 tied/ambiguous match，不能直接当 formal frozen label。
+- converter 会生成 target-match audit report；无 catalog 时 heuristic 在 900 个 step 中有 12 个 tied/ambiguous match。
+- 已新增 catalog / ASIN resolver；在 Jingyan 共享盘的 4 个相关 product-catalog shard 上重跑 public conversion，900 个 step 的 ambiguous match 已降为 0。当前 summary：`catalog=450 / fallback=450 / ambiguous=0`。
+- MemoryArena product DB 正在全量镜像到 Jingyan 共享盘：`/home/ai-jingyan-train/luolirui.1/post-train/data/memoryarena-product-db/`，不落开发机本地盘。
 
 完成标准：
 
@@ -59,7 +61,7 @@
 - accept-reject / compatibility map。
 - reward decomposition。
 - normalized trajectory info。
-- WebShop catalog / ASIN map 或官方 option-to-ASIN 对齐源消掉 ambiguous target matches。
+- WebShop catalog / ASIN map 或官方 option-to-ASIN 对齐源消掉 ambiguous target matches；当前 catalog-assisted smoke 已做到 `0/900`，下一步是冻结正式 item-id 和 split。
 
 ## Stage 3：基线 smoke
 
