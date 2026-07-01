@@ -33,4 +33,5 @@ Skeleton 当前只覆盖 handcrafted MemoryArena/WebShop-style bundled shopping 
 - 当前 Mac/ZBMac 上的检查是 0 卡本地检查，不是单卡 smoke。
 - Jingyan 1×B200 已通过真实单卡 env/client/init smoke：torch CUDA、real AgentGym adapter import、server metadata、real client metadata、`init_env_client` metadata path。
 - latest-observation rollout context 已实现：`agentmemory` 默认只用当前 observation 生成 action，多轮 episode 展平成 per-action PPO 样本，`rollout_parent_indices` 负责 trainer batch 对齐。
-- 仍不代表完整 MemoryArena 数据转换或完整模型 rollout；下一层需要 real MemoryArena/WebShop converter 和真实小模型/API rollout smoke。
+- latest-observation scripted-policy rollout smoke 已通过：`AGENTMEMORY_LATEST_OBSERVATION_POLICY_SMOKE_OK`。
+- 仍不代表完整 MemoryArena 数据转换或完整 LLM/vLLM rollout；下一层需要 real MemoryArena/WebShop converter 和真实小模型/API rollout smoke。

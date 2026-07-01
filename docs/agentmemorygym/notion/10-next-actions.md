@@ -17,7 +17,7 @@
 6. 启 server 做 client smoke。
 7. 记录 0 卡本地检查结果，不写成单卡测试结果。
 8. 已用 Jingyan 1×B200 记录真实单卡 env/client/init smoke 结果。
-9. latest-observation rollout context 已实现；下一步补小模型/API rollout smoke，不把 raw-history override 计入正式结果。
+9. latest-observation scripted-policy rollout smoke 已通过；下一步仍需补真正小模型/API rollout smoke，不把 raw-history override 计入正式结果。
 
 ## 0 卡本地检查边界
 

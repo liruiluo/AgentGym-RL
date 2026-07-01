@@ -21,6 +21,7 @@
 - `evidence/20260701-rollout-guard-smoke.md`：dataset/split metadata 与 raw-history rollout guard 证据。
 - `evidence/20260701-single-gpu-smoke.md`：Jingyan 1×B200 上的真实单卡 GPU/env/client/init smoke 证据。
 - `evidence/20260701-latest-observation-rollout.md`：latest-observation rollout context 与 per-action PPO 样本展开证据。
+- `evidence/20260701-latest-observation-policy-smoke.md`：latest-observation scripted-policy rollout smoke；验证 memory tool contract，不冒充 LLM rollout。
 
 ## 当前 Notion 页面
 
