@@ -2,6 +2,7 @@ from contextlib import contextmanager
 import os
 import time
 from agentenv.envs import (
+    AgentMemoryEnvClient,
     AcademiaEnvClient,
     AlfWorldEnvClient,
     BabyAIEnvClient,
@@ -22,6 +23,7 @@ from agentenv.envs import (
 def init_env_client(args):
     # task_name - task dict
     envclient_classes = {
+        "agentmemory": AgentMemoryEnvClient,
         "webshop": WebshopEnvClient,
         "alfworld": AlfWorldEnvClient,
         "babyai": BabyAIEnvClient,

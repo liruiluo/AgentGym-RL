@@ -1,0 +1,27 @@
+# 证据台账
+
+## 当前核心 claim
+
+| Claim | 状态 | 支撑来源 | 用法 |
+|---|---|---|---|
+| 长程 agent 任务需要功能性记忆，而不只是复述历史。 | 保留 | MemoryArena、MemoryAgentBench、长期记忆系统相关工作 | 支撑问题背景。 |
+| AgentGym-RL 适合作为后训练骨架。 | 保留 | AgentGym-RL 仓库与本地 fork | 支撑代码承载决策。 |
+| 已有 RL-memory 方法存在，不能 claim absolute first。 | 保留 | AgeMem、Memory-R1、MemAct、MEM1、MemAgent、UMA | 支撑 novelty guardrail。 |
+| v0 应改为 MemoryArena / 电商捆绑购物优先。 | 新增 | 用户当前研究判断 + MemoryArena 任务思想 | 支撑方向更新。 |
+| MemoryAgentBench 不再是第一环境主线。 | 更新 | 当前项目定位调整 | 降级为 baseline / 数据参考。 |
+| 代码草稿应保留为 skeleton，不因“先文档再代码”而撤回。 | 新增 | 用户 2026-07-01 纠偏 + 当前 worktree | 支撑执行边界。 |
+| 最小购物环境不能让 product_id 直接泄漏关键尺寸答案。 | 新增 | 当前 smoke 代码审查 | 支撑环境可训练性边界。 |
+
+## 后续需补的一手证据
+
+- MemoryArena 任务细节与数据/代码可用性。
+- AgentGym-RL 当前版本算法支持和训练入口。
+- AgeMem 工具定义与训练流程。
+- 可复现 RL-memory baseline 的代码可用性。
+
+## 本地 smoke 证据
+
+- `docs/agentmemorygym/evidence/20260701-skeleton-smoke.md` 记录了 compile/direct/server-client smoke。
+- JSONL loader 已验证，marker 为 `JSONL_LOADER_SMOKE_OK`；data validator marker 为 `AGENTMEMORY_DATA_VALIDATE_OK`；server-client JSONL/split 路径 marker 为 `SERVER_CLIENT_JSONL_SMOKE_OK` / `SERVER_CLIENT_SPLIT_SMOKE_OK`。
+- 当前 smoke 只证明最小环境 skeleton 可跑，不证明完整 MemoryArena 转换或 RL 提升。
+- 本机缺少 `torch`，完整 AgentGym adapter import / verl rollout 需在单卡依赖环境中验证；当前本地 import probe 记录为 `AGENTGYM_ADAPTER_IMPORT_FAIL ModuleNotFoundError No module named 'torch'`。
