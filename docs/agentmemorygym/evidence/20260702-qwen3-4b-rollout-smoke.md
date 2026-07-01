@@ -207,8 +207,7 @@ SEARCH {"query":"visible candidate title","top_k":3}
 The resulting catalog hit was unrelated (`LIPSTICK QUEEN Visible Lip Liner...`),
 and the model never transitioned to `ADD` or `BUY`. This is still useful
 plumbing evidence: the environment/action parser/model loop can execute SEARCH
-on the real shared-disk index. It is not a task-success result. The next useful
-engineering step is a scripted SEARCH baseline / heuristic memory manager that
-queries actual visible candidate titles, stores the retrieved metadata, and
-then buys, so we can separate environment solvability from untrained Qwen prompt
-behavior before RL.
+on the real shared-disk index. It is not a task-success result. The follow-up scripted SEARCH baseline now queries actual visible candidate
+titles, stores retrieved metadata, and then buys; see
+`20260702-scripted-search-baseline.md`. It separates environment/interface
+solvability from untrained Qwen prompt behavior before RL.

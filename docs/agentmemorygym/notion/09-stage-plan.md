@@ -68,11 +68,18 @@
 - reward decomposition。
 - normalized trajectory info。
 - WebShop catalog / ASIN map 或官方 option-to-ASIN 对齐源消掉 ambiguous target matches；正式 freeze 已做到 `asin_catalog=900 / ambiguous=0`。
-- 下一步不再纠结存储/全量下载：product DB 与 SEARCH index 已在 Jingyan 共享盘。先做 scripted SEARCH baseline / heuristic memory manager，证明 fair SEARCH 接口下环境可解，再等新 8 卡进入正式 RL train/eval。
+- 下一步不再纠结存储/全量下载：product DB 与 SEARCH index 已在 Jingyan 共享盘。scripted SEARCH baseline / heuristic memory manager 已在 dev split 跑完：no-retry `5/15`、`mean_progress=0.5444`；SEARCH + verifier-feedback retry diagnostic `10/15`、`mean_progress=0.8222`。这证明 fair SEARCH 接口有可解性，但不代表 RL/memory 能力提升；后续先修失败例，再等新 8 卡进入正式 RL train/eval。
 
 ## Stage 3：基线 smoke
 
 目标：建立 no-memory、full-context、fixed-RAG、heuristic memory manager 的小规模结果。
+
+当前进展：
+
+- scripted SEARCH baseline / heuristic memory manager 已新增并在 Jingyan 共享盘正式 dev split 上跑完。
+- one-shot/no-retry：`15 episodes / 5 successes / success_rate=0.3333 / mean_progress=0.5444 / search_calls=265`。
+- SEARCH + verifier-feedback retry diagnostic（`max_buy_attempts=5`）：`15 episodes / 10 successes / success_rate=0.6667 / mean_progress=0.8222 / search_calls=365 / rejected_buys=14`。
+- 该 baseline 只证明 `SEARCH + ADD/RETRIEVE + BUY` 接口可推进任务，不是 RL 训练、不代表 memory ability improvement。
 
 完成标准：
 

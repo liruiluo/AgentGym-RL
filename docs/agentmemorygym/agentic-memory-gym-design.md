@@ -3,7 +3,7 @@
 ## 0. State card
 
 - **研究目标**：构建一个面向 agent memory policy 的 RL 后训练 Gym，把长程、多会话、依赖历史状态的 agent 任务改写成可训练、可评测、可归因的环境。
-- **当前阶段**：MemoryArena / e-commerce bundled-shopping data and interface bring-up. Target freeze, full product DB mirror on Jingyan shared disk, SQLite/FTS `SEARCH` index, and Qwen3-4B single-GPU smoke are done; the next step is a scripted SEARCH baseline / heuristic memory manager before formal 8-GPU RL.
+- **当前阶段**：MemoryArena / e-commerce bundled-shopping data and interface bring-up. Target freeze, full product DB mirror on Jingyan shared disk, SQLite/FTS `SEARCH` index, Qwen3-4B single-GPU smoke, and scripted SEARCH baseline diagnostics are done; the next step is to tighten SEARCH/metadata failure cases before formal 8-GPU RL.
 - **已有人类决定**：以电商捆绑/序列购物作为 hero environment；复用 AgentGym-RL / verl 作为训练后端；memory action space 参考 AgeMem/Agentic Memory 工具语义；v0 不把新算法写成主贡献。
 - **已有材料**：本仓 `AgentGym-RL` fork 与 `AgentGym` submodule fork；旧 Notion 备份；MemoryArena、AgeMem、AgentGym-RL、MemoryAgentBench 等参考源。
 - **本轮交付物**：本设计文档 + `agentenv-agentmemory` 环境 skeleton + MemoryArena bundled-shopping converter/freeze + shared-disk product-catalog `SEARCH` draft + AgentGym-RL client 注册入口。
@@ -181,8 +181,8 @@ AgentGym-RL/                         # main training fork
 7. Add data converters for real MemoryArena/WebShop-style bundled shopping tasks.
 8. Freeze real train/dev/test item-id files after MemoryArena conversion (`120/15/15`, `asin_catalog=900`, `ambiguous=0`).
 9. Keep the full MemoryArena product DB and derived SQLite/FTS SEARCH index on the Jingyan shared disk, not on the Mac/devbox.
-10. Add a scripted SEARCH baseline / heuristic memory manager to prove environment solvability under the fair SEARCH interface.
-11. Add a bounded GRPO smoke config only after baseline behavior analysis; decide whether a new method beyond standard GRPO/PPO is needed after that.
+10. Keep the scripted SEARCH baseline / heuristic memory manager as the first reproducible baseline: no-retry dev `5/15` (`mean_progress=0.5444`) and SEARCH + verifier-feedback retry diagnostic `10/15` (`mean_progress=0.8222`). This proves interface/solvability, not RL memory improvement.
+11. Add a bounded GRPO smoke config only after baseline failure analysis; decide whether a new method beyond standard GRPO/PPO is needed after that.
 
 ## 7. Claim guardrails
 
