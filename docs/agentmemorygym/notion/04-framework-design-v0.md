@@ -36,7 +36,7 @@ AgeMem 只作为 STM/LTM tool taxonomy 参考；不采用它的三阶段课程�
 - `SUMMARY {span}` / `FILTER {query}`：只作为 deterministic scaffold、smoke 或规则 baseline，不调用外部 LLM / hidden judge。
 - 环境动作：购物使用 `BUY {product_id}` 和 product-catalog `SEARCH {query, top_k}`；`SEARCH` 返回公开商品 metadata，不暴露 ASIN/source path/target。其它环境后续扩展 `PLAN / ANSWER`。
 
-关键边界：memory tool 是 policy 的 action，不是外部 harness 自动替 policy 做的事。`SUMMARY/FILTER` 的正式 RL 路径必须让当前 policy 产出摘要 token 或 keep/drop 决策；不能让环境后台调外部 LLM，否则不进 rollout/logprob。`SEARCH` 是商品 catalog 工具，不算 memory tool。
+关键边界：memory tool 是 policy 的 action，不是外部 harness 自动替 policy 做的事。`SUMMARY/FILTER` 的正式 RL 路径必须让当前 policy 产出摘要 token 或 keep/drop 决策；不能让环境后台调外部 LLM、helper policy 或另一个 agent，否则不进 rollout/logprob。本项目不做 AgeMem-compatible 的 `qwen-max` 后端模式，只训练/评估一个 policy agent。`SEARCH` 是商品 catalog 工具，不算 memory tool。
 
 ## 第一环境：bundled web shopping
 

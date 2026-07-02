@@ -27,15 +27,17 @@ code/AgentGym-RL/docs/agentmemorygym/  # 当前文档与 Notion 同步源
 3. 再注册 `AgentMemoryEnvClient` 和 `task_name=agentmemory`。
 4. Mac/ZBMac 只做 0 卡本地检查：compile、data/schema、direct env、server API；不能写成单卡测试。
 5. 大 MemoryArena product DB、catalog scan 和 SQLite/FTS index 都放 Jingyan 共享盘，不放开发机/Mac 本地盘。共享盘容量不是限制，可以全量下载、全量建索引；不要因为本机 0 卡或本机无 DB 而降级成“本机最小依赖”。
-6. Jingyan 1×B200 已用于 direct env / client / Qwen3-4B rollout smoke 和 scripted SEARCH baseline；baseline no-retry `6/15`、retry5 semantic matcher 修复后 `13/15`、soft-fallback verifier diagnostic `15/15`，只算接口/可解性证据。
-7. 新 8 卡机器到位后再考虑正式后训练。
+6. Jingyan 1×B200 已用于 direct env / client / Qwen3-4B rollout smoke 和 scripted SEARCH baseline；semanticfix5 当前诊断为 no-memory `0/15`、full-context `6/15`、memory-tool no-retry `6/15`、retry5 `13/15`、soft-fallback verifier diagnostic `15/15`，只算接口/可解性和 memory-dependence 证据。
+7. 环境记忆边界固定为：当前 session 自动 STM trace 可见；成功 `BUY` 进入下一 session 时清空 raw history；跨 session 只通过 LTM `ADD/RETRIEVE` 传递必要信息。
+8. LTM `RETRIEVE` 默认后端固定为本地 BM25；policy 调用仍是 `RETRIEVE {"query": "...", "top_k": 3}`，不接 DashScope/OpenAI embedding API，也不接 helper model。
+9. 新 8 卡机器已提交申请：`luolirui-1-amg-g5a-0702` 和 `luolirui-1-amg-g5b-0702`，当前排队中。devbox 外层 watcher 会在任务 RUNNING 后安装 pod 内 auto-yield GPU/CPU 守护，保证训练结束后自动回到占卡状态。正式 8 卡后训练等这些新机器到位；排队期间继续收口文档、基线和 bounded RL pilot 准备。
 
 ## 资源边界
 
 - 当前 0 卡本地检查不等于单卡 smoke。
 - Jingyan 1×B200 已由用户释放并用于 AgentMemoryGym smoke；继续只做 smoke/诊断，不冒充正式训练资源。
 - 现有 8 卡机器当前给 continual-reasoning gym 项目用。
-- AgentMemoryGym 的新 8 卡机器等后续再配。
+- AgentMemoryGym 的两台新 8 卡机器已在 2026-07-02 提交申请，当前 QUEUEING；不能把排队当成已占住，必须等平台 holder RUNNING 且 pod 内 GPU workload/auto-yield guard 验证后才算占卡成功。
 
 ## 已有代码草稿状态
 

@@ -8,8 +8,10 @@ run, not a vLLM/verl throughput run, and not evidence that memory ability has
 improved.
 
 The smoke uses a local Transformers load of Qwen3-4B and prompts the model with
-only the latest environment observation. No raw-history override and no scripted
-target policy were used.
+only the latest environment observation. In the corrected environment contract,
+that observation may include current-session STM trace; it still excludes
+previous-session raw history unless explicitly using a diagnostic override. No
+raw-history override and no scripted target policy were used.
 
 ## Hardware / runtime
 

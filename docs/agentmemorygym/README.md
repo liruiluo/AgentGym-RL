@@ -7,7 +7,7 @@
 - 目标：构建一个能通过 RL 后训练提升 agent memory policy 的 Gym，而不是只做新 benchmark 或先押一个新算法。
 - Hero 环境：电商捆绑/序列购物。后续购买必须记住前面已购商品属性，例如电视尺寸、重量、VESA、接口等。
 - 训练骨架：继续复用 AgentGym-RL / verl；memory env 落在 AgentGym submodule fork 中。
-- Memory 工具：只参考 AgeMem/Agentic Memory 的 STM/LTM 工具语义，把 `ADD / UPDATE / DELETE / RETRIEVE / SUMMARY / FILTER` 做成 policy 可选动作；不借 AgeMem 的三阶段课程学习路线。`SUMMARY/FILTER` 的正式 RL 路径由当前 policy 模型自己产出摘要文本或 keep/drop IDs，环境只做确定性状态转移，不后台调用外部 LLM。
+- Memory 工具：只参考 AgeMem/Agentic Memory 的 STM/LTM 工具语义，把 `ADD / UPDATE / DELETE / RETRIEVE / SUMMARY / FILTER` 做成 policy 可选动作；不借 AgeMem 的三阶段课程学习路线，也不加 AgeMem-compatible 的外部 `qwen-max` / helper-agent 工具后端。`RETRIEVE` 默认用本地 BM25 ranking，policy 调用仍是 `RETRIEVE {"query": "...", "top_k": 3}`，不需要 API key、embedding 服务或额外模型。`SUMMARY/FILTER` 的正式 RL 路径由当前 policy 模型自己产出摘要文本或 keep/drop IDs，环境只做确定性状态转移，不后台调用外部 LLM。
 - 记忆边界：session 内自动保留 action/tool-result 短期 trace；成功 `BUY` 进入下一 session 时清空 raw session history，跨 session 只靠 LTM `ADD/RETRIEVE`。
 - 奖励：最终任务成功 + 子任务进度 + 兼容约束满足，扣除过度 memory/tool 操作成本。
 - 执行顺序：**先改本地文档与 Notion 文档，再改代码**。这只是优先级/验收顺序，不等于撤回已有代码草稿；当前 `agentenv-agentmemory` skeleton 可以保留在工作树，但在正式收口前必须重新验证并明确标注为草稿。

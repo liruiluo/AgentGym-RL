@@ -19,13 +19,19 @@ AgentGym/agentenv-agentmemory/scripts/run_scripted_search_baseline.py
 
 Policy boundary:
 
-- Reads only visible candidate titles, current instruction text, its own
-  `ADD`/`RETRIEVE` memory, and public product metadata returned by `SEARCH`.
 - Calls `SEARCH` with actual visible candidate titles, not placeholders.
 - Does not use `target_product_id` for action selection. `--include-target-audit`
   only writes target ids into saved audit rows.
 - Chooses by parsed preference (`highest/lowest-rated`,
   `highest/lowest-priced`) after compatibility filtering when parseable.
+- Supports three policy-surface diagnostics:
+  - `scripted-search-memory`: default heuristic memory manager. It reads visible
+    candidate titles, current instruction text, its own `ADD`/`RETRIEVE` memory,
+    and public product metadata returned by `SEARCH`.
+  - `search-full-context`: keeps prior accepted purchase notes in runner context
+    but does not call `ADD`/`RETRIEVE`. This bypasses memory-tool decisions.
+  - `search-no-memory`: ignores prior accepted purchases and calls no memory
+    tools. This tests how much the task depends on cross-session memory.
 
 ## Data / index
 
@@ -71,6 +77,61 @@ focused matcher checks:
 ```
 
 This is 0-card validation only, not a single-GPU smoke.
+
+## Policy-surface diagnostics: no-memory vs full-context vs memory tools
+
+Two additional semanticfix5 diagnostics were run to separate task-memory
+dependence from the explicit memory-tool surface.
+
+No-memory diagnostic:
+
+```text
+/media/cfs/luolirui.1/agentmemorygym-smoke-evidence/scripted_search_baseline_dev_nomemory_semanticfix5_20260702-083000
+AGENTMEMORY_SCRIPTED_SEARCH_BASELINE_OK
+policy=search-no-memory
+episodes=15
+successes=0
+success_rate=0.0000
+mean_progress_score=0.1889
+total_env_steps=162
+search_calls=130
+buy_calls=32
+add_calls=0
+retrieve_calls=0
+rejected_buys=15
+failure_type_counts={"attempt_budget_below_target_rank": 15}
+```
+
+Full-context diagnostic:
+
+```text
+/media/cfs/luolirui.1/agentmemorygym-smoke-evidence/scripted_search_baseline_dev_fullcontext_semanticfix5_20260702-083000
+AGENTMEMORY_SCRIPTED_SEARCH_BASELINE_OK
+policy=search-full-context
+episodes=15
+successes=6
+success_rate=0.4000
+mean_progress_score=0.5778
+total_env_steps=336
+search_calls=275
+buy_calls=61
+add_calls=0
+retrieve_calls=0
+rejected_buys=9
+failure_type_counts={"attempt_budget_below_target_rank": 7, "compatibility_filter_excluded_target": 2}
+```
+
+Interpretation:
+
+- The frozen dev split is strongly memory-dependent under this scripted
+  interface: when prior accepted purchases are unavailable, success drops to
+  `0/15`.
+- Full-context reaches the same one-shot success count as the strict
+  memory-tool baseline (`6/15`) while bypassing `ADD/RETRIEVE`. It is therefore
+  a diagnostic comparator, not a learned memory policy.
+- The explicit memory-tool baseline has higher memory-operation cost because it
+  records and retrieves the same cross-session state through the environment
+  action surface. This is the surface that RL should learn to use.
 
 ## Current strict no-retry dev run: semantic matcher fixed
 

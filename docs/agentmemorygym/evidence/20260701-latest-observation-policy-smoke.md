@@ -9,11 +9,15 @@ inside the released Jingyan lane would be too invasive for a quick smoke.
 This smoke therefore validates the environment contract with a deterministic
 scripted policy rather than a language model:
 
-- the policy receives only the current observation each step;
+- the policy receives only the current observation each step; the current
+  observation now includes automatic current-session STM trace, but not raw
+  previous-session history;
 - it maintains its own external memory store;
 - it explicitly emits `ADD` actions before the context-discontinuity purchase and `RETRIEVE` before dependent accessory purchases;
 - all three bundled-shopping smoke tasks finish successfully;
 - a no-memory wrong-purchase baseline is rejected with compatibility violations.
+- the local smoke also checks that `session_trace` appears after in-session
+  memory actions and clears after successful `BUY` advances to the next session.
 
 This is not an LLM/vLLM rollout, not a model-quality result, and not formal RL
 training evidence.

@@ -80,7 +80,7 @@ reward r_t = task_success/progress - memory/tool cost - violation penalty
 ```
 
 - **自动 STM / session trace**：当前 session 内的 action、observation 摘要和 tool result trace，默认可见；成功 `BUY` 进入下一 session 时清空，防止跨 session raw-history 泄漏。
-- **LTM**：跨 session 持久化，但对 policy 隐藏；只有 `RETRIEVE` 结果会进入 active retrieved/summary context。
+- **LTM**：跨 session 持久化，但对 policy 隐藏；只有 `RETRIEVE` 结果会进入 active retrieved/summary context。当前 `RETRIEVE` 固定使用本地 BM25 ranking；policy-facing action 仍是 `RETRIEVE {query, top_k}`。
 - **Active retrieved/summary context**：由 `RETRIEVE/SUMMARY/FILTER` 操作产生的当前可见工作区；它不是全部 STM，而是从 LTM 或摘要工具带入当前 observation 的显式上下文。
 - **Task state**：例如已买商品、兼容约束、当前成员行程、搜索中间实体、推导中间命题。
 
@@ -93,13 +93,13 @@ v0 采用可解析的文本/JSON action，后续可映射到 function calling：
 | LTM | `ADD {key, value}` | 抽取当前上下文中新且高价值的信息写入长期记忆。 |
 | LTM | `UPDATE {memory_id/key, value}` | 当新信息修正旧信息时更新已有记忆。 |
 | LTM | `DELETE {memory_id/key}` | 删除过时、错误或有害的记忆。 |
-| STM | `RETRIEVE {query, top_k}` | 从 LTM 中检索相关记忆并加入 active retrieved/summary context。 |
+| STM | `RETRIEVE {query, top_k}` | 从 LTM 中检索相关记忆并加入 active retrieved/summary context；default backend is local BM25, with no paid embedding API or helper model. |
 | STM | `SUMMARY {text, source_ids?}` | 当前 policy 模型自己生成摘要文本，并可引用 observation 中可见的 `S*` / `C*` context IDs；环境只验证可见来源并替换 active context。 |
 | STM | `FILTER {keep_ids/drop_ids, scope}` | 当前 policy 模型选择保留或丢弃哪些可见 context IDs；环境只执行确定性 keep/drop。 |
 | STM scaffold | `SUMMARY {span}` / `FILTER {query}` | deterministic smoke / rule-baseline scaffold，不调用外部 LLM 或隐藏 judge。 |
 | Task | `BUY {product_id}` / `SEARCH {query, top_k}` / `PLAN` / `ANSWER` | 环境特定动作。hero env 已实现 `BUY` 和 product-catalog `SEARCH`; SEARCH returns public catalog metadata and hides ASIN/source path/target labels. |
 
-关键点：memory tool 是 policy 的 action，不是外部 harness 自动替 policy 做的事。尤其 `SUMMARY/FILTER` 不能让环境后台调用另一个外部 LLM 完成摘要/判断；正式 RL 路径要让当前 policy 产出摘要 token 或 keep/drop 决策，这些 token 才会进入 rollout/logprob/reward。Harness baseline 可以使用相同工具，但工具触发规则固定。
+关键点：memory tool 是 policy 的 action，不是外部 harness 自动替 policy 做的事。尤其 `SUMMARY/FILTER` 不能让环境后台调用另一个外部 LLM、helper policy 或另一个 agent 完成摘要/判断；正式 RL 路径要让当前 policy 产出摘要 token 或 keep/drop 决策，这些 token 才会进入 rollout/logprob/reward。本项目不做 AgeMem-compatible 的 `qwen-max` 后端模式；只训练/评估一个 policy agent。Harness baseline 可以使用相同工具，但工具触发规则固定。
 
 ## 4. Reward and trajectory schema
 

@@ -38,6 +38,7 @@ Checked points:
   - LTM: `ADD`, `UPDATE`, `DELETE`
   - STM: `RETRIEVE`, `SUMMARY`, `FILTER`
 - The paper argues for integrating memory tools into the agent action space so the policy can learn when and how to use memory, rather than relying only on external heuristics.
+- Boundary correction on 2026-07-02: AgeMem is only a memory-tool taxonomy reference for AgentMemoryGym. Its three-stage curriculum-learning route is not adopted because it is not clean enough for the current Gym/evaluation design.
 - This supports AgentMemoryGym's decision to make memory operations part of the RL action space, while still allowing harness/RAG baselines.
 
 ## Current boundary

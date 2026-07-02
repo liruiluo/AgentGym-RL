@@ -13,17 +13,21 @@ Implemented behavior:
 - Explicit `allow_raw_history_for_agentmemory=true` still selects raw-history
   mode for diagnostic smoke only.
 - In latest-observation mode, each generation prompt contains only the current
-  environment observation and the assistant generation prefix.
+  environment observation and the assistant generation prefix. The environment
+  observation may include current-session STM trace; it must not include raw
+  observations/actions from previous sessions.
 - Multi-round AgentMemory episodes are flattened into one PPO training sample per
   assistant action. Each sample's `input_ids` contains the latest-observation
   prompt plus that action only, so actor/ref log-prob recomputation does not see
-  raw earlier observations or actions.
+  raw previous-session observations or actions.
 - The rollout output carries `rollout_parent_indices`; the PPO trainer aligns the
   original batch to flattened action samples through those parent indices instead
   of blindly using `repeat(n)`.
 
-This is a rollout data-path / leakage-boundary implementation. It is still not a
-full model rollout smoke or RL training result.
+This is a rollout data-path / leakage-boundary implementation. It is not meant
+to delete same-session working context: current-session STM is part of the
+environment observation. It is still not a full model rollout smoke or RL
+training result.
 
 ## Local verification
 

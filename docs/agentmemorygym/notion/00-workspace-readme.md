@@ -26,4 +26,5 @@ code/AgentGym-RL/docs/agentmemorygym/  当前文档与 Notion 同步源
 - MemoryAgentBench 仍是 baseline / 数据参考，不是第一环境主线。
 - 电商捆绑购物是第一版 hero environment。
 - AgentGym-RL / verl 仍是训练后端。
+- session 内自动保留 STM trace；成功 `BUY` 进入下一 session 时清空 raw history，跨 session 只靠 LTM `ADD/RETRIEVE`。
 - 不 claim 第一个 RL-memory 方法。

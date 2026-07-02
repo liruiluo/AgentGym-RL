@@ -28,7 +28,7 @@ Session 2：买兼容这台电视的支架，但当前请求不再重复电视�
 Session 3：买兼容同一台电视的电视柜。
 ```
 
-环境维护 hidden bundle state，例如 `tv_size=75`、`tv_weight_kg=32`、`vesa=400x400`。Agent 只看到当前 active context 和当前候选商品；长期记忆必须通过 memory tools 写入和取回。
+环境维护 hidden bundle state，例如 `tv_size=75`、`tv_weight_kg=32`、`vesa=400x400`。Agent 看到当前候选商品、当前 session 自动 STM trace，以及 `RETRIEVE/SUMMARY/FILTER` 带来的 active retrieved/summary context；跨 session raw history 会清空，长期记忆必须通过 memory tools 写入和取回。
 
 ## 第一版贡献写法
 

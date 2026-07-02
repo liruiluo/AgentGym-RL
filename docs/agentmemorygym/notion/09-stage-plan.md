@@ -38,8 +38,8 @@
 - 已在 Jingyan 1×B200 上通过 torch CUDA、real AgentGym adapter import、server metadata、real client metadata、`init_env_client` metadata smoke。
 - 证据：`TORCH_CUDA_OK`、`AGENTMEMORY_REAL_ADAPTER_IMPORT_OK`、`SERVER_METADATA_SINGLE_GPU_OK`、`AGENTMEMORY_REAL_CLIENT_METADATA_SINGLE_GPU_OK`、`VERL_INIT_ENV_CLIENT_AGENTMEMORY_SINGLE_GPU_OK`。
 - diagnostic rollout 若显式允许 raw-history，必须标记不可计入正式结果。
-- latest-observation rollout context 已实现并通过 smoke：`AGENTMEMORY_LATEST_OBSERVATION_PROMPT_SMOKE_OK`、`AGENTMEMORY_ROLLOUT_CONTEXT_ALIGNMENT_SMOKE_OK`。
-- formal rollout 不再走 raw-history；多轮 episode 展平成每个 action 一条 PPO 样本，trainer 用 `rollout_parent_indices` 对齐原 batch。
+- latest-observation rollout context 已实现并通过 smoke：`AGENTMEMORY_LATEST_OBSERVATION_PROMPT_SMOKE_OK`、`AGENTMEMORY_ROLLOUT_CONTEXT_ALIGNMENT_SMOKE_OK`。这里的 latest observation 不是“没有短期记忆”，而是当前环境 observation 内保留当前 session 自动 STM trace。
+- formal rollout 不再走跨 session raw-history；多轮 episode 展平成每个 action 一条 PPO 样本，trainer 用 `rollout_parent_indices` 对齐原 batch，同时由环境负责在 session 边界清空 `session_trace`。
 - Qwen3-4B / Transformers 小模型 rollout 已在 Jingyan 1×B200 上跑通真实模型→action parser→env step 链路，证据 marker 为 `AGENTMEMORY_QWEN3_4B_LATEST_OBSERVATION_PROGRESS_ROLLOUT_SMOKE_OK`。SEARCH-aware prompt smoke 也已跑通 `SEARCH` 动作链路，但模型反复查询占位文本 `visible candidate title`，frozen dev 仍 `progress_score=0.0`；这不是任务成功或训练收益证据。
 
 ## Stage 2：MemoryArena 电商数据转换
@@ -68,7 +68,7 @@
 - reward decomposition。
 - normalized trajectory info。
 - WebShop catalog / ASIN map 或官方 option-to-ASIN 对齐源消掉 ambiguous target matches；正式 freeze 已做到 `asin_catalog=900 / ambiguous=0`。
-- 下一步不再纠结存储/全量下载：product DB 与 SEARCH index 已在 Jingyan 共享盘。scripted SEARCH baseline / heuristic memory manager 已在 dev split 跑完：no-retry `6/15`、`mean_progress=0.5778`；semantic matcher 修复后 retry5 diagnostic `13/15`、`mean_progress=0.9000`；failure audit 显示当前残余 2 个失败仍是 `compatibility_filter_excluded_target`（`ck/cu`）。semanticfix5 soft-fallback verifier diagnostic 达到 `15/15`、`mean_progress=1.0`，failure audit 无 failed steps。这证明 fair SEARCH + verifier feedback 接口有可解性，但不代表 RL/memory 能力提升；后续先修失败例，再等新 8 卡进入正式 RL train/eval。
+- 下一步不再纠结存储/全量下载：product DB 与 SEARCH index 已在 Jingyan 共享盘。scripted SEARCH baseline / heuristic memory manager 已在 dev split 跑完：no-memory `0/15`、full-context `6/15`、memory-tool no-retry `6/15`、memory-tool retry5 `13/15`；failure audit 显示当前残余 2 个失败仍是 `compatibility_filter_excluded_target`（`ck/cu`）。semanticfix5 soft-fallback verifier diagnostic 达到 `15/15`、`mean_progress=1.0`，failure audit 无 failed steps。这证明 fair SEARCH + verifier feedback 接口有可解性，并且 no-memory 诊断暴露任务确实依赖跨 session 信息。环境现在还保留 session 内自动 STM trace、跨 session 只保留 LTM；这仍不代表 RL/memory 能力提升，后续进入 bounded RL pilot 准备，新 8 卡 RUNNING 后进入正式 RL train/eval。
 
 ## Stage 3：基线 smoke
 
@@ -77,8 +77,10 @@
 当前进展：
 
 - scripted SEARCH baseline / heuristic memory manager 已新增并在 Jingyan 共享盘正式 dev split 上跑完。
-- one-shot/no-retry 当前代码：`15 episodes / 6 successes / success_rate=0.4000 / mean_progress=0.5778 / search_calls=275`。
-- SEARCH + verifier-feedback retry diagnostic 当前代码（`max_buy_attempts=5`）：`15 episodes / 13 successes / success_rate=0.8667 / mean_progress=0.9000 / search_calls=385 / rejected_buys=10`。
+- no-memory 当前代码：`15 episodes / 0 successes / success_rate=0.0000 / mean_progress=0.1889 / add_calls=0 / retrieve_calls=0`。
+- full-context 当前代码：`15 episodes / 6 successes / success_rate=0.4000 / mean_progress=0.5778 / add_calls=0 / retrieve_calls=0`。
+- memory-tool one-shot/no-retry 当前代码：`15 episodes / 6 successes / success_rate=0.4000 / mean_progress=0.5778 / search_calls=275 / add_calls=46 / retrieve_calls=46`。
+- SEARCH + verifier-feedback retry diagnostic 当前代码（`max_buy_attempts=5`）：`15 episodes / 13 successes / success_rate=0.8667 / mean_progress=0.9000 / search_calls=385 / add_calls=68 / retrieve_calls=68 / rejected_buys=10`。
 - retry5 failure audit：`AGENTMEMORY_SCRIPTED_SEARCH_FAILURE_AUDIT_OK`，当前残余 2 个失败类型为 `compatibility_filter_excluded_target`。
 - soft-fallback verifier diagnostic（`--compatibility-fallback ranked-all-after-compatible --max-buy-attempts 7`）：semanticfix5 当前代码为 `15 episodes / 15 successes / success_rate=1.0 / mean_progress=1.0 / total_env_steps=674 / search_calls=420 / buy_calls=104 / rejected_buys=14`，failure audit 无 failed steps。
 - 该 baseline 只证明 `SEARCH + ADD/RETRIEVE + BUY` 接口可推进任务，不是 RL 训练、不代表 memory ability improvement。
@@ -90,11 +92,20 @@
 
 ## Stage 4：正式后训练
 
-目标：等新的 8 卡机器到位后启动正式训练。当前 8 卡机器不占用，因为正在给 continual-reasoning gym 项目使用。
+目标：等新的 8 卡机器到位后启动正式训练。当前旧 8 卡机器不占用，因为正在给 continual-reasoning gym 项目使用。
+
+当前资源状态：
+
+- 已提交两台新 8 卡申请：`luolirui-1-amg-g5a-0702`、`luolirui-1-amg-g5b-0702`。
+- 当前状态为 QUEUEING，不能算已占住。
+- devbox 外层 watcher：`watch_two_h8_0702`；cron 每分钟确保 watcher 存活。
+- watcher 在任务 RUNNING 后会先验证平台 holder，再 SSH 进 pod 安装 `amg_8gpu_auto_yield_guard`。该 guard 在无真实 GPU 训练/评测时启动 placeholder，占满 8 卡；发现真实 GPU workload 后自动让位；真实 workload 结束后自动恢复 placeholder。
 
 完成标准：
 
 - 8 卡资源确认。
+- 平台 holder RUNNING 且 `9Nctl logs` 不返回 deleted/Gone。
+- pod 内 auto-yield GPU workload 守护已启动，并验证 idle 时占卡、真实 workload 出现时让位、结束后恢复。
 - 训练配置固定。
 - baseline 和 reward 不再临时漂移。
 - 训练日志和评测链路可复现。

@@ -65,7 +65,7 @@ reward r_t = task_success/progress - memory/tool cost - violation penalty
 ```
 
 - **自动短期记忆 STM / session trace**：当前 session 内的 action、observation 摘要和 tool result trace，默认可见；成功 `BUY` 进入下一 session 时清空，防止跨 session raw-history 泄漏。
-- **长期记忆 LTM**：跨 session 持久化，但默认对 policy 隐藏；只有 `RETRIEVE` 结果进入 active retrieved/summary context。
+- **长期记忆 LTM**：跨 session 持久化，但默认对 policy 隐藏；只有 `RETRIEVE` 结果进入 active retrieved/summary context。当前 `RETRIEVE` 固定使用本地 BM25 ranking；policy-facing action 仍是 `RETRIEVE {query, top_k}`。
 - **Active retrieved/summary context**：由 `RETRIEVE/SUMMARY/FILTER` 操作产生的当前可见工作区；它不是全部 STM，而是从 LTM 或摘要工具带入当前 observation 的显式上下文。
 - **任务状态**：例如已购商品、兼容约束、旅行成员行程、搜索中间实体、推导中间命题。
 
@@ -74,13 +74,13 @@ v0 memory 工具：
 - `ADD {key, value}`：把高价值新信息写入长期记忆。
 - `UPDATE {memory_id/key, value}`：当新信息修正旧信息时更新记忆。
 - `DELETE {memory_id/key}`：删除过时或错误记忆。
-- `RETRIEVE {query, top_k}`：把相关长期记忆拉回 active retrieved/summary context。
+- `RETRIEVE {query, top_k}`：把相关长期记忆拉回 active retrieved/summary context；环境内部用本地 BM25 排序，不调用收费 embedding API 或其它模型。
 - `SUMMARY {text, source_ids?}`：把当前可见上下文压缩成摘要并放入 active retrieved/summary context。正式 RL 路径里摘要文本由当前 policy 模型自己生成，`source_ids` 只引用当前 observation 里可见的 `S*` / `C*` 条目，环境不在后台调用外部 LLM 代写摘要。
 - `FILTER {keep_ids|drop_ids, scope}`：由当前 policy 模型选择保留或丢弃哪些可见上下文 ID，例如 `C0`、`S1`；环境只执行确定性的 keep/drop 状态转移。
 - `SUMMARY {span}` / `FILTER {query}`：只作为 deterministic scaffold、smoke 和规则 baseline，不能当成隐藏的外部智能模块。
 - 环境动作：购物使用 `BUY {product_id}` 和 product-catalog `SEARCH {query, top_k}`；其它环境后续扩展 `PLAN / ANSWER`。`SEARCH` 只返回公开商品 metadata，不暴露 ASIN/source path 或 target。
 
-关键点：memory tool 是 policy 的 action，不是外部 harness 自动替 policy 做的事。尤其 `SUMMARY/FILTER` 不能让环境偷偷调另一个外部 LLM 完成判断，否则这些 token 不进入 rollout/logprob，RL 信用分配不干净。Harness baseline 可以使用同样工具，但触发规则固定。
+关键点：memory tool 是 policy 的 action，不是外部 harness 自动替 policy 做的事。尤其 `SUMMARY/FILTER` 不能让环境偷偷调另一个外部 LLM、helper policy 或另一个 agent 完成判断，否则这些 token 不进入 rollout/logprob，RL 信用分配不干净。本项目不做 AgeMem-compatible 的 `qwen-max` 后端模式；只训练/评估一个 policy agent。Harness baseline 可以使用同样工具，但触发规则固定。
 
 ## 5. 奖励与轨迹字段
 
