@@ -3,7 +3,7 @@
 ## 0. 当前状态卡
 
 - **研究目标**：构建一个面向 agent memory policy 的 RL 后训练 Gym，把长程、多会话、依赖历史状态的 agent 任务改写成可训练、可评测、可归因的环境。
-- **当前阶段**：MemoryArena / 电商捆绑购物数据与接口打通。已完成 target freeze、全量 product DB 共享盘镜像、SQLite/FTS `SEARCH` 索引、Qwen3-4B 单卡 smoke，以及 scripted SEARCH baseline / heuristic memory manager dev 诊断。failure audit 证明 retry5 的 5 个残余失败全是 strict compatibility filter 排除了 target；soft-fallback verifier diagnostic 已能跑到 `15/15`。下一步是把这个诊断转成更稳的 SEARCH/metadata/训练策略，再等新 8 卡做正式 RL。
+- **当前阶段**：MemoryArena / 电商捆绑购物数据与接口打通。已完成 target freeze、全量 product DB 共享盘镜像、SQLite/FTS `SEARCH` 索引、Qwen3-4B 单卡 smoke，以及 scripted SEARCH baseline / heuristic memory manager dev 诊断。semantic matcher 修复后 retry5 从 `10/15` 提升到 `13/15`，当前 2 个残余失败仍是 strict compatibility filter 排除了 target；semanticfix5 soft-fallback verifier diagnostic 已能跑到 `15/15` 且 failure audit 无 failed steps。下一步是把这个诊断转成更稳的 SEARCH/metadata/训练策略，再等新 8 卡做正式 RL。
 - **已确定边界**：复用 AgentGym-RL / verl；memory 工具参考 AgeMem；v0 先做 Gym、基线、评测和行为分析，不声称第一个 RL-memory 方法。
 - **资源边界**：Mac/ZBMac 只做 0 卡检查；MemoryArena product DB 与 SQLite/FTS index 放 Jingyan 共享盘。Jingyan 1×B200 已跑真单卡 smoke；现有 8 卡仍给 continual-reasoning gym，AgentMemoryGym 等新 8 卡再跑正式后训练。
 - **本阶段完成标准**：本地文档和 Notion 页面不再把 MemoryAgentBench AR/CR 写成第一主线；电商捆绑购物成为 hero environment；已有代码草稿保留为 `agentenv-agentmemory` skeleton，并通过 compile/direct/server-client smoke 后仍只标注为草稿。
@@ -157,7 +157,7 @@ AgentGym-RL/                         # 主训练 fork
 8. rollout 数据路径已推进：AgentMemory 默认 latest-observation，只把当前 observation 给 policy；多轮 episode 展平成每个 action 一条 PPO 样本，并用 `rollout_parent_indices` 对齐原 batch，避免 actor/ref logprob 重算时读到完整历史。
 9. Qwen3-4B / Transformers 真单卡 rollout 已跑通真实模型→parser→env step；SEARCH-aware prompt 也能调用 `SEARCH`，但当前会反复用占位 query，没有任务进度。
 10. 全量 product DB 已在 Jingyan 共享盘构建 SQLite/FTS index；严格 all-candidate metadata 仍只有 `285/900`，说明缺口不是存储/下载范围，而是可靠 option-to-catalog 对齐与 policy 使用 SEARCH。
-11. scripted SEARCH baseline / heuristic memory manager 已跑通 dev split：one-shot/no-retry 为 `5/15`、`mean_progress=0.5444`；`max_buy_attempts=5` 的 SEARCH + verifier-feedback retry diagnostic 为 `10/15`、`mean_progress=0.8222`；failure audit 显示残余 5 个失败均为 `compatibility_filter_excluded_target`。
+11. scripted SEARCH baseline / heuristic memory manager 已跑通 dev split：one-shot/no-retry 为 `6/15`、`mean_progress=0.5778`；`max_buy_attempts=5` 的 SEARCH + verifier-feedback retry diagnostic 在 semantic matcher 修复后为 `13/15`、`mean_progress=0.9000`；failure audit 显示当前残余 2 个失败为 `compatibility_filter_excluded_target`。
 12. 新增 soft-fallback verifier diagnostic：`--compatibility-fallback ranked-all-after-compatible --max-buy-attempts 7` 后 dev split 达到 `15/15`、`mean_progress=1.0`，说明 fair SEARCH + verifier feedback 足以完成当前 frozen dev，但这仍不是 RL 训练或 memory ability improvement。
 13. 下一步用 scripted baseline 的失败例收紧 product option-to-catalog normalization / SEARCH 返回字段 / policy 使用 SEARCH 的方式；拿到新 8 卡后再进入正式后训练。
 

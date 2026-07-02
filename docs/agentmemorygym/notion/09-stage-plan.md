@@ -52,7 +52,7 @@
 - 全量 150 条 public bundled-shopping smoke 已可转换为 `train/dev/test = 120/15/15`，并通过 data validator。
 - converter 会生成 target-match audit report；无 catalog 时 heuristic 在 900 个 step 中有 12 个 tied/ambiguous match。
 - 已新增 catalog / ASIN resolver；在 Jingyan 共享盘的 4 个相关 product-catalog shard 上重跑 public conversion，900 个 step 的 ambiguous match 已降为 0。
-- MemoryArena product DB 已全量镜像到 Jingyan 共享盘：`/home/ai-jingyan-train/luolirui.1/post-train/data/memoryarena-product-db/`，不落开发机本地盘；最终校验为 `135 files / 13,517,161,526 bytes`，extra/missing/mismatch/part 均为 0。
+- MemoryArena product DB 已全量镜像到 Jingyan 共享盘：`/media/cfs/ai-jingyan-train/luolirui.1/post-train/data/memoryarena-product-db/`，不落开发机本地盘；最终校验为 `135 files / 13,517,161,526 bytes`，extra/missing/mismatch/part 均为 0。
 - 正式 freeze 已完成：`memoryarena_formal_freeze_20260701-234045`，`train/dev/test=120/15/15`，`rows=900 / ambiguous=0 / asin_catalog=900 / catalog_paths=11`，source sha256 为 `4411a2da528a33dc6aca519b49cc225895363f18b2d19b191fddb501200134ef`。
 - Qwen3-4B frozen dev rollout 暴露下一层代码缺口：未增强版 observation 只含候选标题和 source-option，不含所有候选的 rating/price/review 等 product DB 字段，也没有 product-catalog `SEARCH` 工具；因此 highest-rated / highest-priced / budget 类任务对模型不公平，不能直接进入正式训练结果口径。
 - 已接入 leakage-safe candidate metadata enrichment：只有同一 subtask 的所有候选都能匹配 catalog 且分数达标，才暴露 `average_rating / price_usd / total_reviews`；严格阈值 90 的 enriched freeze 为 `memoryarena_enriched_freeze_20260702-014308`，`candidate_metadata_full_steps=285/900`。随后按你的纠偏用 Jingyan 共享盘全量 product_catalog 67 个 shard 重跑 full-catalog freeze：`memoryarena_fullcatalog_enriched_freeze_20260702-024824`，结果仍是 `candidate_metadata_full_steps=285/900`，说明缺口不是“没下载全量 DB”，而是 option 文本与 catalog title 的可靠对齐/缺字段问题。
@@ -68,7 +68,7 @@
 - reward decomposition。
 - normalized trajectory info。
 - WebShop catalog / ASIN map 或官方 option-to-ASIN 对齐源消掉 ambiguous target matches；正式 freeze 已做到 `asin_catalog=900 / ambiguous=0`。
-- 下一步不再纠结存储/全量下载：product DB 与 SEARCH index 已在 Jingyan 共享盘。scripted SEARCH baseline / heuristic memory manager 已在 dev split 跑完：no-retry `5/15`、`mean_progress=0.5444`；retry5 diagnostic `10/15`、`mean_progress=0.8222`；failure audit 显示 retry5 残余 5 个失败全是 `compatibility_filter_excluded_target`；soft-fallback verifier diagnostic 达到 `15/15`、`mean_progress=1.0`。这证明 fair SEARCH + verifier feedback 接口有可解性，但不代表 RL/memory 能力提升；后续先修失败例，再等新 8 卡进入正式 RL train/eval。
+- 下一步不再纠结存储/全量下载：product DB 与 SEARCH index 已在 Jingyan 共享盘。scripted SEARCH baseline / heuristic memory manager 已在 dev split 跑完：no-retry `6/15`、`mean_progress=0.5778`；semantic matcher 修复后 retry5 diagnostic `13/15`、`mean_progress=0.9000`；failure audit 显示当前残余 2 个失败仍是 `compatibility_filter_excluded_target`（`ck/cu`）。semanticfix5 soft-fallback verifier diagnostic 达到 `15/15`、`mean_progress=1.0`，failure audit 无 failed steps。这证明 fair SEARCH + verifier feedback 接口有可解性，但不代表 RL/memory 能力提升；后续先修失败例，再等新 8 卡进入正式 RL train/eval。
 
 ## Stage 3：基线 smoke
 
@@ -77,10 +77,10 @@
 当前进展：
 
 - scripted SEARCH baseline / heuristic memory manager 已新增并在 Jingyan 共享盘正式 dev split 上跑完。
-- one-shot/no-retry：`15 episodes / 5 successes / success_rate=0.3333 / mean_progress=0.5444 / search_calls=265`。
-- SEARCH + verifier-feedback retry diagnostic（`max_buy_attempts=5`）：`15 episodes / 10 successes / success_rate=0.6667 / mean_progress=0.8222 / search_calls=365 / rejected_buys=14`。
-- retry5 failure audit：`AGENTMEMORY_SCRIPTED_SEARCH_FAILURE_AUDIT_OK`，残余失败类型全是 `compatibility_filter_excluded_target`。
-- soft-fallback verifier diagnostic（`--compatibility-fallback ranked-all-after-compatible --max-buy-attempts 7`）：`15 episodes / 15 successes / success_rate=1.0 / mean_progress=1.0 / search_calls=420 / rejected_buys=19`。
+- one-shot/no-retry 当前代码：`15 episodes / 6 successes / success_rate=0.4000 / mean_progress=0.5778 / search_calls=275`。
+- SEARCH + verifier-feedback retry diagnostic 当前代码（`max_buy_attempts=5`）：`15 episodes / 13 successes / success_rate=0.8667 / mean_progress=0.9000 / search_calls=385 / rejected_buys=10`。
+- retry5 failure audit：`AGENTMEMORY_SCRIPTED_SEARCH_FAILURE_AUDIT_OK`，当前残余 2 个失败类型为 `compatibility_filter_excluded_target`。
+- soft-fallback verifier diagnostic（`--compatibility-fallback ranked-all-after-compatible --max-buy-attempts 7`）：semanticfix5 当前代码为 `15 episodes / 15 successes / success_rate=1.0 / mean_progress=1.0 / total_env_steps=674 / search_calls=420 / buy_calls=104 / rejected_buys=14`，failure audit 无 failed steps。
 - 该 baseline 只证明 `SEARCH + ADD/RETRIEVE + BUY` 接口可推进任务，不是 RL 训练、不代表 memory ability improvement。
 
 完成标准：

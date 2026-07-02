@@ -19,15 +19,15 @@
 8. 已用 Jingyan 1×B200 记录真实单卡 env/client/init smoke 结果。
 9. latest-observation scripted-policy rollout smoke 已通过；真正 Qwen3-4B / Transformers 小模型 rollout smoke 也已在 Jingyan 1×B200 上跑通模型→action parser→env step 链路，不把 raw-history override 计入正式结果。
 10. MemoryArena bundled-shopping converter 已有入口和全量 smoke；catalog / ASIN resolver 已接入，Jingyan 共享盘 4 个相关 catalog shard 验证后把 12/900 个 target-match 歧义降到 0/900。
-11. Product DB 已全量镜像到 Jingyan 共享盘 `/home/ai-jingyan-train/luolirui.1/post-train/data/memoryarena-product-db/`，最终校验 `135 files / 13,517,161,526 bytes`，extra/missing/mismatch/part 均为 0；不放开发机本地盘。
+11. Product DB 已全量镜像到 Jingyan 共享盘 `/media/cfs/ai-jingyan-train/luolirui.1/post-train/data/memoryarena-product-db/`，最终校验 `135 files / 13,517,161,526 bytes`，extra/missing/mismatch/part 均为 0；不放开发机本地盘。
 12. 正式 train/dev/test item-id 已冻结：`memoryarena_formal_freeze_20260701-234045`，`120/15/15`，`asin_catalog=900 / ambiguous=0`。
 13. 已接上 leakage-safe candidate metadata enrichment：同一 subtask 必须所有候选都匹配达标才暴露 `average_rating / price_usd / total_reviews`，避免 target-only leakage。严格 enriched freeze：`memoryarena_enriched_freeze_20260702-014308`，`candidate_metadata_full_steps=285/900`。
 14. 已重跑 Qwen3-4B enriched dev：普通 prompt 仍 `RETRIEVE highest rated` loop；metadata-aware diagnostic prompt 能在第 1 个 dev episode 买对首个商品并达到 `progress_score=0.1667`，但没有完成任务。
 15. 已用全量 product_catalog 67 个 shard 复跑 strict enriched freeze：`memoryarena_fullcatalog_enriched_freeze_20260702-024824`，`catalog_paths=67` 但 `candidate_metadata_full_steps` 仍为 `285/900`；因此不能再把缺口归因于“没有全量下载”。
 16. Product-catalog `SEARCH` tool 路线已打通：代码草稿新增 `SEARCH {"query":"...","top_k":3}` 与 SQLite/FTS index builder；全量 index 已在 Jingyan 共享盘构建完成，`products=1,031,654`、约 `479M`，不放开发机。
 17. 已跑 SEARCH-aware Qwen3-4B smoke：24 个 parsed/env steps 均有效，但模型重复 `SEARCH {"query":"visible candidate title"}`，没有 `ADD/BUY`，`progress_score=0.0,0.0`。
-18. scripted SEARCH baseline / heuristic memory manager 已实现并在 Jingyan dev split 跑完：no-retry `5/15`、`mean_progress=0.5444`；retry5 diagnostic `10/15`、`mean_progress=0.8222`；failure audit 确认残余 5 个失败全是 strict compatibility filter 排除了 target。
-19. soft-fallback verifier diagnostic 已跑到 `15/15`、`mean_progress=1.0`，说明当前 frozen dev 可由 fair SEARCH + verifier feedback 完成；但这是 exhaustive diagnostic，不是 learned policy。
+18. scripted SEARCH baseline / heuristic memory manager 已实现并在 Jingyan dev split 跑完：no-retry `6/15`、`mean_progress=0.5778`；retry5 semantic matcher 修复后 `13/15`、`mean_progress=0.9000`；failure audit 确认当前残余 2 个失败仍是 strict compatibility filter 排除了 target。
+19. semanticfix5 soft-fallback verifier diagnostic 已跑到 `15/15`、`mean_progress=1.0`，failure audit 无 failed steps，说明当前 frozen dev 可由 fair SEARCH + verifier feedback 完成；但这是 exhaustive diagnostic，不是 learned policy。
 20. 下一步：把 scripted baseline 失败例转成接口/数据修复清单，优先处理 option-to-catalog variant mismatch、缺 rating/price 字段、兼容 label 无法从 title-level metadata 恢复等问题；新 8 卡到位后再开始 RL 训练配置。
 
 ## 0 卡本地检查边界
