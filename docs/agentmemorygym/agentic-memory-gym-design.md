@@ -3,10 +3,10 @@
 ## 0. State card
 
 - **研究目标**：构建一个面向 agent memory policy 的 RL 后训练 Gym，把长程、多会话、依赖历史状态的 agent 任务改写成可训练、可评测、可归因的环境。
-- **当前阶段**：MemoryArena / e-commerce bundled-shopping data and interface bring-up. Target freeze, full product DB mirror on Jingyan shared disk, SQLite/FTS `SEARCH` index, Qwen3-4B single-GPU smoke, scripted SEARCH baseline diagnostics, and failure audit are done. Semantic matcher fixes raised strict retry5 from `10/15` to `13/15`; the two current residual strict failures are still `compatibility_filter_excluded_target`. The semanticfix5 soft-fallback verifier diagnostic reaches `15/15` with no failed steps. The next step is to tighten SEARCH/metadata/policy behavior before formal 8-GPU RL.
-- **已有人类决定**：以电商捆绑/序列购物作为 hero environment；复用 AgentGym-RL / verl 作为训练后端；memory action space 参考 AgeMem/Agentic Memory 工具语义；v0 不把新算法写成主贡献。
+- **当前阶段**：MemoryArena / e-commerce bundled-shopping data and interface bring-up. Target freeze, full product DB mirror on Jingyan shared disk, SQLite/FTS `SEARCH` index, Qwen3-4B single-GPU smoke, scripted SEARCH baseline diagnostics, and failure audit are done. The semanticfix5 policy-surface diagnostics are now: no-memory `0/15`, full-context `6/15`, memory-tool strict no-retry `6/15`, memory-tool retry5 `13/15`, and memory-tool soft-fallback verifier diagnostic `15/15`. The next step is to turn these diagnostics into a bounded real-GPU RL pilot once an authorized lane is available, while keeping formal 8-GPU RL for the newly requested 8-card machines.
+- **已有人类决定**：以电商捆绑/序列购物作为 hero environment；复用 AgentGym-RL / verl 作为训练后端；memory action space 只参考 AgeMem/Agentic Memory 的 STM/LTM 工具语义；不借 AgeMem 的三阶段课程学习路线；v0 不把新算法写成主贡献。
 - **已有材料**：本仓 `AgentGym-RL` fork 与 `AgentGym` submodule fork；旧 Notion 备份；MemoryArena、AgeMem、AgentGym-RL、MemoryAgentBench 等参考源。
-- **本轮交付物**：本设计文档 + `agentenv-agentmemory` 环境 skeleton + MemoryArena bundled-shopping converter/freeze + shared-disk product-catalog `SEARCH` draft + AgentGym-RL client 注册入口。
+- **本轮交付物**：本设计文档 + `agentenv-agentmemory` 环境 skeleton + MemoryArena bundled-shopping converter/freeze + shared-disk product-catalog `SEARCH` draft + session 内自动 STM trace + AgentGym-RL client 注册入口。
 
 ## 1. Positioning
 
@@ -30,7 +30,7 @@ Harness / memory module 可以提供下限：固定写入规则、固定检索�
 ### 1.2 Why a Gym rather than only a benchmark or an algorithm
 
 - **不是只做 benchmark**：MemoryArena、MemoryAgentBench、StructMemEval、Evo-Memory 等已经覆盖了大量 memory 评测面。新的静态指标边际收益有限。
-- **不是先做单算法**：AgeMem、Memory-R1、MemAct、MEM1、MemAgent、UMA 等已经说明 memory operation 可以被训练；问题是各自环境、动作空间、奖励和报告协议不统一，公平比较和 scaling 分析困难。
+- **不是先做单算法**：AgeMem、Memory-R1、MemAct、MEM1、MemAgent、UMA 等已经说明 memory operation 可以被训练；问题是各自环境、动作空间、奖励和报告协议不统一，公平比较和 scaling 分析困难。AgeMem 在本项目里只作为 memory-tool taxonomy 参考，不作为课程学习或训练数据组织方案参考。
 - **Gym 的空白**：把 agent memory 任务改写成统一可训练环境，提供 train/dev/test split、memory tools、verifiable reward、trajectory schema、baseline suite 和行为归因协议。
 
 因此 v0 贡献应写成：**Agentic memory RL training environment + baseline/evaluation/analysis protocol**，而不是“第一个用 RL 训练 agent memory”。
@@ -51,7 +51,7 @@ Session 2: buy a wall mount compatible with the previously bought TV.
 Session 3: buy a media console compatible with the TV size and room constraints.
 ```
 
-环境维护 hidden bundle state，例如 `tv_size=75`、`tv_weight_kg=32`、`vesa=400x400`。policy 只能看到当前 session 的 active context；长期记忆必须通过 `ADD/UPDATE/DELETE/RETRIEVE` 等工具维护和取回。奖励来自购买是否完成且兼容。
+环境维护 hidden bundle state，例如 `tv_size=75`、`tv_weight_kg=32`、`vesa=400x400`。policy 能看到当前 session 的 observation、候选商品、自动记录的本 session action/tool-result trace，以及显式 `RETRIEVE/SUMMARY/FILTER` 带来的 active retrieved/summary context；跨 session 的原始对话/action 历史会清空。长期记忆必须通过 `ADD/UPDATE/DELETE/RETRIEVE` 等工具维护和取回。奖励来自购买是否完成且兼容。
 
 这类任务最贴近产品价值：用户通常无法在第一轮完整描述全套需求，产品也不一定具备多轮序列推荐商品的能力。AgentMemoryGym 应首先把这个场景做成可训练、可验证、可归因的后训练环境。
 
@@ -72,15 +72,16 @@ Session 3: buy a media console compatible with the TV size and room constraints.
 AgentMemoryGym 更准确地是一个带外部记忆状态的 POMDP：
 
 ```text
-hidden state s_t = (task_state_t, long_term_memory_t, short_term_context_t, history_t)
-observation o_t = render(short_term_context_t, current_task_view_t, tool_result_t)
+hidden state s_t = (task_state_t, long_term_memory_t, session_stm_t, retrieved_context_t, history_t)
+observation o_t = render(session_stm_t, retrieved_context_t, current_task_view_t, tool_result_t)
 action a_t = task action or memory tool action
 transition T: (s_t, a_t) -> s_{t+1}
 reward r_t = task_success/progress - memory/tool cost - violation penalty
 ```
 
-- **LTM**：跨 session 持久化，但对 policy 隐藏；只有 `RETRIEVE` 结果会进入 active context。
-- **STM / active context**：当前可见上下文，受摘要、检索、过滤和任务 observation 影响。
+- **自动 STM / session trace**：当前 session 内的 action、observation 摘要和 tool result trace，默认可见；成功 `BUY` 进入下一 session 时清空，防止跨 session raw-history 泄漏。
+- **LTM**：跨 session 持久化，但对 policy 隐藏；只有 `RETRIEVE` 结果会进入 active retrieved/summary context。
+- **Active retrieved/summary context**：由 `RETRIEVE/SUMMARY/FILTER` 操作产生的当前可见工作区；它不是全部 STM，而是从 LTM 或摘要工具带入当前 observation 的显式上下文。
 - **Task state**：例如已买商品、兼容约束、当前成员行程、搜索中间实体、推导中间命题。
 
 ### 3.1 Memory tools
@@ -92,12 +93,13 @@ v0 采用可解析的文本/JSON action，后续可映射到 function calling：
 | LTM | `ADD {key, value}` | 抽取当前上下文中新且高价值的信息写入长期记忆。 |
 | LTM | `UPDATE {memory_id/key, value}` | 当新信息修正旧信息时更新已有记忆。 |
 | LTM | `DELETE {memory_id/key}` | 删除过时、错误或有害的记忆。 |
-| STM | `RETRIEVE {query, top_k}` | 从 LTM 中检索相关记忆并加入 active context。 |
-| STM | `SUMMARY {text}` | 将长上下文压缩为可复用摘要，加入 active context 或 LTM。 |
-| STM | `FILTER {query}` | 从 active context 中移除与当前任务无关的信息。 |
+| STM | `RETRIEVE {query, top_k}` | 从 LTM 中检索相关记忆并加入 active retrieved/summary context。 |
+| STM | `SUMMARY {text, source_ids?}` | 当前 policy 模型自己生成摘要文本，并可引用 observation 中可见的 `S*` / `C*` context IDs；环境只验证可见来源并替换 active context。 |
+| STM | `FILTER {keep_ids/drop_ids, scope}` | 当前 policy 模型选择保留或丢弃哪些可见 context IDs；环境只执行确定性 keep/drop。 |
+| STM scaffold | `SUMMARY {span}` / `FILTER {query}` | deterministic smoke / rule-baseline scaffold，不调用外部 LLM 或隐藏 judge。 |
 | Task | `BUY {product_id}` / `SEARCH {query, top_k}` / `PLAN` / `ANSWER` | 环境特定动作。hero env 已实现 `BUY` 和 product-catalog `SEARCH`; SEARCH returns public catalog metadata and hides ASIN/source path/target labels. |
 
-关键点：memory tool 是 policy 的 action，不是外部 harness 自动替 policy 做的事。Harness baseline 可以使用相同工具，但工具触发规则固定。
+关键点：memory tool 是 policy 的 action，不是外部 harness 自动替 policy 做的事。尤其 `SUMMARY/FILTER` 不能让环境后台调用另一个外部 LLM 完成摘要/判断；正式 RL 路径要让当前 policy 产出摘要 token 或 keep/drop 决策，这些 token 才会进入 rollout/logprob/reward。Harness baseline 可以使用相同工具，但工具触发规则固定。
 
 ## 4. Reward and trajectory schema
 
@@ -125,11 +127,13 @@ v0 skeleton 使用简单 dense progress reward；正式训练前需要固定 rew
   "memory_dependency": "tv_size_weight_vesa_reused_across_sessions",
   "progress_score": 0.67,
   "episode_success": false,
+  "tool_ops": [{"op": "SEARCH", "tool_family": "catalog", "step": 1}],
   "memory_ops": [{"op": "ADD", "key": "tv_size", "step": 1}],
   "memory_state_diff": {"added": [...], "updated": [...], "deleted": [...]},
   "compatibility_violations": [],
   "purchase_history": [...],
-  "current_subtask_index": 2
+  "current_subtask_index": 2,
+  "session_trace": [...]
 }
 ```
 
@@ -177,13 +181,14 @@ AgentGym-RL/                         # main training fork
 3. Run direct environment smoke with scripted memory policy.
 4. Add a JSONL item schema for bundled shopping smoke tasks.
 5. Add split-aware dataset loading and server `/metadata` so the trainer can see real task counts instead of a hard-coded `data_len=1`.
-6. Add a fail-fast raw-history guard for `task_name=agentmemory`; full-history vLLM rollout is diagnostic-only until a latest-observation rollout path is implemented.
+6. Add a fail-fast raw-history guard for `task_name=agentmemory`; full-history vLLM rollout is diagnostic-only.
 7. Add data converters for real MemoryArena/WebShop-style bundled shopping tasks.
 8. Freeze real train/dev/test item-id files after MemoryArena conversion (`120/15/15`, `asin_catalog=900`, `ambiguous=0`).
 9. Keep the full MemoryArena product DB and derived SQLite/FTS SEARCH index on the Jingyan shared disk, not on the Mac/devbox.
-10. Keep the scripted SEARCH baseline / heuristic memory manager as the first reproducible baseline: no-retry dev `6/15` (`mean_progress=0.5778`), SEARCH + verifier-feedback retry diagnostic after semantic matcher fixes `13/15` (`mean_progress=0.9000`), and soft-fallback verifier diagnostic `15/15` (`mean_progress=1.0`). This proves interface/solvability, not RL memory improvement.
+10. Keep the scripted SEARCH baseline / heuristic memory manager as the first reproducible baseline: no-memory dev `0/15` (`mean_progress=0.1889`), full-context dev `6/15` (`mean_progress=0.5778`), memory-tool no-retry dev `6/15` (`mean_progress=0.5778`), SEARCH + verifier-feedback retry diagnostic after semantic matcher fixes `13/15` (`mean_progress=0.9000`), and soft-fallback verifier diagnostic `15/15` (`mean_progress=1.0`). This proves interface/solvability and memory-dependence diagnostics, not RL memory improvement.
 11. Use the failure audit (current strict retry5 residual failures are `ck/cu`, both `compatibility_filter_excluded_target`) to improve SEARCH/metadata/policy behavior before formal RL.
-12. Add a bounded GRPO smoke config only after baseline failure analysis; decide whether a new method beyond standard GRPO/PPO is needed after that.
+12. Preserve automatic current-session STM in the latest-observation rollout path: “latest observation” means current environment observation plus current-session STM, not cross-session raw conversation history.
+13. Start a bounded GRPO/PPO RL pilot when an authorized GPU lane is available. The pilot is for training-chain and policy-failure exposure; do not report it as formal memory-ability improvement until the 8-GPU protocol, splits, metrics, and checksums are accepted.
 
 ## 7. Claim guardrails
 

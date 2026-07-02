@@ -3,8 +3,8 @@
 ## 0. 当前状态卡
 
 - **研究目标**：构建一个面向 agent memory policy 的 RL 后训练 Gym，把长程、多会话、依赖历史状态的 agent 任务改写成可训练、可评测、可归因的环境。
-- **当前阶段**：MemoryArena / 电商捆绑购物数据与接口打通。已完成 target freeze、全量 product DB 共享盘镜像、SQLite/FTS `SEARCH` 索引、Qwen3-4B 单卡 smoke，以及 scripted SEARCH baseline / heuristic memory manager dev 诊断。semantic matcher 修复后 retry5 从 `10/15` 提升到 `13/15`，当前 2 个残余失败仍是 strict compatibility filter 排除了 target；semanticfix5 soft-fallback verifier diagnostic 已能跑到 `15/15` 且 failure audit 无 failed steps。下一步是把这个诊断转成更稳的 SEARCH/metadata/训练策略，再等新 8 卡做正式 RL。
-- **已确定边界**：复用 AgentGym-RL / verl；memory 工具参考 AgeMem；v0 先做 Gym、基线、评测和行为分析，不声称第一个 RL-memory 方法。
+- **当前阶段**：MemoryArena / 电商捆绑购物数据与接口打通。已完成 target freeze、全量 product DB 共享盘镜像、SQLite/FTS `SEARCH` 索引、Qwen3-4B 单卡 smoke，以及 scripted SEARCH baseline / heuristic memory manager dev 诊断。semanticfix5 当前结果为：no-memory `0/15`，full-context `6/15`，显式 memory-tool strict no-retry `6/15`，memory-tool retry5 `13/15`，memory-tool soft-fallback verifier diagnostic `15/15` 且 failure audit 无 failed steps。下一步是在授权 GPU lane 上启动 bounded RL pilot，正式 8 卡后训练等新申请的 8 卡机器到位。
+- **已确定边界**：复用 AgentGym-RL / verl；memory 工具只参考 AgeMem 的 STM/LTM action 语义；不借 AgeMem 的三阶段课程学习路线；v0 先做 Gym、基线、评测和行为分析，不声称第一个 RL-memory 方法。
 - **资源边界**：Mac/ZBMac 只做 0 卡检查；MemoryArena product DB 与 SQLite/FTS index 放 Jingyan 共享盘。Jingyan 1×B200 已跑真单卡 smoke；现有 8 卡仍给 continual-reasoning gym，AgentMemoryGym 等新 8 卡再跑正式后训练。
 - **本阶段完成标准**：本地文档和 Notion 页面不再把 MemoryAgentBench AR/CR 写成第一主线；电商捆绑购物成为 hero environment；已有代码草稿保留为 `agentenv-agentmemory` skeleton，并通过 compile/direct/server-client smoke 后仍只标注为草稿。
 
@@ -18,7 +18,7 @@
 
 当前已经有不少 memory benchmark。MemoryArena、MemoryAgentBench、StructMemEval、Evo-Memory 等都能评估不同层面的 agent memory。再做一个静态 benchmark 的边际收益有限。
 
-另一方面，AgeMem、Memory-R1、MemAct、MEM1、MemAgent、UMA 等已经说明 memory operation 可以被训练，但这些方法往往绑定特定任务、特定记忆形态或特定训练假设，不容易公平比较，也不容易分析 scaling 是否稳定。
+另一方面，AgeMem、Memory-R1、MemAct、MEM1、MemAgent、UMA 等已经说明 memory operation 可以被训练，但这些方法往往绑定特定任务、特定记忆形态或特定训练假设，不容易公平比较，也不容易分析 scaling 是否稳定。AgeMem 在这里仅作为 memory tool taxonomy 参考，不作为课程学习或数据组织方案参考。
 
 因此 AgentMemoryGym 的定位是：把 agent memory 任务转成统一可训练 Gym，提供训练/验证/测试切分、memory action space、可验证奖励、轨迹字段、基线套件和行为分析协议。也就是说，项目要解决的是“怎么让 memory 后训练可复用、可比较、可扩展”，而不是只报告一个新榜单或先押一个新算法。
 
@@ -36,7 +36,7 @@ Session 2：买一个兼容这台电视的支架，但当前请求不再重复�
 Session 3：买一个兼容同一台电视的电视柜。
 ```
 
-环境维护 hidden bundle state，例如 `tv_size=75`、`tv_weight_kg=32`、`vesa=400x400`。Agent 当前只能看到 active context 和当前商品候选；长期记忆需要通过 `ADD/UPDATE/DELETE/RETRIEVE` 等工具维护和取回。奖励来自购买是否完成且兼容。
+环境维护 hidden bundle state，例如 `tv_size=75`、`tv_weight_kg=32`、`vesa=400x400`。Agent 当前能看到当前 session 的 observation、候选商品、自动记录的本 session action/tool-result trace，以及显式 `RETRIEVE/SUMMARY/FILTER` 带来的 active retrieved/summary context；跨 session 的原始对话/action 历史会清空。长期记忆需要通过 `ADD/UPDATE/DELETE/RETRIEVE` 等工具维护和取回。奖励来自购买是否完成且兼容。
 
 这条线最贴近产品价值，也最适合作为第一版 demo 和后训练场景。
 
@@ -57,15 +57,16 @@ Session 3：买一个兼容同一台电视的电视柜。
 AgentMemoryGym 更准确地是一个带外部记忆状态的 POMDP：
 
 ```text
-hidden state s_t = (task_state_t, long_term_memory_t, short_term_context_t, history_t)
-observation o_t = render(short_term_context_t, current_task_view_t, tool_result_t)
+hidden state s_t = (task_state_t, long_term_memory_t, session_stm_t, retrieved_context_t, history_t)
+observation o_t = render(session_stm_t, retrieved_context_t, current_task_view_t, tool_result_t)
 action a_t = task action 或 memory tool action
 transition T: (s_t, a_t) -> s_{t+1}
 reward r_t = task_success/progress - memory/tool cost - violation penalty
 ```
 
-- **长期记忆 LTM**：跨 session 持久化，但默认对 policy 隐藏；只有 `RETRIEVE` 结果进入 active context。
-- **短期记忆 STM / active context**：当前可见上下文，受摘要、检索、过滤和任务 observation 影响。
+- **自动短期记忆 STM / session trace**：当前 session 内的 action、observation 摘要和 tool result trace，默认可见；成功 `BUY` 进入下一 session 时清空，防止跨 session raw-history 泄漏。
+- **长期记忆 LTM**：跨 session 持久化，但默认对 policy 隐藏；只有 `RETRIEVE` 结果进入 active retrieved/summary context。
+- **Active retrieved/summary context**：由 `RETRIEVE/SUMMARY/FILTER` 操作产生的当前可见工作区；它不是全部 STM，而是从 LTM 或摘要工具带入当前 observation 的显式上下文。
 - **任务状态**：例如已购商品、兼容约束、旅行成员行程、搜索中间实体、推导中间命题。
 
 v0 memory 工具：
@@ -73,12 +74,13 @@ v0 memory 工具：
 - `ADD {key, value}`：把高价值新信息写入长期记忆。
 - `UPDATE {memory_id/key, value}`：当新信息修正旧信息时更新记忆。
 - `DELETE {memory_id/key}`：删除过时或错误记忆。
-- `RETRIEVE {query, top_k}`：把相关长期记忆拉回 active context。
-- `SUMMARY {text}`：把冗长上下文压缩成摘要。
-- `FILTER {query}`：剔除与当前任务无关的短期上下文。
+- `RETRIEVE {query, top_k}`：把相关长期记忆拉回 active retrieved/summary context。
+- `SUMMARY {text, source_ids?}`：把当前可见上下文压缩成摘要并放入 active retrieved/summary context。正式 RL 路径里摘要文本由当前 policy 模型自己生成，`source_ids` 只引用当前 observation 里可见的 `S*` / `C*` 条目，环境不在后台调用外部 LLM 代写摘要。
+- `FILTER {keep_ids|drop_ids, scope}`：由当前 policy 模型选择保留或丢弃哪些可见上下文 ID，例如 `C0`、`S1`；环境只执行确定性的 keep/drop 状态转移。
+- `SUMMARY {span}` / `FILTER {query}`：只作为 deterministic scaffold、smoke 和规则 baseline，不能当成隐藏的外部智能模块。
 - 环境动作：购物使用 `BUY {product_id}` 和 product-catalog `SEARCH {query, top_k}`；其它环境后续扩展 `PLAN / ANSWER`。`SEARCH` 只返回公开商品 metadata，不暴露 ASIN/source path 或 target。
 
-关键点：memory tool 是 policy 的 action，不是外部 harness 自动替 policy 做的事。Harness baseline 可以使用同样工具，但触发规则固定。
+关键点：memory tool 是 policy 的 action，不是外部 harness 自动替 policy 做的事。尤其 `SUMMARY/FILTER` 不能让环境偷偷调另一个外部 LLM 完成判断，否则这些 token 不进入 rollout/logprob，RL 信用分配不干净。Harness baseline 可以使用同样工具，但触发规则固定。
 
 ## 5. 奖励与轨迹字段
 
@@ -102,11 +104,13 @@ v0 memory 工具：
   "memory_dependency": "tv_size_weight_vesa_reused_across_sessions",
   "progress_score": 0.67,
   "episode_success": false,
+  "tool_ops": [{"op": "SEARCH", "tool_family": "catalog", "step": 1}],
   "memory_ops": [{"op": "ADD", "key": "tv_size", "step": 1}],
   "memory_state_diff": {"added": [], "updated": [], "deleted": []},
   "compatibility_violations": [],
   "purchase_history": [],
-  "current_subtask_index": 2
+  "current_subtask_index": 2,
+  "session_trace": []
 }
 ```
 
@@ -154,12 +158,12 @@ AgentGym-RL/                         # 主训练 fork
 5. AgentGym-RL vLLM rollout 已加 raw-history guard：`task_name=agentmemory` 默认阻止全历史拼接式 rollout；只有显式 `allow_raw_history_for_agentmemory` / `AGENTMEMORY_ALLOW_RAW_HISTORY=1` 才允许 diagnostic smoke，不得用于正式训练。
 6. 当前 0 卡本地检查只作为代码/schema 快速验证，不写成单卡结果。
 7. 真单卡 GPU 依赖环境已完成 env/client/init smoke：B200 + torch CUDA、real AgentGym adapter import、server metadata、`init_env_client` metadata path 均通过。
-8. rollout 数据路径已推进：AgentMemory 默认 latest-observation，只把当前 observation 给 policy；多轮 episode 展平成每个 action 一条 PPO 样本，并用 `rollout_parent_indices` 对齐原 batch，避免 actor/ref logprob 重算时读到完整历史。
+8. rollout 数据路径已推进：AgentMemory 默认 latest-observation；这里的 observation 包含当前 session 自动 STM trace，但不包含跨 session raw history。多轮 episode 展平成每个 action 一条 PPO 样本，并用 `rollout_parent_indices` 对齐原 batch，避免 actor/ref logprob 重算时读到上一 session 的原始历史。
 9. Qwen3-4B / Transformers 真单卡 rollout 已跑通真实模型→parser→env step；SEARCH-aware prompt 也能调用 `SEARCH`，但当前会反复用占位 query，没有任务进度。
 10. 全量 product DB 已在 Jingyan 共享盘构建 SQLite/FTS index；严格 all-candidate metadata 仍只有 `285/900`，说明缺口不是存储/下载范围，而是可靠 option-to-catalog 对齐与 policy 使用 SEARCH。
-11. scripted SEARCH baseline / heuristic memory manager 已跑通 dev split：one-shot/no-retry 为 `6/15`、`mean_progress=0.5778`；`max_buy_attempts=5` 的 SEARCH + verifier-feedback retry diagnostic 在 semantic matcher 修复后为 `13/15`、`mean_progress=0.9000`；failure audit 显示当前残余 2 个失败为 `compatibility_filter_excluded_target`。
+11. scripted SEARCH baseline / heuristic memory manager 已跑通 dev split：no-memory 为 `0/15`、`mean_progress=0.1889`；full-context 为 `6/15`、`mean_progress=0.5778`；显式 memory-tool one-shot/no-retry 为 `6/15`、`mean_progress=0.5778`；`max_buy_attempts=5` 的 SEARCH + verifier-feedback retry diagnostic 在 semantic matcher 修复后为 `13/15`、`mean_progress=0.9000`；failure audit 显示当前残余 2 个失败为 `compatibility_filter_excluded_target`。
 12. 新增 soft-fallback verifier diagnostic：`--compatibility-fallback ranked-all-after-compatible --max-buy-attempts 7` 后 dev split 达到 `15/15`、`mean_progress=1.0`，说明 fair SEARCH + verifier feedback 足以完成当前 frozen dev，但这仍不是 RL 训练或 memory ability improvement。
-13. 下一步用 scripted baseline 的失败例收紧 product option-to-catalog normalization / SEARCH 返回字段 / policy 使用 SEARCH 的方式；拿到新 8 卡后再进入正式后训练。
+13. 下一步是在授权 GPU lane 上启动 bounded GRPO/PPO pilot，用来暴露训练链路和策略失败；正式 memory 能力提升结论必须等新 8 卡上的 protocol、split、metric、checksum 和 baseline 对比收口。
 
 ## 8. 声明边界
 
