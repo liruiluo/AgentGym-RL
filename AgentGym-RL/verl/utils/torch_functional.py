@@ -111,13 +111,21 @@ def entropy_from_logits(logits: torch.Tensor):
 
 
 def masked_sum(values, mask, axis=None):
-    """Compute mean of tensor with a masked values."""
-    return (values * mask).sum(axis=axis)
+    """Compute sum of tensor values selected by ``mask``.
+
+    ``values * mask`` is not NaN-safe because ``NaN * 0`` is still ``NaN``.
+    Long-horizon AgentMemoryGym rollouts can produce padded / inactive tokens
+    where downstream log-prob tensors contain NaNs outside the response mask.
+    Zero those positions before summing so masked-out padding cannot poison PPO
+    metrics or gradients.
+    """
+    valid_values = torch.where(mask.bool(), values, 0.0)
+    return (valid_values * mask).sum(axis=axis)
 
 
 def masked_mean(values, mask, axis=None):
-    """Compute mean of tensor with a masked values."""
-    return (values * mask).sum(axis=axis) / mask.sum(axis=axis)
+    """Compute mean of tensor with masked values."""
+    return masked_sum(values, mask, axis=axis) / (mask.sum(axis=axis) + 1e-8)
 
 
 def masked_var(values, mask, unbiased=True):
@@ -459,6 +467,8 @@ def get_constant_schedule_with_warmup(
 ):
 
     def lr_lambda(current_step):
+        if num_warmup_steps <= 0:
+            return 1.0
         return min(1, float(current_step) / float(max(1, num_warmup_steps)))
 
     return LambdaLR(optimizer, lr_lambda, last_epoch)

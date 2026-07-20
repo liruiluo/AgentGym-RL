@@ -36,12 +36,34 @@ from verl.utils.import_utils import import_external_libs
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
+from verl.workers.ppo_token_normalization import reduce_worker_metrics
+from verl.workers.formal_update_probe import (
+    capture_parameter_probe,
+    measure_parameter_probe_delta,
+)
+from verl.workers.critic_initialization import (
+    initialize_critic_value_head,
+)
 import datetime
 
 from codetiming import Timer
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_PPO_LOGGING_LEVEL', 'WARN'))
+
+AGENTMEMORY_FORMAL_UPDATE_READBACK_ACTIVE = 'agentmemory_formal_update_readback_active'
+
+
+def _add_parameter_probe_metrics(metrics, *, prefix, summary):
+    for field in (
+            'parameter_delta_l2',
+            'parameter_probe_max_abs_delta',
+            'parameter_probe_l1_delta',
+            'parameter_probe_changed_count',
+            'parameter_probe_element_count',
+            'parameter_probe_total_parameter_count',
+            'parameter_probe_max_elements_per_rank'):
+        metrics[f'{prefix}/{field}'] = summary[field]
 
 
 def create_device_mesh(world_size, fsdp_size):
@@ -113,14 +135,29 @@ class ActorRolloutRefWorker(Worker):
 
         # normalize config
         if self._is_actor:
-            self.config.actor.ppo_mini_batch_size *= self.config.rollout.n
-            self.config.actor.ppo_mini_batch_size //= (self.device_mesh.shape[0] // self.ulysses_sequence_parallel_size)
+            actor_dp = self.device_mesh.shape[0] // self.ulysses_sequence_parallel_size
+            actor_global_rows = self.config.actor.ppo_mini_batch_size * self.config.rollout.n
+            if actor_global_rows % actor_dp != 0:
+                raise ValueError(
+                    "actor mini-batch times rollout.n must be divisible by actor DP: "
+                    f"{self.config.actor.ppo_mini_batch_size} * {self.config.rollout.n} / {actor_dp}."
+                )
+            self.config.actor.ppo_mini_batch_size = actor_global_rows // actor_dp
             # micro bsz
             if self.config.actor.ppo_micro_batch_size is not None:
-                self.config.actor.ppo_micro_batch_size //= (self.device_mesh.shape[0] //
-                                                            self.ulysses_sequence_parallel_size)
+                if self.config.actor.ppo_micro_batch_size % actor_dp != 0:
+                    raise ValueError(
+                        "deprecated actor global micro-batch must be divisible by actor DP."
+                    )
+                self.config.actor.ppo_micro_batch_size //= actor_dp
                 self.config.actor.ppo_micro_batch_size_per_gpu = self.config.actor.ppo_micro_batch_size
-                assert self.config.actor.ppo_mini_batch_size % self.config.actor.ppo_micro_batch_size_per_gpu == 0
+            if self.config.actor.ppo_micro_batch_size_per_gpu is not None and \
+                    self.config.actor.ppo_mini_batch_size % self.config.actor.ppo_micro_batch_size_per_gpu != 0:
+                raise ValueError(
+                    "actor local mini-batch must be divisible by per-GPU micro-batch: "
+                    f"{self.config.actor.ppo_mini_batch_size} / "
+                    f"{self.config.actor.ppo_micro_batch_size_per_gpu}."
+                )
         # normalize rollout config
         if self._is_rollout and self.config.rollout.log_prob_micro_batch_size is not None:
             self.config.rollout.log_prob_micro_batch_size //= (self.device_mesh.shape[0] //
@@ -295,15 +332,34 @@ class ActorRolloutRefWorker(Worker):
                                                  rollout_config=self.config.rollout,
                                                  agentgym_config=self.config.agentgym,
                                                  tokenizer=self.tokenizer,
-                                                 model_hf_config=self.actor_model_config)
+                                                 model_hf_config=self.actor_model_config,
+                                                 model_path=self.config.model.path)
         log_gpu_memory_usage('After building vllm rollout', logger=None)
         if torch.distributed.get_world_size() == 1:
             self.config.rollout.load_format = 'dummy_hf'
-        rollout_sharding_manager = FSDPVLLMShardingManager(module=self.actor_module_fsdp,
-                                                           inference_engine=rollout.inference_engine,
-                                                           model_config=self.actor_model_config,
-                                                           full_params='hf' in self.config.rollout.load_format,
-                                                           device_mesh=rollout_device_mesh)
+
+        if getattr(rollout, '_hf_generate', False):
+            class NoOpRolloutShardingManager:
+                def __init__(self, module):
+                    self.module = module
+                def __enter__(self):
+                    self.module.train(False)
+                    return self
+                def __exit__(self, exc_type, exc_value, traceback):
+                    self.module.train()
+                    torch.cuda.empty_cache()
+                    return False
+                def preprocess_data(self, data):
+                    return data
+                def postprocess_data(self, data):
+                    return data
+            rollout_sharding_manager = NoOpRolloutShardingManager(self.actor_module_fsdp)
+        else:
+            rollout_sharding_manager = FSDPVLLMShardingManager(module=self.actor_module_fsdp,
+                                                               inference_engine=rollout.inference_engine,
+                                                               model_config=self.actor_model_config,
+                                                               full_params='hf' in self.config.rollout.load_format,
+                                                               device_mesh=rollout_device_mesh)
         log_gpu_memory_usage('After building sharding manager', logger=None)
 
         return rollout, rollout_sharding_manager
@@ -388,6 +444,9 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
+        fsdp_group = self.device_mesh.get_group()
+        data.meta_info['ppo_loss_process_group'] = fsdp_group
+        data.meta_info['ppo_metric_process_group'] = fsdp_group
         data = data.to('cuda')
 
         assert self._is_actor
@@ -404,6 +463,9 @@ class ActorRolloutRefWorker(Worker):
 
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
+            parameter_probe = None
+            if data.meta_info.get(AGENTMEMORY_FORMAL_UPDATE_READBACK_ACTIVE, False):
+                parameter_probe = capture_parameter_probe(self.actor_module_fsdp)
             # perform training
             with Timer(name='update_policy', logger=None) as timer:
                 metrics = self.actor.update_policy(data=data)
@@ -415,6 +477,19 @@ class ActorRolloutRefWorker(Worker):
             self.actor_lr_scheduler.step()
             lr = self.actor_lr_scheduler.get_last_lr()[0]
             metrics['actor/lr'] = lr
+            if parameter_probe is not None:
+                probe_summary = measure_parameter_probe_delta(
+                    self.actor_module_fsdp,
+                    parameter_probe,
+                    process_group=fsdp_group,
+                    label='actor',
+                )
+                _add_parameter_probe_metrics(
+                    metrics,
+                    prefix='actor',
+                    summary=probe_summary,
+                )
+            metrics = reduce_worker_metrics(metrics, group=fsdp_group)
 
             log_gpu_memory_usage('After update policy', logger=logger)
 
@@ -451,8 +526,13 @@ class ActorRolloutRefWorker(Worker):
                 if self.generation_config is not None else self.tokenizer.pad_token_id,
         }
         prompts.meta_info.update(meta_info)
+        if hasattr(self.rollout_sharding_manager, 'set_sync_context'):
+            self.rollout_sharding_manager.set_sync_context(prompts.meta_info)
         with self.rollout_sharding_manager:
             log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
+
+            if hasattr(self.rollout_sharding_manager, 'validate_sync_before_generation'):
+                self.rollout_sharding_manager.validate_sync_before_generation()
 
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
             output = self.rollout.generate_sequences(prompts=prompts)
@@ -599,15 +679,30 @@ class CriticWorker(Worker):
         self._is_offload_optimizer = self.config.model.fsdp_config.optimizer_offload
 
         # normalize config
-        self.config.ppo_mini_batch_size //= (torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size)
+        critic_dp = torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size
+        if self.config.ppo_mini_batch_size % critic_dp != 0:
+            raise ValueError(
+                "critic global mini-batch must be divisible by critic DP: "
+                f"{self.config.ppo_mini_batch_size} / {critic_dp}."
+            )
+        self.config.ppo_mini_batch_size //= critic_dp
         if self.config.ppo_micro_batch_size is not None:
-            self.config.ppo_micro_batch_size //= (torch.distributed.get_world_size() //
-                                                  self.ulysses_sequence_parallel_size)
-            self.config.forward_micro_batch_size //= (torch.distributed.get_world_size() //
-                                                      self.ulysses_sequence_parallel_size)
+            if self.config.ppo_micro_batch_size % critic_dp != 0 or \
+                    self.config.forward_micro_batch_size % critic_dp != 0:
+                raise ValueError(
+                    "deprecated critic global micro-batches must be divisible by critic DP."
+                )
+            self.config.ppo_micro_batch_size //= critic_dp
+            self.config.forward_micro_batch_size //= critic_dp
             self.config.ppo_micro_batch_size_per_gpu = self.config.ppo_micro_batch_size
             self.config.forward_micro_batch_size_per_gpu = self.config.forward_micro_batch_size
-            assert self.config.ppo_mini_batch_size % self.config.ppo_micro_batch_size_per_gpu == 0
+        if self.config.ppo_micro_batch_size_per_gpu is not None and \
+                self.config.ppo_mini_batch_size % self.config.ppo_micro_batch_size_per_gpu != 0:
+            raise ValueError(
+                "critic local mini-batch must be divisible by per-GPU micro-batch: "
+                f"{self.config.ppo_mini_batch_size} / "
+                f"{self.config.ppo_micro_batch_size_per_gpu}."
+            )
 
     def _build_critic_model_optimizer(self, config):
         # the following line is necessary
@@ -658,14 +753,31 @@ class CriticWorker(Worker):
             warnings.simplefilter("ignore")
             setattr(critic_model_config, 'classifier_dropout', 0.)
             setattr(critic_model_config, 'hidden_dropout', '0')
-            critic_module = AutoModelForTokenClassification.from_pretrained(pretrained_model_name_or_path=local_path,
-                                                                            torch_dtype=torch_dtype,
-                                                                            config=critic_model_config,
-                                                                            attn_implementation='flash_attention_2',
-                                                                            trust_remote_code=trust_remote_code)
+            critic_module, critic_loading_info = AutoModelForTokenClassification.from_pretrained(
+                pretrained_model_name_or_path=local_path,
+                torch_dtype=torch_dtype,
+                config=critic_model_config,
+                attn_implementation='flash_attention_2',
+                trust_remote_code=trust_remote_code,
+                output_loading_info=True,
+            )
 
             # some parameters may not in torch_dtype
             critic_module.to(torch_dtype)
+
+            critic_head_initialization = (
+                initialize_critic_value_head(
+                    critic_module,
+                    missing_keys=critic_loading_info["missing_keys"],
+                    policy=config.model.get("value_head_init", "preserve"),
+                )
+            )
+            if critic_head_initialization is not None and self.rank == 0:
+                print(
+                    "Formal PPO critic value head initialization: "
+                    f"{critic_head_initialization}",
+                    flush=True,
+                )
 
             if config.model.get('enable_gradient_checkpointing', False):
                 critic_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
@@ -779,6 +891,9 @@ class CriticWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_critic(self, data: DataProto):
+        fsdp_group = self.device_mesh.get_group()
+        data.meta_info['ppo_loss_process_group'] = fsdp_group
+        data.meta_info['ppo_metric_process_group'] = fsdp_group
         data = data.to('cuda')
         if self._is_offload_param:
             load_fsdp_param_and_grad(module=self.critic_module,
@@ -790,6 +905,9 @@ class CriticWorker(Worker):
         # perform forward computation
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
+            parameter_probe = None
+            if data.meta_info.get(AGENTMEMORY_FORMAL_UPDATE_READBACK_ACTIVE, False):
+                parameter_probe = capture_parameter_probe(self.critic_module)
 
             with Timer(name='update_critic', logger=None) as timer:
                 metrics = self.critic.update_critic(data=data)
@@ -802,6 +920,19 @@ class CriticWorker(Worker):
             self.critic_lr_scheduler.step()
             lr = self.critic_lr_scheduler.get_last_lr()[0]
             metrics['critic/lr'] = lr
+            if parameter_probe is not None:
+                probe_summary = measure_parameter_probe_delta(
+                    self.critic_module,
+                    parameter_probe,
+                    process_group=fsdp_group,
+                    label='critic',
+                )
+                _add_parameter_probe_metrics(
+                    metrics,
+                    prefix='critic',
+                    summary=probe_summary,
+                )
+            metrics = reduce_worker_metrics(metrics, group=fsdp_group)
 
             output = DataProto(batch=None, meta_info={'metrics': metrics})
             output = self.ulysses_sharding_manager.postprocess_data(data=output)

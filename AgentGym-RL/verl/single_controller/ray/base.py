@@ -244,6 +244,35 @@ class RayWorkerGroup(WorkerGroup):
                     env_vars['MASTER_ADDR'] = self._master_addr
                     env_vars['MASTER_PORT'] = self._master_port
 
+                # Preserve selected shell/runtime knobs in every actor. This is
+                # required for vLLM engine selection (for example VLLM_USE_V1=0)
+                # because vLLM reads them at import/engine-construction time.
+                for key in (
+                    'VLLM_USE_V1',
+                    'VLLM_ATTENTION_BACKEND',
+                    'VLLM_WORKER_MULTIPROC_METHOD',
+                    'VLLM_USE_MODELSCOPE',
+        'VLLM_ALLOW_INSECURE_SERIALIZATION',
+                    'VERL_AGENTMEMORY_SKIP_VLLM_WEIGHT_SYNC',
+                    'VERL_AGENTMEMORY_HF_SYNC_DIR',
+                    'VERL_PPO_LOGGING_LEVEL',
+                    'AGENTMEMORY_DATA_PATH',
+                    'AGENTMEMORY_SPLIT',
+                    'AGENTMEMORY_SPLIT_DIR',
+                    'AGENTMEMORY_CATALOG_INDEX_PATH',
+                    'HYDRA_FULL_ERROR',
+                    'WANDB_MODE',
+                ):
+                    value = os.environ.get(key)
+                    if value is not None:
+                        env_vars[key] = value
+                # Keep Ray actors aligned with main_task for active
+                # AgentMemoryGym runtime settings. Missing these can silently
+                # split the worker and environment contracts.
+                for key, value in os.environ.items():
+                    if key.startswith("AGENTMEMORY_") and value is not None:
+                        env_vars.setdefault(key, value)
+
                 import re
                 cia_name = type(ray_cls_with_init.cls).__name__
                 match = re.search(r"ActorClass\(([^)]+)\)", cia_name)  # ray.remote(Obj) -> "ActorClass(Obj)"

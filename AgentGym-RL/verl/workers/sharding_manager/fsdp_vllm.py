@@ -28,6 +28,13 @@ from verl.utils.debug import log_gpu_memory_usage
 from verl.third_party.vllm import vllm_version
 
 from .base import BaseShardingManager
+from .vllm_sync_evidence import (
+    append_and_readback_event,
+    bounded_tensor_fingerprint,
+    build_sync_event,
+    read_last_event,
+    validate_sync_event,
+)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_PPO_LOGGING_LEVEL', 'WARN'))
@@ -51,7 +58,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         if full_params:
             FSDP.set_state_dict_type(self.module,
                                      state_dict_type=StateDictType.FULL_STATE_DICT,
-                                     state_dict_config=FullStateDictConfig())
+                                     state_dict_config=FullStateDictConfig(offload_to_cpu=True, rank0_only=False))
         else:
             FSDP.set_state_dict_type(self.module,
                                      state_dict_type=StateDictType.SHARDED_STATE_DICT,
@@ -68,7 +75,128 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         else:
             self.gen_random_states = None
 
+        self._sync_evidence_dir = os.getenv('VERL_AGENTMEMORY_VLLM_SYNC_EVIDENCE_DIR')
+        self._require_post_update_change = (
+            os.getenv('VERL_AGENTMEMORY_REQUIRE_VLLM_POST_UPDATE_CHANGE', '0') == '1')
+        if self._require_post_update_change and not self._sync_evidence_dir:
+            raise ValueError(
+                'VERL_AGENTMEMORY_REQUIRE_VLLM_POST_UPDATE_CHANGE=1 requires '
+                'VERL_AGENTMEMORY_VLLM_SYNC_EVIDENCE_DIR')
+        self._sync_meta_info = None
+        self._sync_sequence = 0
+        self._sync_state_loaded = False
+        self._last_sync_event = None
+        self._current_sync_event = None
+        self._current_sync_previous = None
+
+    def _sync_rank(self):
+        return torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+    def _sync_evidence_path(self):
+        if not self._sync_evidence_dir:
+            return None
+        return os.path.join(self._sync_evidence_dir, f'vllm_sync_rank{self._sync_rank()}.jsonl')
+
+    def set_sync_context(self, meta_info):
+        """Bind the next sync to the exact rollout request that will consume it."""
+        self._sync_meta_info = meta_info
+        self._current_sync_event = None
+        self._current_sync_previous = None
+        if self._sync_evidence_dir and 'global_steps' not in meta_info:
+            raise RuntimeError(
+                'VLLM sync evidence requires prompts.meta_info["global_steps"]')
+
+    def _load_sync_state(self):
+        if self._sync_state_loaded or not self._sync_evidence_dir:
+            return
+        path = self._sync_evidence_path()
+        if os.path.exists(path):
+            self._last_sync_event = read_last_event(path)
+            validate_sync_event(self._last_sync_event)
+            self._sync_sequence = int(self._last_sync_event['sync_sequence'])
+        self._sync_state_loaded = True
+
+    def _next_sync_identity(self):
+        if self._sync_meta_info is None:
+            raise RuntimeError('set_sync_context must run before vLLM weight synchronization')
+        self._load_sync_state()
+        self._sync_sequence += 1
+        global_steps = self._sync_meta_info.get('global_steps')
+        if hasattr(global_steps, 'item'):
+            global_steps = global_steps.item()
+        if not isinstance(global_steps, (str, int, float, bool)) and global_steps is not None:
+            global_steps = str(global_steps)
+        sync_id = f'rank{self._sync_rank()}:pid{os.getpid()}:seq{self._sync_sequence}:step{global_steps}'
+        self._sync_meta_info['vllm_sync_sequence'] = self._sync_sequence
+        self._sync_meta_info['vllm_sync_id'] = sync_id
+        return global_steps, sync_id
+
+    def validate_sync_before_generation(self):
+        """Fail closed after sync evidence is durable and before generation starts."""
+        if not self._sync_evidence_dir:
+            return None
+        if self._current_sync_event is None:
+            raise RuntimeError('No vLLM sync evidence was recorded for the current generation')
+        readback = read_last_event(self._sync_evidence_path())
+        if readback.get('sync_id') != self._current_sync_event.get('sync_id'):
+            raise RuntimeError('Latest vLLM sync evidence does not belong to the current generation')
+        require_change = self._require_post_update_change and readback['sync_sequence'] >= 2
+        validate_sync_event(
+            readback,
+            previous_event=self._current_sync_previous,
+            require_change=require_change,
+        )
+        return readback
+
+    def _get_infer_tp_size(self) -> int:
+        """Return rollout tensor parallel size without requiring vLLM TP group in this worker.
+
+        Official vLLM V1 owns its tensor-parallel process group inside the
+        engine process. AgentMemoryGym g5a pilots use
+        rollout.tensor_model_parallel_size=1, so worker-side data
+        gather/broadcast is a no-op and must not query vLLM's uninitialized
+        TP group. For TP>1 we still fall back to the original vLLM group path.
+        """
+        if self.device_mesh is not None:
+            candidate_getters = (
+                lambda: self.device_mesh["infer_tp"].size(),
+                lambda: self.device_mesh.size(mesh_dim="infer_tp"),
+                lambda: self.device_mesh.size(-1),
+            )
+            for getter in candidate_getters:
+                try:
+                    value = getter()
+                    if value is not None:
+                        return int(value)
+                except Exception:
+                    pass
+        try:
+            return int(vllm_ps.get_tensor_model_parallel_world_size())
+        except AssertionError as exc:
+            if "tensor model parallel group is not initialized" in str(exc):
+                logger.warning(
+                    "vLLM tensor model parallel group is not initialized in the FSDP worker; "
+                    "assuming infer_tp=1 for worker-side data sharding.")
+                return 1
+            raise
+
+    def _get_vllm_tp_group(self):
+        if vllm_version in ("0.3.1", "0.4.2", "0.5.4", "0.6.3"):
+            return vllm_ps.get_tensor_model_parallel_group()
+        return vllm_ps.get_tensor_model_parallel_group().device_group
+
     def __enter__(self):
+        if os.getenv('VERL_AGENTMEMORY_SKIP_VLLM_WEIGHT_SYNC', '0') == '1':
+            # Bounded AgentMemoryGym pilot compatibility path for official
+            # vLLM>=0.7: rollout engine is loaded from the same base checkpoint
+            # as the actor, and the run is one training step, so no updated
+            # actor weights need to be pushed before generation.
+            if hasattr(self.inference_engine, 'wake_up'):
+                try:
+                    self.inference_engine.wake_up()
+                except Exception as exc:
+                    logger.warning('vLLM wake_up skipped/failed under skip-sync mode: %s', exc)
+            return self
         log_gpu_memory_usage('Before state_dict() in sharding manager memory', logger=logger)
         params = self.module.state_dict()
         log_gpu_memory_usage('After state_dict() in sharding manager memory', logger=logger)
@@ -79,10 +207,127 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         else:
             self.inference_engine.wake_up()
             # TODO(ZSL): deal with 'hf' format
+            llm_engine = getattr(self.inference_engine, 'llm_engine', None)
+            if llm_engine is None:
+                raise AttributeError('official vLLM LLM has no llm_engine for weight sync')
             if load_format == 'dtensor':
                 from verl.third_party.vllm import load_dtensor_weights
-                load_dtensor_weights(
-                    params, self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model)
+                # vLLM V1 removed llm_engine.model_executor.driver_worker.
+                # apply_model runs in the V1 engine worker. This is usable for
+                # fully materialized tensors, but DTensor objects may only carry
+                # the actor-rank local shard after crossing into the engine
+                # process, so keep dtensor sync as a diagnostic path.
+                if hasattr(llm_engine, 'apply_model'):
+                    def _agentmemory_load_dtensor(model):
+                        from verl.third_party.vllm import load_dtensor_weights as _load_dtensor_weights
+                        _load_dtensor_weights(params, model)
+                        return model.__class__.__name__
+                    sync_results = llm_engine.apply_model(_agentmemory_load_dtensor)
+                    logger.info('Synced actor DTensor weights into official vLLM via apply_model: %s', sync_results)
+                elif hasattr(llm_engine, 'model_executor'):
+                    load_dtensor_weights(
+                        params, llm_engine.model_executor.driver_worker.worker.model_runner.model)
+                else:
+                    raise AttributeError(
+                        'Unsupported vLLM engine: neither apply_model nor model_executor is available')
+            elif load_format == 'hf':
+                def clean_name(name):
+                    for prefix in ('_fsdp_wrapped_module.', 'module.'):
+                        if name.startswith(prefix):
+                            name = name[len(prefix):]
+                    return name
+
+                def materialize_hf_weights():
+                    weights = []
+                    for name, tensor in params.items():
+                        if hasattr(tensor, 'full_tensor'):
+                            tensor = tensor.full_tensor()
+                        if hasattr(tensor, 'detach'):
+                            tensor = tensor.detach()
+                        weights.append((clean_name(name), tensor.cpu()))
+                    return weights
+
+                def load_hf_weights(model, weights):
+                    if not hasattr(model, 'load_weights'):
+                        raise AttributeError(f'{model.__class__.__name__} has no load_weights method')
+                    loaded = model.load_weights(weights)
+                    try:
+                        loaded_count = len(loaded)
+                    except Exception:
+                        loaded_count = len(list(loaded)) if loaded is not None else -1
+                    return {'model': model.__class__.__name__, 'loaded_count': loaded_count}
+
+                if hasattr(llm_engine, 'apply_model'):
+                    sync_dir = os.getenv('VERL_AGENTMEMORY_HF_SYNC_DIR') or os.getenv('RAY_TMPDIR') or '/tmp'
+                    os.makedirs(sync_dir, exist_ok=True)
+                    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                    sync_file = os.path.join(sync_dir, f'agentmemory_hf_sync_rank{rank}_pid{os.getpid()}.pt')
+                    hf_weights = materialize_hf_weights()
+                    evidence_enabled = bool(self._sync_evidence_dir)
+                    if evidence_enabled:
+                        global_steps, sync_id = self._next_sync_identity()
+                        source_before = bounded_tensor_fingerprint(hf_weights)
+                    else:
+                        global_steps = sync_id = source_before = None
+                    torch.save(hf_weights, sync_file)
+                    del hf_weights
+
+                    def agentmemory_load_hf_from_file(model):
+                        import torch as _torch
+                        from verl.workers.sharding_manager.vllm_sync_evidence import (
+                            bounded_tensor_fingerprint as _bounded_tensor_fingerprint,
+                        )
+                        weights = _torch.load(sync_file, map_location='cpu', weights_only=False)
+                        loaded_source = (
+                            _bounded_tensor_fingerprint(weights) if evidence_enabled else None)
+                        if not hasattr(model, 'load_weights'):
+                            raise AttributeError(f'{model.__class__.__name__} has no load_weights method')
+                        loaded = model.load_weights(weights)
+                        try:
+                            loaded_count = len(loaded)
+                        except Exception:
+                            loaded_count = len(list(loaded)) if loaded is not None else -1
+                        result = {'model': model.__class__.__name__, 'loaded_count': loaded_count}
+                        if evidence_enabled:
+                            result.update({
+                                'sync_id': sync_id,
+                                'source_fingerprint_sha256': source_before['sha256'],
+                                'loaded_source_fingerprint_sha256': loaded_source['sha256'],
+                                'target_after': _bounded_tensor_fingerprint(model.named_parameters()),
+                            })
+                        return result
+
+                    try:
+                        sync_results = llm_engine.apply_model(agentmemory_load_hf_from_file)
+                    finally:
+                        try:
+                            os.remove(sync_file)
+                        except FileNotFoundError:
+                            pass
+                    if evidence_enabled:
+                        previous_event = self._last_sync_event
+                        event = build_sync_event(
+                            rank=rank,
+                            pid=os.getpid(),
+                            global_steps=global_steps,
+                            sync_sequence=self._sync_sequence,
+                            sync_id=sync_id,
+                            source_before=source_before,
+                            apply_model_results=sync_results,
+                            previous_event=previous_event,
+                        )
+                        self._current_sync_previous = previous_event
+                        self._current_sync_event = append_and_readback_event(
+                            self._sync_evidence_path(), event)
+                        self._last_sync_event = self._current_sync_event
+                    logger.info('Synced actor HF weights into official vLLM via file-backed apply_model: %s', sync_results)
+                elif hasattr(llm_engine, 'model_executor'):
+                    model = llm_engine.model_executor.driver_worker.worker.model_runner.model
+                    sync_results = load_hf_weights(model, materialize_hf_weights())
+                    logger.info('Synced actor HF weights into official vLLM model_executor: %s', sync_results)
+                else:
+                    raise AttributeError(
+                        'Unsupported vLLM engine: neither apply_model nor model_executor is available')
             else:
                 raise NotImplementedError(f'load_format {load_format} not implemented')
         log_gpu_memory_usage('After sync model weights in sharding manager', logger=logger)
@@ -103,6 +348,13 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             torch.cuda.set_rng_state(self.gen_random_states)
 
     def __exit__(self, exc_type, exc_value, traceback):
+        if os.getenv('VERL_AGENTMEMORY_SKIP_VLLM_WEIGHT_SYNC', '0') == '1':
+            if hasattr(self.inference_engine, 'sleep'):
+                try:
+                    self.inference_engine.sleep(level=1)
+                except Exception as exc:
+                    logger.warning('vLLM sleep skipped/failed under skip-sync mode: %s', exc)
+            return False
         log_gpu_memory_usage('Before vllm offload in sharding manager', logger=logger)
         # TODO(ZSL): check this
         if vllm_version in ('0.4.2', '0.5.4', '0.6.3'):
@@ -126,12 +378,11 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             torch.cuda.set_rng_state(self.torch_random_states)
 
     def preprocess_data(self, data: DataProto) -> DataProto:
-        # TODO: Current impl doesn't consider FSDP with torch micro-dp
-        tp_size = vllm_ps.get_tensor_model_parallel_world_size()
-        if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3'):
-            group = vllm_ps.get_tensor_model_parallel_group()
-        else:
-            group = vllm_ps.get_tensor_model_parallel_group().device_group
+        # TODO: Current impl doesn't consider FSDP with torch micro-dp.
+        tp_size = self._get_infer_tp_size()
+        if tp_size <= 1:
+            return data
+        group = self._get_vllm_tp_group()
 
         prev_device = data.batch.device
         data.batch = data.batch.cuda(device=torch.cuda.current_device())
@@ -144,18 +395,15 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         return data
 
     def postprocess_data(self, data: DataProto) -> DataProto:
-        # TODO: Current impl doesn't consider FSDP with torch micro-dp
-        local_world_size = vllm_ps.get_tensor_model_parallel_world_size()
+        # TODO: Current impl doesn't consider FSDP with torch micro-dp.
+        local_world_size = self._get_infer_tp_size()
+        if local_world_size <= 1:
+            return data
         src_rank = (torch.distributed.get_rank() // local_world_size) * local_world_size
-        if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3'):
-            broadcast_dict_tensor(data.batch, src=src_rank, group=vllm_ps.get_tensor_model_parallel_group())
-        else:
-            broadcast_dict_tensor(data.batch,
-                                  src=src_rank,
-                                  group=vllm_ps.get_tensor_model_parallel_group().device_group)
+        group = self._get_vllm_tp_group()
+        broadcast_dict_tensor(data.batch, src=src_rank, group=group)
         dp_rank = torch.distributed.get_rank()
-        dp_size = torch.distributed.get_world_size()  # not consider torch micro-dp
-        tp_size = vllm_ps.get_tensor_model_parallel_world_size()
+        tp_size = local_world_size
         if tp_size > 1:
             # TODO: shall we build a micro_dp group for vllm when integrating with vLLM?
             local_prompts = data.chunk(chunks=tp_size)

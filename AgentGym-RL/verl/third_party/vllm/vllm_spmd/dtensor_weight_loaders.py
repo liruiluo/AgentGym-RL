@@ -15,6 +15,7 @@
 
 from typing import Dict
 
+import torch
 import torch.nn as nn
 from torch.distributed._tensor import DTensor
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -148,6 +149,39 @@ def llama_dtensor_weight_loader(actor_weights: Dict, vllm_model: nn.Module) -> n
             weight_loader(param, local_loaded_weight)
 
 
+def _maybe_adjust_vocab_weight_for_vllm(param, loaded_weight):
+    """Match HF padded vocab tensors to vLLM's original tokenizer vocab.
+
+    Qwen3 HF checkpoints keep embedding rows padded to config.vocab_size
+    (151936 for Qwen3-4B), while vLLM V1's VocabParallelEmbedding may set
+    org_vocab_size from the tokenizer length (151669 here) and pads internally
+    when sharding. Its weight_loader asserts the incoming full tensor matches
+    org_vocab_size, so strip/pad only the vocab dimension before delegating.
+    """
+    output_dim = getattr(param, "output_dim", None)
+    if output_dim is None:
+        return loaded_weight
+    weight_loader = getattr(param, "weight_loader", None)
+    owner = getattr(weight_loader, "__self__", None)
+    org_vocab_size = getattr(owner, "org_vocab_size", None)
+    if org_vocab_size is None:
+        return loaded_weight
+    try:
+        org_vocab_size = int(org_vocab_size)
+        output_dim = int(output_dim)
+    except Exception:
+        return loaded_weight
+    current = int(loaded_weight.shape[output_dim])
+    if current == org_vocab_size:
+        return loaded_weight
+    if current > org_vocab_size:
+        return loaded_weight.narrow(output_dim, 0, org_vocab_size).contiguous()
+    pad_shape = list(loaded_weight.shape)
+    pad_shape[output_dim] = org_vocab_size - current
+    padding = torch.zeros(*pad_shape, dtype=loaded_weight.dtype, device=loaded_weight.device)
+    return torch.cat([loaded_weight, padding], dim=output_dim).contiguous()
+
+
 def qwen2_dtensor_weight_loader(actor_weights: Dict, vllm_model: nn.Module) -> nn.Module:
     stacked_params_mapping = [
         # (param_name, shard_name, shard_id)
@@ -173,6 +207,7 @@ def qwen2_dtensor_weight_loader(actor_weights: Dict, vllm_model: nn.Module) -> n
             local_loaded_weight = redistribute_dtensor(param_name=name, loaded_weights=loaded_weight)
             param = params_dict[name]
             weight_loader = param.weight_loader
+            local_loaded_weight = _maybe_adjust_vocab_weight_for_vllm(param, local_loaded_weight)
             weight_loader(param, local_loaded_weight.to(dtype=param.dtype), shard_id)
             break
         else:
@@ -182,6 +217,7 @@ def qwen2_dtensor_weight_loader(actor_weights: Dict, vllm_model: nn.Module) -> n
             param = params_dict[name]
             local_loaded_weight = redistribute_dtensor(param_name=name, loaded_weights=loaded_weight)
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            local_loaded_weight = _maybe_adjust_vocab_weight_for_vllm(param, local_loaded_weight)
             weight_loader(param, local_loaded_weight.to(dtype=param.dtype))
 
 
@@ -353,6 +389,7 @@ __MODEL_DTENSOR_WEIGHT_LOADER_REGISTRY__ = {
     "GPTBigCodeForCausalLM": gptbigcode_dtensor_load_weights,
     "Starcoder2ForCausalLM": starcoder2_dtensor_load_weights,
     "Qwen2ForCausalLM": qwen2_dtensor_weight_loader,
+    "Qwen3ForCausalLM": qwen2_dtensor_weight_loader,
     "DeepseekV2ForCausalLM": deepseekv2_dtensor_weight_loader,
     "Qwen2VLForConditionalGeneration": qwen2vl_dtensor_weight_loader,
 }

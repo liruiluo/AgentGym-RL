@@ -17,7 +17,12 @@ import re
 import os
 import torch
 import argparse
-from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForTokenClassification
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoModelForTokenClassification,
+    GenerationConfig,
+)
 from concurrent.futures import ThreadPoolExecutor
 from torch.distributed._tensor import DTensor, Shard, Placement
 
@@ -31,6 +36,81 @@ def merge_by_placement(tensors: List[torch.Tensor], placement: Placement):
         return torch.cat(tensors, dim=placement.dim).contiguous()
     else:
         raise ValueError(f"Unsupported placement: {placement}")
+
+
+def _generation_token_contract(generation_config):
+    eos_token_id = generation_config.eos_token_id
+    if isinstance(eos_token_id, tuple):
+        eos_token_id = list(eos_token_id)
+    return {
+        "eos_token_id": eos_token_id,
+        "pad_token_id": generation_config.pad_token_id,
+    }
+
+
+def attach_generation_config(
+    hf_path,
+    model,
+    expected_eos_token_ids=None,
+    expected_pad_token_id=None,
+):
+    try:
+        generation_config = GenerationConfig.from_pretrained(hf_path)
+    except OSError:
+        generation_config = getattr(model, "generation_config", None)
+        if generation_config is None:
+            generation_config = GenerationConfig.from_model_config(model.config)
+
+    contract = _generation_token_contract(generation_config)
+    if (
+        expected_eos_token_ids is not None
+        and contract["eos_token_id"] != expected_eos_token_ids
+    ):
+        raise RuntimeError(
+            "Checkpoint generation_config violates the frozen EOS contract: "
+            f"expected {expected_eos_token_ids!r}, got "
+            f"{contract['eos_token_id']!r}"
+        )
+    if (
+        expected_pad_token_id is not None
+        and contract["pad_token_id"] != expected_pad_token_id
+    ):
+        raise RuntimeError(
+            "Checkpoint generation_config violates the frozen pad-token contract: "
+            f"expected {expected_pad_token_id!r}, got "
+            f"{contract['pad_token_id']!r}"
+        )
+
+    model.generation_config = generation_config
+    return contract
+
+
+def verify_generation_config_contract(hf_path, expected_contract):
+    observed = _generation_token_contract(
+        GenerationConfig.from_pretrained(hf_path)
+    )
+    if observed != expected_contract:
+        raise RuntimeError(
+            "Merged generation_config token contract changed during save: "
+            f"expected {expected_contract!r}, got {observed!r}"
+        )
+
+
+def save_pretrained_with_generation_contract(
+    model,
+    hf_path,
+    state_dict,
+    expected_eos_token_ids=None,
+    expected_pad_token_id=None,
+):
+    contract = attach_generation_config(
+        hf_path,
+        model,
+        expected_eos_token_ids=expected_eos_token_ids,
+        expected_pad_token_id=expected_pad_token_id,
+    )
+    model.save_pretrained(hf_path, state_dict=state_dict)
+    verify_generation_config_contract(hf_path, contract)
 
 
 if __name__ == '__main__':
@@ -55,7 +135,32 @@ if __name__ == '__main__':
     state_dict = torch.load(os.path.join(local_dir, f'model_world_size_{world_size}_rank_{rank}.pt'), map_location='cpu')
     pivot_key = sorted(list(state_dict.keys()))[0]
     weight = state_dict[pivot_key]
-    assert isinstance(weight, torch.distributed._tensor.DTensor)
+    if not isinstance(weight, torch.distributed._tensor.DTensor):
+        print("Checkpoint tensors are already materialized; saving plain state_dict directly")
+        state_dict = {
+            key: value.bfloat16() if torch.is_tensor(value) and torch.is_floating_point(value) else value
+            for key, value in state_dict.items()
+        }
+        print('Writing to local disk')
+        hf_path = os.path.join(local_dir, 'huggingface')
+        config = AutoConfig.from_pretrained(hf_path)
+
+        if 'ForTokenClassification' in config.architectures[0]:
+            auto_model = AutoModelForTokenClassification
+        elif 'ForCausalLM' in config.architectures[0]:
+            auto_model = AutoModelForCausalLM
+        else:
+            raise NotImplementedError(f'Unknown architecture {config["architectures"]}')
+
+        with torch.device('meta'):
+            model = auto_model.from_config(config, torch_dtype=torch.bfloat16)
+        model.to_empty(device='cpu')
+
+        print(f'Saving model to {hf_path}')
+        save_pretrained_with_generation_contract(model, hf_path, state_dict)
+        del state_dict
+        del model
+        raise SystemExit(0)
     # get sharding info
     device_mesh = weight.device_mesh
     mesh = device_mesh.mesh
@@ -148,7 +253,7 @@ if __name__ == '__main__':
     model.to_empty(device='cpu')
 
     print(f'Saving model to {hf_path}')
-    model.save_pretrained(hf_path, state_dict=state_dict)
+    save_pretrained_with_generation_contract(model, hf_path, state_dict)
     del state_dict
     del model
     if args.hf_upload_path:
@@ -163,7 +268,6 @@ if __name__ == '__main__':
         )
     
     
-
 
 
 

@@ -24,14 +24,51 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from verl import DataProto
 from verl.agent_trainer.ppo import core_algos
 from verl.workers.agent_critic import BasePPOCritic
-from verl.utils.py_functional import append_to_dict
 from verl.utils.torch_functional import masked_mean
 from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_unpad
 from verl.utils.seqlen_balancing import rearrange_micro_batches, get_reverse_idx
+from verl.workers.ppo_token_normalization import (
+    PPO_BATCH_CONTRACT_META_KEY,
+    TokenWeightedMetricAccumulator,
+    distributed_sum,
+    mask_padding_rows,
+    scale_token_mean_loss,
+    valid_response_token_count,
+    validate_worker_batch_readback,
+)
 
 from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
 
 __all__ = ['DataParallelPPOCritic']
+
+
+def _select_response_state_values(
+    full_sequence_values: torch.Tensor,
+    response_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Align critic states with the tokens whose log probabilities PPO updates.
+
+    The actor scores response token ``t`` from the causal output at ``t - 1``.
+    The critic must use that same pre-token state, including the final prompt
+    position for the first response token.
+    """
+
+    if full_sequence_values.ndim != 2 or response_mask.ndim != 2:
+        raise ValueError("critic values and response_mask must both be rank-2 tensors.")
+    if full_sequence_values.shape[0] != response_mask.shape[0]:
+        raise ValueError("critic values and response_mask must share a batch size.")
+    response_length = response_mask.shape[-1]
+    if full_sequence_values.shape[-1] <= response_length:
+        raise ValueError(
+            "critic sequence must include at least one prompt state before the response."
+        )
+    response_state_values = full_sequence_values[
+        :, -response_length - 1 : -1
+    ]
+    return response_state_values * response_mask.to(
+        device=response_state_values.device,
+        dtype=response_state_values.dtype,
+    )
 
 
 class DataParallelPPOCritic(BasePPOCritic):
@@ -121,8 +158,6 @@ class DataParallelPPOCritic(BasePPOCritic):
                 values = self._forward_micro_batch(micro_batch)
             values_lst.append(values)
         values = torch.concat(values_lst, dim=0)
-        attention_mask = data.batch['attention_mask']
-        values = values * attention_mask
 
         if use_dynamic_bsz:
             indices = list(itertools.chain.from_iterable(indices))
@@ -130,7 +165,7 @@ class DataParallelPPOCritic(BasePPOCritic):
             revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
             values = values[revert_indices]
 
-        return values
+        return _select_response_state_values(values, data.batch['response_mask'])
 
     def update_critic(self, data: DataProto):
         # make sure we are in training mode
@@ -138,57 +173,105 @@ class DataParallelPPOCritic(BasePPOCritic):
         metrics = {}
 
         select_keys = ['input_ids', 'attention_mask', 'position_ids', 'values', 'returns', 'response_mask']
+        if core_algos.PPO_VALID_SAMPLE_MASK in data.batch.keys():
+            select_keys.append(core_algos.PPO_VALID_SAMPLE_MASK)
         batch = data.select(batch_keys=select_keys).batch
+        loss_group = data.meta_info.get('ppo_loss_process_group')
+        metric_group = data.meta_info.get('ppo_metric_process_group', loss_group)
+        batch_contract = data.meta_info.get(PPO_BATCH_CONTRACT_META_KEY)
+        batch_readback = None
+        if batch_contract is not None:
+            batch_readback = validate_worker_batch_readback(
+                batch_contract,
+                role='critic',
+                normalized_mini_batch_rows=self.config.ppo_mini_batch_size,
+                per_gpu_micro_batch_rows=self.config.ppo_micro_batch_size_per_gpu,
+                forward_per_gpu_micro_batch_rows=self.config.forward_micro_batch_size_per_gpu,
+            )
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         dataloader = batch.split(self.config.ppo_mini_batch_size)
 
-        for batch_idx, data in enumerate(dataloader):
-            # split batch into micro_batches
-            mini_batch = data
-            if self.config.use_dynamic_bsz:
-                max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
-            else:
-                micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
-                self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+        raw_ppo_epochs = self.config.ppo_epochs
+        ppo_epochs = int(raw_ppo_epochs)
+        if isinstance(raw_ppo_epochs, bool) or ppo_epochs <= 0 or ppo_epochs != raw_ppo_epochs:
+            raise ValueError(f"critic ppo_epochs must be a positive integer, got {raw_ppo_epochs!r}.")
 
-            self.critic_optimizer.zero_grad()
-
-            for data in micro_batches:
-                data = data.cuda()  # critic device is cpu when using offload
-                values = data['values']
-                returns = data['returns']
-
-                eos_mask = data['response_mask']
-
-                vpreds = self._forward_micro_batch(data)
-
-                # assert not torch.any(torch.isnan(vpreds)).item()
-
-                vf_loss, vf_clipfrac = core_algos.compute_value_loss(vpreds=vpreds,
-                                                                     values=values,
-                                                                     returns=returns,
-                                                                     eos_mask=eos_mask,
-                                                                     cliprange_value=self.config.cliprange_value)
+        token_metrics = TokenWeightedMetricAccumulator()
+        optimizer_steps = 0
+        for _ in range(ppo_epochs):
+            for data in dataloader:
+                mini_batch = data
                 if self.config.use_dynamic_bsz:
-                    # relative to the dynamic bsz
-                    loss = vf_loss * (len(data) / self.config.ppo_mini_batch_size)
+                    max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                    micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
                 else:
-                    loss = vf_loss / self.gradient_accumulation
+                    micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
-                loss.backward()
+                self.critic_optimizer.zero_grad()
+                mini_batch_response_mask = mask_padding_rows(
+                    mini_batch['response_mask'],
+                    mini_batch.get(core_algos.PPO_VALID_SAMPLE_MASK),
+                )
+                global_token_count = distributed_sum(
+                    valid_response_token_count(mini_batch_response_mask),
+                    group=loss_group,
+                )
+                if global_token_count.item() <= 0:
+                    raise ValueError("PPO critic mini-batch has no valid response tokens.")
 
-                data = {
-                    'critic/vf_loss': vf_loss.detach().item(),
-                    'critic/vf_clipfrac': vf_clipfrac.detach().item(),
-                    'critic/vpred_mean': masked_mean(vpreds, eos_mask).detach().item(),
-                }
+                for data in micro_batches:
+                    data = data.cuda()  # critic device is cpu when using offload
+                    values = data['values']
+                    returns = data['returns']
+                    eos_mask = mask_padding_rows(
+                        data['response_mask'],
+                        data.get(core_algos.PPO_VALID_SAMPLE_MASK),
+                    )
+                    local_token_count = valid_response_token_count(eos_mask)
+                    vpreds = _select_response_state_values(
+                        self._forward_micro_batch(data), eos_mask
+                    )
 
-                append_to_dict(metrics, data)
+                    vf_loss, vf_clipfrac = core_algos.compute_value_loss(
+                        vpreds=vpreds,
+                        values=values,
+                        returns=returns,
+                        eos_mask=eos_mask,
+                        cliprange_value=self.config.cliprange_value,
+                    )
+                    loss = scale_token_mean_loss(
+                        vf_loss,
+                        local_token_count,
+                        global_token_count,
+                        group=loss_group,
+                    )
+                    loss.backward()
+                    token_metrics.add(
+                        {
+                            'critic/vf_loss': vf_loss.detach().item(),
+                            'critic/vf_clipfrac': vf_clipfrac.detach().item(),
+                            'critic/vpred_mean': masked_mean(vpreds, eos_mask).detach().item(),
+                        },
+                        local_token_count,
+                    )
 
-            grad_norm = self._optimizer_step()
-            data = {'critic/grad_norm': grad_norm.detach().item()}
-            append_to_dict(metrics, data)
+                grad_norm = self._optimizer_step()
+                optimizer_steps += 1
+                metrics.setdefault('critic/grad_norm', []).append(grad_norm.detach().item())
         self.critic_optimizer.zero_grad()
+        metrics['critic/ppo_epochs'] = [float(ppo_epochs)]
+        metrics['critic/optimizer_steps_per_update'] = [float(optimizer_steps)]
+        metrics['critic/minibatches_per_epoch'] = [float(optimizer_steps / ppo_epochs)]
+        if batch_readback is not None:
+            metrics['critic/normalized_mini_batch_rows'] = [
+                float(batch_readback['normalized_mini_batch_rows'])
+            ]
+            metrics['critic/per_gpu_micro_batch_rows'] = [
+                float(batch_readback['per_gpu_micro_batch_rows'])
+            ]
+            metrics['critic/forward_per_gpu_micro_batch_rows'] = [
+                float(batch_readback['forward_per_gpu_micro_batch_rows'])
+            ]
+        metrics.update(token_metrics.reduce(group=metric_group))
         return metrics

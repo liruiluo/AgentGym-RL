@@ -16,8 +16,43 @@ Note that we don't combine the main with ray_trainer as ray_trainer is used by o
 """
 from verl.agent_trainer.ppo.ray_trainer import RayPPOTrainer
 
+import os
+
 import ray
 import hydra
+
+
+def _ray_runtime_env_vars():
+    env = {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}
+    # AgentMemoryGym / JD 9N compatibility knobs must reach Ray workers before
+    # vLLM/VERL modules are imported. Ray's per-actor runtime_env can otherwise
+    # hide shell exports such as VLLM_USE_V1=0.
+    for key in (
+        'VLLM_USE_V1',
+        'VLLM_ATTENTION_BACKEND',
+        'VLLM_WORKER_MULTIPROC_METHOD',
+        'VLLM_USE_MODELSCOPE',
+        'VLLM_ALLOW_INSECURE_SERIALIZATION',
+        'VERL_AGENTMEMORY_SKIP_VLLM_WEIGHT_SYNC',
+        'VERL_AGENTMEMORY_HF_SYNC_DIR',
+        'VERL_PPO_LOGGING_LEVEL',
+        'AGENTMEMORY_DATA_PATH',
+        'AGENTMEMORY_SPLIT',
+        'AGENTMEMORY_SPLIT_DIR',
+        'AGENTMEMORY_CATALOG_INDEX_PATH',
+        'HYDRA_FULL_ERROR',
+        'WANDB_MODE',
+    ):
+        value = os.environ.get(key)
+        if value is not None:
+            env[key] = value
+    # Positive-control and curriculum knobs can be added faster than this
+    # whitelist is updated. Ray runtime_env is otherwise a silent prompt/action
+    # contract footgun, so forward every explicit AgentMemoryGym knob.
+    for key, value in os.environ.items():
+        if key.startswith("AGENTMEMORY_") and value is not None:
+            env.setdefault(key, value)
+    return env
 
 
 @hydra.main(config_path='config', config_name='ppo_trainer', version_base=None)
@@ -28,7 +63,7 @@ def main(config):
 def run_ppo(config):
     if not ray.is_initialized():
         # this is for local ray cluster
-        ray.init(runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})
+        ray.init(runtime_env={'env_vars': _ray_runtime_env_vars()})
 
     ray.get(main_task.remote(config))
 
@@ -84,8 +119,11 @@ def main_task(config):
                             role_worker_mapping=role_worker_mapping,
                             resource_pool_manager=resource_pool_manager,
                             ray_worker_group_cls=ray_worker_group_cls)
+    print('[main_task] trainer constructed; init_workers begin', flush=True)
     trainer.init_workers()
+    print('[main_task] init_workers done; fit begin', flush=True)
     trainer.fit()
+    print('[main_task] fit returned', flush=True)
 
 
 if __name__ == '__main__':

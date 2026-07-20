@@ -18,6 +18,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import os
 import uuid
+import json
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -28,6 +29,7 @@ import numpy as np
 from codetiming import Timer
 from omegaconf import OmegaConf, open_dict
 from verl import DataProto
+from verl.protocol import pad_dataproto_to_divisor
 from verl.single_controller.base import Worker
 from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, RayClassWithInitArgs
 from verl.single_controller.ray.base import create_colocated_worker_cls
@@ -35,7 +37,37 @@ from verl.agent_trainer.ppo import core_algos
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.agent_dataset.rl_dataset import RLHFDataset, collate_fn
-from verl.utils.agentgym.rollout_context import align_batch_to_rollout
+from verl.utils.agentgym.rollout_context import (
+    AGENTMEMORY_ACTION_TEXT,
+    AGENTMEMORY_EXACT_STATE_UID,
+    AGENTMEMORY_GENERATION_PROMPT_DIGEST,
+    AGENTMEMORY_GENERATION_PROMPT_LENGTH,
+    AGENTMEMORY_IMMEDIATE_REWARD,
+    AGENTMEMORY_PACKED_PROMPT_DIGEST,
+    AGENTMEMORY_PACKED_PROMPT_LENGTH,
+    AGENTMEMORY_PARENT_GROUP_UID,
+    AGENTMEMORY_REPLICA_INDEX,
+    AGENTMEMORY_SUFFIX_CREDIT_APPLIED,
+    AGENTMEMORY_SUFFIX_RETURN,
+    AGENTMEMORY_TRAJECTORY_RETURN,
+    AGENTMEMORY_TRAJECTORY_ROW_ORDER,
+    AGENTMEMORY_TRAJECTORY_ROW_UID,
+    AGENTMEMORY_TRAJECTORY_TERMINAL,
+    AGENTMEMORY_TRAJECTORY_UID,
+    align_batch_to_rollout,
+    requires_formal_trajectory_metadata,
+    summarize_update_readback,
+    validate_formal_trajectory_metadata,
+    validate_state_aware_rollout_uids,
+)
+from verl.utils.agentgym.formal_training_metrics import (
+    summarize_formal_training_rows,
+)
+from verl.workers.ppo_token_normalization import (
+    PPO_BATCH_CONTRACT_META_KEY,
+    build_legacy_asymmetric_batch_contract,
+    optimizer_step_readback,
+)
 from abc import ABC, abstractmethod
 
 WorkerType = Type[Worker]
@@ -108,7 +140,6 @@ def find_latest_ckpt_path_aistudio(path, directory_format="global_step_{}"):
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty='kl'):
     token_level_scores = data.batch['token_level_scores']
-    batch_size = data.batch.batch_size[0]
     response_mask = data.batch['response_mask']
 
     # compute kl between ref_policy and current policy
@@ -123,11 +154,12 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
 
     token_level_rewards = token_level_scores - beta * kld
 
+    valid_samples = _get_ppo_valid_sample_mask(data)
     current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence
-    current_kl = torch.mean(current_kl, dim=0).item()
+    current_kl = torch.mean(current_kl[valid_samples], dim=0).item()
 
     # according to https://github.com/huggingface/trl/blob/951ca1841f29114b969b57b26c7d3e80a39f75a0/trl/trainer/ppo_trainer.py#L837
-    kl_ctrl.update(current_kl=current_kl, n_steps=batch_size)
+    kl_ctrl.update(current_kl=current_kl, n_steps=int(valid_samples.sum().item()))
     data.batch['token_level_rewards'] = token_level_rewards
 
     metrics = {'critic/kl': current_kl, 'critic/kl_coeff': beta}
@@ -135,36 +167,140 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     return data, metrics
 
 
+def _get_ppo_valid_sample_mask(data: DataProto) -> torch.Tensor:
+    mask = data.batch.get(core_algos.PPO_VALID_SAMPLE_MASK)
+    if mask is None:
+        return torch.ones(len(data), dtype=torch.bool, device=data.batch.device)
+    if mask.ndim != 1 or mask.shape[0] != len(data):
+        raise ValueError(
+            f"{core_algos.PPO_VALID_SAMPLE_MASK} must have shape ({len(data)},), got {tuple(mask.shape)}"
+        )
+    mask = mask.to(dtype=torch.bool)
+    if not torch.any(mask):
+        raise ValueError("PPO batch must contain at least one non-padding sample.")
+    return mask
+
+
+def _mask_ppo_padding_samples(data: DataProto) -> None:
+    valid_samples = _get_ppo_valid_sample_mask(data)
+    response_mask = data.batch['response_mask']
+    data.batch['response_mask'] = response_mask * valid_samples.unsqueeze(-1).to(response_mask.dtype)
+
+
 def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1):
     # prepare response group
     # TODO: add other ways to estimate advantages
     if adv_estimator == 'gae':
+        formal_required = requires_formal_trajectory_metadata(data)
+        runtime_evidence_required = _agentmemory_env_flag(
+            "AGENTMEMORY_REQUIRE_FORMAL_RUNTIME_EVIDENCE"
+        )
+        formal_groups = validate_formal_trajectory_metadata(
+            data,
+            expected_replicas=int(num_repeat),
+            require=formal_required or runtime_evidence_required,
+            require_runtime_evidence=runtime_evidence_required,
+            expected_suffix_credit=(
+                False if formal_required or runtime_evidence_required else None
+            ),
+        )
         values = data.batch['values']
         response_mask = data.batch['response_mask']
         token_level_rewards = data.batch['token_level_rewards']
-        advantages, returns = core_algos.compute_gae_advantage_return(token_level_rewards=token_level_rewards,
-                                                                      values=values,
-                                                                      eos_mask=response_mask,
-                                                                      gamma=gamma,
-                                                                      lam=lam)
+        if formal_groups is None:
+            advantages, returns = core_algos.compute_gae_advantage_return(
+                token_level_rewards=token_level_rewards,
+                values=values,
+                eos_mask=response_mask,
+                gamma=gamma,
+                lam=lam,
+            )
+        else:
+            done_flags = data.non_tensor_batch.get("rollout_done_flags")
+            if done_flags is None:
+                raise RuntimeError(
+                    "Formal trajectory GAE requires one environment done flag per action row."
+                )
+            advantages, returns = core_algos.compute_trajectory_gae_advantage_return(
+                token_level_rewards=token_level_rewards,
+                values=values,
+                eos_mask=response_mask,
+                trajectory_uids=data.non_tensor_batch[AGENTMEMORY_TRAJECTORY_UID],
+                trajectory_row_uids=data.non_tensor_batch[
+                    AGENTMEMORY_TRAJECTORY_ROW_UID
+                ],
+                trajectory_row_orders=data.batch[
+                    AGENTMEMORY_TRAJECTORY_ROW_ORDER
+                ],
+                trajectory_terminals=data.batch[AGENTMEMORY_TRAJECTORY_TERMINAL],
+                done_flags=done_flags,
+                sample_mask=_get_ppo_valid_sample_mask(data),
+                gamma=gamma,
+                lam=lam,
+                immediate_rewards=data.batch[AGENTMEMORY_IMMEDIATE_REWARD],
+                advantage_normalization="none",
+            )
+            data.meta_info[
+                "agentmemory_actor_advantage_mode"
+            ] = "standard_trajectory_gae"
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
     elif adv_estimator == 'grpo':
-        token_level_rewards = data.batch['token_level_rewards']
-        index = data.non_tensor_batch['uid']
         response_mask = data.batch['response_mask']
-        advantages, returns = core_algos.compute_grpo_outcome_advantage(token_level_rewards=token_level_rewards,
-                                                                        eos_mask=response_mask,
-                                                                        index=index)
+        sample_mask = _get_ppo_valid_sample_mask(data)
+        formal_required = requires_formal_trajectory_metadata(data)
+        runtime_evidence_required = _agentmemory_env_flag(
+            "AGENTMEMORY_REQUIRE_FORMAL_RUNTIME_EVIDENCE"
+        )
+        formal_groups = validate_formal_trajectory_metadata(
+            data,
+            expected_replicas=int(num_repeat),
+            require=formal_required or runtime_evidence_required,
+            require_runtime_evidence=runtime_evidence_required,
+            expected_suffix_credit=False if runtime_evidence_required else None,
+        )
+        if formal_groups is not None:
+            advantages, returns = core_algos.compute_formal_grpo_complete_trajectory_advantage(
+                immediate_rewards=data.batch[AGENTMEMORY_IMMEDIATE_REWARD],
+                eos_mask=response_mask,
+                parent_group_uids=data.non_tensor_batch[
+                    AGENTMEMORY_PARENT_GROUP_UID
+                ],
+                trajectory_uids=data.non_tensor_batch[AGENTMEMORY_TRAJECTORY_UID],
+                trajectory_row_uids=data.non_tensor_batch[
+                    AGENTMEMORY_TRAJECTORY_ROW_UID
+                ],
+                trajectory_row_orders=data.batch[
+                    AGENTMEMORY_TRAJECTORY_ROW_ORDER
+                ],
+                trajectory_terminals=data.batch[AGENTMEMORY_TRAJECTORY_TERMINAL],
+                declared_trajectory_returns=data.batch[
+                    AGENTMEMORY_TRAJECTORY_RETURN
+                ],
+                sample_mask=sample_mask,
+                expected_group_size=int(num_repeat),
+                gamma=gamma,
+            )
+        else:
+            token_level_rewards = data.batch['token_level_rewards']
+            index = data.non_tensor_batch['uid']
+            advantages, returns = core_algos.compute_grpo_outcome_advantage(
+                token_level_rewards=token_level_rewards,
+                eos_mask=response_mask,
+                index=index,
+                sample_mask=sample_mask,
+            )
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
     elif adv_estimator == 'rloo':
         token_level_rewards = data.batch['token_level_rewards']
         index = data.non_tensor_batch['uid']
         response_mask = data.batch['response_mask']
+        sample_mask = _get_ppo_valid_sample_mask(data)
         advantages, returns = core_algos.compute_rloo_outcome_advantage(token_level_rewards=token_level_rewards,
                                                                         eos_mask=response_mask,
-                                                                        index=index)
+                                                                        index=index,
+                                                                        sample_mask=sample_mask)
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
     elif adv_estimator == 'reinforce_plus_plus':
@@ -190,6 +326,570 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
     else:
         raise NotImplementedError
     return data
+
+
+
+def _agentmemory_env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _validate_formal_actor_advantage_config(config) -> str:
+    mode = os.environ.get(
+        "AGENTMEMORY_FORMAL_ACTOR_ADVANTAGE_MODE",
+        "standard_trajectory_gae",
+    ).strip().lower()
+    if not _agentmemory_env_flag("AGENTMEMORY_REQUIRE_FORMAL_RUNTIME_EVIDENCE"):
+        return mode
+    if mode != "standard_trajectory_gae":
+        raise RuntimeError(
+            "Formal AgentMemory PPO requires standard_trajectory_gae; legacy "
+            f"suffix/Monte-Carlo actor modes are disabled, got {mode!r}."
+        )
+    if _agentmemory_env_flag("AGENTMEMORY_LATEST_OBS_SUFFIX_CREDIT"):
+        raise RuntimeError(
+            "Formal AgentMemory PPO requires AGENTMEMORY_LATEST_OBS_SUFFIX_CREDIT=0; "
+            "future action rewards are propagated by critic GAE."
+        )
+    if float(config.algorithm.kl_ctrl.kl_coef) != 0.0:
+        raise RuntimeError(
+            "Formal trajectory GAE requires algorithm.kl_ctrl.kl_coef=0 so the "
+            "packed reward remains the exact environment action reward."
+        )
+    return mode
+
+
+def _agentmemory_formal_update_readback_target_steps() -> frozenset[int] | None:
+    if not _agentmemory_env_flag("AGENTMEMORY_FORMAL_UPDATE_READBACK"):
+        return None
+    raw_value = os.environ.get("AGENTMEMORY_FORMAL_UPDATE_READBACK_STEP")
+    if raw_value is None or not raw_value.strip():
+        raise RuntimeError(
+            "AGENTMEMORY_FORMAL_UPDATE_READBACK requires an explicit "
+            "AGENTMEMORY_FORMAL_UPDATE_READBACK_STEP."
+        )
+    raw_steps = raw_value.split(",")
+    if any(not raw_step.strip() for raw_step in raw_steps):
+        raise RuntimeError(
+            "AGENTMEMORY_FORMAL_UPDATE_READBACK_STEP contains an empty target, "
+            f"got {raw_value!r}."
+        )
+    try:
+        target_steps = tuple(int(raw_step.strip()) for raw_step in raw_steps)
+    except ValueError as exc:
+        raise RuntimeError(
+            "AGENTMEMORY_FORMAL_UPDATE_READBACK_STEP must be a comma-separated "
+            f"set of positive integers, got {raw_value!r}."
+        ) from exc
+    if any(target_step <= 0 for target_step in target_steps):
+        raise RuntimeError(
+            "AGENTMEMORY_FORMAL_UPDATE_READBACK_STEP targets must be positive, "
+            f"got {target_steps}."
+        )
+    if len(set(target_steps)) != len(target_steps):
+        raise RuntimeError(
+            "AGENTMEMORY_FORMAL_UPDATE_READBACK_STEP targets must be unique, "
+            f"got {target_steps}."
+        )
+    return frozenset(target_steps)
+
+
+def _agentmemory_missing_formal_update_readback_steps(
+    target_steps: frozenset[int] | None,
+    observed_steps: set[int],
+) -> list[int]:
+    return sorted((target_steps or frozenset()) - observed_steps)
+
+
+def _safe_float(value):
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _agentmemory_dump_ppo_batch_debug(batch: DataProto, config, global_steps: int, stage: str) -> None:
+    if not _agentmemory_env_flag("AGENTMEMORY_BATCH_DEBUG"):
+        return
+    try:
+        action_text_key = "agentmemory_action_text"
+        generation_prompt_digest_key = "agentmemory_generation_prompt_digest"
+        generation_prompt_length_key = "agentmemory_generation_prompt_length"
+        packed_prompt_digest_key = "agentmemory_packed_prompt_digest"
+        packed_prompt_length_key = "agentmemory_packed_prompt_length"
+        suffix_credit_applied_key = "agentmemory_suffix_credit_applied"
+        suffix_return_key = "agentmemory_suffix_return"
+        default_dir = str(config.trainer.default_local_dir)
+        run_dir = os.path.dirname(default_dir.rstrip("/")) if default_dir else os.getcwd()
+        out_dir = os.path.join(run_dir, "diagnostics")
+        os.makedirs(out_dir, exist_ok=True)
+
+        response_mask = batch.batch.get("response_mask", None)
+        scores = batch.batch.get("scores", None)
+        token_rewards = batch.batch.get("token_level_rewards", None)
+        advantages = batch.batch.get("advantages", None)
+        returns = batch.batch.get("returns", None)
+        old_log_probs = batch.batch.get("old_log_probs", None)
+        task_rounds = batch.batch.get("task_rounds", None)
+        valid_samples = batch.batch.get(core_algos.PPO_VALID_SAMPLE_MASK)
+        if valid_samples is None:
+            valid_samples = torch.ones(len(batch), dtype=torch.bool)
+        else:
+            valid_samples = valid_samples.to(dtype=torch.bool).detach().cpu()
+
+        rows = []
+        uid_arr = batch.non_tensor_batch.get("uid")
+        parent_arr = batch.non_tensor_batch.get("rollout_parent_indices")
+        parent_group_arr = batch.non_tensor_batch.get(
+            AGENTMEMORY_PARENT_GROUP_UID
+        )
+        exact_state_arr = batch.non_tensor_batch.get(AGENTMEMORY_EXACT_STATE_UID)
+        replica_arr = batch.non_tensor_batch.get(AGENTMEMORY_REPLICA_INDEX)
+        trajectory_arr = batch.non_tensor_batch.get(AGENTMEMORY_TRAJECTORY_UID)
+        trajectory_row_uid_arr = batch.non_tensor_batch.get(
+            AGENTMEMORY_TRAJECTORY_ROW_UID
+        )
+        trajectory_returns = batch.batch.get(AGENTMEMORY_TRAJECTORY_RETURN)
+        trajectory_row_orders = batch.batch.get(AGENTMEMORY_TRAJECTORY_ROW_ORDER)
+        trajectory_terminals = batch.batch.get(AGENTMEMORY_TRAJECTORY_TERMINAL)
+        immediate_rewards = batch.batch.get(AGENTMEMORY_IMMEDIATE_REWARD)
+        suffix_returns = batch.batch.get(suffix_return_key)
+        suffix_flags = batch.batch.get(suffix_credit_applied_key)
+        generation_prompt_lengths = batch.batch.get(
+            generation_prompt_length_key
+        )
+        packed_prompt_lengths = batch.batch.get(packed_prompt_length_key)
+        generation_prompt_digests = batch.non_tensor_batch.get(
+            generation_prompt_digest_key
+        )
+        packed_prompt_digests = batch.non_tensor_batch.get(
+            packed_prompt_digest_key
+        )
+        action_arr = batch.non_tensor_batch.get(action_text_key)
+        step_record_arr = batch.non_tensor_batch.get(
+            "agentmemory_step_record_json"
+        )
+        for i in range(len(batch)):
+            row = {
+                "i": i,
+                "ppo_valid_sample": bool(valid_samples[i].item()),
+            }
+            if uid_arr is not None:
+                row["uid"] = str(uid_arr[i])
+            if parent_arr is not None:
+                row["parent_index"] = int(parent_arr[i])
+            if parent_group_arr is not None:
+                row[AGENTMEMORY_PARENT_GROUP_UID] = str(parent_group_arr[i])
+            if exact_state_arr is not None:
+                row[AGENTMEMORY_EXACT_STATE_UID] = str(exact_state_arr[i])
+            if replica_arr is not None:
+                row[AGENTMEMORY_REPLICA_INDEX] = int(replica_arr[i])
+            if trajectory_arr is not None:
+                row[AGENTMEMORY_TRAJECTORY_UID] = str(trajectory_arr[i])
+            if trajectory_row_uid_arr is not None:
+                row[AGENTMEMORY_TRAJECTORY_ROW_UID] = str(
+                    trajectory_row_uid_arr[i]
+                )
+            if trajectory_row_orders is not None:
+                row[AGENTMEMORY_TRAJECTORY_ROW_ORDER] = int(
+                    trajectory_row_orders[i].item()
+                )
+            if trajectory_terminals is not None:
+                row[AGENTMEMORY_TRAJECTORY_TERMINAL] = bool(
+                    trajectory_terminals[i].item()
+                )
+            if trajectory_returns is not None:
+                row[AGENTMEMORY_TRAJECTORY_RETURN] = _safe_float(
+                    trajectory_returns[i].item()
+                )
+            if immediate_rewards is not None:
+                row[AGENTMEMORY_IMMEDIATE_REWARD] = _safe_float(
+                    immediate_rewards[i].item()
+                )
+            if suffix_returns is not None:
+                row[suffix_return_key] = _safe_float(
+                    suffix_returns[i].item()
+                )
+            if suffix_flags is not None:
+                row[suffix_credit_applied_key] = bool(
+                    suffix_flags[i].item()
+                )
+            if task_rounds is not None:
+                row["task_round"] = int(task_rounds[i].item())
+            if generation_prompt_lengths is not None:
+                row[generation_prompt_length_key] = int(
+                    generation_prompt_lengths[i].item()
+                )
+            if packed_prompt_lengths is not None:
+                row[packed_prompt_length_key] = int(
+                    packed_prompt_lengths[i].item()
+                )
+            if generation_prompt_digests is not None:
+                row[generation_prompt_digest_key] = str(
+                    generation_prompt_digests[i]
+                )
+            if packed_prompt_digests is not None:
+                row[packed_prompt_digest_key] = str(
+                    packed_prompt_digests[i]
+                )
+            if action_arr is not None:
+                row[action_text_key] = str(action_arr[i])
+            if step_record_arr is not None:
+                row["formal_step_record"] = json.loads(str(step_record_arr[i]))
+            if response_mask is not None:
+                row["response_mask_sum"] = _safe_float(response_mask[i].sum().item())
+            if scores is not None:
+                row["score_sum"] = _safe_float(scores[i].sum().item())
+            if token_rewards is not None:
+                row["token_reward_sum"] = _safe_float(token_rewards[i].sum().item())
+            if advantages is not None:
+                vals = advantages[i][response_mask[i].bool()] if response_mask is not None else advantages[i].reshape(-1)
+                if vals.numel():
+                    row["adv_min"] = _safe_float(vals.min().item())
+                    row["adv_max"] = _safe_float(vals.max().item())
+                    row["adv_mean"] = _safe_float(vals.mean().item())
+                    row["adv_nonzero"] = int((vals != 0).sum().item())
+            if returns is not None:
+                vals = returns[i][response_mask[i].bool()] if response_mask is not None else returns[i].reshape(-1)
+                if vals.numel():
+                    row["return_min"] = _safe_float(vals.min().item())
+                    row["return_max"] = _safe_float(vals.max().item())
+                    row["return_mean"] = _safe_float(vals.mean().item())
+                    row["return_nonzero"] = int((vals != 0).sum().item())
+            if old_log_probs is not None:
+                vals = old_log_probs[i]
+                vals = vals[response_mask[i].bool()] if response_mask is not None else vals.reshape(-1)
+                if vals.numel():
+                    row["old_logprob_mean"] = _safe_float(vals.mean().item())
+            rows.append(row)
+
+        uid_counts = {}
+        if uid_arr is not None:
+            for i, uid in enumerate(uid_arr):
+                if not bool(valid_samples[i].item()):
+                    continue
+                uid = str(uid)
+                uid_counts[uid] = uid_counts.get(uid, 0) + 1
+        valid_rows = int(valid_samples.sum().item())
+        parent_group_summaries = []
+        if (
+            parent_group_arr is not None
+            and replica_arr is not None
+            and trajectory_arr is not None
+            and trajectory_returns is not None
+            and trajectory_row_orders is not None
+            and trajectory_terminals is not None
+            and advantages is not None
+        ):
+            grouped_rows = {}
+            for i in range(len(batch)):
+                if not bool(valid_samples[i].item()):
+                    continue
+                parent_group_uid = str(parent_group_arr[i])
+                trajectory_uid = str(trajectory_arr[i])
+                response_values = (
+                    advantages[i][response_mask[i].bool()]
+                    if response_mask is not None
+                    else advantages[i].reshape(-1)
+                )
+                row_token_mean_advantage = (
+                    _safe_float(response_values.mean().item())
+                    if response_values.numel()
+                    else None
+                )
+                trajectory = grouped_rows.setdefault(parent_group_uid, {}).setdefault(
+                    trajectory_uid,
+                    {
+                        AGENTMEMORY_TRAJECTORY_UID: trajectory_uid,
+                        AGENTMEMORY_REPLICA_INDEX: int(replica_arr[i]),
+                        AGENTMEMORY_TRAJECTORY_RETURN: _safe_float(
+                            trajectory_returns[i].item()
+                        ),
+                        "row_count": 0,
+                        "action_row_advantages": [],
+                    },
+                )
+                trajectory["row_count"] += 1
+                if row_token_mean_advantage is not None:
+                    trajectory["action_row_advantages"].append(
+                        {
+                            "row_order": int(trajectory_row_orders[i].item()),
+                            "terminal": bool(trajectory_terminals[i].item()),
+                            "token_mean_advantage": row_token_mean_advantage,
+                        }
+                    )
+            for parent_group_uid in sorted(grouped_rows):
+                trajectories = []
+                replica_indices = set()
+                for trajectory_uid in sorted(grouped_rows[parent_group_uid]):
+                    trajectory = grouped_rows[parent_group_uid][trajectory_uid]
+                    action_rows = sorted(
+                        trajectory.pop("action_row_advantages"),
+                        key=lambda item: item["row_order"],
+                    )
+                    values = [item["token_mean_advantage"] for item in action_rows]
+                    terminal_rows = [item for item in action_rows if item["terminal"]]
+                    trajectory["first_action_row_token_mean_advantage"] = (
+                        values[0] if values else None
+                    )
+                    trajectory["terminal_action_row_token_mean_advantage"] = (
+                        terminal_rows[0]["token_mean_advantage"]
+                        if len(terminal_rows) == 1
+                        else None
+                    )
+                    trajectory["action_row_token_mean_advantage_min"] = (
+                        min(values) if values else None
+                    )
+                    trajectory["action_row_token_mean_advantage_max"] = (
+                        max(values) if values else None
+                    )
+                    replica_indices.add(trajectory[AGENTMEMORY_REPLICA_INDEX])
+                    trajectories.append(trajectory)
+                parent_group_summaries.append(
+                    {
+                        AGENTMEMORY_PARENT_GROUP_UID: parent_group_uid,
+                        "unique_replicas": len(replica_indices),
+                        "replica_indices": sorted(replica_indices),
+                        "trajectories": trajectories,
+                    }
+                )
+        summary = {
+            "global_step": int(global_steps),
+            "stage": stage,
+            "batch_size": len(batch),
+            "valid_rows": valid_rows,
+            "padding_rows": len(batch) - valid_rows,
+            "uid_group_sizes": sorted(uid_counts.values()),
+            "agentmemory_parent_groups": parent_group_summaries,
+            "suffix_credit_enabled": _agentmemory_env_flag(
+                "AGENTMEMORY_LATEST_OBS_SUFFIX_CREDIT"
+            ),
+            "actor_advantage_mode": batch.meta_info.get(
+                "agentmemory_actor_advantage_mode",
+                "standard_trajectory_gae",
+            ),
+            "prompt_attestation_passed": bool(
+                generation_prompt_lengths is not None
+                and packed_prompt_lengths is not None
+            ),
+            "generation_prompt_length_max": (
+                int(
+                    generation_prompt_lengths.detach().cpu()[valid_samples]
+                    .max()
+                    .item()
+                )
+                if generation_prompt_lengths is not None
+                else None
+            ),
+            "packed_prompt_length_max": (
+                int(
+                    packed_prompt_lengths.detach().cpu()[valid_samples]
+                    .max()
+                    .item()
+                )
+                if packed_prompt_lengths is not None
+                else None
+            ),
+            "suffix_formula_mismatch_count": 0 if suffix_returns is not None else None,
+            "rows": rows,
+        }
+        with open(os.path.join(out_dir, f"ppo_batch_step{global_steps}_{stage}.json"), "w") as f:
+            json.dump(summary, f, ensure_ascii=True, indent=2)
+    except Exception as exc:
+        print(f"AgentMemory PPO batch debug dump failed: {exc}", flush=True)
+
+
+def _masked_row_values(
+    tensor: torch.Tensor,
+    response_mask: torch.Tensor,
+    valid_samples: torch.Tensor,
+    *,
+    reduction: str,
+) -> list[float]:
+    values = []
+    for row_index in range(tensor.shape[0]):
+        if not bool(valid_samples[row_index].item()):
+            continue
+        row = tensor[row_index][response_mask[row_index].bool()]
+        if not row.numel():
+            raise RuntimeError(
+                f"Formal update readback row {row_index} has no response tokens."
+            )
+        if reduction == "sum":
+            value = row.sum()
+        elif reduction == "mean":
+            value = row.mean()
+        else:
+            raise ValueError(f"Unsupported readback reduction: {reduction}")
+        values.append(float(value.detach().cpu().item()))
+    return values
+
+
+_PARAMETER_PROBE_FIELDS = (
+    "parameter_delta_l2",
+    "parameter_probe_max_abs_delta",
+    "parameter_probe_l1_delta",
+    "parameter_probe_changed_count",
+    "parameter_probe_element_count",
+    "parameter_probe_total_parameter_count",
+    "parameter_probe_max_elements_per_rank",
+)
+
+
+def _parameter_probe_from_update_metrics(metrics: dict, *, label: str) -> dict:
+    summary = {}
+    for field in _PARAMETER_PROBE_FIELDS:
+        metric_name = f"{label}/{field}"
+        if metric_name not in metrics:
+            raise RuntimeError(
+                f"Formal {label} update readback is missing {metric_name}."
+            )
+        value = float(metrics[metric_name])
+        if not np.isfinite(value):
+            raise RuntimeError(
+                f"Formal {label} update readback has non-finite {metric_name}."
+            )
+        summary[field] = value
+    for field in (
+        "parameter_probe_changed_count",
+        "parameter_probe_element_count",
+        "parameter_probe_total_parameter_count",
+        "parameter_probe_max_elements_per_rank",
+    ):
+        summary[field] = int(round(summary[field]))
+    if (
+        summary["parameter_delta_l2"] <= 0.0
+        or summary["parameter_probe_max_abs_delta"] <= 0.0
+        or summary["parameter_probe_l1_delta"] <= 0.0
+        or summary["parameter_probe_changed_count"] <= 0
+        or summary["parameter_probe_element_count"] <= 0
+    ):
+        raise RuntimeError(
+            f"Formal {label} update readback found zero parameter delta."
+        )
+    summary["parameter_probe_finite"] = True
+    summary["parameter_probe_sampling"] = (
+        "evenly_spaced_local_trainable_shards_then_fsdp_all_reduce"
+    )
+    return summary
+
+
+def _agentmemory_dump_formal_update_readback(
+    *,
+    batch: DataProto,
+    post_actor_log_probs: DataProto,
+    post_critic_values: DataProto | None,
+    actor_update_metrics: dict,
+    critic_update_metrics: dict,
+    config,
+    global_steps: int,
+) -> dict:
+    """Fail closed unless one PPO update changes actor and critic outputs."""
+
+    if not _agentmemory_env_flag("AGENTMEMORY_FORMAL_UPDATE_READBACK"):
+        return {}
+    if post_critic_values is None:
+        raise RuntimeError(
+            "Formal PPO update readback requires a post-update critic forward pass."
+        )
+    response_mask = batch.batch["response_mask"]
+    valid_samples = batch.batch.get(core_algos.PPO_VALID_SAMPLE_MASK)
+    if valid_samples is None:
+        valid_samples = torch.ones(
+            len(batch), dtype=torch.bool, device=response_mask.device
+        )
+    else:
+        valid_samples = valid_samples.to(
+            dtype=torch.bool, device=response_mask.device
+        )
+    step_record_arr = batch.non_tensor_batch.get("agentmemory_step_record_json")
+    if step_record_arr is None:
+        raise RuntimeError(
+            "Formal PPO update readback is missing canonical step records."
+        )
+    formal_step_records = [
+        json.loads(str(step_record_arr[row_index]))
+        for row_index in range(len(batch))
+        if bool(valid_samples[row_index].item())
+    ]
+    actor_before = _masked_row_values(
+        batch.batch["old_log_probs"],
+        response_mask,
+        valid_samples,
+        reduction="sum",
+    )
+    actor_after = _masked_row_values(
+        post_actor_log_probs.batch["old_log_probs"],
+        response_mask,
+        valid_samples,
+        reduction="sum",
+    )
+    critic_before = _masked_row_values(
+        batch.batch["values"],
+        response_mask,
+        valid_samples,
+        reduction="mean",
+    )
+    critic_after = _masked_row_values(
+        post_critic_values.batch["values"],
+        response_mask,
+        valid_samples,
+        reduction="mean",
+    )
+    actor_summary = summarize_update_readback(
+        before=actor_before,
+        after=actor_after,
+        label="actor_logprob",
+    )
+    critic_summary = summarize_update_readback(
+        before=critic_before,
+        after=critic_after,
+        label="critic_value",
+    )
+    actor_parameter_probe = _parameter_probe_from_update_metrics(
+        actor_update_metrics, label="actor"
+    )
+    critic_parameter_probe = _parameter_probe_from_update_metrics(
+        critic_update_metrics, label="critic"
+    )
+    payload = {
+        "global_step": int(global_steps),
+        "role": "same_batch_post_optimizer_readback",
+        "checkpoint_step_labels_are_not_used_as_update_evidence": True,
+        "formal_step_records": formal_step_records,
+        "actor": {
+            "summary": actor_summary,
+            "parameter_delta_l2": actor_parameter_probe["parameter_delta_l2"],
+            "parameter_probe": actor_parameter_probe,
+            "before_sequence_logprob": actor_before,
+            "after_sequence_logprob": actor_after,
+        },
+        "critic": {
+            "summary": critic_summary,
+            "parameter_delta_l2": critic_parameter_probe["parameter_delta_l2"],
+            "parameter_probe": critic_parameter_probe,
+            "before_response_value_mean": critic_before,
+            "after_response_value_mean": critic_after,
+        },
+    }
+    default_dir = str(config.trainer.default_local_dir)
+    run_dir = os.path.dirname(default_dir.rstrip("/")) if default_dir else os.getcwd()
+    out_dir = os.path.join(run_dir, "diagnostics")
+    os.makedirs(out_dir, exist_ok=True)
+    output_path = os.path.join(
+        out_dir, f"formal_update_readback_step{global_steps}.json"
+    )
+    with open(output_path, "w") as handle:
+        json.dump(payload, handle, ensure_ascii=True, indent=2)
+    print(
+        "AgentMemory formal PPO update readback: "
+        f"actor_max_abs_delta={actor_summary['max_abs_delta']:.8g} "
+        f"critic_max_abs_delta={critic_summary['max_abs_delta']:.8g} "
+        f"actor_parameter_delta_l2={actor_parameter_probe['parameter_delta_l2']:.8g} "
+        f"critic_parameter_delta_l2={critic_parameter_probe['parameter_delta_l2']:.8g} "
+        f"path={output_path}",
+        flush=True,
+    )
+    return payload
 
 
 class RoundsScheduler(ABC):
@@ -254,24 +954,25 @@ def reduce_metrics(metrics: dict):
 
 def compute_data_metrics(batch, use_critic=True):
     # TODO: add response length
-    sequence_score = batch.batch['token_level_scores'].sum(-1)
-    sequence_reward = batch.batch['token_level_rewards'].sum(-1)
-    task_scores = batch.batch["task_scores"].sum(-1)
-    task_rounds = batch.batch["task_rounds"]
+    valid_samples = _get_ppo_valid_sample_mask(batch)
+    sequence_score = batch.batch['token_level_scores'].sum(-1)[valid_samples]
+    sequence_reward = batch.batch['token_level_rewards'].sum(-1)[valid_samples]
+    task_scores = batch.batch["task_scores"].sum(-1)[valid_samples]
+    task_rounds = batch.batch["task_rounds"][valid_samples]
 
-    response_length = batch.batch['response_mask'].sum(-1).float()
-    prompt_length = batch.batch['attention_mask'].sum(-1).float() - response_length
+    response_length = batch.batch['response_mask'][valid_samples].sum(-1).float()
+    prompt_length = batch.batch['attention_mask'][valid_samples].sum(-1).float() - response_length
 
-    advantages = batch.batch['advantages']
-    returns = batch.batch['returns']
+    advantages = batch.batch['advantages'][valid_samples]
+    returns = batch.batch['returns'][valid_samples]
 
-    response_mask = batch.batch['response_mask'].bool()
+    response_mask = batch.batch['response_mask'][valid_samples].bool()
 
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
 
     if use_critic:
-        values = batch.batch['values']
+        values = batch.batch['values'][valid_samples]
         valid_values = torch.masked_select(values, response_mask)
         return_diff_var = torch.var(valid_returns - valid_values)
         return_var = torch.var(valid_returns)
@@ -343,12 +1044,63 @@ def compute_data_metrics(batch, use_critic=True):
         'prompt_length/min':
             torch.min(prompt_length).detach().item(),
     }
+    step_record_arr = batch.non_tensor_batch.get("agentmemory_step_record_json")
+    trajectory_uid_arr = batch.non_tensor_batch.get(AGENTMEMORY_TRAJECTORY_UID)
+    if step_record_arr is not None or trajectory_uid_arr is not None:
+        if step_record_arr is None or trajectory_uid_arr is None:
+            raise RuntimeError(
+                "Formal AgentMemory metrics require both step records and trajectory UIDs."
+            )
+        immediate_rewards = batch.batch.get(AGENTMEMORY_IMMEDIATE_REWARD)
+        suffix_returns = batch.batch.get(AGENTMEMORY_SUFFIX_RETURN)
+        trajectory_returns = batch.batch.get(AGENTMEMORY_TRAJECTORY_RETURN)
+        row_orders = batch.batch.get(AGENTMEMORY_TRAJECTORY_ROW_ORDER)
+        terminal_flags = batch.batch.get(AGENTMEMORY_TRAJECTORY_TERMINAL)
+        required_tensors = {
+            AGENTMEMORY_IMMEDIATE_REWARD: immediate_rewards,
+            AGENTMEMORY_SUFFIX_RETURN: suffix_returns,
+            AGENTMEMORY_TRAJECTORY_RETURN: trajectory_returns,
+            AGENTMEMORY_TRAJECTORY_ROW_ORDER: row_orders,
+            AGENTMEMORY_TRAJECTORY_TERMINAL: terminal_flags,
+        }
+        missing = sorted(name for name, value in required_tensors.items() if value is None)
+        if missing:
+            raise RuntimeError(f"Formal AgentMemory metrics are missing tensors: {missing}.")
+        formal_rows = []
+        for row_index in range(len(batch)):
+            if not bool(valid_samples[row_index].item()):
+                continue
+            mask = batch.batch["response_mask"][row_index].bool()
+            row_advantages = batch.batch["advantages"][row_index][mask]
+            if row_advantages.numel() == 0:
+                raise RuntimeError(f"Formal AgentMemory row {row_index} has no response tokens.")
+            formal_rows.append(
+                {
+                    "trajectory_uid": str(trajectory_uid_arr[row_index]),
+                    "row_order": int(row_orders[row_index].item()),
+                    "terminal": bool(terminal_flags[row_index].item()),
+                    "immediate_reward": float(immediate_rewards[row_index].item()),
+                    "suffix_return": float(suffix_returns[row_index].item()),
+                    "trajectory_return": float(trajectory_returns[row_index].item()),
+                    "advantage_token_mean": float(row_advantages.mean().item()),
+                    "record": json.loads(str(step_record_arr[row_index])),
+                }
+            )
+        formal_summary = summarize_formal_training_rows(formal_rows)
+        for name, value in formal_summary.items():
+            metric_name = name
+            for suffix in ("_mean", "_count", "_rate"):
+                if metric_name.endswith(suffix):
+                    metric_name = metric_name[: -len(suffix)] + "/" + suffix[1:]
+                    break
+            metrics[f"agentmemory/{metric_name}"] = value
     return metrics
 
 
 def compute_timing_metrics(batch, timing_raw):
-    num_overall_tokens = torch.sum(batch.batch['attention_mask']).item()
-    num_response_tokens = torch.sum(batch.batch['response_mask']).item()
+    valid_samples = _get_ppo_valid_sample_mask(batch)
+    num_overall_tokens = torch.sum(batch.batch['attention_mask'][valid_samples]).item()
+    num_response_tokens = torch.sum(batch.batch['response_mask'][valid_samples]).item()
 
     num_tokens_of_section = {
         'gen': num_response_tokens,
@@ -437,11 +1189,16 @@ class RayPPOTrainer(object):
         config = self.config
         # number of GPUs total
         n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
+        task_name = str(
+            config.actor_rollout_ref.agentgym.get('task_name', '')
+        ).strip().lower()
+        self.ppo_batch_contract = None
 
         # 1. Check total batch size for data correctness
         real_train_batch_size = config.data.train_batch_size * config.actor_rollout_ref.rollout.n
-        assert real_train_batch_size % n_gpus == 0, \
-            f"real_train_batch_size ({real_train_batch_size}) must be divisible by total n_gpus ({n_gpus})."
+        if task_name != 'agentmemory':
+            assert real_train_batch_size % n_gpus == 0, \
+                f"real_train_batch_size ({real_train_batch_size}) must be divisible by total n_gpus ({n_gpus})."
 
         # A helper function to check "micro_batch_size" vs "micro_batch_size_per_gpu"
         # We throw an error if the user sets both. The new convention is "..._micro_batch_size_per_gpu".
@@ -504,6 +1261,52 @@ class RayPPOTrainer(object):
             if config.critic.get('ulysses_sequence_parallel_size', 1) > 1:
                 assert config.critic.model.use_remove_padding, \
                     "When using sequence parallelism for critic, you must enable `use_remove_padding`."
+
+        if task_name == 'agentmemory' and self.use_critic:
+            if config.actor_rollout_ref.actor.use_dynamic_bsz or config.critic.use_dynamic_bsz:
+                raise ValueError(
+                    "The v32 AgentMemory PPO numerical contract requires static "
+                    "per-GPU micro-batches for exact readback."
+                )
+            expected_micro_raw = os.environ.get(
+                'VERL_PPO_EXPECTED_PER_GPU_MICRO_BATCH_SIZE', '2'
+            )
+            try:
+                expected_micro = int(expected_micro_raw)
+            except ValueError as exc:
+                raise ValueError(
+                    "VERL_PPO_EXPECTED_PER_GPU_MICRO_BATCH_SIZE must be a "
+                    f"positive integer, got {expected_micro_raw!r}."
+                ) from exc
+            self.ppo_batch_contract = build_legacy_asymmetric_batch_contract(
+                actor_mini_batch_size=config.actor_rollout_ref.actor.ppo_mini_batch_size,
+                critic_mini_batch_size=config.critic.ppo_mini_batch_size,
+                rollout_n=config.actor_rollout_ref.rollout.n,
+                world_size=n_gpus,
+                actor_sequence_parallel_size=config.actor_rollout_ref.actor.get(
+                    'ulysses_sequence_parallel_size', 1
+                ),
+                critic_sequence_parallel_size=config.critic.get(
+                    'ulysses_sequence_parallel_size', 1
+                ),
+                per_gpu_micro_batches={
+                    'actor': config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu,
+                    'critic': config.critic.ppo_micro_batch_size_per_gpu,
+                    'critic_forward': config.critic.forward_micro_batch_size_per_gpu,
+                    'reference_logprob': config.actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu,
+                    'rollout_logprob': config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu,
+                },
+                legacy_micro_batches={
+                    'actor': config.actor_rollout_ref.actor.ppo_micro_batch_size,
+                    'critic': config.critic.ppo_micro_batch_size,
+                    'critic_forward': config.critic.forward_micro_batch_size,
+                    'reference_logprob': config.actor_rollout_ref.ref.log_prob_micro_batch_size,
+                    'rollout_logprob': config.actor_rollout_ref.rollout.log_prob_micro_batch_size,
+                },
+                actor_ppo_epochs=config.actor_rollout_ref.actor.ppo_epochs,
+                critic_ppo_epochs=config.critic.ppo_epochs,
+                expected_per_gpu_micro_batch_size=expected_micro,
+            )
 
         print("[validate_config] All configuration checks passed successfully!")
 
@@ -712,7 +1515,8 @@ class RayPPOTrainer(object):
         # load dataloader,
         # TODO: from remote not implemented yet
         dataloader_local_path = os.path.join(global_step_folder, 'data.pt')
-        self.train_dataloader = torch.load(dataloader_local_path)
+        # Native VERL checkpoints are trusted and serialize the DataLoader.
+        self.train_dataloader = torch.load(dataloader_local_path, weights_only=False)
         if isinstance(self.train_dataloader.dataset, RLHFDataset):
             self.train_dataloader.dataset.resume_dataset_state()
 
@@ -742,6 +1546,8 @@ class RayPPOTrainer(object):
         from verl.utils.tracking import Tracking
         from omegaconf import OmegaConf
 
+        _validate_formal_actor_advantage_config(self.config)
+
         logger = Tracking(project_name=self.config.trainer.project_name,
                           experiment_name=self.config.trainer.experiment_name,
                           default_backend=self.config.trainer.logger,
@@ -757,16 +1563,43 @@ class RayPPOTrainer(object):
 
         # we start from step 1
         self.global_steps += 1
+        formal_readback_target_steps = (
+            _agentmemory_formal_update_readback_target_steps()
+        )
+        formal_readback_observed_steps: set[int] = set()
+        if formal_readback_target_steps is not None:
+            last_reachable_step = max(1, int(self.total_training_steps) - 1)
+            unreachable_steps = sorted(
+                target_step
+                for target_step in formal_readback_target_steps
+                if target_step < self.global_steps or target_step > last_reachable_step
+            )
+            if unreachable_steps:
+                raise RuntimeError(
+                    "Formal PPO update readback targets are not reachable: "
+                    f"targets={unreachable_steps} "
+                    f"first={self.global_steps} last={last_reachable_step}."
+                )
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
+                formal_readback_active = (
+                    formal_readback_target_steps is not None
+                    and self.global_steps in formal_readback_target_steps
+                )
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
                 # pop those keys for generation
                 gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'], non_tensor_batch_keys=['item_id', 'raw_prompt'])
+                # Preserve driver-global source identities across DP dispatch.
+                # Rollout workers must return these values as parent indices;
+                # worker-local indices are ambiguous after per-rank splitting.
+                gen_batch.non_tensor_batch['rollout_source_parent_indices'] = np.arange(
+                    len(gen_batch), dtype=object
+                )
                 gen_batch.meta_info['global_steps'] = self.global_steps
                 gen_batch.meta_info['max_rounds'] = self.rounds_scheduler.get_rounds()
                 metrics.update({
@@ -796,6 +1629,27 @@ class RayPPOTrainer(object):
 
                     batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
                                                              dtype=object)
+                    validate_state_aware_rollout_uids(gen_batch_output)
+                    formal_required = requires_formal_trajectory_metadata(
+                        gen_batch_output
+                    )
+                    runtime_evidence_required = _agentmemory_env_flag(
+                        "AGENTMEMORY_REQUIRE_FORMAL_RUNTIME_EVIDENCE"
+                    )
+                    expected_suffix_credit = (
+                        False
+                        if formal_required or runtime_evidence_required
+                        else None
+                    )
+                    validate_formal_trajectory_metadata(
+                        gen_batch_output,
+                        expected_replicas=int(
+                            self.config.actor_rollout_ref.rollout.n
+                        ),
+                        require=formal_required or runtime_evidence_required,
+                        require_runtime_evidence=runtime_evidence_required,
+                        expected_suffix_credit=expected_suffix_credit,
+                    )
                     # Align source samples with rollout outputs. Standard tasks repeat each
                     # source n times; AgentMemoryGym can return one independent training
                     # sample per agent action and provides rollout_parent_indices.
@@ -805,14 +1659,61 @@ class RayPPOTrainer(object):
                         repeat_times=self.config.actor_rollout_ref.rollout.n,
                     )
                     batch = batch.union(gen_batch_output)
+                    rollout_uid = batch.non_tensor_batch.get('rollout_uid')
+                    if rollout_uid is not None:
+                        batch.non_tensor_batch['uid'] = rollout_uid
+                    batch.batch[core_algos.PPO_VALID_SAMPLE_MASK] = torch.ones(
+                        len(batch), dtype=torch.bool, device=batch.batch.device
+                    )
+                    world_size = self.actor_rollout_wg.world_size
+                    before_pad = len(batch)
+                    batch, pad_size = pad_dataproto_to_divisor(batch, world_size)
+                    if pad_size:
+                        batch.batch[core_algos.PPO_VALID_SAMPLE_MASK][-pad_size:] = False
+                    metrics['agentmemory/pad_to_world_size'] = pad_size
+                    metrics['agentmemory/batch_size_before_pad'] = before_pad
+                    metrics['agentmemory/batch_size_after_pad'] = len(batch)
 
                     # balance the number of valid tokens on each dp rank.
                     # Note that this breaks the order of data inside the batch.
                     # Please take care when you implement group based adv computation such as GRPO and rloo
                     self._balance_batch(batch, metrics=metrics)
+                    validate_formal_trajectory_metadata(
+                        batch,
+                        expected_replicas=int(
+                            self.config.actor_rollout_ref.rollout.n
+                        ),
+                        require=formal_required or runtime_evidence_required,
+                        require_runtime_evidence=runtime_evidence_required,
+                        expected_suffix_credit=expected_suffix_credit,
+                    )
 
                     # compute global_valid tokens
                     batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
+                    batch.meta_info['agentmemory_formal_update_readback_active'] = (
+                        formal_readback_active
+                    )
+                    if self.ppo_batch_contract is not None:
+                        batch.meta_info[PPO_BATCH_CONTRACT_META_KEY] = self.ppo_batch_contract
+                        expected_steps = optimizer_step_readback(
+                            self.ppo_batch_contract, len(batch)
+                        )
+                        metrics.update({
+                            'ppo_batch/mode_legacy_asymmetric': 1.0,
+                            'ppo_batch/actor_raw_mini_batch_rows': self.ppo_batch_contract['actor_raw_mini_batch_rows'],
+                            'ppo_batch/critic_raw_mini_batch_rows': self.ppo_batch_contract['critic_raw_mini_batch_rows'],
+                            'ppo_batch/actor_local_mini_batch_rows': self.ppo_batch_contract['actor_local_mini_batch_rows'],
+                            'ppo_batch/critic_local_mini_batch_rows': self.ppo_batch_contract['critic_local_mini_batch_rows'],
+                            'ppo_batch/actor_per_gpu_micro_batch_rows': self.ppo_batch_contract['per_gpu_micro_batches']['actor'],
+                            'ppo_batch/critic_per_gpu_micro_batch_rows': self.ppo_batch_contract['per_gpu_micro_batches']['critic'],
+                            'ppo_batch/critic_forward_per_gpu_micro_batch_rows': self.ppo_batch_contract['per_gpu_micro_batches']['critic_forward'],
+                            'ppo_batch/reference_logprob_per_gpu_micro_batch_rows': self.ppo_batch_contract['per_gpu_micro_batches']['reference_logprob'],
+                            'ppo_batch/rollout_logprob_per_gpu_micro_batch_rows': self.ppo_batch_contract['per_gpu_micro_batches']['rollout_logprob'],
+                            'ppo_batch/local_rows': expected_steps['local_rows'],
+                            'ppo_batch/expected_minibatches_per_epoch': expected_steps['minibatches_per_epoch'],
+                            'ppo_batch/expected_actor_optimizer_steps': expected_steps['actor_optimizer_steps'],
+                            'ppo_batch/expected_critic_optimizer_steps': expected_steps['critic_optimizer_steps'],
+                        })
 
                     # recompute old_log_probs
                     with _timer('old_log_prob', timing_raw):
@@ -830,8 +1731,30 @@ class RayPPOTrainer(object):
                         with _timer('values', timing_raw):
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
+                        if (
+                            runtime_evidence_required
+                            and self.global_steps == 1
+                            and _agentmemory_env_flag(
+                                "AGENTMEMORY_EXPECT_INITIAL_CRITIC_ZERO"
+                            )
+                        ):
+                            valid_value_mask = batch.batch['response_mask'] * (
+                                _get_ppo_valid_sample_mask(batch)
+                                .unsqueeze(-1)
+                                .to(batch.batch['response_mask'].dtype)
+                            )
+                            metrics['agentmemory/initial_critic_value_max_abs'] = (
+                                core_algos.validate_near_zero_critic_values(
+                                    values=batch.batch['values'],
+                                    eos_mask=valid_value_mask,
+                                )
+                            )
 
                     with _timer('adv', timing_raw):
+                        # Keep padding through distributed forward passes so DP
+                        # ranks receive equal chunks, then exclude it from every
+                        # reward, advantage, loss, and logical metric surface.
+                        _mask_ppo_padding_samples(batch)
                         # we combine with rule-based rm
                         reward_tensor = batch.batch['scores']
                         batch.batch['token_level_scores'] = reward_tensor
@@ -851,13 +1774,49 @@ class RayPPOTrainer(object):
                                                   gamma=self.config.algorithm.gamma,
                                                   lam=self.config.algorithm.lam,
                                                   num_repeat=self.config.actor_rollout_ref.rollout.n)
+                        validate_formal_trajectory_metadata(
+                            batch,
+                            expected_replicas=int(
+                                self.config.actor_rollout_ref.rollout.n
+                            ),
+                            require=formal_required or runtime_evidence_required,
+                            require_runtime_evidence=runtime_evidence_required,
+                            expected_suffix_credit=expected_suffix_credit,
+                        )
+                        _agentmemory_dump_ppo_batch_debug(
+                            batch=batch,
+                            config=self.config,
+                            global_steps=self.global_steps,
+                            stage="post_adv",
+                        )
 
                     # update critic
+                    post_update_critic_values = None
                     if self.use_critic:
                         with _timer('update_critic', timing_raw):
                             critic_output = self.critic_wg.update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
+                        if self.ppo_batch_contract is not None:
+                            expected_critic_steps = metrics[
+                                'ppo_batch/expected_critic_optimizer_steps'
+                            ]
+                            actual_critic_steps = critic_output_metrics.get(
+                                'critic/optimizer_steps_per_update'
+                            )
+                            if actual_critic_steps != expected_critic_steps:
+                                raise RuntimeError(
+                                    "critic optimizer-step readback mismatch: "
+                                    f"expected={expected_critic_steps} "
+                                    f"actual={actual_critic_steps}."
+                                )
                         metrics.update(critic_output_metrics)
+                        if formal_readback_active:
+                            with _timer('critic_after_update_values', timing_raw):
+                                post_update_critic_values = self.critic_wg.compute_values(batch)
+                    elif formal_readback_active:
+                        raise RuntimeError(
+                            "Formal PPO update readback requires an active critic."
+                        )
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
@@ -865,7 +1824,67 @@ class RayPPOTrainer(object):
                         with _timer('update_actor', timing_raw):
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
+                        if self.ppo_batch_contract is not None:
+                            expected_actor_steps = metrics[
+                                'ppo_batch/expected_actor_optimizer_steps'
+                            ]
+                            actual_actor_steps = actor_output_metrics.get(
+                                'actor/optimizer_steps_per_update'
+                            )
+                            if actual_actor_steps != expected_actor_steps:
+                                raise RuntimeError(
+                                    "actor optimizer-step readback mismatch: "
+                                    f"expected={expected_actor_steps} "
+                                    f"actual={actual_actor_steps}."
+                                )
+                            if actor_output_metrics.get(
+                                'actor/minibatches_per_epoch'
+                            ) != critic_output_metrics.get(
+                                'critic/minibatches_per_epoch'
+                            ):
+                                raise RuntimeError(
+                                    "actor and critic mini-batches per epoch differ "
+                                    "after worker normalization."
+                                )
                         metrics.update(actor_output_metrics)
+                        need_formal_readback = _agentmemory_env_flag(
+                            "AGENTMEMORY_FORMAL_UPDATE_READBACK"
+                        ) and formal_readback_active
+                        post_update_log_probs = None
+                        if need_formal_readback:
+                            with _timer('actor_after_update_log_prob', timing_raw):
+                                post_update_log_probs = self.actor_rollout_wg.compute_log_prob(batch)
+                        if need_formal_readback:
+                            readback = _agentmemory_dump_formal_update_readback(
+                                batch=batch,
+                                post_actor_log_probs=post_update_log_probs,
+                                post_critic_values=post_update_critic_values,
+                                actor_update_metrics=actor_output_metrics,
+                                critic_update_metrics=critic_output_metrics,
+                                config=self.config,
+                                global_steps=self.global_steps,
+                            )
+                            formal_readback_observed_steps.add(self.global_steps)
+                            metrics.update(
+                                {
+                                    "agentmemory/actor_readback_max_abs_delta": readback[
+                                        "actor"
+                                    ]["summary"]["max_abs_delta"],
+                                    "agentmemory/critic_readback_max_abs_delta": readback[
+                                        "critic"
+                                    ]["summary"]["max_abs_delta"],
+                                    "agentmemory/actor_parameter_delta_l2": readback[
+                                        "actor"
+                                    ]["parameter_delta_l2"],
+                                    "agentmemory/critic_parameter_delta_l2": readback[
+                                        "critic"
+                                    ]["parameter_delta_l2"],
+                                }
+                            )
+                    elif formal_readback_active:
+                        raise RuntimeError(
+                            "Formal PPO update readback cannot run before actor warmup ends."
+                        )
 
                     if self.config.trainer.save_freq > 0 and \
                             self.global_steps % self.config.trainer.save_freq == 0:
@@ -888,4 +1907,25 @@ class RayPPOTrainer(object):
                             (self.global_steps - 1) % self.config.trainer.save_freq != 0:
                         with _timer('save_checkpoint', timing_raw):
                             self._save_checkpoint()
+                    missing_readback_steps = (
+                        _agentmemory_missing_formal_update_readback_steps(
+                            formal_readback_target_steps,
+                            formal_readback_observed_steps,
+                        )
+                    )
+                    if missing_readback_steps:
+                        raise RuntimeError(
+                            "Formal PPO update readback target steps completed without "
+                            f"readback artifacts: {missing_readback_steps}."
+                        )
                     return
+
+        missing_readback_steps = _agentmemory_missing_formal_update_readback_steps(
+            formal_readback_target_steps,
+            formal_readback_observed_steps,
+        )
+        if missing_readback_steps:
+            raise RuntimeError(
+                "Formal PPO training ended before configured update readback steps: "
+                f"{missing_readback_steps}."
+            )

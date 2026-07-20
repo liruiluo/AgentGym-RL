@@ -86,12 +86,21 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False):
         policies.append(size_policy)
     elif fsdp_transformer_layer_cls_to_wrap is not None:
         transformer_cls_to_wrap = set()
+        missing_transformer_cls_names = []
         for layer_class in fsdp_transformer_layer_cls_to_wrap:
             transformer_cls = get_module_class_from_name(module, layer_class)
             if transformer_cls is None:
-                raise Exception("Could not find the transformer layer class to wrap in the model.")
-            else:
-                transformer_cls_to_wrap.add(transformer_cls)
+                missing_transformer_cls_names.append(layer_class)
+                continue
+            transformer_cls_to_wrap.add(transformer_cls)
+        if not transformer_cls_to_wrap:
+            raise Exception(
+                "Could not find any transformer layer class to wrap in the model. "
+                f"requested={fsdp_transformer_layer_cls_to_wrap}, missing={missing_transformer_cls_names}")
+        if missing_transformer_cls_names:
+            print(
+                "FSDP wrap policy skipped missing no-split module classes: "
+                f"{missing_transformer_cls_names}")
 
         transformer_policy = functools.partial(
             transformer_auto_wrap_policy,

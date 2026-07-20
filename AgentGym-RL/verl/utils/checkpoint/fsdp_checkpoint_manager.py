@@ -65,7 +65,8 @@ class FSDPCheckpointManager(BaseCheckpointManager):
 
         model_state_dict = torch.load(local_model_path)
         optimizer_state_dict = torch.load(local_optim_path)
-        extra_state_dict = torch.load(local_extra_state_path)
+        # VERL creates this trusted file and stores NumPy RNG state in it.
+        extra_state_dict = torch.load(local_extra_state_path, weights_only=False)
 
         if del_local_after_load:
             try:
@@ -141,7 +142,11 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         if self.rank == 0:
             hf_local_path = os.path.join(local_path, 'huggingface')
             os.makedirs(hf_local_path, exist_ok=True)
-            self.model._fsdp_wrapped_module.config.save_pretrained(hf_local_path)
+            wrapped_model = self.model._fsdp_wrapped_module
+            wrapped_model.config.save_pretrained(hf_local_path)
+            generation_config = getattr(wrapped_model, 'generation_config', None)
+            if generation_config is not None:
+                generation_config.save_pretrained(hf_local_path)
             self.tokenizer.save_pretrained(hf_local_path)
 
         torch.distributed.barrier()
