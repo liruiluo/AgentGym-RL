@@ -371,7 +371,7 @@ def normalize_generation_record(
 def validate_official_vllm_generation_record(
     record: dict[str, Any],
 ) -> dict[str, Any]:
-    """Fail closed on the exact Qwen3/vLLM 0.11 stop-token contract."""
+    """Validate exact Qwen3/vLLM completion metadata without dropping samples."""
 
     if record.get("backend_source") != "official_vllm":
         raise RuntimeError("Formal generation is not bound to official vLLM.")
@@ -383,9 +383,15 @@ def validate_official_vllm_generation_record(
         "token_ids_are_exact"
     ):
         raise RuntimeError("Formal official-vLLM token IDs are not exact.")
-    if record.get("finish_reason") != "stop" or record.get("truncated"):
+    finish_reason = record.get("finish_reason")
+    truncated = record.get("truncated")
+    if finish_reason not in {"stop", "length"}:
         raise RuntimeError(
-            "Formal official-vLLM generation did not finish with an EOS stop."
+            "Formal official-vLLM generation has an unsupported finish_reason."
+        )
+    if type(truncated) is not bool or truncated != (finish_reason == "length"):
+        raise RuntimeError(
+            "Formal official-vLLM finish_reason/truncated metadata is inconsistent."
         )
 
     raw_token_ids = record.get("token_ids", [])
@@ -412,9 +418,43 @@ def validate_official_vllm_generation_record(
     if not token_ids:
         raise RuntimeError("Formal official-vLLM generation returned no tokens.")
 
+    response_token_count = record.get("response_token_count")
+    max_response_tokens = record.get("max_response_tokens")
+    if (
+        type(response_token_count) is not int
+        or response_token_count != len(token_ids)
+    ):
+        raise RuntimeError(
+            "Formal official-vLLM response token count does not match exact token IDs."
+        )
+    if type(max_response_tokens) is not int or max_response_tokens <= 0:
+        raise RuntimeError(
+            "Formal official-vLLM max response token count is invalid."
+        )
+    if response_token_count > max_response_tokens:
+        raise RuntimeError(
+            "Formal official-vLLM response exceeds the configured token limit."
+        )
+
     eos_positions = [
         index for index, token_id in enumerate(token_ids) if token_id in eos_token_ids
     ]
+    stop_reason = record.get("stop_reason")
+    if finish_reason == "length":
+        if response_token_count != max_response_tokens:
+            raise RuntimeError(
+                "Formal official-vLLM length completion did not reach max_response_tokens."
+            )
+        if eos_positions:
+            raise RuntimeError(
+                "Formal official-vLLM length completion unexpectedly contains EOS."
+            )
+        if stop_reason is not None:
+            raise RuntimeError(
+                "Formal official-vLLM length completion requires stop_reason=None."
+            )
+        return record
+
     if not eos_positions:
         raise RuntimeError(
             "Formal official-vLLM generation is missing a terminal EOS."
@@ -425,7 +465,6 @@ def validate_official_vllm_generation_record(
         )
 
     final_token_id = token_ids[-1]
-    stop_reason = record.get("stop_reason")
     primary_eos_token_id = eos_token_ids[0]
     if final_token_id == primary_eos_token_id:
         if stop_reason is not None:
@@ -803,9 +842,9 @@ def _validate_formal_step_record(
         raise ValueError(
             f"Formal step response has no sampled tokens at row {row_index}."
         )
-    if max_response_tokens <= 0 or response_token_count >= max_response_tokens:
+    if max_response_tokens <= 0 or response_token_count > max_response_tokens:
         raise ValueError(
-            "Formal response reached the configured generation token limit: "
+            "Formal response exceeded the configured generation token limit: "
             f"row={row_index} count={response_token_count} "
             f"max_tokens={max_response_tokens}."
         )
@@ -827,9 +866,11 @@ def _validate_formal_step_record(
         raise ValueError(
             f"Formal finish_reason/truncated mismatch at row {row_index}."
         )
-    if finish_reason == "length" or record["truncated"]:
+    if finish_reason == "length" and response_token_count != max_response_tokens:
         raise ValueError(
-            f"Formal response was length-truncated at row {row_index}."
+            "Formal length completion did not reach the configured token limit: "
+            f"row={row_index} count={response_token_count} "
+            f"max_tokens={max_response_tokens}."
         )
     if not str(record["finish_reason_source"]):
         raise ValueError(
@@ -880,11 +921,6 @@ def _validate_formal_step_record(
         raise ValueError(
             f"Formal generation stop-reason aliases differ at row {row_index}."
         )
-    if record["finish_reason"] != "stop":
-        raise ValueError(
-            "Formal official-vLLM response did not finish by stop: "
-            f"row={row_index} finish_reason={record['finish_reason']!r}."
-        )
     if not normalized_response_ids:
         raise ValueError(
             f"Formal response is empty at row {row_index}."
@@ -894,43 +930,58 @@ def _validate_formal_step_record(
         for index, token_id in enumerate(normalized_response_ids)
         if token_id in generation_eos_token_ids
     ]
-    final_token_id = normalized_response_ids[-1]
-    if not eos_positions or eos_positions[0] != len(normalized_response_ids) - 1:
-        raise ValueError(
-            "Formal response must preserve exactly one terminal EOS position: "
-            f"row={row_index} eos_positions={eos_positions} length={len(normalized_response_ids)}."
-        )
-    if final_token_id not in generation_eos_token_ids:
-        raise ValueError(
-            "Formal response final token is not a configured EOS: "
-            f"row={row_index} final_token_id={final_token_id}."
-        )
     stop_reason = record["generation_stop_reason"]
-    primary_eos_token_id = generation_eos_token_ids[0]
-    if final_token_id == primary_eos_token_id:
+    if finish_reason == "length":
+        if eos_positions:
+            raise ValueError(
+                "Formal length completion unexpectedly contains EOS: "
+                f"row={row_index} eos_positions={eos_positions}."
+            )
         if stop_reason is not None:
             raise ValueError(
-                "Formal primary EOS requires the official-vLLM raw "
-                "stop_reason=None contract: "
+                "Formal length completion requires stop_reason=None: "
                 f"row={row_index} stop_reason={stop_reason!r}."
             )
+        final_token_id = None
     else:
-        if stop_reason is None:
+        final_token_id = normalized_response_ids[-1]
+        if not eos_positions or eos_positions[0] != len(normalized_response_ids) - 1:
             raise ValueError(
-                "Formal alternate EOS requires an explicit backend stop_reason: "
+                "Formal response must preserve exactly one terminal EOS position: "
+                f"row={row_index} eos_positions={eos_positions} length={len(normalized_response_ids)}."
+            )
+        if final_token_id not in generation_eos_token_ids:
+            raise ValueError(
+                "Formal response final token is not a configured EOS: "
                 f"row={row_index} final_token_id={final_token_id}."
             )
-        if type(stop_reason) is not int:
-            raise ValueError(
-                "Formal official-vLLM stop_reason is not a raw integer token id: "
-                f"row={row_index} stop_reason={stop_reason!r}."
-            )
-        if stop_reason != final_token_id:
-            raise ValueError(
-                "Formal response does not preserve the backend stop token: "
-                f"row={row_index} stop_reason={stop_reason} "
-                f"final_token_id={final_token_id}."
-            )
+
+    if finish_reason == "stop":
+        primary_eos_token_id = generation_eos_token_ids[0]
+        if final_token_id == primary_eos_token_id:
+            if stop_reason is not None:
+                raise ValueError(
+                    "Formal primary EOS requires the official-vLLM raw "
+                    "stop_reason=None contract: "
+                    f"row={row_index} stop_reason={stop_reason!r}."
+                )
+        else:
+            if stop_reason is None:
+                raise ValueError(
+                    "Formal alternate EOS requires an explicit backend stop_reason: "
+                    f"row={row_index} final_token_id={final_token_id}."
+                )
+            if type(stop_reason) is not int:
+                raise ValueError(
+                    "Formal official-vLLM stop_reason is not a raw integer token id: "
+                    f"row={row_index} stop_reason={stop_reason!r}."
+                )
+            if stop_reason != final_token_id:
+                raise ValueError(
+                    "Formal response does not preserve the backend stop token: "
+                    f"row={row_index} stop_reason={stop_reason} "
+                    f"final_token_id={final_token_id}."
+                )
     if _validate_prompt_digest(
         record["single_observation_prompt_digest"],
         name="single-observation prompt digest",
