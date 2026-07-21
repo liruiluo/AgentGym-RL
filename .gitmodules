@@ -1,4 +1,4 @@
 [submodule "AgentGym"]
 	path = AgentGym
 	url = https://github.com/liruiluo/AgentGym.git
-	branch = feat/agentmemory-env-v0
+	branch = chore/agentmemory-repo-cleanup

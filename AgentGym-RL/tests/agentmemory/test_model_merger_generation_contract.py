@@ -19,7 +19,6 @@ class ModelMergerGenerationContractTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         source = (
             Path(__file__).resolve().parents[2]
-            / "AgentGym-RL"
             / "scripts"
             / "model_merger.py"
         )
@@ -140,7 +139,6 @@ class ModelMergerGenerationContractTests(unittest.TestCase):
     def test_plain_and_sharded_causal_branches_use_guarded_save_helper(self) -> None:
         source = (
             Path(__file__).resolve().parents[2]
-            / "AgentGym-RL"
             / "scripts"
             / "model_merger.py"
         ).read_text(encoding="utf-8")
