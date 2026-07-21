@@ -301,35 +301,6 @@ class FormalAdvantageTests(unittest.TestCase):
         )
         torch.testing.assert_close(rms_returns, whitened_returns, rtol=0.0, atol=0.0)
 
-    def test_monte_carlo_actor_credit_ignores_noisy_critic_sign(self) -> None:
-        rewards = torch.tensor([[0.0, -0.05], [0.0, 1.0]])
-        values = torch.tensor([[-0.30, -0.20], [0.80, 0.70]])
-        mask = torch.ones_like(rewards)
-        gae_advantages, returns = core_algos.compute_gae_advantage_return(
-            rewards,
-            values,
-            mask,
-            1.0,
-            1.0,
-            advantage_normalization="rms",
-        )
-        self.assertGreater(gae_advantages[0].mean().item(), 0.0)
-        monte_carlo = core_algos.validate_and_scale_monte_carlo_actor_advantages(
-            returns,
-            mask,
-            torch.tensor([-0.05, 1.0]),
-        )
-        self.assertTrue(torch.all(monte_carlo[0] < 0.0))
-        self.assertTrue(torch.all(monte_carlo[1] > 0.0))
-
-    def test_monte_carlo_actor_credit_rejects_suffix_mismatch(self) -> None:
-        with self.assertRaisesRegex(RuntimeError, "declared suffix"):
-            core_algos.validate_and_scale_monte_carlo_actor_advantages(
-                torch.tensor([[0.10, 0.10]]),
-                torch.ones(1, 2),
-                torch.tensor([0.05]),
-            )
-
     def test_masked_padding_is_zero_and_nonfinite_valid_values_fail(self) -> None:
         advantages = torch.tensor([[0.05, -0.10, 99.0]])
         mask = torch.tensor([[1, 1, 0]])

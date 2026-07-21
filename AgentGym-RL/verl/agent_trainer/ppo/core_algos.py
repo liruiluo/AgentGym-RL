@@ -73,49 +73,6 @@ def masked_rms_scale_advantages(
     return scaled
 
 
-def validate_and_scale_monte_carlo_actor_advantages(
-    returns: torch.Tensor,
-    eos_mask: torch.Tensor,
-    declared_suffix_returns: torch.Tensor,
-    *,
-    atol: float = 1e-6,
-) -> torch.Tensor:
-    """Use exact action-row return-to-go for actor credit, with RMS scaling."""
-
-    if returns.shape != eos_mask.shape:
-        raise ValueError("returns and eos_mask must have identical shapes.")
-    if declared_suffix_returns.ndim != 1 or declared_suffix_returns.shape[0] != returns.shape[0]:
-        raise ValueError(
-            "declared_suffix_returns must have one scalar per action row."
-        )
-    if not torch.isfinite(declared_suffix_returns).all():
-        raise ValueError("declared_suffix_returns contains non-finite values.")
-    mask = eos_mask.bool()
-    expected = declared_suffix_returns.to(
-        device=returns.device,
-        dtype=returns.dtype,
-    ).unsqueeze(-1).expand_as(returns)
-    if not torch.allclose(
-        returns.masked_select(mask),
-        expected.masked_select(mask),
-        rtol=0.0,
-        atol=atol,
-    ):
-        max_error = (
-            returns.masked_select(mask) - expected.masked_select(mask)
-        ).abs().max().item()
-        raise RuntimeError(
-            "Formal Monte Carlo actor return does not match declared suffix return: "
-            f"max_abs_error={max_error}."
-        )
-    scaled = masked_rms_scale_advantages(expected, eos_mask)
-    valid_scaled = scaled.masked_select(mask)
-    valid_expected = expected.masked_select(mask)
-    if not torch.equal(torch.sign(valid_scaled), torch.sign(valid_expected)):
-        raise RuntimeError("Formal Monte Carlo actor scaling changed a return sign.")
-    return scaled
-
-
 def validate_near_zero_critic_values(
     values: torch.Tensor,
     eos_mask: torch.Tensor,

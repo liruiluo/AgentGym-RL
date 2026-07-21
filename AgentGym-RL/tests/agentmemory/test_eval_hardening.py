@@ -23,7 +23,6 @@ _SPEC.loader.exec_module(_MODULE)
 class EvalHardeningTest(unittest.TestCase):
     def test_formal_eval_scrubs_train_only_rollout_flags(self):
         env = {
-            "AGENTMEMORY_ACTION_SEQUENCE_ENUMERATION_ROLLOUT": "1",
             "AGENTMEMORY_LATEST_OBS_SUFFIX_CREDIT": "1",
         }
         with mock.patch.dict(os.environ, env, clear=True):
