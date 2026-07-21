@@ -105,6 +105,64 @@ def trajectory_gae(
 
 
 class StandardTrajectoryGaeTests(unittest.TestCase):
+    def test_low_precision_reward_validation_uses_accumulator_dtype(self) -> None:
+        rewards = torch.tensor([[0.01]], dtype=torch.bfloat16)
+        advantages, returns = core_algos.compute_trajectory_gae_advantage_return(
+            token_level_rewards=rewards,
+            values=torch.zeros_like(rewards),
+            eos_mask=torch.ones_like(rewards),
+            trajectory_uids=np.array(["a"], dtype=object),
+            trajectory_row_uids=np.array(["a-0"], dtype=object),
+            trajectory_row_orders=torch.tensor([0]),
+            trajectory_terminals=torch.tensor([True]),
+            done_flags=np.array([True], dtype=object),
+            sample_mask=torch.ones(1, dtype=torch.bool),
+            gamma=1.0,
+            lam=1.0,
+            immediate_rewards=rewards.flatten(),
+            advantage_normalization="none",
+        )
+
+        expected = rewards.float()
+        self.assertEqual(advantages.dtype, torch.float32)
+        self.assertEqual(returns.dtype, torch.float32)
+        torch.testing.assert_close(advantages, expected, atol=0.0, rtol=0.0)
+        torch.testing.assert_close(returns, expected, atol=0.0, rtol=0.0)
+
+    def test_bfloat16_critic_keeps_float32_micro_reward_accumulation(self) -> None:
+        row_count = 30
+        rewards = torch.full((row_count, 1), 0.01, dtype=torch.float32)
+        advantages, returns = core_algos.compute_trajectory_gae_advantage_return(
+            token_level_rewards=rewards,
+            values=torch.zeros((row_count, 1), dtype=torch.bfloat16),
+            eos_mask=torch.ones((row_count, 1), dtype=torch.float32),
+            trajectory_uids=np.array(["a"] * row_count, dtype=object),
+            trajectory_row_uids=np.array(
+                [f"a-{row_index}" for row_index in range(row_count)],
+                dtype=object,
+            ),
+            trajectory_row_orders=torch.arange(row_count),
+            trajectory_terminals=torch.tensor(
+                [False] * (row_count - 1) + [True], dtype=torch.bool
+            ),
+            done_flags=np.array(
+                [False] * (row_count - 1) + [True], dtype=object
+            ),
+            sample_mask=torch.ones(row_count, dtype=torch.bool),
+            gamma=1.0,
+            lam=1.0,
+            immediate_rewards=rewards.flatten(),
+            advantage_normalization="none",
+        )
+
+        expected = torch.arange(
+            row_count, 0, -1, dtype=torch.float32
+        ).reshape(-1, 1) * 0.01
+        self.assertEqual(advantages.dtype, torch.float32)
+        self.assertEqual(returns.dtype, torch.float32)
+        torch.testing.assert_close(advantages, expected, atol=1e-7, rtol=0.0)
+        torch.testing.assert_close(returns, expected, atol=1e-7, rtol=0.0)
+
     def test_later_correct_buy_gives_earlier_actions_positive_advantage(self) -> None:
         advantages, returns = trajectory_gae([0.0, 0.0, 1.0])
         torch.testing.assert_close(advantages.flatten(), torch.ones(3))

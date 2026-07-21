@@ -281,6 +281,12 @@ def compute_trajectory_gae_advantage_return(
     if token_level_rewards.device != values.device or eos_mask.device != values.device:
         raise ValueError("trajectory GAE rewards, values, and mask must share a device.")
 
+    accumulator_dtype = torch.promote_types(
+        token_level_rewards.dtype, values.dtype
+    )
+    if accumulator_dtype in (torch.float16, torch.bfloat16):
+        accumulator_dtype = torch.float32
+
     row_count = token_level_rewards.shape[0]
     named_metadata = {
         "trajectory_uids": trajectory_uids,
@@ -333,7 +339,7 @@ def compute_trajectory_gae_advantage_return(
         if not immediate_rewards.is_floating_point():
             raise TypeError("immediate_rewards must be a floating-point tensor.")
         immediate_rewards = immediate_rewards.to(
-            device=values.device, dtype=token_level_rewards.dtype
+            device=values.device, dtype=accumulator_dtype
         )
 
     mask_is_binary = torch.logical_or(eos_mask == 0, eos_mask == 1)
@@ -400,7 +406,10 @@ def compute_trajectory_gae_advantage_return(
                     f"environment reward must appear only on the final token at row {row_index}."
                 )
             if not torch.isclose(
-                row_rewards[-1], expected_reward, rtol=0.0, atol=tolerance
+                row_rewards[-1].to(accumulator_dtype),
+                expected_reward,
+                rtol=0.0,
+                atol=tolerance,
             ):
                 raise ValueError(
                     "packed environment reward differs from the immediate action reward: "
@@ -450,7 +459,10 @@ def compute_trajectory_gae_advantage_return(
     trajectory_count = len(ordered_trajectories)
     max_action_count = max(len(rows) for rows in ordered_trajectories)
     packed_values = torch.zeros(
-        trajectory_count, max_action_count, device=values.device, dtype=values.dtype
+        trajectory_count,
+        max_action_count,
+        device=values.device,
+        dtype=accumulator_dtype,
     )
     packed_rewards = torch.zeros_like(packed_values)
     packed_done = torch.zeros(
@@ -474,11 +486,13 @@ def compute_trajectory_gae_advantage_return(
         action_count = len(rows)
         packed_values[trajectory_index, :action_count] = values[
             row_indices, state_token_indices
-        ]
+        ].to(accumulator_dtype)
         if immediate_rewards is None:
             packed_rewards[trajectory_index, :action_count] = torch.stack(
                 [
-                    token_level_rewards[int(row["row_index"]), row["token_indices"]].sum()
+                    token_level_rewards[
+                        int(row["row_index"]), row["token_indices"]
+                    ].to(accumulator_dtype).sum()
                     for row in rows
                 ]
             )
@@ -494,7 +508,9 @@ def compute_trajectory_gae_advantage_return(
         packed_mask[trajectory_index, :action_count] = True
 
     packed_advantages = torch.zeros_like(packed_values)
-    last_gae = torch.zeros(trajectory_count, device=values.device, dtype=values.dtype)
+    last_gae = torch.zeros(
+        trajectory_count, device=values.device, dtype=accumulator_dtype
+    )
     with torch.no_grad():
         for action_index in reversed(range(max_action_count)):
             valid = packed_mask[:, action_index]
@@ -507,19 +523,22 @@ def compute_trajectory_gae_advantage_return(
             continuation = next_valid & ~packed_done[:, action_index]
             delta = (
                 packed_rewards[:, action_index]
-                + gamma * continuation.to(values.dtype) * next_values
+                + gamma * continuation.to(accumulator_dtype) * next_values
                 - packed_values[:, action_index]
             )
             last_gae = torch.where(
                 valid,
-                delta + gamma * lam * continuation.to(values.dtype) * last_gae,
+                delta
+                + gamma * lam * continuation.to(accumulator_dtype) * last_gae,
                 torch.zeros_like(last_gae),
             )
             packed_advantages[:, action_index] = last_gae
     packed_returns = packed_advantages + packed_values
 
-    advantages = torch.zeros_like(values)
-    returns = torch.zeros_like(values)
+    advantages = torch.zeros(
+        values.shape, device=values.device, dtype=accumulator_dtype
+    )
+    returns = torch.zeros_like(advantages)
     for trajectory_index, rows in enumerate(ordered_trajectories):
         for action_index, row in enumerate(rows):
             row_index = int(row["row_index"])
