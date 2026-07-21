@@ -62,6 +62,7 @@ class FakeDataProto:
     def __init__(self, batch, non_tensor_batch):
         self.batch = batch
         self.non_tensor_batch = non_tensor_batch
+        self.meta_info = {}
 
     def __len__(self):
         for value in self.batch.values():
@@ -93,6 +94,15 @@ def load_ray_trainer_functions():
         "AGENTMEMORY_PARENT_GROUP_UID": grouping.AGENTMEMORY_PARENT_GROUP_UID,
         "AGENTMEMORY_REPLICA_INDEX": grouping.AGENTMEMORY_REPLICA_INDEX,
         "AGENTMEMORY_TRAJECTORY_RETURN": grouping.AGENTMEMORY_TRAJECTORY_RETURN,
+        "AGENTMEMORY_TRAJECTORY_ROW_ORDER": (
+            grouping.AGENTMEMORY_TRAJECTORY_ROW_ORDER
+        ),
+        "AGENTMEMORY_TRAJECTORY_ROW_UID": (
+            grouping.AGENTMEMORY_TRAJECTORY_ROW_UID
+        ),
+        "AGENTMEMORY_TRAJECTORY_TERMINAL": (
+            grouping.AGENTMEMORY_TRAJECTORY_TERMINAL
+        ),
         "AGENTMEMORY_TRAJECTORY_UID": grouping.AGENTMEMORY_TRAJECTORY_UID,
         "DataProto": FakeDataProto,
         "core_algos": core_algos,
@@ -124,6 +134,9 @@ def build_rows(turn_counts=(3, 5, 4, 6), returns=(1.0, 3.0, 0.0, 2.0)):
     trajectory_uids = []
     trajectory_returns = []
     immediate_rewards = []
+    trajectory_row_uids = []
+    trajectory_row_orders = []
+    trajectory_terminals = []
     parent_indices = []
     rollout_uids = []
     for replica_index, (turn_count, trajectory_return) in enumerate(
@@ -134,6 +147,7 @@ def build_rows(turn_counts=(3, 5, 4, 6), returns=(1.0, 3.0, 0.0, 2.0)):
             parent_group_uid, replica_index
         )
         for turn in range(1, turn_count + 1):
+            row_order = turn - 1
             exact_uid = f"7:turn{turn}:statev1:r{replica_index}-s{turn}"
             parent_group_uids.append(parent_group_uid)
             exact_state_uids.append(exact_uid)
@@ -144,6 +158,11 @@ def build_rows(turn_counts=(3, 5, 4, 6), returns=(1.0, 3.0, 0.0, 2.0)):
             immediate_rewards.append(
                 trajectory_return if turn == turn_count else 0.0
             )
+            trajectory_row_uids.append(
+                grouping.build_row_uid(trajectory_uid, row_order)
+            )
+            trajectory_row_orders.append(row_order)
+            trajectory_terminals.append(turn == turn_count)
             parent_indices.append(7)
     return {
         "parent_group_uids": parent_group_uids,
@@ -152,6 +171,9 @@ def build_rows(turn_counts=(3, 5, 4, 6), returns=(1.0, 3.0, 0.0, 2.0)):
         "trajectory_uids": trajectory_uids,
         "trajectory_returns": trajectory_returns,
         "immediate_rewards": immediate_rewards,
+        "trajectory_row_uids": trajectory_row_uids,
+        "trajectory_row_orders": trajectory_row_orders,
+        "trajectory_terminals": trajectory_terminals,
         "parent_indices": parent_indices,
         "rollout_uids": rollout_uids,
         "valid_mask": [True] * len(parent_group_uids),
@@ -168,6 +190,12 @@ class FormalTrajectoryGroupingTest(unittest.TestCase):
                 grouping.AGENTMEMORY_IMMEDIATE_REWARD: torch.tensor(
                     rows["immediate_rewards"]
                 ),
+                grouping.AGENTMEMORY_TRAJECTORY_ROW_ORDER: torch.tensor(
+                    rows["trajectory_row_orders"], dtype=torch.long
+                ),
+                grouping.AGENTMEMORY_TRAJECTORY_TERMINAL: torch.tensor(
+                    rows["trajectory_terminals"], dtype=torch.bool
+                ),
             },
             non_tensor_batch={
                 grouping.AGENTMEMORY_PARENT_GROUP_UID: np.array(
@@ -181,6 +209,9 @@ class FormalTrajectoryGroupingTest(unittest.TestCase):
                 ),
                 grouping.AGENTMEMORY_TRAJECTORY_UID: np.array(
                     rows["trajectory_uids"], dtype=object
+                ),
+                grouping.AGENTMEMORY_TRAJECTORY_ROW_UID: np.array(
+                    rows["trajectory_row_uids"], dtype=object
                 ),
                 "rollout_parent_indices": np.array(
                     rows["parent_indices"], dtype=object
@@ -249,6 +280,9 @@ class FormalTrajectoryGroupingTest(unittest.TestCase):
             "trajectory_uids",
             "trajectory_returns",
             "immediate_rewards",
+            "trajectory_row_uids",
+            "trajectory_row_orders",
+            "trajectory_terminals",
             "parent_indices",
             "rollout_uids",
         ):
@@ -280,7 +314,7 @@ class FormalTrajectoryGroupingTest(unittest.TestCase):
 
     def test_missing_replica_fails_closed(self):
         rows = build_rows(turn_counts=(3, 5, 4), returns=(1.0, 3.0, 0.0))
-        with self.assertRaisesRegex(ValueError, "replicas"):
+        with self.assertRaisesRegex(ValueError, "incomplete"):
             grouping.validate_formal_trajectory_rows(
                 **rows, expected_replicas=4
             )
@@ -377,8 +411,8 @@ class FormalTrajectoryGroupingTest(unittest.TestCase):
         self.assertEqual(len(parent["trajectories"]), 4)
         for trajectory in parent["trajectories"]:
             self.assertEqual(
-                trajectory["broadcast_advantage_min"],
-                trajectory["broadcast_advantage_max"],
+                trajectory["action_row_token_mean_advantage_min"],
+                trajectory["action_row_token_mean_advantage_max"],
             )
         first_row = payload["rows"][0]
         for key in (
@@ -388,6 +422,9 @@ class FormalTrajectoryGroupingTest(unittest.TestCase):
             grouping.AGENTMEMORY_TRAJECTORY_UID,
             grouping.AGENTMEMORY_TRAJECTORY_RETURN,
             grouping.AGENTMEMORY_IMMEDIATE_REWARD,
+            grouping.AGENTMEMORY_TRAJECTORY_ROW_UID,
+            grouping.AGENTMEMORY_TRAJECTORY_ROW_ORDER,
+            grouping.AGENTMEMORY_TRAJECTORY_TERMINAL,
         ):
             self.assertIn(key, first_row)
 
