@@ -13,28 +13,5 @@ __pycache__/
 # 常见临时产物
 *.tmp
 
-# 实验证据/结果产物(机器生成,不进代码库)
-docs/agentmemorygym/evidence/
-# 覆盖嵌套层级(如 AgentGym-RL/docs/.../evidence)
-**/docs/agentmemorygym/evidence/
-# 训练/运行输出产物(所有层级)
-**/outputs/
-outputs/
-
-# 古早 superpowers 计划驱动文档(已弃用,所有层级)
-**/docs/superpowers/
-docs/superpowers/
-
-# AgentMemoryGym local/generated artifacts
-HF_MERGE_EXIT_CODE
-*.pre_eos_contract_*
-*.pre_*_20260720
-AgentGym-RL/AgentGym/
-
-# AgentMemoryGym local/generated artifacts
-
-# AgentMemoryGym local/generated artifacts
-
-# AgentMemoryGym local/generated artifacts
-
-# AgentMemoryGym local/generated artifacts
+# Run outputs, evidence, plans, recovery copies, and nested source copies must
+# live outside this source repository so accidental recurrence remains visible.
