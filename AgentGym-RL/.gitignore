@@ -1,18 +1,14 @@
-**/*.pt
-**/checkpoints
 **/wget-log
 **/_build/
-**/*.ckpt
-**/outputs
-**/*.tar.gz
-**/playground
-**/wandb
+
+# Project datasets, checkpoints, run outputs, archives, playground files, and
+# tracking logs must live outside this source tree so misplaced artifacts stay
+# visible to repository-boundary checks.
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
-dataset/*
 tensorflow/my_graph/*
 .idea/
 # C extensions
