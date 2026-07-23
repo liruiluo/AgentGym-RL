@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
-import importlib
 import ast
 import json
 import os
 import sys
 import tempfile
-import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,13 +29,6 @@ sys.modules.setdefault(
     "verl.workers.rollout.agent_vllm_rollout.agentmemory_grouping", grouping
 )
 
-# core_algos only needs this module for helpers outside the focused function.
-torch_functional_stub = types.ModuleType("verl.utils.torch_functional")
-torch_functional_stub.masked_whiten = lambda values, mask: values
-torch_functional_stub.masked_mean = lambda values, mask: values[mask.bool()].mean()
-verl_utils = importlib.import_module("verl.utils")
-sys.modules.setdefault("verl.utils.torch_functional", torch_functional_stub)
-setattr(verl_utils, "torch_functional", torch_functional_stub)
 _CORE_PATH = _ROOT / "verl/agent_trainer/ppo/core_algos.py"
 _CORE_SPEC = importlib.util.spec_from_file_location(
     "agentmemory_formal_core_algos_for_test", _CORE_PATH
