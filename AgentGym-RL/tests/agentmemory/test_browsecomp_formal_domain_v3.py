@@ -14,6 +14,9 @@ if str(AGENTMEMORY_PACKAGE) not in sys.path:
     sys.path.insert(0, str(AGENTMEMORY_PACKAGE))
 
 from agentenv_agentmemory.domains.browsecomp import BrowseCompPlusFactory
+from agentenv_agentmemory.domains.memoryarena_dataset import (
+    attest_injected_test_dataset,
+)
 from agentenv_agentmemory.runtime.wrapper import DomainEnvWrapper
 
 FORMAL_SOURCE = ROOT / "verl/utils/agentgym/formal_domain_v3.py"
@@ -46,46 +49,47 @@ class BrowseCompFormalDomainV3Test(unittest.TestCase):
     def test_native_search_transition_builds_a_formal_v3_row(self):
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
-            ground_truth = root / "ground_truth.jsonl"
-            decomposition = root / "decomposition.jsonl"
-            ground_truth.write_text(
-                json.dumps(
-                    {
-                        "query_id": "q1",
-                        "query": "final query",
-                        "answer": "private final answer",
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            decomposition.write_text(
+            tasks_path = root / "progressive_search.jsonl"
+            tasks_path.write_text(
                 json.dumps(
                     {
                         "id": "q1",
-                        "question": ["subquery", "final query"],
-                        "answer": ["private sub answer", "private final answer"],
+                        "questions": ["subquery", "final query"],
+                        "answers": ["private sub answer", "private final answer"],
                     }
                 )
                 + "\n",
                 encoding="utf-8",
             )
+            provenance = attest_injected_test_dataset(
+                tasks_path,
+                config="progressive_search",
+            )
             factory = BrowseCompPlusFactory(
-                ground_truth_path=ground_truth,
-                decomposition_path=decomposition,
-                search_tool=lambda query: json.dumps(
-                    [{"docid": "D1", "score": 1.0, "snippet": query}]
+                contract_mode="failfast",
+                tasks_path=tasks_path,
+                dataset_provenance=provenance,
+                search_tool=lambda op, arguments: json.dumps(
+                    [
+                        {
+                            "docid": "D1",
+                            "score": 1.0,
+                            "snippet": arguments["query"],
+                        }
+                    ]
                 ),
                 judge=lambda question, predicted, correct: {
                     "correct": predicted == correct,
                     "confidence": 100.0,
                     "parse_error": False,
                 },
+                test_mode=True,
             )
             wrapper = DomainEnvWrapper(factory)
             created = wrapper.create()
             raw = 'Action: search {"query": "evidence"}'
             stepped = wrapper.step(created["id"], raw)
+            system_prompt = factory.contract.system_prompt
             record = FORMAL_MODULE.build_formal_domain_step_v3(
                 content=raw,
                 score=stepped["reward"],
@@ -100,14 +104,17 @@ class BrowseCompFormalDomainV3Test(unittest.TestCase):
                 prompt_token_ids=[10, 11],
                 response_token_ids=[20, 21, 22, 23],
                 latest_observation=created["observation"],
-                visible_prompt=created["observation"],
+                visible_prompt=f"{system_prompt}\n{created['observation']}",
+                system_prompt=system_prompt,
+                single_observation_prompt_digest="b" * 64,
+                env_result=stepped["observation"],
                 generation_record=generation_record(),
                 env_info_before=created["info"],
                 env_info_after=stepped["info"],
             )
             wrapper.close(created["id"])
 
-        self.assertEqual(record["domain_id"], "browsecomp_plus")
+        self.assertEqual(record["domain_id"], "progressive_search")
         self.assertEqual(record["action_execution"]["op"], "search")
         self.assertEqual(record["tool_ops"][0]["retrieved_docids"], ["D1"])
         self.assertEqual(record["reward_components"][0]["value"], 0.0)

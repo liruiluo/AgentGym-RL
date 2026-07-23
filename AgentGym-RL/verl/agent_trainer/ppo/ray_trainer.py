@@ -1601,9 +1601,12 @@ class RayPPOTrainer(object):
                     len(gen_batch), dtype=object
                 )
                 gen_batch.meta_info['global_steps'] = self.global_steps
-                gen_batch.meta_info['max_rounds'] = self.rounds_scheduler.get_rounds()
+                max_policy_turns = self.rounds_scheduler.get_rounds()
+                gen_batch.meta_info['max_policy_turns'] = max_policy_turns
+                gen_batch.meta_info['max_rounds'] = max_policy_turns
                 metrics.update({
-                    'max_rounds': self.rounds_scheduler.get_rounds(),
+                    'max_policy_turns': max_policy_turns,
+                    'max_rounds': max_policy_turns,
                 })
 
                 with _timer('step', timing_raw):

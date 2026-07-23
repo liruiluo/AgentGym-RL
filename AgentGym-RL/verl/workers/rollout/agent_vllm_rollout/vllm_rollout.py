@@ -26,7 +26,7 @@ When working with Megatron:
 """
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
-from typing import List
+from typing import List, Mapping
 from omegaconf import DictConfig
 import numpy as np
 import torch
@@ -52,6 +52,15 @@ from verl.utils.model import compute_position_id_with_mask
 from verl.utils.torch_functional import get_eos_mask, pad_sequence_to_length
 from verl.utils.agentgym.client import init_env_client
 from verl.utils.agentgym.context_policy import assert_rollout_context_supported, read_config, rollout_context_policy
+from verl.utils.agentgym.formal_domain_v3 import (
+    FORMAL_DOMAIN_SCHEMA_V3,
+    FORMAL_WEBSHOP_SCHEMA_V2,
+    FormalDomainV3Error,
+    bind_generic_timeout_v3,
+    build_formal_domain_step_v3,
+    resolve_formal_runtime_contract,
+    validate_formal_env_schema,
+)
 from verl.utils.agentgym.rollout_context import (
     AGENTMEMORY_ACTION_TEXT,
     AGENTMEMORY_GENERATION_PROMPT_DIGEST,
@@ -96,7 +105,12 @@ from verl.workers.rollout.agent_vllm_rollout.formal_buy_transition import (
     FormalBuyTransitionError,
     validate_formal_buy_transition,
 )
-from verl.workers.rollout.schemas import RolloutHandler, Message, _pre_process_inputs
+from verl.workers.rollout.schemas import (
+    Message,
+    RolloutHandler,
+    _pre_process_inputs,
+    agentmemory_action_system_prompt,
+)
 
 # TODO
 # 1. support pp in vllm
@@ -106,6 +120,208 @@ from verl.workers.rollout.schemas import RolloutHandler, Message, _pre_process_i
 
 class FormalRuntimeEvidenceError(RuntimeError):
     pass
+
+
+def _formal_runtime_contract_for_client(env_client) -> tuple[str, str, str]:
+    info = getattr(env_client, "info", None)
+    if not isinstance(info, Mapping):
+        raise FormalRuntimeEvidenceError(
+            "Formal AgentMemory client is missing its runtime info payload."
+        )
+    info_metadata = info.get("metadata")
+    client_metadata = getattr(env_client, "metadata", None)
+    if not isinstance(info_metadata, Mapping):
+        raise FormalRuntimeEvidenceError(
+            "Formal AgentMemory client info is missing server metadata."
+        )
+    if isinstance(client_metadata, Mapping):
+        contract_keys = (
+            "formal_schema_version",
+            "domain_id",
+            "surface",
+            "contract_id",
+            "contract_sha256",
+            "system_prompt",
+        )
+        mismatches = [
+            key
+            for key in contract_keys
+            if key in info_metadata
+            and key in client_metadata
+            and info_metadata[key] != client_metadata[key]
+        ]
+        if mismatches:
+            raise FormalRuntimeEvidenceError(
+                "Formal AgentMemory client/server metadata mismatch: "
+                f"fields={mismatches}."
+            )
+    try:
+        return resolve_formal_runtime_contract(
+            info_metadata,
+            webshop_v2_system_prompt=agentmemory_action_system_prompt(),
+        )
+    except FormalDomainV3Error as exc:
+        raise FormalRuntimeEvidenceError(
+            f"Invalid formal AgentMemory runtime contract: {exc}"
+        ) from exc
+
+
+def _validate_runtime_env_schema(
+    schema_version: str,
+    env_info: Mapping,
+    *,
+    boundary: str,
+) -> None:
+    try:
+        validate_formal_env_schema(
+            schema_version,
+            env_info,
+            boundary=boundary,
+        )
+    except FormalDomainV3Error as exc:
+        raise FormalRuntimeEvidenceError(str(exc)) from exc
+
+
+def _build_formal_webshop_step_v2(
+    *,
+    content: str,
+    score: float,
+    task_round: int,
+    done: bool,
+    item_id: str,
+    parent_index: int,
+    parent_group_uid: str,
+    replica_index: int,
+    trajectory_uid: str,
+    exact_state_uid: str,
+    prompt_token_ids: list[int],
+    response_token_ids: list[int],
+    latest_observation: str,
+    visible_prompt: str,
+    single_observation_prompt_digest: str,
+    env_result: str,
+    generation_record: Mapping,
+    env_info_before: Mapping,
+    env_info_after: Mapping,
+) -> dict:
+    if "current_subtask_index" not in env_info_before:
+        raise FormalRuntimeEvidenceError(
+            f"Formal WebShop v2 step is missing the pre-action session index for item {item_id}."
+        )
+    if "current_subtask_index" not in env_info_after:
+        raise FormalRuntimeEvidenceError(
+            f"Formal WebShop v2 step is missing the post-action session index for item {item_id}."
+        )
+    session_index = int(env_info_before["current_subtask_index"])
+    next_session_index = int(env_info_after["current_subtask_index"])
+    session_advanced = next_session_index > session_index
+    tool_ops = env_info_after.get("tool_ops", [])
+    try:
+        buy_evidence = validate_formal_buy_transition(
+            tool_ops=tool_ops,
+            env_step=task_round,
+            subtask_index_before=session_index,
+            subtask_index_after=next_session_index,
+            done=done,
+        )
+    except FormalBuyTransitionError as exc:
+        raise FormalRuntimeEvidenceError(
+            f"Formal BUY transition evidence is invalid for item={item_id}: {exc}"
+        ) from exc
+    committed_purchase = bool(buy_evidence["committed_purchase"])
+    purchase_correct = buy_evidence["purchase_correct"]
+    accepted_purchase = bool(buy_evidence["accepted_purchase"])
+    session_trace_after = env_info_after.get("session_trace")
+    if not isinstance(session_trace_after, list):
+        raise FormalRuntimeEvidenceError(
+            "Formal AgentMemory step is missing post-action session_trace."
+        )
+    raw_history_cleared = bool(session_advanced and not session_trace_after)
+    search_tool_ops = [
+        tool_op
+        for tool_op in tool_ops
+        if isinstance(tool_op, dict)
+        and str(tool_op.get("op", "")).upper() == "SEARCH"
+        and int(tool_op.get("step", -1)) == task_round
+    ]
+    search_result_count = None
+    if search_tool_ops:
+        if len(search_tool_ops) != 1 or "result_count" not in search_tool_ops[0]:
+            raise FormalRuntimeEvidenceError(
+                "Formal SEARCH tool record is missing result_count."
+            )
+        search_result_count = int(search_tool_ops[0]["result_count"])
+    if "episode_success" not in env_info_after:
+        raise FormalRuntimeEvidenceError(
+            "Formal WebShop v2 step is missing authoritative episode_success."
+        )
+    if type(env_info_after["episode_success"]) is not bool:
+        raise FormalRuntimeEvidenceError(
+            "Formal WebShop v2 episode_success must be a boolean."
+        )
+    episode_success = env_info_after["episode_success"]
+    outcome = (
+        "success"
+        if done and episode_success
+        else "terminal_failure" if done else "continue"
+    )
+    return {
+        "schema_version": FORMAL_WEBSHOP_SCHEMA_V2,
+        "prompt_token_ids": prompt_token_ids,
+        "content": content,
+        "score": float(score),
+        "parent_index": parent_index,
+        "parent_group_uid": parent_group_uid,
+        "replica_index": replica_index,
+        "trajectory_uid": trajectory_uid,
+        "exact_state_uid": exact_state_uid,
+        "task_round": task_round,
+        "done": done,
+        "item_id": item_id,
+        "session_index": session_index,
+        "subtask_index": session_index,
+        "next_session_index": next_session_index,
+        "subtask_index_before": session_index,
+        "subtask_index_after": next_session_index,
+        "visible_prompt": visible_prompt,
+        "latest_observation": latest_observation,
+        "prompt_history_policy": "latest_observation_only",
+        "raw_prior_messages_visible": False,
+        "single_observation_prompt_digest": single_observation_prompt_digest,
+        "response_token_ids": response_token_ids,
+        "response_token_count": int(generation_record["response_token_count"]),
+        "max_response_tokens": int(generation_record["max_response_tokens"]),
+        "finish_reason": str(generation_record["finish_reason"]),
+        "finish_reason_source": str(generation_record["finish_reason_source"]),
+        "stop_reason": generation_record.get("stop_reason"),
+        "generation_backend_source": str(generation_record["backend_source"]),
+        "generation_stop_reason": generation_record.get("stop_reason"),
+        "generation_eos_token_ids": list(
+            generation_record["configured_eos_token_ids"]
+        ),
+        "tokenizer_pad_token_id": generation_record["tokenizer_pad_token_id"],
+        "generation_token_ids_are_exact": bool(
+            generation_record["token_ids_are_exact"]
+        ),
+        "backend_token_ids_are_exact": bool(
+            generation_record["backend_token_ids_are_exact"]
+        ),
+        "truncated": bool(generation_record["truncated"]),
+        "env_result": env_result,
+        "env_info_before": deepcopy(dict(env_info_before)),
+        "env_info_after": deepcopy(dict(env_info_after)),
+        "action_execution": deepcopy(env_info_after.get("action_execution")),
+        "committed_purchase": committed_purchase,
+        "purchase_correct": purchase_correct,
+        "accepted_purchase": accepted_purchase,
+        "session_advanced": session_advanced,
+        "buy_committed": committed_purchase,
+        "buy_accepted": accepted_purchase,
+        "subtask_advanced": session_advanced,
+        "raw_history_cleared": raw_history_cleared,
+        "search_result_count": search_result_count,
+        "outcome": outcome,
+    }
 
 
 def _ordered_unique_token_ids(*values) -> list[int]:
@@ -701,15 +917,32 @@ class vLLMRollout(BaseRollout):
         assert "raw_prompt" in prompts.non_tensor_batch.keys(), "raw_prompt is not in non_tensor_batch, need to set data.return_raw_chat=True"
         handler_list = []
         eval_parent_indices = prompts.non_tensor_batch.get("rollout_eval_parent_indices")
+        eval_data_indices = prompts.non_tensor_batch.get("rollout_data_indices")
         source_parent_indices = prompts.non_tensor_batch.get(
             "rollout_source_parent_indices"
         )
+        if eval_data_indices is not None and len(eval_data_indices) != len(
+            prompts.non_tensor_batch["raw_prompt"]
+        ):
+            raise RuntimeError(
+                "rollout_data_indices must align with raw_prompt rows: "
+                f"indices={len(eval_data_indices)} "
+                f"prompts={len(prompts.non_tensor_batch['raw_prompt'])}"
+            )
         for i, raw_prompt in enumerate(prompts.non_tensor_batch["raw_prompt"]):
             parent_index_for_eval = resolve_rollout_parent_index(
                 i,
                 source_parent_indices=source_parent_indices,
                 eval_parent_indices=eval_parent_indices,
             )
+            raw_item_id = str(prompts.non_tensor_batch["item_id"][i])
+            try:
+                parsed_item_id = int(raw_item_id.rsplit("_", 1)[-1])
+            except (TypeError, ValueError):
+                # Eval rows may carry an opaque source task id.  The explicit
+                # rollout_data_indices value remains authoritative for reset;
+                # this integer is only a stable logging/evidence row id.
+                parsed_item_id = int(eval_data_indices[i]) if eval_data_indices is not None else i
             for replica_index in range(n):
                 # only keep not pad part
                 input_ids = _pre_process_inputs(self.pad_token_id, prompts.batch['input_ids'][i])
@@ -719,8 +952,8 @@ class vLLMRollout(BaseRollout):
                     messages=[
                         Message(role=prompt["role"], content=prompt["content"]) for prompt in raw_prompt
                     ],
-                    task_name=prompts.non_tensor_batch["item_id"][i].split("_")[0],
-                    item_id=int(prompts.non_tensor_batch["item_id"][i].split("_")[-1]),
+                    task_name=raw_item_id.split("_", 1)[0],
+                    item_id=parsed_item_id,
                     score=0,
                     done=False,
                     input_ids=list(input_ids),
@@ -740,6 +973,21 @@ class vLLMRollout(BaseRollout):
                 )
                 assert len(handler.input_ids) == len(handler.attention_mask) == len(handler.position_ids) == len(handler.loss_mask), f"RolloutHandler has mismatched length: input_ids={len(handler.input_ids)}, attention_mask={len(handler.attention_mask)}, position_ids={len(handler.position_ids)}, loss_mask={len(handler.loss_mask)}"
                 handler.parent_index = parent_index_for_eval
+                if eval_data_indices is not None:
+                    raw_data_index = eval_data_indices[i]
+                    if isinstance(raw_data_index, bool):
+                        raise RuntimeError(
+                            f"rollout_data_indices[{i}] must be an integer, got bool"
+                        )
+                    try:
+                        handler.data_idx = int(raw_data_index)
+                    except (TypeError, ValueError, OverflowError) as exc:
+                        raise RuntimeError(
+                            f"rollout_data_indices[{i}] is not an integer: "
+                            f"{raw_data_index!r}"
+                        ) from exc
+                else:
+                    handler.data_idx = int(handler.item_id)
                 handler.rollout_replica_index = replica_index
                 handler_list.append(handler)
         return handler_list
@@ -1114,11 +1362,27 @@ class vLLMRollout(BaseRollout):
                         f"Formal step record {index} must be a dictionary."
                     )
                 record = deepcopy(raw_record)
-                for internal_field in ("prompt_token_ids", "content", "score"):
+                schema_version = record.get(
+                    "schema_version", FORMAL_WEBSHOP_SCHEMA_V2
+                )
+                if schema_version not in (
+                    FORMAL_WEBSHOP_SCHEMA_V2,
+                    FORMAL_DOMAIN_SCHEMA_V3,
+                ):
+                    raise RuntimeError(
+                        "Unsupported formal step schema before packing: "
+                        f"row={index} schema={schema_version!r}."
+                    )
+                internal_fields = (
+                    ("prompt_token_ids",)
+                    if schema_version == FORMAL_DOMAIN_SCHEMA_V3
+                    else ("prompt_token_ids", "content", "score")
+                )
+                for internal_field in internal_fields:
                     record.pop(internal_field, None)
                 record.update(
                     {
-                        "schema_version": "agentmemory_formal_step_v2",
+                        "schema_version": schema_version,
                         "exact_state_uid": str(exact_state_uids[index]),
                         "trajectory_uid": str(trajectory_uids[index]),
                         "trajectory_row_uid": str(trajectory_row_uids[index]),
@@ -1192,7 +1456,12 @@ class vLLMRollout(BaseRollout):
             )
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 
-    def latest_observation_prompt_from_text(self, observation: str) -> List[int]:
+    def latest_observation_prompt_from_text(
+        self,
+        observation: str,
+        *,
+        system_prompt: str | None = None,
+    ) -> List[int]:
         temp_handler = RolloutHandler(
             messages=[Message(role="user", content=observation)],
             task_name="agentmemory",
@@ -1214,14 +1483,17 @@ class vLLMRollout(BaseRollout):
             max_response_len=self.config.response_length,
             max_model_len=min(self.config.max_model_len, self.config.prompt_length + self.config.response_length),
         )
-        return temp_handler.get_latest_observation_prompt(self.tokenizer)
+        return temp_handler.get_latest_observation_prompt(
+            self.tokenizer,
+            system_prompt=system_prompt,
+        )
 
     def generate_agentmemory_latest_observation(
         self,
         rollout_handler_ls: List[RolloutHandler],
         env_clients,
         cur_device,
-        max_rounds: int,
+        max_policy_turns: int,
         sampling_kwargs: dict,
         global_steps,
     ) -> DataProto:
@@ -1243,10 +1515,19 @@ class vLLMRollout(BaseRollout):
             try:
                 _agentmemory_debug(f"reset_start idx={idx} item_id={rollout_handler.item_id}")
                 reset_started = time.time()
-                env_clients[idx].reset(rollout_handler.item_id)
+                env_clients[idx].reset(
+                    getattr(rollout_handler, "data_idx", rollout_handler.item_id)
+                )
                 task = env_clients[idx].observe()
                 rollout_handler.add_user_message(self.tokenizer, task)
+                (
+                    rollout_handler.formal_schema_version,
+                    rollout_handler.formal_system_prompt,
+                    rollout_handler.formal_system_prompt_source,
+                ) = _formal_runtime_contract_for_client(env_clients[idx])
                 _agentmemory_debug(f"reset_done idx={idx} item_id={rollout_handler.item_id} seconds={time.time() - reset_started:.2f}")
+            except FormalRuntimeEvidenceError:
+                raise
             except Exception as e:
                 print(f"Reset Error: AgentMemory Env error={e} item id = {rollout_handler.item_id}", flush=True)
                 rollout_handler.done = True
@@ -1255,13 +1536,18 @@ class vLLMRollout(BaseRollout):
 
         rounds = 0
         all_done_flag = False
-        rollout_bar = tqdm(total=max_rounds, desc="Running AgentMemory rounds", disable=torch.distributed.get_rank() != 0)
-        while rounds < max_rounds and not all_done_flag:
+        rollout_bar = tqdm(total=max_policy_turns, desc="Running AgentMemory policy turns", disable=torch.distributed.get_rank() != 0)
+        while rounds < max_policy_turns and not all_done_flag:
             generation_prompt_idxs = []
             not_done_idxs = []
             for idx, rollout_handler in enumerate(rollout_handler_ls):
                 if not rollout_handler.done:
-                    generation_prompt_idxs.append(rollout_handler.get_latest_observation_prompt(self.tokenizer))
+                    generation_prompt_idxs.append(
+                        rollout_handler.get_latest_observation_prompt(
+                            self.tokenizer,
+                            system_prompt=rollout_handler.formal_system_prompt,
+                        )
+                    )
                     not_done_idxs.append(idx)
 
             overlong_generation_prompts = [
@@ -1277,8 +1563,8 @@ class vLLMRollout(BaseRollout):
                     f"rows={overlong_generation_prompts[:8]}"
                 )
 
-            rollout_bar.set_description(f"AgentMemory rounds {rounds + 1}/{max_rounds} | Active agents per gpu: {len(not_done_idxs)}")
-            _agentmemory_debug(f"round_start round={rounds + 1}/{max_rounds} active={len(not_done_idxs)}")
+            rollout_bar.set_description(f"AgentMemory policy turns {rounds + 1}/{max_policy_turns} | Active agents per gpu: {len(not_done_idxs)}")
+            _agentmemory_debug(f"round_start round={rounds + 1}/{max_policy_turns} active={len(not_done_idxs)}")
             if len(not_done_idxs) == 0:
                 break
             with self.update_sampling_params(**sampling_kwargs):
@@ -1307,8 +1593,17 @@ class vLLMRollout(BaseRollout):
                     prompt_token_ids, skip_special_tokens=False
                 )
                 latest_observation = rollout_handler_ls[idx].messages[-1].content
+                formal_schema_version = str(
+                    rollout_handler_ls[idx].formal_schema_version
+                )
+                formal_system_prompt = str(
+                    rollout_handler_ls[idx].formal_system_prompt
+                )
                 single_observation_prompt_ids = (
-                    self.latest_observation_prompt_from_text(latest_observation)
+                    self.latest_observation_prompt_from_text(
+                        latest_observation,
+                        system_prompt=formal_system_prompt,
+                    )
                 )
                 if single_observation_prompt_ids != list(prompt_token_ids):
                     raise FormalRuntimeEvidenceError(
@@ -1321,12 +1616,25 @@ class vLLMRollout(BaseRollout):
                     if isinstance(env_info_payload, dict)
                     else {}
                 )
-                if "current_subtask_index" not in env_info_before:
-                    raise FormalRuntimeEvidenceError(
-                        "Formal AgentMemory step is missing the pre-action "
-                        f"session index for item {rollout_handler_ls[idx].item_id}."
-                    )
-                session_index = int(env_info_before["current_subtask_index"])
+                _validate_runtime_env_schema(
+                    formal_schema_version,
+                    env_info_before,
+                    boundary="pre-action",
+                )
+                if formal_schema_version == FORMAL_WEBSHOP_SCHEMA_V2:
+                    if "current_subtask_index" not in env_info_before:
+                        raise FormalRuntimeEvidenceError(
+                            "Formal AgentMemory step is missing the pre-action "
+                            f"session index for item {rollout_handler_ls[idx].item_id}."
+                        )
+                    session_index = int(env_info_before["current_subtask_index"])
+                else:
+                    if "phase_index" not in env_info_before:
+                        raise FormalRuntimeEvidenceError(
+                            "Formal v3 step is missing the pre-action phase_index "
+                            f"for item {rollout_handler_ls[idx].item_id}."
+                        )
+                    phase_index = int(env_info_before["phase_index"])
                 content = self.tokenizer.decode(action_token_ids, skip_special_tokens=True)
                 rollout_handler_ls[idx].add_assistant_message(self.tokenizer, content)
                 task_rounds[idx] += 1
@@ -1368,149 +1676,74 @@ class vLLMRollout(BaseRollout):
                         if isinstance(env_info_payload, dict)
                         else {}
                     )
-                    if "current_subtask_index" not in env_info_after:
-                        raise FormalRuntimeEvidenceError(
-                            "Formal AgentMemory step is missing the post-action "
-                            f"session index for item {rollout_handler_ls[idx].item_id}."
-                        )
-                    next_session_index = int(
-                        env_info_after["current_subtask_index"]
+                    _validate_runtime_env_schema(
+                        formal_schema_version,
+                        env_info_after,
+                        boundary="post-action",
                     )
-                    session_advanced = next_session_index > session_index
-                    tool_ops = env_info_after.get("tool_ops", [])
-                    try:
-                        buy_evidence = validate_formal_buy_transition(
-                            tool_ops=tool_ops,
-                            env_step=task_rounds[idx],
-                            subtask_index_before=session_index,
-                            subtask_index_after=next_session_index,
-                            done=bool(step_output.done),
-                        )
-                    except FormalBuyTransitionError as exc:
-                        raise FormalRuntimeEvidenceError(
-                            "Formal BUY transition evidence is invalid for "
-                            f"item={rollout_handler_ls[idx].item_id}: {exc}"
-                        ) from exc
-                    committed_purchase = bool(
-                        buy_evidence["committed_purchase"]
+                    prompt_digest = prompt_state_digest(
+                        single_observation_prompt_ids
                     )
-                    purchase_correct = buy_evidence["purchase_correct"]
-                    accepted_purchase = bool(
-                        buy_evidence["accepted_purchase"]
-                    )
-                    session_trace_after = env_info_after.get("session_trace")
-                    if not isinstance(session_trace_after, list):
-                        raise FormalRuntimeEvidenceError(
-                            "Formal AgentMemory step is missing post-action session_trace."
-                        )
-                    raw_history_cleared = bool(
-                        session_advanced and not session_trace_after
-                    )
-                    search_tool_ops = [
-                        tool_op
-                        for tool_op in tool_ops
-                        if isinstance(tool_op, dict)
-                        and str(tool_op.get("op", "")).upper() == "SEARCH"
-                        and int(tool_op.get("step", -1)) == task_rounds[idx]
-                    ]
-                    search_result_count = None
-                    if search_tool_ops:
-                        if (
-                            len(search_tool_ops) != 1
-                            or "result_count" not in search_tool_ops[0]
-                        ):
+                    if formal_schema_version == FORMAL_DOMAIN_SCHEMA_V3:
+                        if "phase_index" not in env_info_after:
                             raise FormalRuntimeEvidenceError(
-                                "Formal SEARCH tool record is missing result_count."
+                                "Formal v3 step is missing the post-action phase_index "
+                                f"for item {rollout_handler_ls[idx].item_id}."
                             )
-                        search_result_count = int(
-                            search_tool_ops[0]["result_count"]
+                        if int(env_info_after["phase_index"]) < phase_index:
+                            raise FormalRuntimeEvidenceError(
+                                "Formal v3 phase_index regressed across one action."
+                            )
+                        try:
+                            step_record = build_formal_domain_step_v3(
+                                content=content,
+                                score=float(rollout_handler_ls[idx].score),
+                                task_round=task_rounds[idx],
+                                done=bool(step_output.done),
+                                item_id=str(rollout_handler_ls[idx].item_id),
+                                parent_index=parent_index,
+                                parent_group_uid=parent_group_uid,
+                                replica_index=replica_index,
+                                trajectory_uid=trajectory_uid,
+                                exact_state_uid=exact_state_uid,
+                                prompt_token_ids=prompt_token_ids,
+                                response_token_ids=action_token_ids,
+                                latest_observation=latest_observation,
+                                visible_prompt=visible_prompt,
+                                system_prompt=formal_system_prompt,
+                                single_observation_prompt_digest=prompt_digest,
+                                env_result=str(step_output.state),
+                                generation_record=generation_record,
+                                env_info_before=env_info_before,
+                                env_info_after=env_info_after,
+                            )
+                        except FormalDomainV3Error as exc:
+                            raise FormalRuntimeEvidenceError(
+                                "Formal v3 step evidence is invalid for "
+                                f"item={rollout_handler_ls[idx].item_id}: {exc}"
+                            ) from exc
+                    else:
+                        step_record = _build_formal_webshop_step_v2(
+                            content=content,
+                            score=float(rollout_handler_ls[idx].score),
+                            task_round=task_rounds[idx],
+                            done=bool(step_output.done),
+                            item_id=str(rollout_handler_ls[idx].item_id),
+                            parent_index=parent_index,
+                            parent_group_uid=parent_group_uid,
+                            replica_index=replica_index,
+                            trajectory_uid=trajectory_uid,
+                            exact_state_uid=exact_state_uid,
+                            prompt_token_ids=prompt_token_ids,
+                            response_token_ids=list(action_token_ids),
+                            latest_observation=latest_observation,
+                            visible_prompt=visible_prompt,
+                            single_observation_prompt_digest=prompt_digest,
+                            env_result=str(step_output.state),
+                            generation_record=generation_record,
+                            env_info_before=env_info_before,
+                            env_info_after=env_info_after,
                         )
-                    episode_success = bool(
-                        env_info_after.get("episode_success", False)
-                    )
-                    outcome = (
-                        "success"
-                        if bool(step_output.done) and episode_success
-                        else (
-                            "terminal_failure"
-                            if bool(step_output.done)
-                            else "continue"
-                        )
-                    )
-                    step_record = {
-                        "prompt_token_ids": prompt_token_ids,
-                        "content": content,
-                        "score": float(rollout_handler_ls[idx].score),
-                        "parent_index": parent_index,
-                        "parent_group_uid": parent_group_uid,
-                        "replica_index": replica_index,
-                        "trajectory_uid": trajectory_uid,
-                        "exact_state_uid": exact_state_uid,
-                        "task_round": task_rounds[idx],
-                        "done": bool(step_output.done),
-                        "item_id": str(rollout_handler_ls[idx].item_id),
-                        "session_index": session_index,
-                        "subtask_index": session_index,
-                        "next_session_index": next_session_index,
-                        "subtask_index_before": session_index,
-                        "subtask_index_after": next_session_index,
-                        "visible_prompt": visible_prompt,
-                        "latest_observation": latest_observation,
-                        "prompt_history_policy": "latest_observation_only",
-                        "raw_prior_messages_visible": False,
-                        "single_observation_prompt_digest": prompt_state_digest(
-                            single_observation_prompt_ids
-                        ),
-                        "response_token_ids": list(action_token_ids),
-                        "response_token_count": int(
-                            generation_record["response_token_count"]
-                        ),
-                        "max_response_tokens": int(
-                            generation_record["max_response_tokens"]
-                        ),
-                        "finish_reason": str(
-                            generation_record["finish_reason"]
-                        ),
-                        "finish_reason_source": str(
-                            generation_record["finish_reason_source"]
-                        ),
-                        "stop_reason": generation_record.get("stop_reason"),
-                        "generation_backend_source": str(
-                            generation_record["backend_source"]
-                        ),
-                        "generation_stop_reason": generation_record.get(
-                            "stop_reason"
-                        ),
-                        "generation_eos_token_ids": list(
-                            generation_record["configured_eos_token_ids"]
-                        ),
-                        "tokenizer_pad_token_id": generation_record[
-                            "tokenizer_pad_token_id"
-                        ],
-                        "generation_token_ids_are_exact": bool(
-                            generation_record["token_ids_are_exact"]
-                        ),
-                        "backend_token_ids_are_exact": bool(
-                            generation_record["backend_token_ids_are_exact"]
-                        ),
-                        "truncated": bool(generation_record["truncated"]),
-                        "env_result": str(step_output.state),
-                        "env_info_before": env_info_before,
-                        "env_info_after": env_info_after,
-                        "action_execution": deepcopy(
-                            env_info_after.get("action_execution")
-                        ),
-                        "committed_purchase": committed_purchase,
-                        "purchase_correct": purchase_correct,
-                        "accepted_purchase": accepted_purchase,
-                        "session_advanced": session_advanced,
-                        "buy_committed": committed_purchase,
-                        "buy_accepted": accepted_purchase,
-                        "subtask_advanced": session_advanced,
-                        "raw_history_cleared": raw_history_cleared,
-                        "search_result_count": search_result_count,
-                        "outcome": outcome,
-                    }
                     if suffix_credit or formal_trajectory_credit:
                         step_record["trajectory_row_order"] = len(
                             trajectory_steps[idx]
@@ -1696,11 +1929,17 @@ class vLLMRollout(BaseRollout):
                 continue
             if not steps:
                 continue
-            if not steps[-1]["done"] and rounds >= max_rounds:
-                bind_max_round_timeout_failure(
-                    steps[-1],
-                    max_rounds=max_rounds,
-                )
+            if not steps[-1]["done"] and rounds >= max_policy_turns:
+                if steps[-1].get("schema_version") == FORMAL_DOMAIN_SCHEMA_V3:
+                    bind_generic_timeout_v3(
+                        steps[-1],
+                        max_policy_turns=max_policy_turns,
+                    )
+                else:
+                    bind_max_round_timeout_failure(
+                        steps[-1],
+                        max_rounds=max_policy_turns,
+                    )
                 rollout_handler_ls[trajectory_index].score = steps[-1]["score"]
             suffix_scores = compute_suffix_credit_scores(
                 [step["score"] for step in steps],
@@ -1717,6 +1956,8 @@ class vLLMRollout(BaseRollout):
         if formal_trajectory_credit and not suffix_credit:
             for handler, step in zip(flat_handlers, flat_step_refs):
                 handler.score = float(step["score"])
+                handler.done = bool(step["done"])
+            flat_done_flags = [bool(step["done"]) for step in flat_step_refs]
 
         if suffix_credit:
             for trajectory_index, steps in enumerate(trajectory_steps):
@@ -1905,7 +2146,10 @@ class vLLMRollout(BaseRollout):
             self._maybe_resume_engine()
 
         global_steps = prompts.meta_info.get('global_steps', None)
-        max_rounds = prompts.meta_info.get('max_rounds', 10)
+        max_policy_turns = prompts.meta_info.get(
+            'max_policy_turns',
+            prompts.meta_info.get('max_rounds', 10),
+        )
         cur_device = prompts.batch["input_ids"].device
 
         do_sample = prompts.meta_info.get('do_sample', True)
@@ -1932,7 +2176,7 @@ class vLLMRollout(BaseRollout):
                 rollout_handler_ls=rollout_handler_ls,
                 env_clients=env_clients,
                 cur_device=cur_device,
-                max_rounds=max_rounds,
+                max_policy_turns=max_policy_turns,
                 sampling_kwargs=kwargs,
                 global_steps=global_steps,
             )
@@ -1961,7 +2205,7 @@ class vLLMRollout(BaseRollout):
 
         rounds = 0
         task_rounds = [0] * batch_size
-        rollout_bar = tqdm(total = max_rounds, desc="Running rounds", disable=torch.distributed.get_rank() != 0)
+        rollout_bar = tqdm(total = max_policy_turns, desc="Running rounds", disable=torch.distributed.get_rank() != 0)
         def agent_step(i, idx):
             content = self.tokenizer.decode(response_ids[i], skip_special_tokens=True)
             rollout_handler_ls[idx].add_assistant_message(self.tokenizer, content)
@@ -1980,7 +2224,7 @@ class vLLMRollout(BaseRollout):
                 rollout_handler_ls[idx].done = True
                 print(f"Rollou step Error: {e} item id = {rollout_handler_ls[idx].item_id}")
                 return True
-        while rounds < max_rounds and not all_done_flag:
+        while rounds < max_policy_turns and not all_done_flag:
             # get generation prompt
             generation_prompt_idxs = []
             not_done_idxs = []
@@ -1989,7 +2233,7 @@ class vLLMRollout(BaseRollout):
                     generation_prompt_idxs.append(rollout_handler.get_generation_prompt(self.tokenizer))
                     not_done_idxs.append(idx)
 
-            rollout_bar.set_description(f"Rounds {rounds + 1}/{max_rounds} | Active agents per gpu: {len(not_done_idxs)}")
+            rollout_bar.set_description(f"Rounds {rounds + 1}/{max_policy_turns} | Active agents per gpu: {len(not_done_idxs)}")
             # users can customize different sampling_params at different run
             with self.update_sampling_params(**kwargs):
                 output = self.inference_engine.generate(

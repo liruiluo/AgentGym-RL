@@ -13,6 +13,12 @@ from verl.utils.agentgym.formal_grpo_credit import (
     build_row_uid,
     compute_formal_grpo_credit,
 )
+from verl.utils.agentgym.formal_domain_v3 import (
+    FORMAL_DOMAIN_SCHEMA_V3,
+    FORMAL_WEBSHOP_SCHEMA_V2,
+    FormalDomainV3Error,
+    validate_formal_domain_step_v3,
+)
 
 
 AGENTMEMORY_PARENT_GROUP_UID = "agentmemory_parent_group_uid"
@@ -290,10 +296,13 @@ def normalize_generation_record(
         ordered_eos_ids = [int(eos_token_ids)]
     else:
         ordered_eos_ids = []
-        for token_id in eos_token_ids:
-            normalized_token_id = int(token_id)
-            if normalized_token_id not in ordered_eos_ids:
-                ordered_eos_ids.append(normalized_token_id)
+        for index, token_id in enumerate(eos_token_ids):
+            try:
+                ordered_eos_ids.append(int(token_id))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Invalid configured EOS token id at index {index}: {token_id!r}"
+                ) from exc
     eos_ids = set(ordered_eos_ids)
 
     raw_tokens: list[int] = []
@@ -371,7 +380,7 @@ def normalize_generation_record(
 def validate_official_vllm_generation_record(
     record: dict[str, Any],
 ) -> dict[str, Any]:
-    """Validate exact Qwen3/vLLM completion metadata without dropping samples."""
+    """Validate exact official-vLLM completion metadata without model assumptions."""
 
     if record.get("backend_source") != "official_vllm":
         raise RuntimeError("Formal generation is not bound to official vLLM.")
@@ -397,23 +406,36 @@ def validate_official_vllm_generation_record(
     raw_token_ids = record.get("token_ids", [])
     raw_eos_token_ids = record.get("configured_eos_token_ids", [])
     if not isinstance(raw_token_ids, list) or any(
-        type(token_id) is not int for token_id in raw_token_ids
+        type(token_id) is not int or token_id < 0 for token_id in raw_token_ids
     ):
         raise RuntimeError(
-            "Formal official-vLLM generation token IDs are not raw integers."
+            "Formal official-vLLM generation token IDs are not non-negative raw integers."
         )
-    if not isinstance(raw_eos_token_ids, list) or any(
-        type(token_id) is not int for token_id in raw_eos_token_ids
+    if (
+        not isinstance(raw_eos_token_ids, list)
+        or not raw_eos_token_ids
+        or any(
+            type(token_id) is not int or token_id < 0
+            for token_id in raw_eos_token_ids
+        )
     ):
         raise RuntimeError(
-            "Formal official-vLLM EOS token IDs are not raw integers."
+            "Formal official-vLLM EOS token IDs must be a non-empty list of "
+            "non-negative raw integers."
         )
     token_ids = list(raw_token_ids)
     eos_token_ids = list(raw_eos_token_ids)
-    if eos_token_ids != [151645, 151643]:
+    if len(eos_token_ids) != len(set(eos_token_ids)):
         raise RuntimeError(
-            "Formal Qwen3 official-vLLM EOS configuration must be "
-            "[151645, 151643]."
+            "Formal official-vLLM EOS token IDs must be unique."
+        )
+    pad_token_id = record.get("tokenizer_pad_token_id")
+    if pad_token_id is not None and (
+        type(pad_token_id) is not int or pad_token_id < 0
+    ):
+        raise RuntimeError(
+            "Formal official-vLLM tokenizer pad token ID must be a "
+            "non-negative raw integer or None."
         )
     if not token_ids:
         raise RuntimeError("Formal official-vLLM generation returned no tokens.")
@@ -465,24 +487,14 @@ def validate_official_vllm_generation_record(
         )
 
     final_token_id = token_ids[-1]
-    primary_eos_token_id = eos_token_ids[0]
-    if final_token_id == primary_eos_token_id:
-        if stop_reason is not None:
-            raise RuntimeError(
-                "Formal primary EOS requires raw official-vLLM stop_reason=None."
-            )
-    else:
-        if stop_reason is None:
-            raise RuntimeError(
-                "Formal alternate EOS requires an explicit backend stop_reason."
-            )
+    if stop_reason is not None:
         if type(stop_reason) is not int:
             raise RuntimeError(
-                "Formal alternate EOS stop_reason is not a raw integer token ID."
+                "Formal EOS stop_reason is not a raw integer token ID."
             )
         if stop_reason != final_token_id:
             raise RuntimeError(
-                "Formal alternate EOS does not match the backend stop_reason."
+                "Formal EOS does not match the backend stop_reason."
             )
     return record
 
@@ -605,6 +617,266 @@ def _resolve_formal_native_action_op(
     return tool_op
 
 
+def _validate_formal_domain_step_record_v3(
+    record: dict[str, Any],
+    *,
+    row_index: int,
+    expected_exact_state_uid: str,
+    expected_trajectory_uid: str,
+    expected_trajectory_row_uid: str,
+    expected_trajectory_row_order: int,
+    expected_trajectory_terminal: bool,
+    expected_task_round: int,
+    expected_immediate_reward: float,
+    expected_suffix_return: float,
+    expected_trajectory_return: float,
+    expected_action_text: str,
+    expected_done: bool,
+    expected_generation_length: int,
+    expected_generation_digest: str,
+    expected_packed_length: int,
+    expected_packed_digest: str,
+    expected_generation_response_length: int,
+    expected_generation_response_digest: str,
+    expected_packed_response_length: int,
+    expected_packed_response_digest: str,
+    expected_suffix_credit_applied: bool,
+    tolerance: float,
+) -> dict[str, Any]:
+    """Validate packed domain-v3 evidence without applying WebShop semantics."""
+
+    required_fields = {
+        "item_id",
+        "parent_index",
+        "parent_group_uid",
+        "replica_index",
+        "exact_state_uid",
+        "trajectory_uid",
+        "trajectory_row_uid",
+        "trajectory_row_order",
+        "trajectory_terminal",
+        "task_round",
+        "content",
+        "action",
+        "score",
+        "immediate_reward",
+        "suffix_return",
+        "suffix_credit_applied",
+        "trajectory_return",
+        "done",
+        "visible_prompt",
+        "latest_observation",
+        "system_prompt",
+        "system_prompt_source",
+        "system_prompt_sha256",
+        "prompt_history_policy",
+        "raw_prior_messages_visible",
+        "single_observation_prompt_digest",
+        "response_token_ids",
+        "response_token_count",
+        "max_response_tokens",
+        "finish_reason",
+        "finish_reason_source",
+        "stop_reason",
+        "generation_backend_source",
+        "generation_eos_token_ids",
+        "tokenizer_pad_token_id",
+        "generation_token_ids_are_exact",
+        "backend_token_ids_are_exact",
+        "truncated",
+        "env_result",
+        "env_info_before",
+        "env_info_after",
+        "action_execution",
+        "tool_ops",
+        "reward_components",
+        "domain_evidence",
+        "phase_index_before",
+        "phase_index_after",
+        "phase_count",
+        "phase_advanced",
+        "episode_success",
+        "sample_excluded",
+        "generation_prompt_length",
+        "generation_prompt_digest",
+        "packed_prompt_length",
+        "packed_prompt_digest",
+        "generation_response_length",
+        "generation_response_digest",
+        "packed_response_length",
+        "packed_response_digest",
+    }
+    missing = sorted(required_fields - set(record))
+    if missing:
+        raise ValueError(
+            f"Formal v3 step record is missing fields at row {row_index}: {missing}"
+        )
+    try:
+        validate_formal_domain_step_v3(record)
+    except FormalDomainV3Error as exc:
+        raise ValueError(
+            f"Invalid formal v3 step record at row {row_index}: {exc}"
+        ) from exc
+
+    if record["prompt_history_policy"] != "latest_observation_only":
+        raise ValueError(
+            f"Formal v3 prompt history policy mismatch at row {row_index}."
+        )
+    if record["raw_prior_messages_visible"] is not False:
+        raise ValueError(
+            f"Formal v3 prompt exposes raw prior messages at row {row_index}."
+        )
+    if not isinstance(record["env_result"], str):
+        raise ValueError(f"Formal v3 env_result must be text at row {row_index}.")
+
+    trajectory_row_order = _coerce_nonnegative_int(
+        record["trajectory_row_order"],
+        name="trajectory row order",
+        row_index=row_index,
+    )
+    if trajectory_row_order != expected_trajectory_row_order:
+        raise ValueError(
+            f"Formal v3 trajectory row order mismatch at row {row_index}."
+        )
+    trajectory_row_uid = str(record["trajectory_row_uid"])
+    if (
+        trajectory_row_uid != expected_trajectory_row_uid
+        or trajectory_row_uid
+        != build_row_uid(expected_trajectory_uid, expected_trajectory_row_order)
+    ):
+        raise ValueError(
+            f"Formal v3 trajectory row UID mismatch at row {row_index}."
+        )
+    if type(record["trajectory_terminal"]) is not bool or record[
+        "trajectory_terminal"
+    ] != bool(expected_trajectory_terminal):
+        raise ValueError(
+            f"Formal v3 trajectory terminal mismatch at row {row_index}."
+        )
+
+    response_token_ids = record["response_token_ids"]
+    if not isinstance(response_token_ids, list) or any(
+        type(token_id) is not int for token_id in response_token_ids
+    ):
+        raise ValueError(
+            f"Formal v3 response_token_ids must contain raw integers at row {row_index}."
+        )
+    response_token_count = _coerce_nonnegative_int(
+        record["response_token_count"],
+        name="response token count",
+        row_index=row_index,
+    )
+    if response_token_count != len(response_token_ids):
+        raise ValueError(
+            f"Formal v3 response token count mismatch at row {row_index}."
+        )
+    response_digest = prompt_token_digest(response_token_ids)
+    if (
+        response_token_count != expected_generation_response_length
+        or response_digest != expected_generation_response_digest
+    ):
+        raise ValueError(
+            f"Formal v3 generated-response metadata mismatch at row {row_index}."
+        )
+    generation_record = {
+        "token_ids": response_token_ids,
+        "response_token_count": response_token_count,
+        "max_response_tokens": record["max_response_tokens"],
+        "finish_reason": record["finish_reason"],
+        "finish_reason_source": record["finish_reason_source"],
+        "stop_reason": record["stop_reason"],
+        "truncated": record["truncated"],
+        "configured_eos_token_ids": record["generation_eos_token_ids"],
+        "tokenizer_pad_token_id": record["tokenizer_pad_token_id"],
+        "backend_source": record["generation_backend_source"],
+        "backend_token_ids_are_exact": record["backend_token_ids_are_exact"],
+        "token_ids_are_exact": record["generation_token_ids_are_exact"],
+    }
+    try:
+        validate_official_vllm_generation_record(generation_record)
+    except RuntimeError as exc:
+        raise ValueError(
+            f"Formal v3 generation provenance is invalid at row {row_index}: {exc}"
+        ) from exc
+    tokenizer_pad_token_id = record["tokenizer_pad_token_id"]
+    if tokenizer_pad_token_id is not None and (
+        type(tokenizer_pad_token_id) is not int or tokenizer_pad_token_id < 0
+    ):
+        raise ValueError(
+            "Formal v3 tokenizer pad readback must be a non-negative integer "
+            "or None: "
+            f"row={row_index} actual={record['tokenizer_pad_token_id']!r}."
+        )
+
+    single_observation_digest = _validate_prompt_digest(
+        record["single_observation_prompt_digest"],
+        name="single-observation prompt digest",
+        row_index=row_index,
+    )
+    if single_observation_digest != expected_generation_digest:
+        raise ValueError(
+            f"Formal v3 prompt was not built from one latest observation at row {row_index}."
+        )
+    exact_state_uid = str(record["exact_state_uid"])
+    if ":statev1:" not in exact_state_uid:
+        raise ValueError(
+            f"Invalid formal v3 exact-state UID at row {row_index}: {exact_state_uid!r}"
+        )
+    if exact_state_uid.rsplit(":statev1:", 1)[1] != expected_generation_digest:
+        raise ValueError(
+            f"Formal v3 exact-state UID digest mismatch at row {row_index}."
+        )
+
+    numeric_expectations = {
+        "score": expected_immediate_reward,
+        "immediate_reward": expected_immediate_reward,
+        "suffix_return": expected_suffix_return,
+        "trajectory_return": expected_trajectory_return,
+    }
+    for name, expected in numeric_expectations.items():
+        try:
+            actual = float(record[name])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid formal v3 step {name} at row {row_index}."
+            ) from exc
+        if not math.isfinite(actual) or not math.isclose(
+            actual, expected, rel_tol=tolerance, abs_tol=tolerance
+        ):
+            raise ValueError(
+                f"Formal v3 step {name} mismatch at row {row_index}: "
+                f"expected={expected} actual={actual}."
+            )
+
+    exact_expectations = {
+        "exact_state_uid": expected_exact_state_uid,
+        "trajectory_uid": expected_trajectory_uid,
+        "trajectory_row_uid": expected_trajectory_row_uid,
+        "trajectory_row_order": expected_trajectory_row_order,
+        "trajectory_terminal": expected_trajectory_terminal,
+        "task_round": expected_task_round,
+        "content": expected_action_text,
+        "action": expected_action_text,
+        "done": expected_done,
+        "generation_prompt_length": expected_generation_length,
+        "generation_prompt_digest": expected_generation_digest,
+        "packed_prompt_length": expected_packed_length,
+        "packed_prompt_digest": expected_packed_digest,
+        "generation_response_length": expected_generation_response_length,
+        "generation_response_digest": expected_generation_response_digest,
+        "packed_response_length": expected_packed_response_length,
+        "packed_response_digest": expected_packed_response_digest,
+        "suffix_credit_applied": expected_suffix_credit_applied,
+    }
+    for name, expected in exact_expectations.items():
+        if record[name] != expected:
+            raise ValueError(
+                f"Formal v3 step record {name} mismatch at row {row_index}: "
+                f"expected={expected!r} actual={record[name]!r}."
+            )
+    return record
+
+
 def _validate_formal_step_record(
     value: Any,
     *,
@@ -637,6 +909,42 @@ def _validate_formal_step_record(
         raise ValueError(
             f"Invalid formal step record JSON at row {row_index}."
         ) from exc
+    schema_version = record.get("schema_version")
+    if schema_version == FORMAL_DOMAIN_SCHEMA_V3:
+        return _validate_formal_domain_step_record_v3(
+            record,
+            row_index=row_index,
+            expected_exact_state_uid=expected_exact_state_uid,
+            expected_trajectory_uid=expected_trajectory_uid,
+            expected_trajectory_row_uid=expected_trajectory_row_uid,
+            expected_trajectory_row_order=expected_trajectory_row_order,
+            expected_trajectory_terminal=expected_trajectory_terminal,
+            expected_task_round=expected_task_round,
+            expected_immediate_reward=expected_immediate_reward,
+            expected_suffix_return=expected_suffix_return,
+            expected_trajectory_return=expected_trajectory_return,
+            expected_action_text=expected_action_text,
+            expected_done=expected_done,
+            expected_generation_length=expected_generation_length,
+            expected_generation_digest=expected_generation_digest,
+            expected_packed_length=expected_packed_length,
+            expected_packed_digest=expected_packed_digest,
+            expected_generation_response_length=(
+                expected_generation_response_length
+            ),
+            expected_generation_response_digest=(
+                expected_generation_response_digest
+            ),
+            expected_packed_response_length=expected_packed_response_length,
+            expected_packed_response_digest=expected_packed_response_digest,
+            expected_suffix_credit_applied=expected_suffix_credit_applied,
+            tolerance=tolerance,
+        )
+    if schema_version != FORMAL_WEBSHOP_SCHEMA_V2:
+        raise ValueError(
+            f"Unknown formal step record schema at row {row_index}: "
+            f"{schema_version!r}"
+        )
     required_fields = {
         "schema_version",
         "item_id",
@@ -703,7 +1011,7 @@ def _validate_formal_step_record(
         raise ValueError(
             f"Formal step record is missing fields at row {row_index}: {missing}"
         )
-    if record["schema_version"] != "agentmemory_formal_step_v2":
+    if record["schema_version"] != FORMAL_WEBSHOP_SCHEMA_V2:
         raise ValueError(
             f"Unknown formal step record schema at row {row_index}: "
             f"{record['schema_version']!r}"
@@ -902,19 +1210,24 @@ def _validate_formal_step_record(
             f"Formal generation EOS readback is not raw integer data at row {row_index}."
         )
     generation_eos_token_ids = list(eos_values)
-    if generation_eos_token_ids != [151645, 151643]:
+    if not generation_eos_token_ids or any(
+        token_id < 0 for token_id in generation_eos_token_ids
+    ):
         raise ValueError(
-            "Formal Qwen3 generation EOS readback mismatch: "
+            "Formal generation EOS readback must be a non-empty list of "
+            "non-negative integers: "
             f"row={row_index} actual={generation_eos_token_ids}."
         )
-    if type(record["tokenizer_pad_token_id"]) is not int:
+    if len(generation_eos_token_ids) != len(set(generation_eos_token_ids)):
         raise ValueError(
-            f"Formal tokenizer pad readback is not a raw integer at row {row_index}."
+            f"Formal generation EOS readback contains duplicates at row {row_index}."
         )
     tokenizer_pad_token_id = record["tokenizer_pad_token_id"]
-    if tokenizer_pad_token_id != 151643:
+    if tokenizer_pad_token_id is not None and (
+        type(tokenizer_pad_token_id) is not int or tokenizer_pad_token_id < 0
+    ):
         raise ValueError(
-            "Formal Qwen3 tokenizer pad readback mismatch: "
+            "Formal tokenizer pad readback must be a non-negative integer or None: "
             f"row={row_index} actual={tokenizer_pad_token_id}."
         )
     if record["generation_stop_reason"] != record["stop_reason"]:
