@@ -283,6 +283,64 @@ class BatchContractTest(unittest.TestCase):
                 forward_per_gpu_micro_batch_rows=2,
             )
 
+    def test_role_specific_micro_batch_declaration(self):
+        declared = {
+            "actor": 2,
+            "critic": 4,
+            "critic_forward": 4,
+            "reference_logprob": 2,
+            "rollout_logprob": 2,
+        }
+        contract = _batch_contract(
+            per_gpu_micro_batches=declared,
+            expected_per_gpu_micro_batch_size=None,
+            expected_per_gpu_micro_batches=declared,
+        )
+
+        self.assertIsNone(contract["expected_per_gpu_micro_batch_size"])
+        self.assertEqual(
+            contract["expected_per_gpu_micro_batches"], declared
+        )
+        self.assertEqual(
+            validate_worker_batch_readback(
+                contract,
+                role="actor",
+                normalized_mini_batch_rows=64,
+                per_gpu_micro_batch_rows=2,
+            )["per_gpu_micro_batch_rows"],
+            2,
+        )
+        critic = validate_worker_batch_readback(
+            contract,
+            role="critic",
+            normalized_mini_batch_rows=64,
+            per_gpu_micro_batch_rows=4,
+            forward_per_gpu_micro_batch_rows=4,
+        )
+        self.assertEqual(critic["per_gpu_micro_batch_rows"], 4)
+        self.assertEqual(critic["forward_per_gpu_micro_batch_rows"], 4)
+
+    def test_role_specific_micro_batch_declaration_fails_closed(self):
+        configured = {
+            "actor": 2,
+            "critic": 4,
+            "critic_forward": 4,
+            "reference_logprob": 2,
+            "rollout_logprob": 2,
+        }
+        declared = dict(configured, critic=2)
+        with self.assertRaisesRegex(ValueError, "role-specific declaration"):
+            _batch_contract(
+                per_gpu_micro_batches=configured,
+                expected_per_gpu_micro_batch_size=None,
+                expected_per_gpu_micro_batches=declared,
+            )
+
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            _batch_contract(
+                expected_per_gpu_micro_batches=configured,
+            )
+
 
 class DistributedTokenMeanTest(unittest.TestCase):
     def test_padding_only_rank_matches_unpadded_global_gradient(self):

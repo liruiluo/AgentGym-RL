@@ -1268,16 +1268,37 @@ class RayPPOTrainer(object):
                     "The v32 AgentMemory PPO numerical contract requires static "
                     "per-GPU micro-batches for exact readback."
                 )
-            expected_micro_raw = os.environ.get(
-                'VERL_PPO_EXPECTED_PER_GPU_MICRO_BATCH_SIZE', '2'
+            expected_micro_by_role = None
+            expected_micro_by_role_raw = os.environ.get(
+                'VERL_PPO_EXPECTED_PER_GPU_MICRO_BATCHES'
             )
-            try:
-                expected_micro = int(expected_micro_raw)
-            except ValueError as exc:
-                raise ValueError(
-                    "VERL_PPO_EXPECTED_PER_GPU_MICRO_BATCH_SIZE must be a "
-                    f"positive integer, got {expected_micro_raw!r}."
-                ) from exc
+            if expected_micro_by_role_raw is not None:
+                try:
+                    expected_micro_by_role = json.loads(
+                        expected_micro_by_role_raw
+                    )
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        "VERL_PPO_EXPECTED_PER_GPU_MICRO_BATCHES must be a "
+                        "JSON object."
+                    ) from exc
+                if not isinstance(expected_micro_by_role, dict):
+                    raise ValueError(
+                        "VERL_PPO_EXPECTED_PER_GPU_MICRO_BATCHES must decode "
+                        "to a JSON object."
+                    )
+                expected_micro = None
+            else:
+                expected_micro_raw = os.environ.get(
+                    'VERL_PPO_EXPECTED_PER_GPU_MICRO_BATCH_SIZE', '2'
+                )
+                try:
+                    expected_micro = int(expected_micro_raw)
+                except ValueError as exc:
+                    raise ValueError(
+                        "VERL_PPO_EXPECTED_PER_GPU_MICRO_BATCH_SIZE must be a "
+                        f"positive integer, got {expected_micro_raw!r}."
+                    ) from exc
             self.ppo_batch_contract = build_legacy_asymmetric_batch_contract(
                 actor_mini_batch_size=config.actor_rollout_ref.actor.ppo_mini_batch_size,
                 critic_mini_batch_size=config.critic.ppo_mini_batch_size,
@@ -1306,6 +1327,7 @@ class RayPPOTrainer(object):
                 actor_ppo_epochs=config.actor_rollout_ref.actor.ppo_epochs,
                 critic_ppo_epochs=config.critic.ppo_epochs,
                 expected_per_gpu_micro_batch_size=expected_micro,
+                expected_per_gpu_micro_batches=expected_micro_by_role,
             )
 
         print("[validate_config] All configuration checks passed successfully!")

@@ -49,6 +49,7 @@ def build_legacy_asymmetric_batch_contract(
     actor_ppo_epochs: int,
     critic_ppo_epochs: int,
     expected_per_gpu_micro_batch_size: Optional[int] = None,
+    expected_per_gpu_micro_batches: Optional[Mapping[str, int]] = None,
 ) -> dict:
     """Validate and describe the legacy flattened-row compensation mode.
 
@@ -113,7 +114,51 @@ def build_legacy_asymmetric_batch_contract(
         name: _positive_int(per_gpu_micro_batches[name], f"{name}_per_gpu")
         for name in _PER_GPU_MICRO_BATCH_FIELDS
     }
-    if expected_per_gpu_micro_batch_size is not None:
+    if (
+        expected_per_gpu_micro_batch_size is not None
+        and expected_per_gpu_micro_batches is not None
+    ):
+        raise ValueError(
+            "scalar and role-specific expected per-GPU micro-batch declarations "
+            "are mutually exclusive."
+        )
+
+    expected_micro_by_role = None
+    if expected_per_gpu_micro_batches is not None:
+        expected_missing = set(_PER_GPU_MICRO_BATCH_FIELDS) - set(
+            expected_per_gpu_micro_batches
+        )
+        expected_extra = set(expected_per_gpu_micro_batches) - set(
+            _PER_GPU_MICRO_BATCH_FIELDS
+        )
+        if expected_missing or expected_extra:
+            raise ValueError(
+                "expected_per_gpu_micro_batches must contain exactly "
+                f"{_PER_GPU_MICRO_BATCH_FIELDS}; missing={sorted(expected_missing)} "
+                f"extra={sorted(expected_extra)}."
+            )
+        expected_micro_by_role = {
+            name: _positive_int(
+                expected_per_gpu_micro_batches[name],
+                f"expected_{name}_per_gpu",
+            )
+            for name in _PER_GPU_MICRO_BATCH_FIELDS
+        }
+        mismatched = {
+            name: {
+                "configured": parsed_micro[name],
+                "declared": expected_micro_by_role[name],
+            }
+            for name in _PER_GPU_MICRO_BATCH_FIELDS
+            if parsed_micro[name] != expected_micro_by_role[name]
+        }
+        if mismatched:
+            raise ValueError(
+                "per-GPU micro-batch readback does not match the role-specific "
+                f"declaration: {mismatched}."
+            )
+        expected_micro = None
+    elif expected_per_gpu_micro_batch_size is not None:
         expected_micro = _positive_int(
             expected_per_gpu_micro_batch_size,
             "expected_per_gpu_micro_batch_size",
@@ -165,6 +210,7 @@ def build_legacy_asymmetric_batch_contract(
         "actor_ppo_epochs": actor_epochs,
         "critic_ppo_epochs": critic_epochs,
         "expected_per_gpu_micro_batch_size": expected_micro,
+        "expected_per_gpu_micro_batches": expected_micro_by_role,
         "per_gpu_micro_batches": parsed_micro,
     }
 
