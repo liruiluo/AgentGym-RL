@@ -467,9 +467,12 @@ def validate_official_vllm_generation_record(
             raise RuntimeError(
                 "Formal official-vLLM length completion did not reach max_response_tokens."
             )
-        if eos_positions:
+        # vLLM checks the length cap before EOS. If EOS is sampled exactly at
+        # max_tokens, the backend therefore reports a legitimate length finish
+        # with that EOS retained as the final sampled token.
+        if eos_positions and eos_positions != [len(token_ids) - 1]:
             raise RuntimeError(
-                "Formal official-vLLM length completion unexpectedly contains EOS."
+                "Formal official-vLLM length completion contains a non-terminal EOS."
             )
         if stop_reason is not None:
             raise RuntimeError(
