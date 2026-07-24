@@ -41,8 +41,17 @@ SEARCH_FAILFAST_SURFACE = (
 SEARCH_PAPER_EVAL_SURFACE = (
     "memoryarena_progressive_search_paper_eval_public221_one_action_v3"
 )
-MATH_SURFACE = "memoryarena_formal_reasoning_math_failfast_v3"
-PHYS_SURFACE = "memoryarena_formal_reasoning_phys_failfast_v3"
+MATH_FAILFAST_SURFACE = "memoryarena_formal_reasoning_math_failfast_v3"
+PHYS_FAILFAST_SURFACE = "memoryarena_formal_reasoning_phys_failfast_v3"
+MATH_PAPER_EVAL_SURFACE = (
+    "memoryarena_formal_reasoning_math_paper_eval_one_action_v3"
+)
+PHYS_PAPER_EVAL_SURFACE = (
+    "memoryarena_formal_reasoning_phys_paper_eval_one_action_v3"
+)
+# Compatibility aliases for existing fail-fast callers and launchers.
+MATH_SURFACE = MATH_FAILFAST_SURFACE
+PHYS_SURFACE = PHYS_FAILFAST_SURFACE
 EVAL_SCHEMA = "agentmemory_eval_evidence_v1"
 PAPER_SUCCESS_COLUMNS = ("Shopping", "Travel", "Search", "Math", "Physics")
 MEMORYARENA_HF_REPO = "ZexueHe/memoryarena"
@@ -83,6 +92,11 @@ SEARCH_PAPER_METRIC_CONTRACT = (
     "memoryarena_progressive_search_ps_sr_at_k_final_sr_v1"
 )
 SEARCH_PAPER_DATASET_SCOPE = "public221_of_paper256"
+FORMAL_PAPER_METRIC_CONTRACT = "memoryarena_formal_reasoning_ps_final_sr_v1"
+FORMAL_PAPER_DATASET_SCOPES = {
+    MATH_PAPER_EVAL_SURFACE: "memoryarena_formal_reasoning_math_frozen40",
+    PHYS_PAPER_EVAL_SURFACE: "memoryarena_formal_reasoning_phys_frozen20",
+}
 PAPER_MACRO5_METRIC_CONTRACT = "memoryarena_paper_macro5_v1"
 TRAVEL_RECORD_COUNT = 270
 TRAVEL_PHASE_COUNT = 1869
@@ -267,21 +281,27 @@ SHOPPING_DATASET_PROVENANCE_FIELDS = frozenset(
 )
 # Row order and question counts are part of each frozen JSONL byte contract.
 # Binding both prevents a complete-looking panel assembled from the wrong rows.
+MATH_TASK_PHASE_COUNTS = (
+    5, 5, 8, 10, 11, 6, 10, 5, 13, 7,
+    6, 8, 9, 6, 7, 9, 16, 8, 7, 8,
+    13, 14, 7, 9, 12, 10, 13, 12, 9, 6,
+    9, 8, 15, 11, 7, 11, 7, 4, 11, 2,
+)
+PHYS_TASK_PHASE_COUNTS = (
+    3, 12, 8, 3, 4, 3, 3, 2, 5, 4,
+    4, 3, 4, 9, 3, 3, 2, 4, 4, 3,
+)
 FORMAL_TASK_PHASE_COUNTS = {
-    MATH_SURFACE: (
-        5, 5, 8, 10, 11, 6, 10, 5, 13, 7,
-        6, 8, 9, 6, 7, 9, 16, 8, 7, 8,
-        13, 14, 7, 9, 12, 10, 13, 12, 9, 6,
-        9, 8, 15, 11, 7, 11, 7, 4, 11, 2,
-    ),
-    PHYS_SURFACE: (
-        3, 12, 8, 3, 4, 3, 3, 2, 5, 4,
-        4, 3, 4, 9, 3, 3, 2, 4, 4, 3,
-    ),
+    MATH_FAILFAST_SURFACE: MATH_TASK_PHASE_COUNTS,
+    PHYS_FAILFAST_SURFACE: PHYS_TASK_PHASE_COUNTS,
+    MATH_PAPER_EVAL_SURFACE: MATH_TASK_PHASE_COUNTS,
+    PHYS_PAPER_EVAL_SURFACE: PHYS_TASK_PHASE_COUNTS,
 }
 FORMAL_SURFACE_DATASETS = {
-    MATH_SURFACE: "formal_reasoning_math",
-    PHYS_SURFACE: "formal_reasoning_phys",
+    MATH_FAILFAST_SURFACE: "formal_reasoning_math",
+    PHYS_FAILFAST_SURFACE: "formal_reasoning_phys",
+    MATH_PAPER_EVAL_SURFACE: "formal_reasoning_math",
+    PHYS_PAPER_EVAL_SURFACE: "formal_reasoning_phys",
 }
 FORMAL_MEMORYARENA_COMMIT = "6cd9de14b71915e39ac742a20dc33785e14b6aab"
 FORMAL_ENV_GIT_TREE_OID = "5576f4aaa4bf17a2a807650635ce335b8c620d32"
@@ -316,14 +336,27 @@ FORMAL_JUDGE_PROMPT_TEMPLATE_SHA256 = (
 )
 
 
-def _formal_system_prompt(label: str) -> str:
+def _formal_system_prompt(label: str, *, contract_mode: str) -> str:
+    if contract_mode == "failfast":
+        outcome = (
+            "A correct answer advances to the next question and earns +1; an "
+            "incorrect answer ends the episode immediately."
+        )
+    elif contract_mode == "paper_eval":
+        outcome = (
+            "Every submitted answer is privately judged and then advances to the "
+            "next question, whether correct or incorrect. A correct answer earns "
+            "+1 and an incorrect answer earns 0. The final question's correctness "
+            "determines task success."
+        )
+    else:  # pragma: no cover - immutable evaluator construction owns this.
+        raise ValueError(f"unsupported Formal contract mode: {contract_mode!r}")
     return (
         f"You are operating the MemoryArena formal-reasoning {label} domain. "
         "An episode contains sequential questions from one paper. The current "
         "question and its published background are visible; answer text is "
-        "privately evaluated by the original MemoryArena judge. A correct answer "
-        "advances to the next question and earns +1; an incorrect answer ends the "
-        "episode immediately. Submit one final answer for the current question.\n\n"
+        "privately evaluated by the original MemoryArena judge. "
+        f"{outcome} Submit one final answer for the current question.\n\n"
         "Native domain action forms:\n- <final answer text>\n\n"
         "Policy memory action forms:\n"
         '- ADD {"key": "...", "value": "..."}\n'
@@ -347,25 +380,73 @@ def _formal_system_prompt(label: str) -> str:
 
 
 FORMAL_RUNTIME_CONTRACTS = {
-    MATH_SURFACE: {
+    MATH_FAILFAST_SURFACE: {
         "contract_id": "memoryarena_formal_reasoning_math_failfast_v3_20260721",
         "contract_sha256": (
             "87b7ac62bd2595ad32c10f5586713b78ec91564f7f6e950fd65c567e7df22f6a"
         ),
-        "system_prompt": _formal_system_prompt("mathematics"),
+        "system_prompt": _formal_system_prompt(
+            "mathematics", contract_mode="failfast"
+        ),
         "system_prompt_sha256": (
             "07575bd2d47ca1997871fbf32866a92485c054c3c63b5450536fe17cb873a812"
         ),
+        "contract_mode": "failfast",
+        "semantic_variant": "ordered_subtask_failfast_v1",
+        "phase_transition": "advance_on_correct; terminal_on_incorrect",
+        "episode_success": "all_questions_correct",
     },
-    PHYS_SURFACE: {
+    PHYS_FAILFAST_SURFACE: {
         "contract_id": "memoryarena_formal_reasoning_phys_failfast_v3_20260721",
         "contract_sha256": (
             "fee34fe351102ae1a3ee43dc26d92689a1246175086d5d515679331a6b4bef4a"
         ),
-        "system_prompt": _formal_system_prompt("physics"),
+        "system_prompt": _formal_system_prompt("physics", contract_mode="failfast"),
         "system_prompt_sha256": (
             "a2cec3dcdca74764585b7c6f8c3343dd11cb1ce172d4368170abed7373c65eb0"
         ),
+        "contract_mode": "failfast",
+        "semantic_variant": "ordered_subtask_failfast_v1",
+        "phase_transition": "advance_on_correct; terminal_on_incorrect",
+        "episode_success": "all_questions_correct",
+    },
+    MATH_PAPER_EVAL_SURFACE: {
+        "contract_id": (
+            "memoryarena_formal_reasoning_math_"
+            "paper_eval_one_action_v3_20260723"
+        ),
+        "contract_sha256": (
+            "cbccf42639727276346ee524429e3826c59e8d9d62c63f207e2b15e127f7c305"
+        ),
+        "system_prompt": _formal_system_prompt(
+            "mathematics", contract_mode="paper_eval"
+        ),
+        "system_prompt_sha256": (
+            "6b6498b25081ae3c11f7ea8332508f9474c75432c6b1901028dbc44a2d776a85"
+        ),
+        "contract_mode": "paper_eval",
+        "semantic_variant": "paper_metric_continue_on_incorrect_one_action_v1",
+        "phase_transition": "advance_after_every_judged_answer",
+        "episode_success": "final_question_correct",
+    },
+    PHYS_PAPER_EVAL_SURFACE: {
+        "contract_id": (
+            "memoryarena_formal_reasoning_phys_"
+            "paper_eval_one_action_v3_20260723"
+        ),
+        "contract_sha256": (
+            "339bf7f07ed94b1089682f80486396753953fc047df9b9e807be5bf6c2888120"
+        ),
+        "system_prompt": _formal_system_prompt(
+            "physics", contract_mode="paper_eval"
+        ),
+        "system_prompt_sha256": (
+            "f8caa9d251656b345097fe09c4ac51648db1abbc4d84be10ec00355ef9ddb620"
+        ),
+        "contract_mode": "paper_eval",
+        "semantic_variant": "paper_metric_continue_on_incorrect_one_action_v1",
+        "phase_transition": "advance_after_every_judged_answer",
+        "episode_success": "final_question_correct",
     },
 }
 for _formal_runtime in FORMAL_RUNTIME_CONTRACTS.values():
@@ -433,6 +514,24 @@ SEARCH_PHASE_VERDICT_FIELDS = frozenset(
     }
 )
 SEARCH_SR_AT_K_FIELDS = frozenset({"correct", "numerator", "denominator"})
+FORMAL_PAPER_LEDGER_FIELDS = frozenset(
+    {
+        "metric_contract",
+        "dataset_scope",
+        "task_id",
+        "paper_name",
+        "complete",
+        "phase_results",
+        "completed_phase_count",
+        "process_score_numerator",
+        "process_score_denominator",
+        "process_score",
+        "final_sr_numerator",
+        "final_sr_denominator",
+        "final_success",
+        "online_reward_is_separate",
+    }
+)
 
 PAPER_SURFACE_REGISTRY = {
     WEBSHOP_V2_SURFACE: {
@@ -472,19 +571,33 @@ PAPER_SURFACE_REGISTRY = {
         # It is a valid public-panel metric, never a complete paper macro column.
         "canonical_macro_candidate": False,
     },
-    MATH_SURFACE: {
+    MATH_FAILFAST_SURFACE: {
         "paper_column": "Math",
         "domain_id": "formal_reasoning_math",
         "variant": "failfast_v3",
         "metric_mode": "episode_success",
         "canonical_macro_candidate": False,
     },
-    PHYS_SURFACE: {
+    PHYS_FAILFAST_SURFACE: {
         "paper_column": "Physics",
         "domain_id": "formal_reasoning_phys",
         "variant": "failfast_v3",
         "metric_mode": "episode_success",
         "canonical_macro_candidate": False,
+    },
+    MATH_PAPER_EVAL_SURFACE: {
+        "paper_column": "Math",
+        "domain_id": "formal_reasoning_math",
+        "variant": "paper_eval_one_action_v3",
+        "metric_mode": "formal_paper_ledger",
+        "canonical_macro_candidate": True,
+    },
+    PHYS_PAPER_EVAL_SURFACE: {
+        "paper_column": "Physics",
+        "domain_id": "formal_reasoning_phys",
+        "variant": "paper_eval_one_action_v3",
+        "metric_mode": "formal_paper_ledger",
+        "canonical_macro_candidate": True,
     },
 }
 
@@ -1062,9 +1175,10 @@ def _require_formal_runtime_metadata(
         "native_action_descriptions": ["<final answer text>"],
         "max_steps": 64,
         "judge": "memoryarena_llm_math_equivalence_v1",
-        "semantic_variant": "ordered_subtask_failfast_v1",
-        "phase_transition": "advance_on_correct; terminal_on_incorrect",
-        "episode_success": "all_questions_correct",
+        "contract_mode": runtime["contract_mode"],
+        "semantic_variant": runtime["semantic_variant"],
+        "phase_transition": runtime["phase_transition"],
+        "episode_success": runtime["episode_success"],
         "reward_overlay": "none",
     }
     mismatches = {
@@ -1084,6 +1198,25 @@ def _require_formal_runtime_metadata(
             "invalid_action": 0.0,
         },
     )
+    if runtime["contract_mode"] == "paper_eval":
+        _require_exact_mapping(
+            "Formal paper_evaluation",
+            metadata.get("paper_evaluation"),
+            {
+                "id": FORMAL_PAPER_METRIC_CONTRACT,
+                "dataset_scope": FORMAL_PAPER_DATASET_SCOPES[surface],
+                "available": True,
+                "metrics": ["PS", "SR"],
+                "metric_scale": "unit_interval",
+                "canonical_semantics": True,
+                "paper_panel_complete": True,
+                "paper_column_eligible": True,
+                "continue_after_incorrect": True,
+                "separate_from_online_reward": True,
+            },
+        )
+    elif "paper_evaluation" in metadata:
+        raise EvalError("Formal fail-fast surface must not claim paper evaluation")
     expected_upstream = {
         "mode": "pinned_pristine_upstream_scopes",
         "memoryarena_commit": FORMAL_MEMORYARENA_COMMIT,
@@ -1175,6 +1308,9 @@ def _validate_formal_episode_steps(
     expected_paper_name: str,
     expected_phase_count: int,
 ) -> tuple[list[bool], Mapping[str, Any]]:
+    contract_mode = metadata.get("contract_mode")
+    if contract_mode not in {"failfast", "paper_eval"}:
+        raise EvalError(f"unsupported Formal contract mode: {contract_mode!r}")
     initial = episode["initial_env_info"]
     assert isinstance(initial, Mapping)
     _validate_formal_info_identity(
@@ -1296,15 +1432,33 @@ def _validate_formal_episode_steps(
                     raise EvalError(
                         f"Formal episode {episode_index} correct answer did not advance"
                     )
+                expected_done = after_index == expected_phase_count
+                if step["done"] is not expected_done:
+                    raise EvalError(
+                        f"Formal episode {episode_index} correct answer has invalid "
+                        f"{contract_mode} termination"
+                    )
             elif status == "committed_incorrect":
                 passed = False
                 expected_reward = 0.0
                 expected_component = "formal_reasoning_answer_incorrect"
-                if after_index != before_index or step["done"] is not True:
-                    raise EvalError(
-                        f"Formal episode {episode_index} incorrect answer did not "
-                        "fail fast"
-                    )
+                if contract_mode == "failfast":
+                    if after_index != before_index or step["done"] is not True:
+                        raise EvalError(
+                            f"Formal episode {episode_index} incorrect answer did not "
+                            "fail fast"
+                        )
+                else:
+                    expected_after = before_index + 1
+                    expected_done = expected_after == expected_phase_count
+                    if (
+                        after_index != expected_after
+                        or step["done"] is not expected_done
+                    ):
+                        raise EvalError(
+                            f"Formal episode {episode_index} incorrect answer violates "
+                            "paper-eval continuation"
+                        )
             else:
                 raise EvalError(
                     f"Formal episode {episode_index} has unsupported ANSWER status"
@@ -1364,6 +1518,97 @@ def _validate_formal_episode_steps(
     return answer_results, previous
 
 
+def _validate_formal_paper_ledger(
+    ledger: Any,
+    *,
+    episode_index: int,
+    dataset_scope: str,
+    task_id: str,
+    paper_name: str,
+    phase_results: Sequence[bool],
+) -> tuple[float, bool]:
+    if not isinstance(ledger, Mapping):
+        raise EvalError(f"Formal episode {episode_index} lacks paper_evaluation ledger")
+    if set(ledger) != FORMAL_PAPER_LEDGER_FIELDS:
+        raise EvalError(
+            f"Formal episode {episode_index} paper_evaluation fields mismatch"
+        )
+
+    phase_count = len(phase_results)
+    correct_count = sum(phase_results)
+    final_success = phase_results[-1]
+    exact_values = {
+        "metric_contract": FORMAL_PAPER_METRIC_CONTRACT,
+        "dataset_scope": dataset_scope,
+        "task_id": task_id,
+        "paper_name": paper_name,
+        "complete": True,
+        "phase_results": list(phase_results),
+        "completed_phase_count": phase_count,
+        "process_score_numerator": correct_count,
+        "process_score_denominator": phase_count,
+        "final_sr_numerator": int(final_success),
+        "final_sr_denominator": 1,
+        "final_success": final_success,
+        "online_reward_is_separate": True,
+    }
+    mismatches = {
+        key: (expected, ledger.get(key))
+        for key, expected in exact_values.items()
+        if ledger.get(key) != expected
+    }
+    integer_fields = (
+        "completed_phase_count",
+        "process_score_numerator",
+        "process_score_denominator",
+        "final_sr_numerator",
+        "final_sr_denominator",
+    )
+    if any(type(ledger.get(key)) is not int for key in integer_fields):
+        raise EvalError(
+            f"Formal episode {episode_index} paper_evaluation integer fields mismatch"
+        )
+    boolean_fields = (
+        "complete",
+        "final_success",
+        "online_reward_is_separate",
+    )
+    if any(type(ledger.get(key)) is not bool for key in boolean_fields):
+        raise EvalError(
+            f"Formal episode {episode_index} paper_evaluation boolean fields mismatch"
+        )
+    ledger_phase_results = ledger.get("phase_results")
+    if not isinstance(ledger_phase_results, list) or any(
+        type(value) is not bool for value in ledger_phase_results
+    ):
+        raise EvalError(
+            f"Formal episode {episode_index} paper_evaluation phase results mismatch"
+        )
+    if mismatches:
+        raise EvalError(
+            f"Formal episode {episode_index} paper_evaluation ledger mismatch: "
+            f"{mismatches}"
+        )
+
+    expected_process_score = correct_count / phase_count
+    process_score = ledger.get("process_score")
+    if (
+        isinstance(process_score, bool)
+        or not isinstance(process_score, (int, float))
+        or not math.isfinite(float(process_score))
+        or not math.isclose(
+            float(process_score),
+            expected_process_score,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        )
+    ):
+        raise EvalError(
+            f"Formal episode {episode_index} paper_evaluation process score mismatch"
+        )
+    return expected_process_score, final_success
+
+
 def aggregate_formal_panel_evidence(
     episodes: Sequence[Mapping[str, Any]],
     metadata: Mapping[str, Any],
@@ -1384,10 +1629,15 @@ def aggregate_formal_panel_evidence(
         record_count=len(phase_counts),
         phase_count=expected_phase_total,
     )
+    contract_mode = metadata["contract_mode"]
+    if not episodes:
+        raise EvalError("Formal panel requires at least one episode")
 
     data_indices: set[int] = set()
     task_ids: set[str] = set()
     observed_phase_total = 0
+    process_scores: list[float] = []
+    final_successes = 0
     for episode_index, episode in enumerate(episodes):
         data_idx = episode.get("data_idx")
         if (
@@ -1450,23 +1700,41 @@ def aggregate_formal_panel_evidence(
         success = episode.get("episode_success")
         if type(success) is not bool or after.get("episode_success") is not success:
             raise EvalError(f"Formal episode {episode_index} terminal success conflicts")
-        if success:
+        if contract_mode == "failfast":
+            if success:
+                valid_ledger = (
+                    final_index == expected_phase_count
+                    and len(phase_results) == expected_phase_count
+                    and all(phase_results)
+                )
+            else:
+                valid_ledger = (
+                    0 <= final_index < expected_phase_count
+                    and len(phase_results) == final_index + 1
+                    and all(phase_results[:-1])
+                    and phase_results[-1] is False
+                )
+        else:
             valid_ledger = (
                 final_index == expected_phase_count
                 and len(phase_results) == expected_phase_count
-                and all(phase_results)
-            )
-        else:
-            valid_ledger = (
-                0 <= final_index < expected_phase_count
-                and len(phase_results) == final_index + 1
-                and all(phase_results[:-1])
-                and phase_results[-1] is False
+                and success is phase_results[-1]
             )
         if not valid_ledger:
             raise EvalError(
                 f"Formal episode {episode_index} phase results conflict with progress"
             )
+        if contract_mode == "paper_eval":
+            process_score, final_success = _validate_formal_paper_ledger(
+                domain.get("paper_evaluation"),
+                episode_index=episode_index,
+                dataset_scope=FORMAL_PAPER_DATASET_SCOPES[surface],
+                task_id=expected_task_id,
+                paper_name=initial_domain["paper_name"],
+                phase_results=phase_results,
+            )
+            process_scores.append(process_score)
+            final_successes += int(final_success)
         if expected_task_id in task_ids:
             raise EvalError(f"Formal paper evaluation repeats task_id {expected_task_id}")
         task_ids.add(expected_task_id)
@@ -1477,9 +1745,9 @@ def aggregate_formal_panel_evidence(
         and len(task_ids) == len(phase_counts)
         and observed_phase_total == expected_phase_total
     )
-    return {
-        "metric_contract": "episode_success",
-        "dataset_scope": f"memoryarena_{dataset_config}_frozen{len(phase_counts)}",
+    dataset_scope = f"memoryarena_{dataset_config}_frozen{len(phase_counts)}"
+    common = {
+        "dataset_scope": dataset_scope,
         "task_count": len(data_indices),
         "unique_task_id_count": len(task_ids),
         "phase_count": observed_phase_total,
@@ -1487,6 +1755,22 @@ def aggregate_formal_panel_evidence(
         "expected_phase_count": expected_phase_total,
         "server_provenance_verified": True,
         "paper_panel_complete": complete,
+    }
+    if contract_mode == "failfast":
+        return {"metric_contract": "episode_success", **common}
+
+    process_score_sum = math.fsum(process_scores)
+    task_count = len(process_scores)
+    return {
+        "metric_contract": FORMAL_PAPER_METRIC_CONTRACT,
+        **common,
+        "process_score_numerator": process_score_sum,
+        "process_score_denominator": task_count,
+        "process_score": process_score_sum / task_count,
+        "final_sr_numerator": final_successes,
+        "final_sr_denominator": task_count,
+        "final_success_rate": final_successes / task_count,
+        "online_reward_is_separate": True,
     }
 
 
@@ -2436,6 +2720,13 @@ def summarize_paper_surface(
         paper_metric_contract = paper_metrics["metric_contract"]
         paper_success_rate = float(paper_metrics["final_success_rate"])
         expected_task_count = SEARCH_RECORD_COUNT
+    elif metric_mode == "formal_paper_ledger":
+        paper_metrics = aggregate_formal_panel_evidence(episodes, metadata)
+        paper_metric_contract = paper_metrics["metric_contract"]
+        paper_success_rate = float(paper_metrics["final_success_rate"])
+        expected_task_count = len(
+            FORMAL_TASK_PHASE_COUNTS[registration["surface"]]
+        )
     else:  # pragma: no cover - registry construction owns this invariant
         raise EvalError(f"unsupported paper metric mode: {metric_mode!r}")
 

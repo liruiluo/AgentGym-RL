@@ -514,7 +514,7 @@ def _formal_metadata(surface: str) -> dict:
         "endpoint_sha256": "e" * 64,
         "prompt_template_sha256": MODULE.FORMAL_JUDGE_PROMPT_TEMPLATE_SHA256,
     }
-    return {
+    metadata = {
         "formal_schema_version": MODULE.FORMAL_SCHEMA_V3,
         "source": "MemoryArena",
         "surface": surface,
@@ -535,9 +535,10 @@ def _formal_metadata(surface: str) -> dict:
             **judge_config,
             "config_sha256": MODULE._canonical_json_sha256(judge_config),
         },
-        "semantic_variant": "ordered_subtask_failfast_v1",
-        "phase_transition": "advance_on_correct; terminal_on_incorrect",
-        "episode_success": "all_questions_correct",
+        "contract_mode": runtime["contract_mode"],
+        "semantic_variant": runtime["semantic_variant"],
+        "phase_transition": runtime["phase_transition"],
+        "episode_success": runtime["episode_success"],
         "upstream_provenance": {
             "mode": "pinned_pristine_upstream_scopes",
             "memoryarena_commit": MODULE.FORMAL_MEMORYARENA_COMMIT,
@@ -561,6 +562,20 @@ def _formal_metadata(surface: str) -> dict:
         },
         "reward_overlay": "none",
     }
+    if runtime["contract_mode"] == "paper_eval":
+        metadata["paper_evaluation"] = {
+            "id": MODULE.FORMAL_PAPER_METRIC_CONTRACT,
+            "dataset_scope": MODULE.FORMAL_PAPER_DATASET_SCOPES[surface],
+            "available": True,
+            "metrics": ["PS", "SR"],
+            "metric_scale": "unit_interval",
+            "canonical_semantics": True,
+            "paper_panel_complete": True,
+            "paper_column_eligible": True,
+            "continue_after_incorrect": True,
+            "separate_from_online_reward": True,
+        }
+    return metadata
 
 
 def _formal_episode(
@@ -568,12 +583,23 @@ def _formal_episode(
     *,
     surface: str,
     success: bool = True,
+    results: list[bool] | None = None,
 ) -> dict:
     phase_count = MODULE.FORMAL_TASK_PHASE_COUNTS[surface][position]
     metadata = _formal_metadata(surface)
     task_id = str(position)
     paper_name = f"paper-{position}"
-    phase_results = [True] * phase_count if success else [False]
+    contract_mode = metadata["contract_mode"]
+    if results is not None:
+        phase_results = list(results)
+    elif contract_mode == "paper_eval":
+        phase_results = (
+            [True] * phase_count
+            if success
+            else [True] * (phase_count - 1) + [False]
+        )
+    else:
+        phase_results = [True] * phase_count if success else [False]
     initial_domain = {"task_id": task_id, "paper_name": paper_name}
     initial_info = {
         "formal_schema_version": MODULE.FORMAL_SCHEMA_V3,
@@ -592,8 +618,11 @@ def _formal_episode(
     observed_results = []
     for turn, passed in enumerate(phase_results, start=1):
         before_index = previous["phase_index"]
-        after_index = before_index + int(passed)
-        terminal = not passed or after_index == phase_count
+        phase_advanced = passed or contract_mode == "paper_eval"
+        after_index = before_index + int(phase_advanced)
+        terminal = after_index == phase_count or (
+            contract_mode == "failfast" and not passed
+        )
         observed_results.append(passed)
         reward = float(passed)
         component_name = (
@@ -623,7 +652,7 @@ def _formal_episode(
                     "committed": True,
                     "submission_correct": passed,
                     "phase_index": before_index,
-                    "phase_advanced": passed,
+                    "phase_advanced": phase_advanced,
                     "terminal": terminal,
                     "answer_sha256": "a" * 64,
                 }
@@ -658,11 +687,30 @@ def _formal_episode(
                     "phase_index_before": before_index,
                     "phase_index_after": after_index,
                     "phase_count": phase_count,
-                    "phase_advanced": passed,
+                    "phase_advanced": phase_advanced,
                 },
             }
         )
         previous = current
+    if contract_mode == "paper_eval" and previous["phase_index"] == phase_count:
+        final_success = bool(observed_results[-1])
+        previous["domain_evidence"]["paper_evaluation"] = {
+            "metric_contract": MODULE.FORMAL_PAPER_METRIC_CONTRACT,
+            "dataset_scope": MODULE.FORMAL_PAPER_DATASET_SCOPES[surface],
+            "task_id": task_id,
+            "paper_name": paper_name,
+            "complete": True,
+            "phase_results": list(observed_results),
+            "completed_phase_count": phase_count,
+            "process_score_numerator": sum(observed_results),
+            "process_score_denominator": phase_count,
+            "process_score": sum(observed_results) / phase_count,
+            "final_sr_numerator": int(final_success),
+            "final_sr_denominator": 1,
+            "final_success": final_success,
+            "online_reward_is_separate": True,
+        }
+        steps[-1]["env_info_after"] = copy.deepcopy(previous)
     final_index = previous["phase_index"]
     return {
         "data_idx": position,
@@ -670,7 +718,7 @@ def _formal_episode(
         "steps": steps,
         "episode_return": float(sum(phase_results)),
         "done": True,
-        "episode_success": success,
+        "episode_success": bool(previous["episode_success"]),
         "timed_out": False,
         "final_phase_progress": {
             "phase_index_after": final_index,
@@ -728,11 +776,11 @@ class EvalV3OpenAITest(unittest.TestCase):
             "Travel": (MODULE.TRAVEL_PAPER_EVAL_SURFACE, "travel_planner"),
             "Search": (MODULE.SEARCH_PAPER_EVAL_SURFACE, "progressive_search"),
             "Math": (
-                MODULE.MATH_SURFACE,
+                MODULE.MATH_PAPER_EVAL_SURFACE,
                 "formal_reasoning_math",
             ),
             "Physics": (
-                MODULE.PHYS_SURFACE,
+                MODULE.PHYS_PAPER_EVAL_SURFACE,
                 "formal_reasoning_phys",
             ),
         }
@@ -745,6 +793,58 @@ class EvalV3OpenAITest(unittest.TestCase):
                 registration = MODULE.resolve_paper_surface(metadata)
                 self.assertEqual(registration["paper_column"], label)
                 self.assertEqual(registration["surface"], surface)
+
+    def test_formal_failfast_wrong_answer_contract_is_preserved(self):
+        for surface in (MODULE.MATH_FAILFAST_SURFACE, MODULE.PHYS_FAILFAST_SURFACE):
+            with self.subTest(surface=surface):
+                metadata = _formal_metadata(surface)
+                episode = _formal_episode(0, surface=surface, success=False)
+                metrics = MODULE.aggregate_formal_panel_evidence(
+                    [episode], metadata
+                )
+                self.assertEqual(metrics["metric_contract"], "episode_success")
+                self.assertEqual(
+                    episode["final_phase_progress"]["phase_index_after"], 0
+                )
+
+                continued = copy.deepcopy(episode)
+                continued["steps"][0]["env_info_after"]["phase_index"] = 1
+                continued["steps"][0]["done"] = False
+                with self.assertRaisesRegex(MODULE.EvalError, "fail fast"):
+                    MODULE.aggregate_formal_panel_evidence([continued], metadata)
+
+    def test_formal_paper_eval_wrong_answer_continues_for_both_domains(self):
+        for surface in (
+            MODULE.MATH_PAPER_EVAL_SURFACE,
+            MODULE.PHYS_PAPER_EVAL_SURFACE,
+        ):
+            with self.subTest(surface=surface):
+                phase_count = MODULE.FORMAL_TASK_PHASE_COUNTS[surface][0]
+                results = [False] + [True] * (phase_count - 1)
+                metadata = _formal_metadata(surface)
+                episode = _formal_episode(0, surface=surface, results=results)
+                metrics = MODULE.aggregate_formal_panel_evidence(
+                    [episode], metadata
+                )
+                first = episode["steps"][0]
+                self.assertFalse(first["done"])
+                self.assertEqual(
+                    first["env_info_after"]["phase_index"], 1
+                )
+                self.assertTrue(episode["episode_success"])
+                self.assertAlmostEqual(
+                    metrics["process_score"], (phase_count - 1) / phase_count
+                )
+                self.assertEqual(metrics["final_success_rate"], 1.0)
+
+                failfast_forgery = copy.deepcopy(episode)
+                failfast_forgery["steps"][0]["env_info_after"]["phase_index"] = 0
+                with self.assertRaisesRegex(
+                    MODULE.EvalError, "paper-eval continuation"
+                ):
+                    MODULE.aggregate_formal_panel_evidence(
+                        [failfast_forgery], metadata
+                    )
 
     def test_travel_paper_ledger_uses_people_and_group_weighting(self):
         self.assertEqual(
@@ -1197,6 +1297,45 @@ class EvalV3OpenAITest(unittest.TestCase):
                 provenance_drift["dataset_provenance"]["sha256"] = "0" * 64
                 with self.assertRaisesRegex(MODULE.EvalError, "provenance mismatch"):
                     MODULE.summarize_paper_surface(episodes, provenance_drift)
+
+    def test_formal_paper_eval_full_panels_are_macro_eligible(self):
+        for surface in (
+            MODULE.MATH_PAPER_EVAL_SURFACE,
+            MODULE.PHYS_PAPER_EVAL_SURFACE,
+        ):
+            with self.subTest(surface=surface):
+                phase_counts = MODULE.FORMAL_TASK_PHASE_COUNTS[surface]
+                episodes = [
+                    _formal_episode(position, surface=surface)
+                    for position in range(len(phase_counts))
+                ]
+                first_results = [False] + [True] * (phase_counts[0] - 1)
+                final_wrong_results = [True] * (phase_counts[1] - 1) + [False]
+                episodes[0] = _formal_episode(
+                    0, surface=surface, results=first_results
+                )
+                episodes[1] = _formal_episode(
+                    1, surface=surface, results=final_wrong_results
+                )
+
+                summary = MODULE.summarize_paper_surface(
+                    episodes, _formal_metadata(surface)
+                )
+                expected_ps = 1.0 - (
+                    (1.0 / phase_counts[0]) + (1.0 / phase_counts[1])
+                ) / len(phase_counts)
+                expected_sr = (len(phase_counts) - 1) / len(phase_counts)
+                self.assertTrue(summary["panel_complete"])
+                self.assertTrue(summary["paper_panel_complete"])
+                self.assertTrue(summary["paper_macro_eligible"])
+                self.assertEqual(
+                    summary["paper_metric_contract"],
+                    MODULE.FORMAL_PAPER_METRIC_CONTRACT,
+                )
+                self.assertAlmostEqual(
+                    summary["paper_metrics"]["process_score"], expected_ps
+                )
+                self.assertAlmostEqual(summary["paper_success_rate"], expected_sr)
 
     def test_formal_panel_rejects_runtime_provenance_and_step_forgery(self):
         surface = MODULE.MATH_SURFACE
