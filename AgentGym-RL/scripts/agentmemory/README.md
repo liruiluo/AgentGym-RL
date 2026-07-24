@@ -21,8 +21,9 @@ policy turn it:
 
 Both `/tokenize` and `/chat/completions` receive the same
 `chat_template_kwargs.enable_thinking` value. Native thinking is explicitly
-disabled by default, matching the current AMG rollout; pass
-`--enable-thinking` only for a deliberately thinking-enabled test.
+disabled by default; pass `--enable-thinking` when evaluating a policy trained
+or served with native thinking enabled. Record this choice in the run manifest
+and keep it fixed across compared checkpoints.
 
 The normal OpenAI response does not expose completion token IDs.  Accordingly
 `response_token_ids_exact` is `false` unless the response carries an explicit
@@ -97,8 +98,8 @@ The currently registered runtime surfaces are:
 | Shopping | `memoryarena_webshop_native_v1` | terminal `episode_success` |
 | Travel | `memoryarena_travel_planner_paper_eval_one_action_v3` | official Travel SR ledger |
 | Search | `memoryarena_progressive_search_paper_eval_public221_one_action_v3` | official Search paper ledger |
-| Math | `memoryarena_formal_reasoning_math_failfast_v3` | diagnostic terminal `episode_success` for the named variant |
-| Physics | `memoryarena_formal_reasoning_phys_failfast_v3` | diagnostic terminal `episode_success` for the named variant |
+| Math | `memoryarena_formal_reasoning_math_paper_eval_one_action_v3` | original-style per-paper PS ledger and final-question SR |
+| Physics | `memoryarena_formal_reasoning_phys_paper_eval_one_action_v3` | original-style per-paper PS ledger and final-question SR |
 
 `memoryarena_travel_planner_failfast_one_action_v3` and
 `memoryarena_progressive_search_failfast_public221_one_action_v3` are explicit
@@ -153,15 +154,30 @@ manifest means all 221 tasks on this named public surface were evaluated;
 the nested Search metric remains `paper_panel_complete=false`. Results must
 retain this dataset-scope label and must not claim full paper-256 coverage.
 
-The Math+Physics **Formal Reasoning** family average is an auxiliary diagnostic
-only.  It must not replace the five-column macro or hide a missing surface.
+Formal paper evaluation uses
+`memoryarena_formal_reasoning_ps_final_sr_v1`. Every submitted answer is
+privately judged and advances to the next question, including an incorrect
+answer. Each terminal paper ledger records the ordered question verdicts,
+process-score numerator and denominator, and the final-question success bit.
+The outer evaluator recomputes:
 
-The currently wired Math and Physics surfaces are explicitly named
+```text
+PS = mean(correct questions / questions in paper)
+SR = papers whose final question is correct / evaluated papers
+```
+
+Math and Physics use separate frozen panels and separate paper columns. A
+complete Math panel contains 40 papers; a complete Physics panel contains 20.
+Partial panels remain diagnostic and are marked `paper_macro_eligible=false`.
+Only complete, provenance-verified panels may contribute their final `SR` to
+the canonical five-column macro.
+
+The Math+Physics **Formal Reasoning** family average is an auxiliary diagnostic
+only. It must not replace the five-column macro or hide a missing surface.
+
+The fail-fast training/diagnostic surfaces remain separately registered as
 `memoryarena_formal_reasoning_math_failfast_v3` and
-`memoryarena_formal_reasoning_phys_failfast_v3`.  Their `episode_success`
-belongs to that fail-fast multi-phase wrapper contract.  Results must retain
-the `failfast_v3` label and must not be presented as the original MemoryArena
-final-answer success metric. Both surfaces therefore emit
-`paper_macro_eligible=false`; they cannot enter the canonical five-column
-macro until separate Formal paper-evaluation surfaces preserve the original
-continue-through-all-questions ledger and final-question SR.
+`memoryarena_formal_reasoning_phys_failfast_v3`. A wrong answer terminates
+those variants immediately, and success means every question was correct.
+Their output must retain the `failfast_v3` label and cannot be reported as the
+paper Math or Physics column.
