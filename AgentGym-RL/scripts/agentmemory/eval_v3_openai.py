@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
+import importlib.util
 import json
 import math
 import re
@@ -602,52 +603,55 @@ PAPER_SURFACE_REGISTRY = {
 }
 
 # Native WebShop v2 predates the v3 metadata contract and therefore does not
-# expose ``system_prompt`` from its server.  This is the same fallback selected
-# by ``resolve_formal_runtime_contract`` in the training rollout.  v3 domains
-# never use this string: they must provide and hash their server prompt.
-LEGACY_WEBSHOP_SYSTEM_PROMPT = (
-    "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping "
-    "environment. Reply with exactly one executable action and nothing else: "
-    "either one native browser action or one uppercase memory-tool JSON action. "
-    "Output excludes angle-bracket placeholders, markdown, explanations, "
-    "Thought/Action labels, and <think> blocks. Native browser actions use "
-    "square-bracket syntax. search[keywords] runs a catalog search whose "
-    "keywords are concrete product wording such as a visible product name or "
-    "title; a bare category word or attribute alone matches little. click[value] "
-    "clicks one currently displayed clickable value, exactly as shown in the "
-    "available-actions list: an asin opens that product page, and the page also "
-    "exposes navigation such as click[Back to Search], click[< Prev], "
-    "click[Next >], click[Description], click[Features], click[Reviews], option "
-    "values, and click[Buy Now]. A product page shows title, price, rating, "
-    "sub-pages, and selectable options. click[Buy Now] on the open product "
-    "commits the purchase of the current shopping session; a correct purchase "
-    "advances to the next session and an incorrect purchase ends the episode "
-    "with reward -0.01 and no retry. The visible available-actions list enumerates "
-    "the clickable values valid on the current page. Memory tools use one uppercase name "
-    "followed by one JSON object. ADD requires key:string and value:string and "
-    "returns a new memory_id while storing exactly the text you wrote. UPDATE "
-    "requires memory_id:string and value:string and replaces that memory value. "
-    "DELETE requires memory_id:string and removes it. RETRIEVE requires "
-    "query:string and top_k=3 and matches text you previously wrote to long-term "
-    "memory with ADD (facts carried over from earlier sessions), not the current "
-    "page or catalog, exposing matches as visible C# items. SUMMARY requires "
-    "text:string and a non-empty source_ids:list[string] of visible S#/C# ids and "
-    "replaces active context with that summary. FILTER requires exactly one "
-    "non-empty keep_ids:list[string] or drop_ids:list[string], plus scope set to "
-    "active, session, or all, and only changes visible S#/C# context. Current-"
-    "session browser trace is shown as S# items and retrieved or summarized "
-    "memory as C# items. Current-session trace clears when a purchase advances "
-    "the session. Long-term memory persists across shopping sessions and remains "
-    "hidden until RETRIEVE exposes it. A successful purchase clears the current "
-    "session's page and short-term trace. Once you have selected the product for "
-    "the current session, use ADD before click[Buy Now] to save one concise "
-    "memory containing that product's identity and any visible attributes needed "
-    "for later compatibility decisions. At the start of every later shopping "
-    "session, use RETRIEVE to expose the relevant prior-purchase memories before "
-    "choosing a compatible product. The environment does not perform these "
-    "memory actions for you, and it does not reject an otherwise correct purchase "
-    "when ADD was skipped."
-)
+# expose ``system_prompt`` from its server. Load the canonical no-thinking
+# prompt from the rollout schema so evaluation cannot drift from training when
+# that contract changes. The lightweight evaluator still avoids importing the
+# training stack: loading ``schemas.py`` only needs type-only dependencies,
+# which are stubbed when they are unavailable in an eval-only environment.
+def _load_legacy_webshop_system_prompt() -> str:
+    schemas_path = Path(__file__).resolve().parents[2] / "verl/workers/rollout/schemas.py"
+    if not schemas_path.is_file():
+        raise RuntimeError(f"missing canonical AgentMemory prompt schema: {schemas_path}")
+
+    sentinel = object()
+    original_modules = {
+        name: sys.modules.get(name, sentinel) for name in ("torch", "transformers")
+    }
+    try:
+        if original_modules["torch"] is sentinel:
+            import types
+
+            torch_stub = types.ModuleType("torch")
+            torch_stub.Tensor = object
+            sys.modules["torch"] = torch_stub
+        if original_modules["transformers"] is sentinel:
+            import types
+
+            transformers_stub = types.ModuleType("transformers")
+            transformers_stub.PreTrainedTokenizer = object
+            sys.modules["transformers"] = transformers_stub
+
+        spec = importlib.util.spec_from_file_location(
+            "agentmemory_eval_prompt_schema", schemas_path
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"cannot load canonical prompt schema: {schemas_path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        prompt = module.AGENTMEMORY_ACTION_SYSTEM_PROMPT
+    finally:
+        for name, original in original_modules.items():
+            if original is sentinel:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = original
+
+    if not isinstance(prompt, str) or not prompt:
+        raise RuntimeError("canonical AgentMemory WebShop prompt is empty")
+    return prompt
+
+
+LEGACY_WEBSHOP_SYSTEM_PROMPT = _load_legacy_webshop_system_prompt()
 LEGACY_WEBSHOP_MAX_POLICY_TURNS = 56
 
 

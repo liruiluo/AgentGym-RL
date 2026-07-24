@@ -180,4 +180,5 @@ The fail-fast training/diagnostic surfaces remain separately registered as
 `memoryarena_formal_reasoning_phys_failfast_v3`. A wrong answer terminates
 those variants immediately, and success means every question was correct.
 Their output must retain the `failfast_v3` label and cannot be reported as the
-paper Math or Physics column.
+paper Math or Physics column. This deliberate training contract
+must not be presented as the original MemoryArena evaluation protocol.
