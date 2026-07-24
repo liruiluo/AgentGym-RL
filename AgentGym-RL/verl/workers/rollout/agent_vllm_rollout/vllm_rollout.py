@@ -517,6 +517,17 @@ class vLLMRollout(BaseRollout):
                                                   num_tp_per_train_tp=num_tp_per_train_tp)
 
         self._official_vllm = vllm_version not in ('0.3.1', '0.4.2', '0.5.4', '0.6.3')
+        if (
+            self._official_vllm
+            and not self._hf_generate
+            and rollout_config.free_cache_engine
+            and not rollout_config.get('enable_sleep_mode', False)
+        ):
+            raise ValueError(
+                'Official vLLM requires enable_sleep_mode=true when '
+                'free_cache_engine=true; otherwise rollout weights/KV cache '
+                'can remain resident during the PPO optimizer phase.'
+            )
         if self._hf_generate:
             # Qwen3.5-4B (Qwen3_5ForConditionalGeneration) is supported by
             # Transformers 5.x here but not by vLLM 0.11.  Keep the normal
