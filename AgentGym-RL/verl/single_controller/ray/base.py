@@ -223,6 +223,20 @@ class RayWorkerGroup(WorkerGroup):
         # cia.add_kwarg("_world_size", world_size)
         num_gpus = 1 / resource_pool.max_collocate_count
 
+        # Pre-allocate rank-0 rendezvous info in the driver and pass it to every
+        # actor. This avoids blocking on Ray named helper actors whose namespace
+        # handling changed in newer Ray versions.
+        import socket
+        self._master_addr = ray._private.services.get_node_ip_address()
+        with socket.socket() as _sock:
+            _sock.bind(("", 0))
+            self._master_port = str(_sock.getsockname()[1])
+        print(
+            f"[RayWorkerGroup] driver rendezvous for {self.name_prefix}: "
+            f"{self._master_addr}:{self._master_port}",
+            flush=True,
+        )
+
         rank = -1
         for pg_idx, local_world_size in enumerate(resource_pool.store):
             pg = pgs[pg_idx]
@@ -239,10 +253,9 @@ class RayWorkerGroup(WorkerGroup):
                     'WG_BACKEND': 'ray',
                     'RAY_LOCAL_WORLD_SIZE': str(local_world_size),
                     'RAY_LOCAL_RANK': str(local_rank),
+                    'MASTER_ADDR': self._master_addr,
+                    'MASTER_PORT': self._master_port,
                 }
-                if rank != 0:
-                    env_vars['MASTER_ADDR'] = self._master_addr
-                    env_vars['MASTER_PORT'] = self._master_port
 
                 # Preserve selected shell/runtime knobs in every actor. This is
                 # required for vLLM engine selection (for example VLLM_USE_V1=0)
@@ -293,18 +306,14 @@ class RayWorkerGroup(WorkerGroup):
                 self._worker_names.append(name)
 
                 if rank == 0:
-                    register_center_actor = None
-                    for _ in range(120):
-                        if f"{self.name_prefix}_register_center" not in list_named_actors():
-                            time.sleep(1)
-                        else:
-                            register_center_actor = ray.get_actor(f"{self.name_prefix}_register_center")
-                            break
-                    assert register_center_actor is not None, f"failed to get register_center_actor: {self.name_prefix}_register_center in {list_named_actors(all_namespaces=True)}"
-                    rank_zero_info = ray.get(register_center_actor.get_rank_zero_info.remote())
-                    self._master_addr, self._master_port = rank_zero_info['MASTER_ADDR'], rank_zero_info['MASTER_PORT']
-                    # print(f"rank_zero_info: {rank_zero_info}")
-                    # print(f"master_addr: {self._master_addr}, master_port: {self._master_port}")
+                    # Rendezvous is already provided by the driver. Do not block on
+                    # register_center named actors; they may be invisible across Ray
+                    # namespaces even though the rank-0 worker is alive.
+                    print(
+                        f"[RayWorkerGroup] rank0 uses driver rendezvous "
+                        f"{self._master_addr}:{self._master_port}",
+                        flush=True,
+                    )
 
     @property
     def worker_names(self):

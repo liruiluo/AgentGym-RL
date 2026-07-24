@@ -61,6 +61,18 @@ class WorkerHelper:
     def get_availale_master_addr_port(self):
         return self._get_node_ip(), str(self._get_free_port())
 
+    def get_rank_zero_info(self):
+        """Return rank-zero rendezvous info from the worker itself.
+
+        Ray named actor registration can be delayed or hidden across namespaces in
+        newer Ray versions. The driver may use this as a fallback after the rank-0
+        worker has initialized its own MASTER_ADDR/MASTER_PORT.
+        """
+        return {
+            "MASTER_ADDR": self._master_addr,
+            "MASTER_PORT": self._master_port,
+        }
+
     def _get_pid(self):
         return
 
@@ -101,11 +113,21 @@ class Worker(WorkerHelper):
         assert isinstance(rank, int), f"rank must be int, instead of {type(rank)}"
 
         if rank == 0:
-            master_addr, master_port = self.get_availale_master_addr_port()
-            rank_zero_info = {
-                "MASTER_ADDR": master_addr,
-                "MASTER_PORT": master_port,
-            }
+            # Prefer driver-provided rendezvous info. Newer Ray versions may hide
+            # helper named actors across namespaces; relying on the driver to
+            # pre-allocate MASTER_ADDR/MASTER_PORT avoids a fragile register-center
+            # dependency while keeping the same distributed contract.
+            if os.environ.get("MASTER_ADDR") and os.environ.get("MASTER_PORT"):
+                rank_zero_info = {
+                    "MASTER_ADDR": os.environ["MASTER_ADDR"],
+                    "MASTER_PORT": os.environ["MASTER_PORT"],
+                }
+            else:
+                master_addr, master_port = self.get_availale_master_addr_port()
+                rank_zero_info = {
+                    "MASTER_ADDR": master_addr,
+                    "MASTER_PORT": master_port,
+                }
 
             if os.getenv("WG_BACKEND", None) == "ray":
                 from verl.single_controller.base.register_center.ray import create_worker_group_register_center
