@@ -4,6 +4,7 @@ trainer:
 
 data:
   path: null
+  file: null # optional explicit JSON/JSONL eval file
   max_prompt_length: 1024
   max_response_length: 15360
   prompt_key: item_id
@@ -15,7 +16,10 @@ agentgym:
     task_name: textcraft
     env_addr: 'http://localhost:5000'
     max_retries: 10
-    max_rounds: 10
+    # Canonical ceiling for policy turns.  Leave null to use the legacy
+    # max_rounds value for older invocations.
+    max_policy_turns: null
+    max_rounds: 10 # legacy compatibility fallback
     timeout: 300
 
 model:

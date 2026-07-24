@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 from dataclasses import dataclass
 from typing import List, Literal
@@ -250,7 +252,12 @@ class RolloutHandler:
         ]
         return apply_chat_template(tokenizer, conversations)
 
-    def get_latest_observation_prompt(self, tokenizer: PreTrainedTokenizer) -> List[int]:
+    def get_latest_observation_prompt(
+        self,
+        tokenizer: PreTrainedTokenizer,
+        *,
+        system_prompt: str | None = None,
+    ) -> List[int]:
         assert self.messages, "RolloutHandler has no messages."
         latest_user_message = self.messages[-1]
         assert latest_user_message.role == "user", (
@@ -259,7 +266,10 @@ class RolloutHandler:
         )
         # Preserve the no-raw-history policy while giving the model the neutral
         # action and state-transition contract every round.
-        system_prompt = agentmemory_action_system_prompt()
+        if system_prompt is None:
+            system_prompt = agentmemory_action_system_prompt()
+        if not isinstance(system_prompt, str) or not system_prompt.strip():
+            raise ValueError("Latest-observation system prompt must not be empty.")
         return apply_chat_template(
             tokenizer,
             [

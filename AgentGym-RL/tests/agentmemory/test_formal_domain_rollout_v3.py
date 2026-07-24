@@ -1,0 +1,350 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+import sys
+import types
+import unittest
+from copy import deepcopy
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[2]
+_MISSING = object()
+_ROLLOUT_MODULE_NAMES = (
+    "verl",
+    "verl.utils",
+    "verl.utils.agentgym",
+    "verl.utils.agentgym.formal_grpo_credit",
+    "verl.utils.agentgym.formal_domain_v3",
+    "formal_domain_rollout_context_for_test",
+)
+
+
+def _restore_module(name: str, previous) -> None:
+    if previous is _MISSING:
+        sys.modules.pop(name, None)
+    else:
+        sys.modules[name] = previous
+
+
+def load_module(name: str, relative_path: str, *, keep_registered: bool = False):
+    spec = importlib.util.spec_from_file_location(name, ROOT / relative_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    previous = sys.modules.get(name, _MISSING)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        if not keep_registered:
+            _restore_module(name, previous)
+    return module
+
+
+def load_rollout_context():
+    previous = {
+        name: sys.modules.get(name, _MISSING) for name in _ROLLOUT_MODULE_NAMES
+    }
+    try:
+        verl_module = types.ModuleType("verl")
+        verl_module.__path__ = []
+        utils_module = types.ModuleType("verl.utils")
+        utils_module.__path__ = []
+        agentgym_module = types.ModuleType("verl.utils.agentgym")
+        agentgym_module.__path__ = []
+        setattr(verl_module, "utils", utils_module)
+        setattr(utils_module, "agentgym", agentgym_module)
+        sys.modules["verl"] = verl_module
+        sys.modules["verl.utils"] = utils_module
+        sys.modules["verl.utils.agentgym"] = agentgym_module
+        formal_grpo = load_module(
+            "verl.utils.agentgym.formal_grpo_credit",
+            "verl/utils/agentgym/formal_grpo_credit.py",
+            keep_registered=True,
+        )
+        formal_domain = load_module(
+            "verl.utils.agentgym.formal_domain_v3",
+            "verl/utils/agentgym/formal_domain_v3.py",
+            keep_registered=True,
+        )
+        rollout_context = load_module(
+            "formal_domain_rollout_context_for_test",
+            "verl/utils/agentgym/rollout_context.py",
+            keep_registered=True,
+        )
+        return formal_grpo, formal_domain, rollout_context
+    finally:
+        for name in reversed(_ROLLOUT_MODULE_NAMES):
+            _restore_module(name, previous[name])
+
+
+FORMAL_GRPO, FORMAL_DOMAIN, ROLLOUT_CONTEXT = load_rollout_context()
+
+
+def env_info(*, phase: int, done: bool, episode_success: bool, reward: float):
+    action_execution = {
+        "raw_policy_output": "Action: ADVANCE {}",
+        "submitted_action": "ADVANCE {}",
+        "op": "ADVANCE",
+        "status": "executed",
+        "step": 1,
+    }
+    return {
+        "formal_schema_version": FORMAL_DOMAIN.FORMAL_DOMAIN_SCHEMA_V3,
+        "domain_id": "fake",
+        "surface": "fake_v3",
+        "contract_id": "fake_v1",
+        "contract_sha256": "a" * 64,
+        "phase_index": phase,
+        "phase_count": 2,
+        "episode_success": episode_success,
+        "done": done,
+        "action_execution": action_execution,
+        "tool_ops": [{"op": "ADVANCE", "step": 1}],
+        "reward_components": [
+            {"name": "phase_advance", "value": reward, "op": "ADVANCE", "step": 1}
+        ],
+        "domain_evidence": {"phase_advanced": True},
+        "sample_excluded": False,
+    }
+
+
+def packed_v3_record():
+    system_prompt = "SERVER CANONICAL PROMPT: use ADVANCE with exact JSON grammar."
+    latest_observation = "Current phase observation."
+    visible_prompt = f"<system>{system_prompt}</system>\n{latest_observation}"
+    prompt_token_ids = [101, 102, 103]
+    prompt_digest = ROLLOUT_CONTEXT.prompt_token_digest(prompt_token_ids)
+    response_token_ids = [201, 151645]
+    response_digest = ROLLOUT_CONTEXT.prompt_token_digest(response_token_ids)
+    exact_state_uid = f"0:turn1:statev1:{prompt_digest}"
+    trajectory_uid = "agentmemory:parentv1:0:replica0"
+    before = env_info(phase=1, done=False, episode_success=False, reward=0.0)
+    before["action_execution"] = {}
+    before["tool_ops"] = []
+    before["reward_components"] = []
+    before["domain_evidence"] = {"phase_advanced": False}
+    after = env_info(phase=2, done=True, episode_success=True, reward=1.0)
+    record = FORMAL_DOMAIN.build_formal_domain_step_v3(
+        content="Action: ADVANCE {}",
+        score=1.0,
+        task_round=1,
+        done=True,
+        item_id="0",
+        parent_index=0,
+        parent_group_uid="agentmemory:parentv1:0",
+        replica_index=0,
+        trajectory_uid=trajectory_uid,
+        exact_state_uid=exact_state_uid,
+        prompt_token_ids=prompt_token_ids,
+        response_token_ids=response_token_ids,
+        latest_observation=latest_observation,
+        visible_prompt=visible_prompt,
+        system_prompt=system_prompt,
+        single_observation_prompt_digest=prompt_digest,
+        env_result="terminal observation",
+        generation_record={
+            "response_token_count": len(response_token_ids),
+            "max_response_tokens": 8,
+            "finish_reason": "stop",
+            "finish_reason_source": "official_vllm:backend",
+            "stop_reason": None,
+            "backend_source": "official_vllm",
+            "configured_eos_token_ids": [151645, 151643],
+            "tokenizer_pad_token_id": 151643,
+            "token_ids_are_exact": True,
+            "backend_token_ids_are_exact": True,
+            "truncated": False,
+        },
+        env_info_before=before,
+        env_info_after=after,
+    )
+    record.pop("prompt_token_ids")
+    record.update(
+        {
+            "trajectory_row_uid": FORMAL_GRPO.build_row_uid(trajectory_uid, 0),
+            "trajectory_row_order": 0,
+            "trajectory_terminal": True,
+            "action": "Action: ADVANCE {}",
+            "immediate_reward": 1.0,
+            "suffix_return": 1.0,
+            "suffix_credit_applied": False,
+            "trajectory_return": 1.0,
+            "generation_prompt_length": len(prompt_token_ids),
+            "generation_prompt_digest": prompt_digest,
+            "packed_prompt_length": len(prompt_token_ids),
+            "packed_prompt_digest": prompt_digest,
+            "generation_response_length": len(response_token_ids),
+            "generation_response_digest": response_digest,
+            "packed_response_length": len(response_token_ids),
+            "packed_response_digest": response_digest,
+        }
+    )
+    return record
+
+
+def validate_one_record(record: dict):
+    return ROLLOUT_CONTEXT.validate_formal_runtime_evidence_rows(
+        exact_state_uids=[record["exact_state_uid"]],
+        trajectory_uids=[record["trajectory_uid"]],
+        trajectory_row_uids=[record["trajectory_row_uid"]],
+        trajectory_row_orders=[record["trajectory_row_order"]],
+        trajectory_terminals=[record["trajectory_terminal"]],
+        task_rounds=[record["task_round"]],
+        immediate_rewards=[record["immediate_reward"]],
+        trajectory_returns=[record["trajectory_return"]],
+        action_texts=[record["action"]],
+        done_flags=[record["done"]],
+        generation_prompt_lengths=[record["generation_prompt_length"]],
+        generation_prompt_digests=[record["generation_prompt_digest"]],
+        packed_prompt_lengths=[record["packed_prompt_length"]],
+        packed_prompt_digests=[record["packed_prompt_digest"]],
+        generation_response_lengths=[record["generation_response_length"]],
+        generation_response_digests=[record["generation_response_digest"]],
+        packed_response_lengths=[record["packed_response_length"]],
+        packed_response_digests=[record["packed_response_digest"]],
+        suffix_credit_applied=[record["suffix_credit_applied"]],
+        suffix_returns=[record["suffix_return"]],
+        step_record_jsons=[json.dumps(record)],
+        valid_mask=[True],
+        expected_suffix_credit=False,
+        expected_prompt_width=16,
+    )
+
+
+class FormalDomainRolloutV3Test(unittest.TestCase):
+    def test_isolated_loaders_restore_sys_modules(self):
+        before = {
+            name: (name in sys.modules, sys.modules.get(name))
+            for name in _ROLLOUT_MODULE_NAMES
+        }
+        formal_grpo, formal_domain, rollout_context = load_rollout_context()
+        self.assertTrue(callable(formal_grpo.build_row_uid))
+        self.assertEqual(
+            formal_domain.FORMAL_DOMAIN_SCHEMA_V3,
+            "agentmemory_formal_step_v3",
+        )
+        self.assertTrue(callable(rollout_context.prompt_token_digest))
+        after = {
+            name: (name in sys.modules, sys.modules.get(name))
+            for name in _ROLLOUT_MODULE_NAMES
+        }
+        for name in _ROLLOUT_MODULE_NAMES:
+            with self.subTest(name=name):
+                self.assertEqual(after[name][0], before[name][0])
+                self.assertIs(after[name][1], before[name][1])
+
+        probe_name = "formal_domain_v3_isolation_probe"
+        probe_before = sys.modules.get(probe_name, _MISSING)
+        loaded = load_module(
+            probe_name,
+            "verl/utils/agentgym/formal_domain_v3.py",
+        )
+        self.assertEqual(loaded.FORMAL_DOMAIN_SCHEMA_V3, "agentmemory_formal_step_v3")
+        self.assertIs(sys.modules.get(probe_name, _MISSING), probe_before)
+
+    def test_runtime_validator_accepts_domain_v3_without_buy_semantics(self):
+        summary = validate_one_record(packed_v3_record())
+        self.assertEqual(summary["valid_rows"], 1)
+        self.assertEqual(summary["trajectory_count"], 1)
+
+    def test_runtime_validator_rejects_prompt_digest_drift(self):
+        record = packed_v3_record()
+        record["single_observation_prompt_digest"] = "c" * 64
+        with self.assertRaisesRegex(ValueError, "one latest observation"):
+            validate_one_record(record)
+
+    def test_runtime_validator_rejects_server_raw_action_drift(self):
+        record = packed_v3_record()
+        record["action_execution"]["raw_policy_output"] = "different"
+        record["env_info_after"]["action_execution"]["raw_policy_output"] = "different"
+        with self.assertRaisesRegex(ValueError, "sampled content"):
+            validate_one_record(record)
+
+    def test_real_prompt_builder_receives_exact_metadata_prompt(self):
+        transformers_stub = types.ModuleType("transformers")
+        transformers_stub.PreTrainedTokenizer = object
+        torch_stub = types.ModuleType("torch")
+        torch_stub.Tensor = object
+        original_transformers = sys.modules.get("transformers")
+        original_torch = sys.modules.get("torch")
+        sys.modules["transformers"] = transformers_stub
+        sys.modules["torch"] = torch_stub
+        try:
+            schemas = load_module(
+                "formal_domain_schemas_for_test",
+                "verl/workers/rollout/schemas.py",
+            )
+        finally:
+            if original_transformers is None:
+                sys.modules.pop("transformers", None)
+            else:
+                sys.modules["transformers"] = original_transformers
+            if original_torch is None:
+                sys.modules.pop("torch", None)
+            else:
+                sys.modules["torch"] = original_torch
+
+        class CapturingTokenizer:
+            def __init__(self):
+                self.conversations = None
+
+            def apply_chat_template(self, conversations, **kwargs):
+                self.conversations = deepcopy(conversations)
+                return [7, 8, 9]
+
+        system_prompt = "  COMPLETE SERVER PROMPT WITH Action: GRAMMAR  "
+        observation = "latest observation"
+        handler = schemas.RolloutHandler.__new__(schemas.RolloutHandler)
+        handler.messages = [schemas.Message(role="user", content=observation)]
+        tokenizer = CapturingTokenizer()
+        token_ids = handler.get_latest_observation_prompt(
+            tokenizer,
+            system_prompt=system_prompt,
+        )
+        self.assertEqual(token_ids, [7, 8, 9])
+        self.assertEqual(
+            tokenizer.conversations,
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": observation},
+            ],
+        )
+
+    def test_rollout_source_keeps_v3_schema_and_skips_buy_validator(self):
+        source_path = (
+            ROOT
+            / "verl/workers/rollout/agent_vllm_rollout/vllm_rollout.py"
+        )
+        source = source_path.read_text(encoding="utf-8")
+        pack_start = source.index("def pack_rollout_handlers")
+        pack_end = source.index("def latest_observation_prompt_from_text", pack_start)
+        pack_source = source[pack_start:pack_end]
+        self.assertIn('schema_version = record.get(', pack_source)
+        self.assertIn('"schema_version": schema_version', pack_source)
+        self.assertNotIn(
+            '"schema_version": "agentmemory_formal_step_v2"',
+            pack_source,
+        )
+
+        rollout_start = source.index("def generate_agentmemory_latest_observation")
+        rollout_end = source.index("@torch.no_grad()", rollout_start)
+        rollout_source = source[rollout_start:rollout_end]
+        v3_start = rollout_source.index(
+            "if formal_schema_version == FORMAL_DOMAIN_SCHEMA_V3:"
+        )
+        v3_end = rollout_source.index("else:", v3_start)
+        v3_source = rollout_source[v3_start:v3_end]
+        self.assertIn("build_formal_domain_step_v3", v3_source)
+        self.assertNotIn("validate_formal_buy_transition", v3_source)
+        self.assertIn(
+            "system_prompt=rollout_handler.formal_system_prompt",
+            rollout_source,
+        )
+        self.assertIn("system_prompt=formal_system_prompt", rollout_source)
+        self.assertIn("except FormalRuntimeEvidenceError:", rollout_source)
+
+
+if __name__ == "__main__":
+    unittest.main()

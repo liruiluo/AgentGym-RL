@@ -110,7 +110,8 @@ class RolloutGroupingContractTest(unittest.TestCase):
         pack_source = source[pack_start:pack_end]
         self.assertIn("AGENTMEMORY_STEP_RECORD_JSON", pack_source)
         self.assertIn("validate_formal_runtime_evidence_rows", pack_source)
-        self.assertIn('"schema_version": "agentmemory_formal_step_v2"', pack_source)
+        self.assertIn("FORMAL_WEBSHOP_SCHEMA_V2", pack_source)
+        self.assertIn("FORMAL_DOMAIN_SCHEMA_V3", pack_source)
 
     def test_infra_failure_removes_the_complete_parent_group(self):
         expanded = expand_excluded_rollout_parent_groups(
