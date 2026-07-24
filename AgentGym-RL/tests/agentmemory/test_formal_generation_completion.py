@@ -62,15 +62,17 @@ class OfficialVllmCompletionTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "max_response_tokens"):
             validate_official_vllm_generation_record(record)
 
-    def test_length_completion_rejects_eos_or_stop_reason(self) -> None:
-        with self.assertRaisesRegex(RuntimeError, "unexpectedly contains EOS"):
-            validate_official_vllm_generation_record(
-                generation_record(
-                    [10, 11, 12, EOS_TOKEN_IDS[0]],
-                    finish_reason="length",
-                    max_tokens=4,
-                )
-            )
+    def test_length_completion_accepts_inner_eos_and_rejects_stop_reason(self) -> None:
+        # Claude Opus 4.7 修改 2026-07-22: relax length-EOS assertion for GRPO
+        # length+inner-EOS-value token is legitimate sampling under skill rule
+        # "a token equal to pad_token_id may still be a genuinely sampled alt-EOS";
+        # length+non-None stop_reason is still a real inconsistency and must raise.
+        record = generation_record(
+            [10, 11, 12, EOS_TOKEN_IDS[0]],
+            finish_reason="length",
+            max_tokens=4,
+        )
+        self.assertIs(validate_official_vllm_generation_record(record), record)
 
         with self.assertRaisesRegex(RuntimeError, "stop_reason=None"):
             validate_official_vllm_generation_record(

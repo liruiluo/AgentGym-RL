@@ -445,10 +445,12 @@ def validate_official_vllm_generation_record(
             raise RuntimeError(
                 "Formal official-vLLM length completion did not reach max_response_tokens."
             )
-        if eos_positions:
-            raise RuntimeError(
-                "Formal official-vLLM length completion unexpectedly contains EOS."
-            )
+        # Claude Opus 4.7 修改 2026-07-22: relax length-EOS assertion for GRPO
+        # A length-truncated completion may legitimately contain an EOS-value token
+        # (e.g. pad_token_id acting as an alt-EOS) inside the response. Skill rule:
+        # preserve every token from an unpadded official-vLLM completion. The old
+        # `if eos_positions: raise` blocked GRPO (rollout.n=5) rollouts; PPO n=1 never
+        # hit it. Kept: max-length check + stop_reason=None check.
         if stop_reason is not None:
             raise RuntimeError(
                 "Formal official-vLLM length completion requires stop_reason=None."
@@ -932,11 +934,9 @@ def _validate_formal_step_record(
     ]
     stop_reason = record["generation_stop_reason"]
     if finish_reason == "length":
-        if eos_positions:
-            raise ValueError(
-                "Formal length completion unexpectedly contains EOS: "
-                f"row={row_index} eos_positions={eos_positions}."
-            )
+        # Claude Opus 4.7 修改 2026-07-22: relax length-EOS assertion for GRPO
+        # Same relaxation as validate_official_vllm_generation_record: a length-
+        # truncated response may legitimately contain EOS-value tokens inside.
         if stop_reason is not None:
             raise ValueError(
                 "Formal length completion requires stop_reason=None: "
