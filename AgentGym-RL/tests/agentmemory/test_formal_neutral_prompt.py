@@ -91,7 +91,9 @@ class FormalPromptTests(unittest.TestCase):
 
     def test_key_inventory_prompt_exposes_only_policy_authored_ids_and_keys(self) -> None:
         self.assertIn("key-only long-term memory inventory", self.inventory_prompt)
-        self.assertIn("memory_id and key", self.inventory_prompt)
+        self.assertIn("memory_id and a policy-authored lookup key", self.inventory_prompt)
+        self.assertIn("at most 24", self.inventory_prompt)
+        self.assertIn("put product identity and compatibility facts in value, not key", self.inventory_prompt)
         self.assertIn("values remain hidden until RETRIEVE", self.inventory_prompt)
         self.assertIn("RETRIEVE matches both the key and value", self.inventory_prompt)
         self.assertNotIn("target", self.inventory_prompt.lower())

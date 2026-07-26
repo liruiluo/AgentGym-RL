@@ -102,9 +102,12 @@ _AGENTMEMORY_MEMORY_LIFECYCLE = (
 
 _AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT = (
     "The observation includes a key-only long-term memory inventory when that interface "
-    "variant is enabled. It lists only the memory_id and key exactly authored by the policy; "
-    "memory values remain hidden until RETRIEVE. RETRIEVE matches both the key and value of "
-    "memories previously written with ADD."
+    "variant is enabled. It lists only the memory_id and a policy-authored lookup key; memory "
+    "values remain hidden until RETRIEVE. In this variant each key must be a single ASCII "
+    "lookup label of at most 24 letters, digits, spaces, underscores, or hyphens, without a "
+    "leading or trailing separator; put product identity and compatibility facts in value, "
+    "not key. RETRIEVE matches "
+    "both the key and value of memories previously written with ADD."
 )
 
 # Full prompts for each mode: same intro and action contract, different reply rule.
@@ -146,10 +149,17 @@ AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_LTM_KEY_INVENTORY = (
 )
 
 
-def agentmemory_action_system_prompt() -> str:
+def agentmemory_action_system_prompt(*, ltm_inventory_mode: str | None = None) -> str:
     # Pick the reply rule that matches the active thinking mode so the prompt
     # never contradicts what the chat template does with <think>.
-    key_inventory = agentmemory_ltm_inventory_mode() == "keys"
+    inventory_mode = (
+        agentmemory_ltm_inventory_mode()
+        if ltm_inventory_mode is None
+        else ltm_inventory_mode
+    )
+    if inventory_mode not in ("hidden", "keys"):
+        raise ValueError("ltm_inventory_mode must be 'hidden' or 'keys'.")
+    key_inventory = inventory_mode == "keys"
     if _agentmemory_thinking_enabled():
         if key_inventory:
             return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_LTM_KEY_INVENTORY

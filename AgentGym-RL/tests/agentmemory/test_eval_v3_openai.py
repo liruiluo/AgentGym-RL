@@ -1677,6 +1677,8 @@ class EvalV3OpenAITest(unittest.TestCase):
         transport = MODULE.JsonHttp(opener=fake)
         env = MODULE.AgentMemoryEnvClient("http://env.test", transport)
         self.assertEqual(env.system_prompt_source, "webshop_v2_rollout_fallback")
+        self.assertEqual(env.metadata["ltm_inventory_mode"], "hidden")
+        self.assertNotIn("key-only long-term memory inventory", env.system_prompt)
         self.assertEqual(
             MODULE.extract_webshop_v2_action(
                 "Thought: search\n\nAction:\nsearch[wireless headphones]"
@@ -1718,6 +1720,33 @@ class EvalV3OpenAITest(unittest.TestCase):
             if method == "POST" and url.endswith("/step")
         ]
         self.assertEqual(step_requests[-1]["action"], "search[item]")
+
+    def test_native_webshop_v2_derives_key_inventory_prompt_from_server(self):
+        metadata = {
+            "surface": MODULE.WEBSHOP_V2_SURFACE,
+            "task_count": 1,
+            "ltm_inventory_mode": "keys",
+        }
+        env = MODULE.AgentMemoryEnvClient(
+            "http://env.test",
+            MODULE.JsonHttp(opener=_FakeOpen(metadata)),
+        )
+
+        self.assertEqual(env.metadata["ltm_inventory_mode"], "keys")
+        self.assertIn("key-only long-term memory inventory", env.system_prompt)
+        self.assertIn("at most 24", env.system_prompt)
+
+    def test_native_webshop_v2_rejects_unknown_inventory_mode(self):
+        metadata = {
+            "surface": MODULE.WEBSHOP_V2_SURFACE,
+            "task_count": 1,
+            "ltm_inventory_mode": "values",
+        }
+        with self.assertRaisesRegex(MODULE.EvalError, "ltm_inventory_mode"):
+            MODULE.AgentMemoryEnvClient(
+                "http://env.test",
+                MODULE.JsonHttp(opener=_FakeOpen(metadata)),
+            )
 
     def test_native_webshop_v2_rejects_prompt_drift(self):
         with self.assertRaisesRegex(MODULE.EvalError, "disagrees"):
