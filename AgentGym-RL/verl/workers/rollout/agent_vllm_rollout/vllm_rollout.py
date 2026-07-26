@@ -60,6 +60,7 @@ from verl.utils.agentgym.formal_domain_v3 import (
     build_formal_domain_step_v3,
     resolve_formal_runtime_contract,
     validate_formal_env_schema,
+    validate_webshop_ltm_inventory_mode,
 )
 from verl.utils.agentgym.rollout_context import (
     AGENTMEMORY_ACTION_TEXT,
@@ -110,6 +111,7 @@ from verl.workers.rollout.schemas import (
     RolloutHandler,
     _pre_process_inputs,
     agentmemory_action_system_prompt,
+    agentmemory_ltm_inventory_mode,
 )
 
 # TODO
@@ -142,6 +144,7 @@ def _formal_runtime_contract_for_client(env_client) -> tuple[str, str, str]:
             "contract_id",
             "contract_sha256",
             "system_prompt",
+            "ltm_inventory_mode",
         )
         mismatches = [
             key
@@ -156,6 +159,10 @@ def _formal_runtime_contract_for_client(env_client) -> tuple[str, str, str]:
                 f"fields={mismatches}."
             )
     try:
+        validate_webshop_ltm_inventory_mode(
+            info_metadata,
+            expected_mode=agentmemory_ltm_inventory_mode(),
+        )
         return resolve_formal_runtime_contract(
             info_metadata,
             webshop_v2_system_prompt=agentmemory_action_system_prompt(),

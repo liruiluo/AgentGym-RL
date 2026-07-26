@@ -10,11 +10,41 @@ from typing import Any, Mapping, Sequence
 FORMAL_DOMAIN_SCHEMA_V3 = "agentmemory_formal_step_v3"
 FORMAL_WEBSHOP_SCHEMA_V2 = "agentmemory_formal_step_v2"
 FORMAL_WEBSHOP_SURFACE_V2 = "memoryarena_webshop_native_v1"
+LTM_INVENTORY_MODES = ("hidden", "keys")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
 class FormalDomainV3Error(ValueError):
     pass
+
+
+def validate_webshop_ltm_inventory_mode(
+    metadata: Mapping[str, Any],
+    *,
+    expected_mode: str,
+) -> None:
+    """Keep the WebShop observation and rollout prompt on the same interface."""
+
+    if expected_mode not in LTM_INVENTORY_MODES:
+        raise FormalDomainV3Error(
+            f"unsupported rollout LTM inventory mode: {expected_mode!r}"
+        )
+    server_mode = metadata.get("ltm_inventory_mode")
+    if server_mode is None:
+        if expected_mode != "hidden":
+            raise FormalDomainV3Error(
+                "WebShop runtime metadata is missing ltm_inventory_mode"
+            )
+        return
+    if server_mode not in LTM_INVENTORY_MODES:
+        raise FormalDomainV3Error(
+            f"unsupported server LTM inventory mode: {server_mode!r}"
+        )
+    if server_mode != expected_mode:
+        raise FormalDomainV3Error(
+            "WebShop server and rollout LTM inventory modes disagree: "
+            f"server={server_mode!r} rollout={expected_mode!r}"
+        )
 
 
 def resolve_formal_runtime_contract(

@@ -638,7 +638,7 @@ def _load_legacy_webshop_system_prompt() -> str:
             raise RuntimeError(f"cannot load canonical prompt schema: {schemas_path}")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        prompt = module.AGENTMEMORY_ACTION_SYSTEM_PROMPT
+        prompt = module.agentmemory_action_system_prompt()
     finally:
         for name, original in original_modules.items():
             if original is sentinel:

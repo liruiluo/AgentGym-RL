@@ -20,6 +20,15 @@ def _agentmemory_reasoning_enabled() -> bool:
     return os.environ.get("AGENTMEMORY_ALLOW_REASONING", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
+def agentmemory_ltm_inventory_mode() -> str:
+    mode = os.environ.get("AGENTMEMORY_LTM_INVENTORY_MODE", "hidden").strip()
+    if mode not in ("hidden", "keys"):
+        raise ValueError(
+            "AGENTMEMORY_LTM_INVENTORY_MODE must be 'hidden' or 'keys'."
+        )
+    return mode
+
+
 # The system prompt is built from three parts. The intro and the action-space
 # contract are identical in both modes; only the reply-format rule differs, so
 # that the rule never contradicts whether the chat template opened a <think>
@@ -91,6 +100,13 @@ _AGENTMEMORY_MEMORY_LIFECYCLE = (
     "for you, and it does not reject an otherwise correct purchase when ADD was skipped."
 )
 
+_AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT = (
+    "The observation includes a key-only long-term memory inventory when that interface "
+    "variant is enabled. It lists only the memory_id and key exactly authored by the policy; "
+    "memory values remain hidden until RETRIEVE. RETRIEVE matches both the key and value of "
+    "memories previously written with ADD."
+)
+
 # Full prompts for each mode: same intro and action contract, different reply rule.
 AGENTMEMORY_ACTION_SYSTEM_PROMPT = (
     _AGENTMEMORY_INTRO
@@ -113,15 +129,37 @@ AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING = (
     + " "
     + _AGENTMEMORY_MEMORY_LIFECYCLE
 )
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_LTM_KEY_INVENTORY = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT
+    + " "
+    + _AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_LTM_KEY_INVENTORY = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING
+    + " "
+    + _AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_LTM_KEY_INVENTORY = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING
+    + " "
+    + _AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT
+)
 
 
 def agentmemory_action_system_prompt() -> str:
     # Pick the reply rule that matches the active thinking mode so the prompt
     # never contradicts what the chat template does with <think>.
+    key_inventory = agentmemory_ltm_inventory_mode() == "keys"
     if _agentmemory_thinking_enabled():
+        if key_inventory:
+            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_LTM_KEY_INVENTORY
         return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING
     if _agentmemory_reasoning_enabled():
+        if key_inventory:
+            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_LTM_KEY_INVENTORY
         return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING
+    if key_inventory:
+        return AGENTMEMORY_ACTION_SYSTEM_PROMPT_LTM_KEY_INVENTORY
     return AGENTMEMORY_ACTION_SYSTEM_PROMPT
 
 def _normalize_chat_template_token_ids(encoded) -> List[int]:

@@ -40,6 +40,9 @@ class FormalPromptTests(unittest.TestCase):
         self.no_thinking_prompt = values["AGENTMEMORY_ACTION_SYSTEM_PROMPT"]
         self.thinking_prompt = values["AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING"]
         self.reasoning_prompt = values["AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING"]
+        self.inventory_prompt = values[
+            "AGENTMEMORY_ACTION_SYSTEM_PROMPT_LTM_KEY_INVENTORY"
+        ]
 
     def test_both_prompts_have_native_action_contract(self) -> None:
         for prompt in (self.no_thinking_prompt, self.thinking_prompt, self.reasoning_prompt):
@@ -85,6 +88,13 @@ class FormalPromptTests(unittest.TestCase):
                 "try a different candidate",
             ):
                 self.assertNotIn(forbidden, prompt)
+
+    def test_key_inventory_prompt_exposes_only_policy_authored_ids_and_keys(self) -> None:
+        self.assertIn("key-only long-term memory inventory", self.inventory_prompt)
+        self.assertIn("memory_id and key", self.inventory_prompt)
+        self.assertIn("values remain hidden until RETRIEVE", self.inventory_prompt)
+        self.assertIn("RETRIEVE matches both the key and value", self.inventory_prompt)
+        self.assertNotIn("target", self.inventory_prompt.lower())
 
 
 if __name__ == "__main__":

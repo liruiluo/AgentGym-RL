@@ -300,6 +300,21 @@ class FormalDomainV3Test(unittest.TestCase):
                 webshop_v2_system_prompt="webshop prompt",
             )
 
+    def test_webshop_ltm_inventory_mode_requires_prompt_server_parity(self):
+        MODULE.validate_webshop_ltm_inventory_mode(
+            {"ltm_inventory_mode": "keys"},
+            expected_mode="keys",
+        )
+        MODULE.validate_webshop_ltm_inventory_mode({}, expected_mode="hidden")
+
+        with self.assertRaisesRegex(MODULE.FormalDomainV3Error, "disagree"):
+            MODULE.validate_webshop_ltm_inventory_mode(
+                {"ltm_inventory_mode": "keys"},
+                expected_mode="hidden",
+            )
+        with self.assertRaisesRegex(MODULE.FormalDomainV3Error, "missing"):
+            MODULE.validate_webshop_ltm_inventory_mode({}, expected_mode="keys")
+
     def test_schema_mismatch_fails_closed(self):
         with self.assertRaisesRegex(MODULE.FormalDomainV3Error, "does not match"):
             MODULE.validate_formal_env_schema(
