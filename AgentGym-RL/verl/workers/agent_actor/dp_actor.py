@@ -37,6 +37,7 @@ from verl.workers.ppo_token_normalization import (
     valid_response_token_count,
     validate_worker_batch_readback,
 )
+from verl.workers.qwen35_runtime import qwen3_5_packed_forward_kwargs
 import verl.utils.torch_functional as verl_F
 
 from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
@@ -77,8 +78,9 @@ class DataParallelPPOActor(BasePPOActor):
             position_ids = micro_batch['position_ids']
 
             if self.use_remove_padding:
-                input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1),
-                                                           attention_mask)  # input_ids_rmpad (total_nnz, ...)
+                input_ids_rmpad, indices, cu_seqlens, *_ = unpad_input(
+                    input_ids.unsqueeze(-1), attention_mask
+                )  # input_ids_rmpad (total_nnz, ...)
                 input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
 
                 # unpad the position_ids to align the rotary
@@ -99,10 +101,18 @@ class DataParallelPPOActor(BasePPOActor):
                 input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
 
                 # only pass input_ids and position_ids to enable flash_attn_varlen
-                output = self.actor_module(input_ids=input_ids_rmpad,
-                                           attention_mask=None,
-                                           position_ids=position_ids_rmpad,
-                                           use_cache=False)  # prevent model thinks we are generating
+                packed_forward_kwargs = qwen3_5_packed_forward_kwargs(
+                    self.actor_module,
+                    cu_seqlens,
+                    self.ulysses_sequence_parallel_size,
+                )
+                output = self.actor_module(
+                    input_ids=input_ids_rmpad,
+                    attention_mask=None,
+                    position_ids=position_ids_rmpad,
+                    use_cache=False,
+                    **packed_forward_kwargs,
+                )  # prevent model thinks we are generating
                 logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
 
                 logits_rmpad.div_(temperature)

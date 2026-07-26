@@ -25,7 +25,7 @@ When working with Megatron:
 - After inference, all the parameters that doesn't belong to this pp rank is freed.
 """
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from typing import List, Mapping
 from omegaconf import DictConfig
 import numpy as np
@@ -34,7 +34,6 @@ import torch.distributed
 from torch.nn.utils.rnn import pad_sequence
 from tensordict import TensorDict
 from torch import nn
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from tqdm import tqdm
 
 from verl import DataProto
@@ -104,6 +103,9 @@ from verl.workers.rollout.agent_vllm_rollout.agentmemory_grouping import (
 from verl.workers.rollout.agent_vllm_rollout.formal_buy_transition import (
     FormalBuyTransitionError,
     validate_formal_buy_transition,
+)
+from verl.workers.rollout.agent_vllm_rollout.vllm_runtime_config import (
+    resolve_official_vllm_compilation_config,
 )
 from verl.workers.rollout.schemas import (
     Message,
@@ -203,6 +205,7 @@ def _build_formal_webshop_step_v2(
     generation_record: Mapping,
     env_info_before: Mapping,
     env_info_after: Mapping,
+    action_submission: Mapping | None,
 ) -> dict:
     if "current_subtask_index" not in env_info_before:
         raise FormalRuntimeEvidenceError(
@@ -299,6 +302,9 @@ def _build_formal_webshop_step_v2(
         "generation_eos_token_ids": list(
             generation_record["configured_eos_token_ids"]
         ),
+        "tokenizer_primary_eos_token_id": generation_record[
+            "primary_eos_token_id"
+        ],
         "tokenizer_pad_token_id": generation_record["tokenizer_pad_token_id"],
         "generation_token_ids_are_exact": bool(
             generation_record["token_ids_are_exact"]
@@ -310,7 +316,7 @@ def _build_formal_webshop_step_v2(
         "env_result": env_result,
         "env_info_before": deepcopy(dict(env_info_before)),
         "env_info_after": deepcopy(dict(env_info_after)),
-        "action_execution": deepcopy(env_info_after.get("action_execution")),
+        "action_submission": deepcopy(dict(action_submission or {})),
         "committed_purchase": committed_purchase,
         "purchase_correct": purchase_correct,
         "accepted_purchase": accepted_purchase,
@@ -493,13 +499,11 @@ class vLLMRollout(BaseRollout):
                 rollout_config.get("trust_remote_code", False)
             ),
         )
-        rollout_name = str(rollout_config.get('name', '')).lower()
-        self._hf_generate = bool(rollout_config.get('use_hf_generate', False)) or rollout_name in {
-            'hf', 'hf_agentmemory', 'agent_hf', 'agentmemory_hf'
-        }
-        if not self._hf_generate:
-            assert not (not rollout_config.enforce_eager and rollout_config.free_cache_engine), \
-                "disable CUDA graph (enforce_eager = False) if free cache engine"
+        self.primary_eos_token_id = getattr(tokenizer, "eos_token_id", None)
+        if self.primary_eos_token_id is None:
+            raise RuntimeError("Generation tokenizer has no primary EOS token ID.")
+        if bool(rollout_config.get('use_hf_generate', False)):
+            raise ValueError('AgentMemoryGym formal rollouts require native vLLM, not HF generate.')
 
         tensor_parallel_size = self.config.get('tensor_model_parallel_size', 1)
         assert tensor_parallel_size <= torch.distributed.get_world_size(), \
@@ -517,9 +521,13 @@ class vLLMRollout(BaseRollout):
                                                   num_tp_per_train_tp=num_tp_per_train_tp)
 
         self._official_vllm = vllm_version not in ('0.3.1', '0.4.2', '0.5.4', '0.6.3')
+        if not self._official_vllm:
+            assert not (
+                not rollout_config.enforce_eager
+                and rollout_config.free_cache_engine
+            ), "legacy vLLM cannot combine CUDA graph with free_cache_engine"
         if (
             self._official_vllm
-            and not self._hf_generate
             and rollout_config.free_cache_engine
             and not rollout_config.get('enable_sleep_mode', False)
         ):
@@ -528,17 +536,7 @@ class vLLMRollout(BaseRollout):
                 'free_cache_engine=true; otherwise rollout weights/KV cache '
                 'can remain resident during the PPO optimizer phase.'
             )
-        if self._hf_generate:
-            # Qwen3.5-4B (Qwen3_5ForConditionalGeneration) is supported by
-            # Transformers 5.x here but not by vLLM 0.11.  Keep the normal
-            # AgentMemoryGym rollout/env loop and swap only the token generator
-            # to the current FSDP actor module.  This path is intentionally a
-            # correctness/speed gate before any long Qwen3.5 run; it avoids the
-            # invalid vLLM generic-Transformers override that produced乱码.
-            self.inference_engine = None
-            if self.config.free_cache_engine:
-                print('HF AgentMemory rollout ignores free_cache_engine because no vLLM cache is used.')
-        elif self._official_vllm:
+        if self._official_vllm:
             # Avoid vLLM V1 startup port races when AgentMemoryGym launches one
             # rollout engine per FSDP/Ray rank on the same host.  vLLM's default
             # get_open_port() probes then releases a random port; concurrent
@@ -553,27 +551,21 @@ class vLLMRollout(BaseRollout):
                     print(f'AgentMemoryGym vLLM rank port base: rank={rank} VLLM_PORT={os.environ["VLLM_PORT"]}', flush=True)
                 except Exception as exc:  # noqa: BLE001
                     print(f'AgentMemoryGym vLLM rank port setup skipped: {type(exc).__name__}: {exc}', flush=True)
-            # vLLM>=0.7 no longer accepts the old VERL in-memory model_hf_config
-            # constructor path.  For the AgentMemoryGym one-step pilot we load
-            # the rollout engine from the same HF checkpoint path as the actor
-            # and optionally skip per-step weight sync in the sharding manager.
-            # This keeps real GPU rollout/training unblocked on B200/vLLM 0.11;
-            # do not treat multi-step synced training as validated until the
-            # weight-transfer path is upgraded separately.
             if model_path is None:
                 raise ValueError("model_path is required for official vLLM rollout")
             ensure_transformers_tokenizer_compat()
+            from verl.workers.qwen35_weight_sync import resolve_vllm_init_load_format
+
+            init_load_format = resolve_vllm_init_load_format(
+                model_type=str(getattr(model_hf_config, 'model_type', '')),
+                configured_init_load_format=rollout_config.get(
+                    'vllm_init_load_format', None
+                ),
+            )
             hf_overrides = rollout_config.get('hf_overrides', None)
             if hf_overrides is not None and not isinstance(hf_overrides, dict):
                 hf_overrides = dict(hf_overrides)
-            if hf_overrides is None and getattr(model_hf_config, 'model_type', None) == 'qwen3_5':
-                # vLLM 0.11 does not register Qwen3_5ForConditionalGeneration
-                # yet.  For text-only AgentMemoryGym rollouts, force vLLM's
-                # generic Transformers causal-LM backend while FSDP/Transformers
-                # keeps the real Qwen3.5 actor class.
-                hf_overrides = {'architectures': ['TransformersForCausalLM']}
-                print('vLLM hf_overrides for qwen3_5 text rollout:', hf_overrides)
-            self.inference_engine = LLM(
+            official_vllm_kwargs = dict(
                 model=model_path,
                 tokenizer=model_path,
                 tensor_parallel_size=tensor_parallel_size,
@@ -590,12 +582,51 @@ class vLLMRollout(BaseRollout):
                 disable_log_stats=rollout_config.disable_log_stats,
                 enable_chunked_prefill=rollout_config.enable_chunked_prefill,
                 enable_sleep_mode=rollout_config.get('enable_sleep_mode', False),
-                # On B200 + vLLM 0.11, the forced XFORMERS backend can fail
-                # with `Paged KV cache block size must be divisible by 256`.
-                # Allow the caller to pass a vLLM-supported block size when
-                # using the official vLLM compatibility path.
                 block_size=rollout_config.get('block_size', None),
+                language_model_only=rollout_config.get('language_model_only', False),
             )
+            limit_mm_per_prompt = rollout_config.get('limit_mm_per_prompt', None)
+            if limit_mm_per_prompt is not None:
+                official_vllm_kwargs['limit_mm_per_prompt'] = dict(limit_mm_per_prompt)
+            gdn_prefill_backend = rollout_config.get('gdn_prefill_backend', None)
+            if gdn_prefill_backend is not None:
+                official_vllm_kwargs['gdn_prefill_backend'] = gdn_prefill_backend
+            if init_load_format is not None:
+                official_vllm_kwargs['load_format'] = init_load_format
+            compilation_config = resolve_official_vllm_compilation_config(
+                enforce_eager=bool(rollout_config.enforce_eager),
+                configured=rollout_config.get('compilation_config', None),
+                cudagraph_capture_sizes=rollout_config.get(
+                    'cudagraph_capture_sizes', None
+                ),
+            )
+            if compilation_config is not None:
+                official_vllm_kwargs['compilation_config'] = compilation_config
+            print(
+                'AgentMemoryGym official vLLM runtime config: '
+                f'version={vllm_version} '
+                f'enforce_eager={bool(rollout_config.enforce_eager)} '
+                f'free_cache_engine={bool(rollout_config.free_cache_engine)} '
+                f'enable_sleep_mode={bool(rollout_config.get("enable_sleep_mode", False))} '
+                f'compilation_config={compilation_config}',
+                flush=True,
+            )
+            self.inference_engine = LLM(**official_vllm_kwargs)
+            llm_engine = getattr(self.inference_engine, 'llm_engine', None)
+            engine_core = getattr(llm_engine, 'engine_core', None)
+            engine_client_type = type(engine_core).__name__
+            print(
+                f'AgentMemoryGym official vLLM engine client: {engine_client_type}',
+                flush=True,
+            )
+            if (
+                os.environ.get('AGENTMEMORY_REQUIRE_VLLM_INPROC', '0') == '1'
+                and engine_client_type != 'InprocClient'
+            ):
+                raise RuntimeError(
+                    'AGENTMEMORY_REQUIRE_VLLM_INPROC=1 requires InprocClient, '
+                    f'got {engine_client_type}.'
+                )
         else:
             self.inference_engine = LLM(
                 actor_module,
@@ -644,8 +675,9 @@ class vLLMRollout(BaseRollout):
             "AgentMemory generation token contract: "
             f"eos_token_ids={self.generation_eos_token_ids} "
             f"stop_token_ids={self.generation_stop_token_ids} "
+            f"primary_eos_token_id={self.primary_eos_token_id} "
             f"pad_token_id={tokenizer.pad_token_id} "
-            f"backend={'hf' if self._hf_generate else ('official_vllm' if self._official_vllm else 'legacy_vllm')}",
+            f"backend={'official_vllm' if self._official_vllm else 'legacy_vllm'}",
             flush=True,
         )
 
@@ -676,71 +708,7 @@ class vLLMRollout(BaseRollout):
                 print(f"vLLM sleep skipped/failed: {exc}")
 
 
-    def _generate_token_ids_hf(self, generation_prompt_idxs, sampling_params):
-        if not generation_prompt_idxs:
-            return []
-        device = torch.device('cuda', torch.cuda.current_device())
-        prompt_tensors = [torch.tensor(list(ids), dtype=torch.long, device=device) for ids in generation_prompt_idxs]
-        input_ids = left_pad_sequence(prompt_tensors, self.pad_token_id).long()
-        attention_mask = (input_ids != self.pad_token_id).long()
-        max_new_tokens = int(getattr(sampling_params, 'max_tokens', self.config.get('max_tokens', self.config.response_length)))
-        temperature = float(getattr(sampling_params, 'temperature', self.config.get('temperature', 1.0)) or 0.0)
-        top_p = float(getattr(sampling_params, 'top_p', self.config.get('top_p', 1.0)) or 1.0)
-        top_k = int(getattr(sampling_params, 'top_k', self.config.get('top_k', 0)) or 0)
-        do_sample = temperature > 0
-        gen_kwargs = dict(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            do_sample=do_sample,
-            eos_token_id=self.generation_eos_token_ids,
-            pad_token_id=self.pad_token_id,
-            use_cache=True,
-            return_dict_in_generate=True,
-            output_scores=False,
-        )
-        if do_sample:
-            gen_kwargs.update(temperature=temperature, top_p=top_p)
-            if top_k > 0:
-                gen_kwargs['top_k'] = top_k
-        else:
-            gen_kwargs['num_beams'] = 1
-        if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
-            gen_kwargs['synced_gpus'] = True
-
-        was_training = self.actor_module.training
-        self.actor_module.eval()
-        param_ctx = nullcontext()
-        if isinstance(self.actor_module, FSDP):
-            # FSDP stores sharded/empty local embedding weights; HF generate
-            # reads parameters through normal module calls and needs full
-            # parameters materialized for this correctness-gate path.
-            param_ctx = FSDP.summon_full_params(self.actor_module, writeback=False, recurse=False)
-        try:
-            with param_ctx, torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                output = self.actor_module.generate(**gen_kwargs)
-        finally:
-            if was_training:
-                self.actor_module.train()
-        sequences = output.sequences
-        prompt_width = input_ids.shape[1]
-        rows = []
-        for row in sequences[:, prompt_width:]:
-            rows.append(
-                normalize_generation_record(
-                    row.detach().tolist(),
-                    eos_token_ids=self.generation_stop_token_ids,
-                    pad_token_id=self.pad_token_id,
-                    max_tokens=max_new_tokens,
-                    finish_reason_source="transformers_generate",
-                    token_ids_are_exact=False,
-                )
-            )
-        return rows
-
     def _generate_token_ids(self, generation_prompt_idxs, sampling_params):
-        if self._hf_generate:
-            return self._generate_token_ids_hf(generation_prompt_idxs, sampling_params)
         if self._official_vllm:
             prompts = [{"prompt_token_ids": list(ids)} for ids in generation_prompt_idxs]
             return self.inference_engine.generate(
@@ -794,6 +762,7 @@ class vLLMRollout(BaseRollout):
             return normalize_generation_record(
                 token_ids,
                 eos_token_ids=configured_stop_ids,
+                primary_eos_token_id=self.primary_eos_token_id,
                 pad_token_id=self.pad_token_id,
                 max_tokens=max_tokens,
                 backend_finish_reason=finish_reason,
@@ -1754,6 +1723,9 @@ class vLLMRollout(BaseRollout):
                             generation_record=generation_record,
                             env_info_before=env_info_before,
                             env_info_after=env_info_after,
+                            action_submission=getattr(
+                                env_clients[idx], "last_action_submission", None
+                            ),
                         )
                     if suffix_credit or formal_trajectory_credit:
                         step_record["trajectory_row_order"] = len(
@@ -1857,6 +1829,9 @@ class vLLMRollout(BaseRollout):
                         "generation_eos_token_ids": list(
                             generation_record["configured_eos_token_ids"]
                         ),
+                        "tokenizer_primary_eos_token_id": generation_record[
+                            "primary_eos_token_id"
+                        ],
                         "tokenizer_pad_token_id": generation_record[
                             "tokenizer_pad_token_id"
                         ],

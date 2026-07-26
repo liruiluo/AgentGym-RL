@@ -253,7 +253,6 @@ class RayWorkerGroup(WorkerGroup):
                     'VLLM_WORKER_MULTIPROC_METHOD',
                     'VLLM_USE_MODELSCOPE',
         'VLLM_ALLOW_INSECURE_SERIALIZATION',
-                    'VERL_AGENTMEMORY_SKIP_VLLM_WEIGHT_SYNC',
                     'VERL_AGENTMEMORY_HF_SYNC_DIR',
                     'VERL_PPO_LOGGING_LEVEL',
                     'AGENTMEMORY_DATA_PATH',

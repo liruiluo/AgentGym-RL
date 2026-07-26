@@ -36,6 +36,7 @@ from verl.workers.ppo_token_normalization import (
     valid_response_token_count,
     validate_worker_batch_readback,
 )
+from verl.workers.qwen35_runtime import qwen3_5_packed_forward_kwargs
 
 from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
 
@@ -90,8 +91,9 @@ class DataParallelPPOCritic(BasePPOCritic):
             position_ids = micro_batch['position_ids']
 
             if self.use_remove_padding:
-                input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1),
-                                                           attention_mask)  # input_ids_rmpad (total_nnz, ...)
+                input_ids_rmpad, indices, cu_seqlens, *_ = unpad_input(
+                    input_ids.unsqueeze(-1), attention_mask
+                )  # input_ids_rmpad (total_nnz, ...)
                 input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
 
                 # unpad the position_ids to align the rotary
@@ -105,10 +107,18 @@ class DataParallelPPOCritic(BasePPOCritic):
                                                                                                 sp_size=self.ulysses_sequence_parallel_size)
 
                 # only pass input_ids and position_ids to enable flash_attn_varlen
-                output = self.critic_module(input_ids=input_ids_rmpad,
-                                            attention_mask=None,
-                                            position_ids=position_ids_rmpad,
-                                            use_cache=False)  # prevent model thinks we are generating
+                packed_forward_kwargs = qwen3_5_packed_forward_kwargs(
+                    self.critic_module,
+                    cu_seqlens,
+                    self.ulysses_sequence_parallel_size,
+                )
+                output = self.critic_module(
+                    input_ids=input_ids_rmpad,
+                    attention_mask=None,
+                    position_ids=position_ids_rmpad,
+                    use_cache=False,
+                    **packed_forward_kwargs,
+                )  # prevent model thinks we are generating
                 values_rmpad = output.logits.squeeze(0)  # (total_nnz)
 
                 # gather output if sp > 1

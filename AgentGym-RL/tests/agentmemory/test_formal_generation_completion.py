@@ -18,12 +18,19 @@ def generation_record(
     max_tokens: int,
     stop_reason: int | None = None,
     eos_token_ids: list[int] | None = None,
+    primary_eos_token_id: int | None = None,
     pad_token_id: int | None = 151643,
 ) -> dict:
     eos_token_ids = EOS_TOKEN_IDS if eos_token_ids is None else eos_token_ids
+    primary_eos_token_id = (
+        eos_token_ids[0]
+        if primary_eos_token_id is None
+        else primary_eos_token_id
+    )
     return normalize_generation_record(
         token_ids,
         eos_token_ids=eos_token_ids,
+        primary_eos_token_id=primary_eos_token_id,
         pad_token_id=pad_token_id,
         max_tokens=max_tokens,
         backend_finish_reason=finish_reason,
@@ -43,6 +50,30 @@ class OfficialVllmCompletionTests(unittest.TestCase):
 
         self.assertIs(validate_official_vllm_generation_record(record), record)
         self.assertFalse(record["truncated"])
+
+    def test_primary_eos_is_explicit_not_inferred_from_stop_list_order(self) -> None:
+        record = generation_record(
+            [10, 11, EOS_TOKEN_IDS[1]],
+            finish_reason="stop",
+            max_tokens=8,
+            primary_eos_token_id=EOS_TOKEN_IDS[1],
+        )
+
+        self.assertIs(validate_official_vllm_generation_record(record), record)
+        self.assertIsNone(record["stop_reason"])
+
+    def test_alternate_eos_requires_matching_backend_stop_reason(self) -> None:
+        record = generation_record(
+            [10, 11, EOS_TOKEN_IDS[0]],
+            finish_reason="stop",
+            max_tokens=8,
+            primary_eos_token_id=EOS_TOKEN_IDS[1],
+        )
+        with self.assertRaisesRegex(RuntimeError, "alternate EOS"):
+            validate_official_vllm_generation_record(record)
+
+        record["stop_reason"] = EOS_TOKEN_IDS[0]
+        self.assertIs(validate_official_vllm_generation_record(record), record)
 
     def test_length_completion_keeps_exact_sampled_tokens(self) -> None:
         record = generation_record(
@@ -65,20 +96,39 @@ class OfficialVllmCompletionTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "max_response_tokens"):
             validate_official_vllm_generation_record(record)
 
-    def test_length_completion_accepts_eos_sampled_at_exact_limit(self) -> None:
+    def test_length_completion_rejects_eos_sampled_at_exact_limit(self) -> None:
         for eos_token_id in EOS_TOKEN_IDS:
+            with self.subTest(eos_token_id=eos_token_id):
+                with self.assertRaisesRegex(RuntimeError, "configured EOS"):
+                    validate_official_vllm_generation_record(
+                        generation_record(
+                            [10, 11, 12, eos_token_id],
+                            finish_reason="length",
+                            max_tokens=4,
+                        )
+                    )
+
+    def test_exact_limit_eos_is_a_stop_for_primary_and_alternate(self) -> None:
+        eos_token_ids = [248044, 248046]
+        primary_eos_token_id = 248046
+        cases = (
+            (primary_eos_token_id, None),
+            (248044, 248044),
+        )
+        for eos_token_id, stop_reason in cases:
             with self.subTest(eos_token_id=eos_token_id):
                 record = generation_record(
                     [10, 11, 12, eos_token_id],
-                    finish_reason="length",
+                    finish_reason="stop",
                     max_tokens=4,
+                    stop_reason=stop_reason,
+                    eos_token_ids=eos_token_ids,
+                    primary_eos_token_id=primary_eos_token_id,
+                    pad_token_id=248044,
                 )
 
-                self.assertIs(
-                    validate_official_vllm_generation_record(record), record
-                )
-                self.assertEqual(record["token_ids"][-1], eos_token_id)
-                self.assertTrue(record["truncated"])
+                self.assertIs(validate_official_vllm_generation_record(record), record)
+                self.assertFalse(record["truncated"])
 
     def test_length_completion_rejects_non_terminal_eos(self) -> None:
         for token_ids in (
@@ -86,7 +136,7 @@ class OfficialVllmCompletionTests(unittest.TestCase):
             [10, EOS_TOKEN_IDS[0], EOS_TOKEN_IDS[1], 13],
         ):
             with self.subTest(token_ids=token_ids):
-                with self.assertRaisesRegex(RuntimeError, "non-terminal EOS"):
+                with self.assertRaisesRegex(RuntimeError, "configured EOS"):
                     validate_official_vllm_generation_record(
                         generation_record(
                             token_ids,

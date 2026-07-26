@@ -79,6 +79,8 @@ actor_rollout_ref:
     ignore_eos: False
     enforce_eager: True
     free_cache_engine: True
+    compilation_config: null
+    cudagraph_capture_sizes: null
     load_format: dummy_dtensor
     tensor_model_parallel_size: 2
     max_num_batched_tokens: 8192

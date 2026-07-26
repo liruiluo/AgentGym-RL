@@ -110,13 +110,21 @@ def env_info(*, phase: int, done: bool, episode_success: bool, reward: float):
     }
 
 
-def packed_v3_record():
+QWEN35_EOS_TOKEN_IDS = [248044, 248046]
+QWEN35_PRIMARY_EOS_TOKEN_ID = 248046
+
+
+def packed_v3_record(
+    *,
+    terminal_eos_token_id: int = QWEN35_PRIMARY_EOS_TOKEN_ID,
+    stop_reason: int | None = None,
+):
     system_prompt = "SERVER CANONICAL PROMPT: use ADVANCE with exact JSON grammar."
     latest_observation = "Current phase observation."
     visible_prompt = f"<system>{system_prompt}</system>\n{latest_observation}"
     prompt_token_ids = [101, 102, 103]
     prompt_digest = ROLLOUT_CONTEXT.prompt_token_digest(prompt_token_ids)
-    response_token_ids = [201, 151645]
+    response_token_ids = [201, terminal_eos_token_id]
     response_digest = ROLLOUT_CONTEXT.prompt_token_digest(response_token_ids)
     exact_state_uid = f"0:turn1:statev1:{prompt_digest}"
     trajectory_uid = "agentmemory:parentv1:0:replica0"
@@ -149,10 +157,11 @@ def packed_v3_record():
             "max_response_tokens": 8,
             "finish_reason": "stop",
             "finish_reason_source": "official_vllm:backend",
-            "stop_reason": None,
+            "stop_reason": stop_reason,
             "backend_source": "official_vllm",
-            "configured_eos_token_ids": [151645, 151643],
-            "tokenizer_pad_token_id": 151643,
+            "configured_eos_token_ids": QWEN35_EOS_TOKEN_IDS,
+            "primary_eos_token_id": QWEN35_PRIMARY_EOS_TOKEN_ID,
+            "tokenizer_pad_token_id": 248044,
             "token_ids_are_exact": True,
             "backend_token_ids_are_exact": True,
             "truncated": False,
@@ -181,6 +190,139 @@ def packed_v3_record():
             "packed_response_digest": response_digest,
         }
     )
+    return record
+
+
+def packed_webshop_v2_record(
+    *,
+    terminal_eos_token_id: int = QWEN35_PRIMARY_EOS_TOKEN_ID,
+    stop_reason: int | None = None,
+):
+    latest_observation = "Current WebShop observation."
+    visible_prompt = f"<system>WebShop tools</system>\n{latest_observation}"
+    prompt_token_ids = [101, 102, 103]
+    prompt_digest = ROLLOUT_CONTEXT.prompt_token_digest(prompt_token_ids)
+    response_token_ids = [201, terminal_eos_token_id]
+    response_digest = ROLLOUT_CONTEXT.prompt_token_digest(response_token_ids)
+    trajectory_uid = "agentmemory:parentv1:0:replica0"
+    exact_state_uid = f"0:turn1:statev1:{prompt_digest}"
+    action = 'search["displayed product"]'
+    tool_op = {
+        "op": "SEARCH",
+        "step": 1,
+        "raw_action": action,
+        "result_count": 1,
+    }
+    reward_component = {
+        "name": "search_transition",
+        "op": "SEARCH",
+        "step": 1,
+        "value": 0.0,
+    }
+    env_info_before = {
+        "current_subtask_index": 0,
+        "episode_success": False,
+        "session_trace": [],
+        "tool_ops": [],
+        "reward_components": [],
+    }
+    env_info_after = {
+        "current_subtask_index": 0,
+        "episode_success": False,
+        "session_trace": [action],
+        "tool_ops": [tool_op],
+        "reward_components": [reward_component],
+    }
+    return {
+        "schema_version": FORMAL_DOMAIN.FORMAL_WEBSHOP_SCHEMA_V2,
+        "item_id": "0",
+        "exact_state_uid": exact_state_uid,
+        "trajectory_uid": trajectory_uid,
+        "trajectory_row_uid": FORMAL_GRPO.build_row_uid(trajectory_uid, 0),
+        "trajectory_row_order": 0,
+        "trajectory_terminal": True,
+        "task_round": 1,
+        "session_index": 0,
+        "subtask_index": 0,
+        "next_session_index": 0,
+        "subtask_index_before": 0,
+        "subtask_index_after": 0,
+        "visible_prompt": visible_prompt,
+        "latest_observation": latest_observation,
+        "prompt_history_policy": "latest_observation_only",
+        "raw_prior_messages_visible": False,
+        "single_observation_prompt_digest": prompt_digest,
+        "action": action,
+        "response_token_ids": response_token_ids,
+        "response_token_count": len(response_token_ids),
+        "max_response_tokens": 8,
+        "finish_reason": "stop",
+        "finish_reason_source": "official_vllm:backend",
+        "stop_reason": stop_reason,
+        "generation_backend_source": "official_vllm",
+        "generation_stop_reason": stop_reason,
+        "generation_eos_token_ids": QWEN35_EOS_TOKEN_IDS,
+        "tokenizer_primary_eos_token_id": QWEN35_PRIMARY_EOS_TOKEN_ID,
+        "tokenizer_pad_token_id": 248044,
+        "generation_token_ids_are_exact": True,
+        "backend_token_ids_are_exact": True,
+        "truncated": False,
+        "env_result": "Search results.",
+        "env_info_before": env_info_before,
+        "env_info_after": env_info_after,
+        "action_submission": {
+            "raw_policy_output": action,
+            "submitted_action": action,
+            "parser_status": "adapter_parsed",
+        },
+        "committed_purchase": False,
+        "purchase_correct": None,
+        "accepted_purchase": False,
+        "session_advanced": False,
+        "buy_committed": False,
+        "buy_accepted": False,
+        "subtask_advanced": False,
+        "raw_history_cleared": False,
+        "search_result_count": 1,
+        "immediate_reward": 0.0,
+        "suffix_return": 0.0,
+        "suffix_credit_applied": False,
+        "trajectory_return": 0.0,
+        "done": False,
+        "outcome": "continue",
+        "generation_prompt_length": len(prompt_token_ids),
+        "generation_prompt_digest": prompt_digest,
+        "packed_prompt_length": len(prompt_token_ids),
+        "packed_prompt_digest": prompt_digest,
+        "generation_response_length": len(response_token_ids),
+        "generation_response_digest": response_digest,
+        "packed_response_length": len(response_token_ids),
+        "packed_response_digest": response_digest,
+    }
+
+
+def invalid_webshop_v2_record(raw_output: str, submitted_action: str):
+    record = packed_webshop_v2_record()
+    record["action"] = raw_output
+    record["action_submission"] = {
+        "raw_policy_output": raw_output,
+        "submitted_action": submitted_action,
+        "parser_status": "raw_fallback",
+    }
+    record["env_info_after"]["tool_ops"] = []
+    record["env_info_after"]["reward_components"] = [
+        {
+            "name": "invalid_action",
+            "op": "INVALID",
+            "step": 1,
+            "value": -0.01,
+            "raw_action": submitted_action.strip(),
+            "error": "unsupported action",
+        }
+    ]
+    record["search_result_count"] = None
+    for field in ("immediate_reward", "suffix_return", "trajectory_return"):
+        record[field] = -0.01
     return record
 
 
@@ -249,6 +391,57 @@ class FormalDomainRolloutV3Test(unittest.TestCase):
         self.assertEqual(summary["valid_rows"], 1)
         self.assertEqual(summary["trajectory_count"], 1)
 
+    def test_real_qwen35_primary_and_alternate_eos_pass_both_packed_schemas(self):
+        cases = (
+            (QWEN35_PRIMARY_EOS_TOKEN_ID, None),
+            (248044, 248044),
+        )
+        for record_factory in (packed_webshop_v2_record, packed_v3_record):
+            for terminal_eos_token_id, stop_reason in cases:
+                with self.subTest(
+                    schema=record_factory.__name__,
+                    terminal_eos_token_id=terminal_eos_token_id,
+                ):
+                    summary = validate_one_record(
+                        record_factory(
+                            terminal_eos_token_id=terminal_eos_token_id,
+                            stop_reason=stop_reason,
+                        )
+                    )
+                    self.assertEqual(summary["valid_rows"], 1)
+
+    def test_invalid_qwen35_primary_eos_metadata_fails_both_packed_schemas(self):
+        for record_factory in (packed_webshop_v2_record, packed_v3_record):
+            with self.subTest(schema=record_factory.__name__, case="missing"):
+                record = record_factory()
+                record.pop("tokenizer_primary_eos_token_id")
+                with self.assertRaisesRegex(ValueError, "missing field"):
+                    validate_one_record(record)
+
+            with self.subTest(schema=record_factory.__name__, case="outside"):
+                record = record_factory()
+                record["tokenizer_primary_eos_token_id"] = 999999
+                with self.assertRaisesRegex(ValueError, "primary EOS"):
+                    validate_one_record(record)
+
+    def test_swapped_qwen35_stop_reason_fails_both_packed_schemas(self):
+        for record_factory in (packed_webshop_v2_record, packed_v3_record):
+            cases = (
+                (QWEN35_PRIMARY_EOS_TOKEN_ID, 248044),
+                (248044, None),
+            )
+            for terminal_eos_token_id, stop_reason in cases:
+                with self.subTest(
+                    schema=record_factory.__name__,
+                    terminal_eos_token_id=terminal_eos_token_id,
+                ):
+                    record = record_factory(
+                        terminal_eos_token_id=terminal_eos_token_id,
+                        stop_reason=stop_reason,
+                    )
+                    with self.assertRaisesRegex(ValueError, "EOS"):
+                        validate_one_record(record)
+
     def test_runtime_validator_rejects_prompt_digest_drift(self):
         record = packed_v3_record()
         record["single_observation_prompt_digest"] = "c" * 64
@@ -260,6 +453,91 @@ class FormalDomainRolloutV3Test(unittest.TestCase):
         record["action_execution"]["raw_policy_output"] = "different"
         record["env_info_after"]["action_execution"]["raw_policy_output"] = "different"
         with self.assertRaisesRegex(ValueError, "sampled content"):
+            validate_one_record(record)
+
+    def test_webshop_v2_binds_qwen_think_output_to_submitted_native_action(self):
+        record = packed_webshop_v2_record()
+        raw_output = (
+            "<think>\nI need to find a relevant item. "
+            "Let me search for red velvet cake mix first.\n</think>\n\n"
+            "search[red velvet cake mix]"
+        )
+        record["action"] = raw_output
+        record["action_submission"]["raw_policy_output"] = raw_output
+        record["action_submission"]["submitted_action"] = (
+            "search[red velvet cake mix]"
+        )
+        record["env_info_after"]["tool_ops"][0]["raw_action"] = (
+            "search[red velvet cake mix]"
+        )
+        summary = validate_one_record(record)
+        self.assertEqual(summary["valid_rows"], 1)
+
+    def test_webshop_v2_accepts_server_authoritative_invalid_wrapper(self):
+        raw_output = '{"action": "click[Buy Now]"}'
+        summary = validate_one_record(
+            invalid_webshop_v2_record(raw_output, raw_output)
+        )
+        self.assertEqual(summary["valid_rows"], 1)
+
+    def test_webshop_v2_accepts_eos_only_empty_invalid_submission(self):
+        summary = validate_one_record(invalid_webshop_v2_record("", ""))
+        self.assertEqual(summary["valid_rows"], 1)
+
+    def test_webshop_v2_raw_fallback_removes_exactly_one_terminal_textual_eos(self):
+        cases = (
+            ("</s>", ""),
+            ("</s></s>", "</s>"),
+            ("   </s>", "   "),
+        )
+        for raw_output, submitted_action in cases:
+            with self.subTest(raw_output=raw_output):
+                summary = validate_one_record(
+                    invalid_webshop_v2_record(raw_output, submitted_action)
+                )
+                self.assertEqual(summary["valid_rows"], 1)
+
+    def test_webshop_v2_rejects_forged_raw_fallback_submission(self):
+        with self.assertRaisesRegex(ValueError, "raw fallback"):
+            validate_one_record(
+                invalid_webshop_v2_record(
+                    "raw-model-output",
+                    "forged-submission",
+                )
+            )
+
+    def test_webshop_v2_empty_submission_requires_authoritative_invalid_ledger(self):
+        adapter_parsed = invalid_webshop_v2_record("", "")
+        adapter_parsed["action_submission"]["parser_status"] = "adapter_parsed"
+        with self.subTest(case="adapter_parsed"):
+            with self.assertRaisesRegex(ValueError, "submitted action is empty"):
+                validate_one_record(adapter_parsed)
+
+        tool_event = invalid_webshop_v2_record("", "")
+        tool_event["env_info_after"]["tool_ops"] = [
+            {
+                "op": "SEARCH",
+                "step": 1,
+                "raw_action": "",
+                "result_count": 0,
+            }
+        ]
+        with self.subTest(case="tool_event"):
+            with self.assertRaisesRegex(ValueError, "claims a tool operation"):
+                validate_one_record(tool_event)
+
+        non_invalid_ledger = invalid_webshop_v2_record("", "")
+        non_invalid_ledger["env_info_after"]["reward_components"][0]["name"] = (
+            "format_penalty"
+        )
+        with self.subTest(case="non_invalid_ledger"):
+            with self.assertRaisesRegex(ValueError, "lacks one invalid-action"):
+                validate_one_record(non_invalid_ledger)
+
+    def test_webshop_v2_rejects_forged_submitted_action_binding(self):
+        record = packed_webshop_v2_record()
+        record["action_submission"]["submitted_action"] = "click[Buy Now]"
+        with self.assertRaisesRegex(ValueError, "bound to SEARCH|raw_action binding"):
             validate_one_record(record)
 
     def test_real_prompt_builder_receives_exact_metadata_prompt(self):

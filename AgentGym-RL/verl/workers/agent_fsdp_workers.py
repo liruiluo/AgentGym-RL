@@ -201,7 +201,14 @@ class ActorRolloutRefWorker(Worker):
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
         # override model kwargs
-        actor_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
+        checkpoint_model_config = AutoConfig.from_pretrained(
+            local_path, trust_remote_code=trust_remote_code
+        )
+        from verl.workers.qwen35_runtime import (
+            resolve_qwen3_5_text_config,
+            validate_qwen3_5_training_runtime,
+        )
+        actor_model_config = resolve_qwen3_5_text_config(checkpoint_model_config)
 
         self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
 
@@ -209,9 +216,18 @@ class ActorRolloutRefWorker(Worker):
             from verl.models.registry import check_model_support_rmpad
             check_model_support_rmpad(actor_model_config.model_type)
 
-        if use_remove_padding and self.ulysses_sequence_parallel_size > 1:
+        is_qwen3_5 = actor_model_config.model_type == 'qwen3_5_text'
+        if use_remove_padding and (self.ulysses_sequence_parallel_size > 1 or is_qwen3_5):
             from verl.models.transformers.monkey_patch import apply_monkey_patch
             apply_monkey_patch(actor_model_config, verbose=True)
+
+        qwen3_5_runtime = validate_qwen3_5_training_runtime(
+            model_type=actor_model_config.model_type,
+            use_remove_padding=use_remove_padding,
+            sequence_parallel_size=self.ulysses_sequence_parallel_size,
+        )
+        if qwen3_5_runtime is not None and self.rank == 0:
+            print(f'Qwen3.5 actor runtime gate: {qwen3_5_runtime}', flush=True)
 
         override_config_kwargs = {
             'bos_token_id': self.tokenizer.bos_token_id,
@@ -233,6 +249,16 @@ class ActorRolloutRefWorker(Worker):
                                                                 config=actor_model_config,
                                                                 attn_implementation='flash_attention_2',
                                                                 trust_remote_code=trust_remote_code)
+            if actor_model_config.model_type == 'qwen3_5_text' and role == 'actor':
+                from verl.workers.qwen35_weight_sync import map_actor_weight_name_for_vllm
+
+                self._qwen35_expected_vllm_source_names = tuple(
+                    map_actor_weight_name_for_vllm(
+                        name,
+                        model_type=actor_model_config.model_type,
+                    )
+                    for name in actor_module.state_dict()
+                )
             # Apply Liger kernel to the model if use_liger is set to True
             if use_liger:
                 from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
@@ -335,31 +361,28 @@ class ActorRolloutRefWorker(Worker):
                                                  model_hf_config=self.actor_model_config,
                                                  model_path=self.config.model.path)
         log_gpu_memory_usage('After building vllm rollout', logger=None)
-        if torch.distributed.get_world_size() == 1:
-            self.config.rollout.load_format = 'dummy_hf'
+        sync_weight_format = str(
+            self.config.rollout.get('sync_weight_format', 'dtensor')
+        ).lower()
+        if sync_weight_format not in ('hf', 'dtensor'):
+            raise ValueError(
+                'rollout.sync_weight_format must be hf or dtensor, '
+                f'got {sync_weight_format!r}.'
+            )
+        from verl.models.transformers.qwen3_5 import is_qwen3_5_model_type
+        if is_qwen3_5_model_type(self.actor_model_config.model_type) and sync_weight_format != 'hf':
+            raise ValueError('Qwen3.5 native vLLM rollout requires sync_weight_format=hf.')
 
-        if getattr(rollout, '_hf_generate', False):
-            class NoOpRolloutShardingManager:
-                def __init__(self, module):
-                    self.module = module
-                def __enter__(self):
-                    self.module.train(False)
-                    return self
-                def __exit__(self, exc_type, exc_value, traceback):
-                    self.module.train()
-                    torch.cuda.empty_cache()
-                    return False
-                def preprocess_data(self, data):
-                    return data
-                def postprocess_data(self, data):
-                    return data
-            rollout_sharding_manager = NoOpRolloutShardingManager(self.actor_module_fsdp)
-        else:
-            rollout_sharding_manager = FSDPVLLMShardingManager(module=self.actor_module_fsdp,
-                                                               inference_engine=rollout.inference_engine,
-                                                               model_config=self.actor_model_config,
-                                                               full_params='hf' in self.config.rollout.load_format,
-                                                               device_mesh=rollout_device_mesh)
+        rollout_sharding_manager = FSDPVLLMShardingManager(
+            module=self.actor_module_fsdp,
+            inference_engine=rollout.inference_engine,
+            model_config=self.actor_model_config,
+            sync_weight_format=sync_weight_format,
+            expected_source_names=getattr(
+                self, '_qwen35_expected_vllm_source_names', None
+            ),
+            device_mesh=rollout_device_mesh,
+        )
         log_gpu_memory_usage('After building sharding manager', logger=None)
 
         return rollout, rollout_sharding_manager
@@ -744,23 +767,49 @@ class CriticWorker(Worker):
             from verl.models.registry import check_model_support_rmpad
             check_model_support_rmpad(critic_model_config.model_type)
 
-        if use_remove_padding and self.ulysses_sequence_parallel_size > 1:
+        qwen3_5_critic = critic_model_config.model_type == 'qwen3_5'
+        if use_remove_padding and (self.ulysses_sequence_parallel_size > 1 or qwen3_5_critic):
             from verl.models.transformers.monkey_patch import apply_monkey_patch
             apply_monkey_patch(critic_model_config, verbose=True)
 
-        init_context = get_init_weight_context_manager()
+        from verl.workers.qwen35_runtime import validate_qwen3_5_training_runtime
+        qwen3_5_runtime = validate_qwen3_5_training_runtime(
+            model_type=critic_model_config.model_type,
+            use_remove_padding=use_remove_padding,
+            sequence_parallel_size=self.ulysses_sequence_parallel_size,
+        )
+        if qwen3_5_runtime is not None and self.rank == 0:
+            print(f'Qwen3.5 critic runtime gate: {qwen3_5_runtime}', flush=True)
+
+        init_context = get_init_weight_context_manager(
+            use_meta_tensor=not (
+                qwen3_5_critic
+                and critic_model_config.text_config.tie_word_embeddings
+            )
+        )
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
             setattr(critic_model_config, 'classifier_dropout', 0.)
             setattr(critic_model_config, 'hidden_dropout', '0')
-            critic_module, critic_loading_info = AutoModelForTokenClassification.from_pretrained(
-                pretrained_model_name_or_path=local_path,
-                torch_dtype=torch_dtype,
-                config=critic_model_config,
-                attn_implementation='flash_attention_2',
-                trust_remote_code=trust_remote_code,
-                output_loading_info=True,
-            )
+            if qwen3_5_critic:
+                from verl.workers.qwen35_critic import load_qwen3_5_token_value_model
+
+                critic_module, critic_loading_info = load_qwen3_5_token_value_model(
+                    pretrained_model_name_or_path=local_path,
+                    torch_dtype=torch_dtype,
+                    config=critic_model_config,
+                    attn_implementation='flash_attention_2',
+                    trust_remote_code=trust_remote_code,
+                )
+            else:
+                critic_module, critic_loading_info = AutoModelForTokenClassification.from_pretrained(
+                    pretrained_model_name_or_path=local_path,
+                    torch_dtype=torch_dtype,
+                    config=critic_model_config,
+                    attn_implementation='flash_attention_2',
+                    trust_remote_code=trust_remote_code,
+                    output_loading_info=True,
+                )
 
             # some parameters may not in torch_dtype
             critic_module.to(torch_dtype)

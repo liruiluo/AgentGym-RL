@@ -279,6 +279,7 @@ def normalize_generation_record(
     token_ids: Sequence[Any],
     *,
     eos_token_ids: Sequence[int] | int | None,
+    primary_eos_token_id: int | None,
     pad_token_id: int | None,
     max_tokens: int,
     backend_finish_reason: Any = None,
@@ -304,6 +305,18 @@ def normalize_generation_record(
                     f"Invalid configured EOS token id at index {index}: {token_id!r}"
                 ) from exc
     eos_ids = set(ordered_eos_ids)
+    normalized_primary_eos_token_id = (
+        None if primary_eos_token_id is None else int(primary_eos_token_id)
+    )
+    if (
+        normalized_primary_eos_token_id is not None
+        and normalized_primary_eos_token_id not in eos_ids
+    ):
+        raise ValueError(
+            "Primary EOS token ID is absent from the configured stop-token set: "
+            f"primary={normalized_primary_eos_token_id} "
+            f"configured={ordered_eos_ids}."
+        )
 
     raw_tokens: list[int] = []
     for index, raw_token_id in enumerate(token_ids):
@@ -361,6 +374,7 @@ def normalize_generation_record(
         ),
         "truncated": finish_reason == "length",
         "configured_eos_token_ids": ordered_eos_ids,
+        "primary_eos_token_id": normalized_primary_eos_token_id,
         "tokenizer_pad_token_id": (
             None if pad_token_id is None else int(pad_token_id)
         ),
@@ -429,6 +443,16 @@ def validate_official_vllm_generation_record(
         raise RuntimeError(
             "Formal official-vLLM EOS token IDs must be unique."
         )
+    primary_eos_token_id = record.get("primary_eos_token_id")
+    if (
+        type(primary_eos_token_id) is not int
+        or primary_eos_token_id < 0
+        or primary_eos_token_id not in eos_token_ids
+    ):
+        raise RuntimeError(
+            "Formal official-vLLM primary EOS token ID must be a configured "
+            "non-negative raw integer."
+        )
     pad_token_id = record.get("tokenizer_pad_token_id")
     if pad_token_id is not None and (
         type(pad_token_id) is not int or pad_token_id < 0
@@ -467,12 +491,12 @@ def validate_official_vllm_generation_record(
             raise RuntimeError(
                 "Formal official-vLLM length completion did not reach max_response_tokens."
             )
-        # vLLM checks the length cap before EOS. If EOS is sampled exactly at
-        # max_tokens, the backend therefore reports a legitimate length finish
-        # with that EOS retained as the final sampled token.
-        if eos_positions and eos_positions != [len(token_ids) - 1]:
+        # vLLM 0.24 checks primary EOS and stop-token IDs before the length cap.
+        # A sampled configured EOS therefore produces finish_reason=stop even
+        # when it is the token at max_tokens.
+        if eos_positions:
             raise RuntimeError(
-                "Formal official-vLLM length completion contains a non-terminal EOS."
+                "Formal official-vLLM length completion contains a configured EOS."
             )
         if stop_reason is not None:
             raise RuntimeError(
@@ -490,7 +514,17 @@ def validate_official_vllm_generation_record(
         )
 
     final_token_id = token_ids[-1]
-    if stop_reason is not None:
+    if final_token_id == primary_eos_token_id:
+        if stop_reason is not None:
+            raise RuntimeError(
+                "Formal official-vLLM primary EOS requires stop_reason=None."
+            )
+    else:
+        if stop_reason is None:
+            raise RuntimeError(
+                "Formal official-vLLM alternate EOS requires an explicit "
+                "backend stop_reason."
+            )
         if type(stop_reason) is not int:
             raise RuntimeError(
                 "Formal EOS stop_reason is not a raw integer token ID."
@@ -683,6 +717,7 @@ def _validate_formal_domain_step_record_v3(
         "stop_reason",
         "generation_backend_source",
         "generation_eos_token_ids",
+        "tokenizer_primary_eos_token_id",
         "tokenizer_pad_token_id",
         "generation_token_ids_are_exact",
         "backend_token_ids_are_exact",
@@ -790,6 +825,7 @@ def _validate_formal_domain_step_record_v3(
         "stop_reason": record["stop_reason"],
         "truncated": record["truncated"],
         "configured_eos_token_ids": record["generation_eos_token_ids"],
+        "primary_eos_token_id": record["tokenizer_primary_eos_token_id"],
         "tokenizer_pad_token_id": record["tokenizer_pad_token_id"],
         "backend_source": record["generation_backend_source"],
         "backend_token_ids_are_exact": record["backend_token_ids_are_exact"],
@@ -977,6 +1013,7 @@ def _validate_formal_step_record(
         "generation_backend_source",
         "generation_stop_reason",
         "generation_eos_token_ids",
+        "tokenizer_primary_eos_token_id",
         "tokenizer_pad_token_id",
         "generation_token_ids_are_exact",
         "backend_token_ids_are_exact",
@@ -984,6 +1021,7 @@ def _validate_formal_step_record(
         "env_result",
         "env_info_before",
         "env_info_after",
+        "action_submission",
         "committed_purchase",
         "purchase_correct",
         "accepted_purchase",
@@ -1050,6 +1088,49 @@ def _validate_formal_step_record(
         raise ValueError(
             f"Formal step record env_info must be objects at row {row_index}."
         )
+    action_submission = record["action_submission"]
+    if not isinstance(action_submission, dict):
+        raise ValueError(
+            f"Formal WebShop action_submission must be an object at row {row_index}."
+        )
+    if set(action_submission) != {
+        "raw_policy_output",
+        "submitted_action",
+        "parser_status",
+    }:
+        raise ValueError(
+            f"Formal WebShop action_submission fields mismatch at row {row_index}."
+        )
+    raw_policy_output = action_submission["raw_policy_output"]
+    if raw_policy_output != record["action"]:
+        raise ValueError(
+            f"Formal WebShop raw policy output differs from sampled content at row {row_index}."
+        )
+    submitted_action = action_submission["submitted_action"]
+    if not isinstance(submitted_action, str):
+        raise ValueError(
+            f"Formal WebShop submitted action must be text at row {row_index}."
+        )
+    parser_status = action_submission["parser_status"]
+    if parser_status not in {
+        "adapter_parsed",
+        "raw_fallback",
+    }:
+        raise ValueError(
+            f"Formal WebShop parser status is invalid at row {row_index}."
+        )
+    if parser_status == "adapter_parsed" and not submitted_action.strip():
+        raise ValueError(
+            f"Formal WebShop submitted action is empty at row {row_index}."
+        )
+    if parser_status == "raw_fallback":
+        expected_fallback = raw_policy_output
+        if expected_fallback.endswith("</s>"):
+            expected_fallback = expected_fallback[:-4]
+        if submitted_action != expected_fallback:
+            raise ValueError(
+                f"Formal WebShop raw fallback differs from submitted action at row {row_index}."
+            )
     for name in (
         "committed_purchase",
         "accepted_purchase",
@@ -1225,6 +1306,17 @@ def _validate_formal_step_record(
         raise ValueError(
             f"Formal generation EOS readback contains duplicates at row {row_index}."
         )
+    tokenizer_primary_eos_token_id = record["tokenizer_primary_eos_token_id"]
+    if (
+        type(tokenizer_primary_eos_token_id) is not int
+        or tokenizer_primary_eos_token_id < 0
+        or tokenizer_primary_eos_token_id not in generation_eos_token_ids
+    ):
+        raise ValueError(
+            "Formal tokenizer primary EOS readback must be a configured "
+            "non-negative integer: "
+            f"row={row_index} actual={tokenizer_primary_eos_token_id!r}."
+        )
     tokenizer_pad_token_id = record["tokenizer_pad_token_id"]
     if tokenizer_pad_token_id is not None and (
         type(tokenizer_pad_token_id) is not int or tokenizer_pad_token_id < 0
@@ -1273,8 +1365,7 @@ def _validate_formal_step_record(
             )
 
     if finish_reason == "stop":
-        primary_eos_token_id = generation_eos_token_ids[0]
-        if final_token_id == primary_eos_token_id:
+        if final_token_id == tokenizer_primary_eos_token_id:
             if stop_reason is not None:
                 raise ValueError(
                     "Formal primary EOS requires the official-vLLM raw "
@@ -1425,7 +1516,7 @@ def _validate_formal_step_record(
             f"row={row_index} indices={invalid_tool_steps}."
         )
     expected_action_op = _resolve_formal_native_action_op(
-        record["action"],
+        submitted_action,
         tool_ops,
         row_index=row_index,
     )
@@ -1487,7 +1578,7 @@ def _validate_formal_step_record(
                 f"Formal action without a tool event lacks one invalid-action component at row {row_index}."
             )
         invalid_component = invalid_action_components[0]
-        if invalid_component.get("raw_action") != record["action"].strip():
+        if invalid_component.get("raw_action") != submitted_action.strip():
             raise ValueError(
                 f"Formal invalid-action raw binding mismatch at row {row_index}."
             )
