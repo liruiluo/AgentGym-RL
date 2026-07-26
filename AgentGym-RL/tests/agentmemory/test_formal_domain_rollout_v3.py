@@ -184,6 +184,134 @@ def packed_v3_record():
     return record
 
 
+def packed_webshop_v2_record():
+    latest_observation = "Current WebShop observation."
+    visible_prompt = f"<system>WebShop tools</system>\n{latest_observation}"
+    prompt_token_ids = [101, 102, 103]
+    prompt_digest = ROLLOUT_CONTEXT.prompt_token_digest(prompt_token_ids)
+    response_token_ids = [201, 151645]
+    response_digest = ROLLOUT_CONTEXT.prompt_token_digest(response_token_ids)
+    trajectory_uid = "agentmemory:parentv1:0:replica0"
+    exact_state_uid = f"0:turn1:statev1:{prompt_digest}"
+    action = 'search["displayed product"]'
+    tool_op = {
+        "op": "SEARCH",
+        "step": 1,
+        "raw_action": action,
+        "result_count": 1,
+    }
+    reward_component = {
+        "name": "search_transition",
+        "op": "SEARCH",
+        "step": 1,
+        "value": 0.0,
+    }
+    env_info_before = {
+        "current_subtask_index": 0,
+        "episode_success": False,
+        "session_trace": [],
+        "tool_ops": [],
+        "reward_components": [],
+    }
+    env_info_after = {
+        "current_subtask_index": 0,
+        "episode_success": False,
+        "session_trace": [action],
+        "tool_ops": [tool_op],
+        "reward_components": [reward_component],
+    }
+    return {
+        "schema_version": FORMAL_DOMAIN.FORMAL_WEBSHOP_SCHEMA_V2,
+        "item_id": "0",
+        "exact_state_uid": exact_state_uid,
+        "trajectory_uid": trajectory_uid,
+        "trajectory_row_uid": FORMAL_GRPO.build_row_uid(trajectory_uid, 0),
+        "trajectory_row_order": 0,
+        "trajectory_terminal": True,
+        "task_round": 1,
+        "session_index": 0,
+        "subtask_index": 0,
+        "next_session_index": 0,
+        "subtask_index_before": 0,
+        "subtask_index_after": 0,
+        "visible_prompt": visible_prompt,
+        "latest_observation": latest_observation,
+        "prompt_history_policy": "latest_observation_only",
+        "raw_prior_messages_visible": False,
+        "single_observation_prompt_digest": prompt_digest,
+        "action": action,
+        "response_token_ids": response_token_ids,
+        "response_token_count": len(response_token_ids),
+        "max_response_tokens": 8,
+        "finish_reason": "stop",
+        "finish_reason_source": "official_vllm:backend",
+        "stop_reason": None,
+        "generation_backend_source": "official_vllm",
+        "generation_stop_reason": None,
+        "generation_eos_token_ids": [151645, 151643],
+        "tokenizer_pad_token_id": 151643,
+        "generation_token_ids_are_exact": True,
+        "backend_token_ids_are_exact": True,
+        "truncated": False,
+        "env_result": "Search results.",
+        "env_info_before": env_info_before,
+        "env_info_after": env_info_after,
+        "action_submission": {
+            "raw_policy_output": action,
+            "submitted_action": action,
+            "parser_status": "adapter_parsed",
+        },
+        "committed_purchase": False,
+        "purchase_correct": None,
+        "accepted_purchase": False,
+        "session_advanced": False,
+        "buy_committed": False,
+        "buy_accepted": False,
+        "subtask_advanced": False,
+        "raw_history_cleared": False,
+        "search_result_count": 1,
+        "immediate_reward": 0.0,
+        "suffix_return": 0.0,
+        "suffix_credit_applied": False,
+        "trajectory_return": 0.0,
+        "done": False,
+        "outcome": "continue",
+        "generation_prompt_length": len(prompt_token_ids),
+        "generation_prompt_digest": prompt_digest,
+        "packed_prompt_length": len(prompt_token_ids),
+        "packed_prompt_digest": prompt_digest,
+        "generation_response_length": len(response_token_ids),
+        "generation_response_digest": response_digest,
+        "packed_response_length": len(response_token_ids),
+        "packed_response_digest": response_digest,
+    }
+
+
+def invalid_webshop_v2_record(raw_output: str, submitted_action: str):
+    record = packed_webshop_v2_record()
+    record["action"] = raw_output
+    record["action_submission"] = {
+        "raw_policy_output": raw_output,
+        "submitted_action": submitted_action,
+        "parser_status": "raw_fallback",
+    }
+    record["env_info_after"]["tool_ops"] = []
+    record["env_info_after"]["reward_components"] = [
+        {
+            "name": "invalid_action",
+            "op": "INVALID",
+            "step": 1,
+            "value": -0.01,
+            "raw_action": submitted_action.strip(),
+            "error": "unsupported action",
+        }
+    ]
+    record["search_result_count"] = None
+    for field in ("immediate_reward", "suffix_return", "trajectory_return"):
+        record[field] = -0.01
+    return record
+
+
 def validate_one_record(record: dict):
     return ROLLOUT_CONTEXT.validate_formal_runtime_evidence_rows(
         exact_state_uids=[record["exact_state_uid"]],
@@ -260,6 +388,64 @@ class FormalDomainRolloutV3Test(unittest.TestCase):
         record["action_execution"]["raw_policy_output"] = "different"
         record["env_info_after"]["action_execution"]["raw_policy_output"] = "different"
         with self.assertRaisesRegex(ValueError, "sampled content"):
+            validate_one_record(record)
+
+    def test_webshop_v2_binds_thinking_output_to_submitted_native_action(self):
+        record = packed_webshop_v2_record()
+        raw_output = (
+            "<think>\nI need to find a relevant item.\n</think>\n\n"
+            "search[red velvet cake mix]"
+        )
+        submitted_action = "search[red velvet cake mix]"
+        record["action"] = raw_output
+        record["action_submission"]["raw_policy_output"] = raw_output
+        record["action_submission"]["submitted_action"] = submitted_action
+        record["env_info_after"]["tool_ops"][0]["raw_action"] = submitted_action
+
+        summary = validate_one_record(record)
+
+        self.assertEqual(summary["valid_rows"], 1)
+
+    def test_webshop_v2_accepts_server_authoritative_invalid_wrapper(self):
+        raw_output = '{"action": "click[Buy Now]"}'
+
+        summary = validate_one_record(
+            invalid_webshop_v2_record(raw_output, raw_output)
+        )
+
+        self.assertEqual(summary["valid_rows"], 1)
+
+    def test_webshop_v2_accepts_eos_only_empty_invalid_submission(self):
+        summary = validate_one_record(invalid_webshop_v2_record("", ""))
+
+        self.assertEqual(summary["valid_rows"], 1)
+
+    def test_webshop_v2_raw_fallback_removes_one_terminal_textual_eos(self):
+        for raw_output, submitted_action in (
+            ("</s>", ""),
+            ("</s></s>", "</s>"),
+            ("   </s>", "   "),
+        ):
+            with self.subTest(raw_output=raw_output):
+                summary = validate_one_record(
+                    invalid_webshop_v2_record(raw_output, submitted_action)
+                )
+                self.assertEqual(summary["valid_rows"], 1)
+
+    def test_webshop_v2_rejects_forged_raw_fallback_submission(self):
+        with self.assertRaisesRegex(ValueError, "raw fallback"):
+            validate_one_record(
+                invalid_webshop_v2_record(
+                    "raw-model-output",
+                    "forged-submission",
+                )
+            )
+
+    def test_webshop_v2_rejects_forged_submitted_action_binding(self):
+        record = packed_webshop_v2_record()
+        record["action_submission"]["submitted_action"] = "click[Buy Now]"
+
+        with self.assertRaisesRegex(ValueError, "bound to SEARCH|raw_action binding"):
             validate_one_record(record)
 
     def test_real_prompt_builder_receives_exact_metadata_prompt(self):

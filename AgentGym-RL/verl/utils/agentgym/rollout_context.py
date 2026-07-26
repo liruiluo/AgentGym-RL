@@ -984,6 +984,7 @@ def _validate_formal_step_record(
         "env_result",
         "env_info_before",
         "env_info_after",
+        "action_submission",
         "committed_purchase",
         "purchase_correct",
         "accepted_purchase",
@@ -1050,6 +1051,49 @@ def _validate_formal_step_record(
         raise ValueError(
             f"Formal step record env_info must be objects at row {row_index}."
         )
+    action_submission = record["action_submission"]
+    if not isinstance(action_submission, dict):
+        raise ValueError(
+            f"Formal WebShop action_submission must be an object at row {row_index}."
+        )
+    if set(action_submission) != {
+        "raw_policy_output",
+        "submitted_action",
+        "parser_status",
+    }:
+        raise ValueError(
+            f"Formal WebShop action_submission fields mismatch at row {row_index}."
+        )
+    raw_policy_output = action_submission["raw_policy_output"]
+    if raw_policy_output != record["action"]:
+        raise ValueError(
+            f"Formal WebShop raw policy output differs from sampled content at row {row_index}."
+        )
+    submitted_action = action_submission["submitted_action"]
+    if not isinstance(submitted_action, str):
+        raise ValueError(
+            f"Formal WebShop submitted action must be text at row {row_index}."
+        )
+    parser_status = action_submission["parser_status"]
+    if parser_status not in {
+        "adapter_parsed",
+        "raw_fallback",
+    }:
+        raise ValueError(
+            f"Formal WebShop parser status is invalid at row {row_index}."
+        )
+    if parser_status == "adapter_parsed" and not submitted_action.strip():
+        raise ValueError(
+            f"Formal WebShop submitted action is empty at row {row_index}."
+        )
+    if parser_status == "raw_fallback":
+        expected_fallback = raw_policy_output
+        if expected_fallback.endswith("</s>"):
+            expected_fallback = expected_fallback[:-4]
+        if submitted_action != expected_fallback:
+            raise ValueError(
+                f"Formal WebShop raw fallback differs from submitted action at row {row_index}."
+            )
     for name in (
         "committed_purchase",
         "accepted_purchase",
@@ -1425,7 +1469,7 @@ def _validate_formal_step_record(
             f"row={row_index} indices={invalid_tool_steps}."
         )
     expected_action_op = _resolve_formal_native_action_op(
-        record["action"],
+        submitted_action,
         tool_ops,
         row_index=row_index,
     )
@@ -1487,7 +1531,7 @@ def _validate_formal_step_record(
                 f"Formal action without a tool event lacks one invalid-action component at row {row_index}."
             )
         invalid_component = invalid_action_components[0]
-        if invalid_component.get("raw_action") != record["action"].strip():
+        if invalid_component.get("raw_action") != submitted_action.strip():
             raise ValueError(
                 f"Formal invalid-action raw binding mismatch at row {row_index}."
             )

@@ -203,6 +203,7 @@ def _build_formal_webshop_step_v2(
     generation_record: Mapping,
     env_info_before: Mapping,
     env_info_after: Mapping,
+    action_submission: Mapping | None,
 ) -> dict:
     if "current_subtask_index" not in env_info_before:
         raise FormalRuntimeEvidenceError(
@@ -310,7 +311,7 @@ def _build_formal_webshop_step_v2(
         "env_result": env_result,
         "env_info_before": deepcopy(dict(env_info_before)),
         "env_info_after": deepcopy(dict(env_info_after)),
-        "action_execution": deepcopy(env_info_after.get("action_execution")),
+        "action_submission": deepcopy(dict(action_submission or {})),
         "committed_purchase": committed_purchase,
         "purchase_correct": purchase_correct,
         "accepted_purchase": accepted_purchase,
@@ -1754,6 +1755,9 @@ class vLLMRollout(BaseRollout):
                             generation_record=generation_record,
                             env_info_before=env_info_before,
                             env_info_after=env_info_after,
+                            action_submission=getattr(
+                                env_clients[idx], "last_action_submission", None
+                            ),
                         )
                     if suffix_credit or formal_trajectory_credit:
                         step_record["trajectory_row_order"] = len(
