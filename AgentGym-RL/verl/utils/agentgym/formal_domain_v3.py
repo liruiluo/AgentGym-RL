@@ -11,7 +11,7 @@ FORMAL_DOMAIN_SCHEMA_V3 = "agentmemory_formal_step_v3"
 FORMAL_WEBSHOP_SCHEMA_V2 = "agentmemory_formal_step_v2"
 FORMAL_WEBSHOP_SURFACE_V2 = "memoryarena_webshop_native_v1"
 LTM_INVENTORY_MODES = ("hidden", "keys")
-MEMORY_PROMPT_MODES = ("legacy", "neutral")
+MEMORY_PROMPT_MODES = ("legacy", "neutral", "neutral_horizon")
 ACTION_LISTING_MODES = ("separate", "unified")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 

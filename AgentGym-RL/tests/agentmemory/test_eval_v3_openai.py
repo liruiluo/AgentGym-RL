@@ -1769,6 +1769,29 @@ class EvalV3OpenAITest(unittest.TestCase):
             env.system_prompt,
         )
 
+    def test_native_webshop_v2_derives_neutral_horizon_prompt_from_server_mode(self):
+        metadata = {
+            "surface": MODULE.WEBSHOP_V2_SURFACE,
+            "task_count": 1,
+            "memory_prompt_mode": "neutral_horizon",
+        }
+        env = MODULE.AgentMemoryEnvClient(
+            "http://env.test",
+            MODULE.JsonHttp(opener=_FakeOpen(metadata)),
+        )
+
+        self.assertEqual(env.metadata["memory_prompt_mode"], "neutral_horizon")
+        self.assertIn("six sequential shopping sessions", env.system_prompt)
+        self.assertIn(
+            "may refer to products purchased in earlier sessions",
+            env.system_prompt,
+        )
+        self.assertNotIn("use ADD before click[Buy Now]", env.system_prompt)
+        self.assertNotIn(
+            "At the start of every later shopping session",
+            env.system_prompt,
+        )
+
     def test_native_webshop_v2_rejects_unknown_memory_prompt_mode(self):
         metadata = {
             "surface": MODULE.WEBSHOP_V2_SURFACE,

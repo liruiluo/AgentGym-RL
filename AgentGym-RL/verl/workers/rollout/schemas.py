@@ -29,14 +29,15 @@ def agentmemory_ltm_inventory_mode() -> str:
     return mode
 
 
-AGENTMEMORY_MEMORY_PROMPT_MODES = ("legacy", "neutral")
+AGENTMEMORY_MEMORY_PROMPT_MODES = ("legacy", "neutral", "neutral_horizon")
 
 
 def agentmemory_memory_prompt_mode() -> str:
     mode = os.environ.get("AGENTMEMORY_MEMORY_PROMPT_MODE", "legacy").strip()
     if mode not in AGENTMEMORY_MEMORY_PROMPT_MODES:
         raise ValueError(
-            "AGENTMEMORY_MEMORY_PROMPT_MODE must be 'legacy' or 'neutral'."
+            "AGENTMEMORY_MEMORY_PROMPT_MODE must be 'legacy', 'neutral', or "
+            "'neutral_horizon'."
         )
     return mode
 
@@ -124,6 +125,11 @@ _AGENTMEMORY_MEMORY_LIFECYCLE = (
     "for you, and it does not reject an otherwise correct purchase when ADD was skipped."
 )
 
+_AGENTMEMORY_TASK_HORIZON = (
+    "This episode has six sequential shopping sessions. Later-session compatibility "
+    "constraints may refer to products purchased in earlier sessions."
+)
+
 _AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT = (
     "The observation includes a key-only long-term memory inventory when that interface "
     "variant is enabled. It lists only the memory_id and a policy-authored lookup key; memory "
@@ -171,6 +177,21 @@ AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL = (
     + _AGENTMEMORY_REPLY_RULE_REASONING
     + _AGENTMEMORY_ACTION_CONTRACT
 )
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL
+    + " "
+    + _AGENTMEMORY_TASK_HORIZON
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_HORIZON = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL
+    + " "
+    + _AGENTMEMORY_TASK_HORIZON
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_HORIZON = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL
+    + " "
+    + _AGENTMEMORY_TASK_HORIZON
+)
 AGENTMEMORY_ACTION_SYSTEM_PROMPT_LTM_KEY_INVENTORY = (
     AGENTMEMORY_ACTION_SYSTEM_PROMPT
     + " "
@@ -201,6 +222,21 @@ AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_LTM_KEY_INVENTORY = (
     + " "
     + _AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT
 )
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON_LTM_KEY_INVENTORY = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON
+    + " "
+    + _AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_HORIZON_LTM_KEY_INVENTORY = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_HORIZON
+    + " "
+    + _AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_HORIZON_LTM_KEY_INVENTORY = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_HORIZON
+    + " "
+    + _AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT
+)
 
 
 def agentmemory_action_system_prompt(
@@ -223,29 +259,44 @@ def agentmemory_action_system_prompt(
         else memory_prompt_mode
     )
     if prompt_mode not in AGENTMEMORY_MEMORY_PROMPT_MODES:
-        raise ValueError("memory_prompt_mode must be 'legacy' or 'neutral'.")
+        raise ValueError(
+            "memory_prompt_mode must be 'legacy', 'neutral', or 'neutral_horizon'."
+        )
     key_inventory = inventory_mode == "keys"
-    neutral = prompt_mode == "neutral"
+    neutral = prompt_mode in ("neutral", "neutral_horizon")
+    neutral_horizon = prompt_mode == "neutral_horizon"
     if _agentmemory_thinking_enabled():
         if key_inventory:
+            if neutral_horizon:
+                return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_HORIZON_LTM_KEY_INVENTORY
             if neutral:
                 return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_LTM_KEY_INVENTORY
             return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_LTM_KEY_INVENTORY
+        if neutral_horizon:
+            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_HORIZON
         if neutral:
             return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL
         return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING
     if _agentmemory_reasoning_enabled():
         if key_inventory:
+            if neutral_horizon:
+                return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_HORIZON_LTM_KEY_INVENTORY
             if neutral:
                 return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_LTM_KEY_INVENTORY
             return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_LTM_KEY_INVENTORY
+        if neutral_horizon:
+            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_HORIZON
         if neutral:
             return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL
         return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING
     if key_inventory:
+        if neutral_horizon:
+            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON_LTM_KEY_INVENTORY
         if neutral:
             return AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_LTM_KEY_INVENTORY
         return AGENTMEMORY_ACTION_SYSTEM_PROMPT_LTM_KEY_INVENTORY
+    if neutral_horizon:
+        return AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON
     if neutral:
         return AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL
     return AGENTMEMORY_ACTION_SYSTEM_PROMPT

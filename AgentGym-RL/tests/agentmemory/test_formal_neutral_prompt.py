@@ -77,6 +77,14 @@ class FormalPromptTests(unittest.TestCase):
         self.neutral_inventory_prompt = values[
             "AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_LTM_KEY_INVENTORY"
         ]
+        self.neutral_horizon_prompts = (
+            values["AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON"],
+            values["AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_HORIZON"],
+            values["AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_HORIZON"],
+        )
+        self.neutral_horizon_inventory_prompt = values[
+            "AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON_LTM_KEY_INVENTORY"
+        ]
 
     def test_both_prompts_have_native_action_contract(self) -> None:
         for prompt in (self.no_thinking_prompt, self.thinking_prompt, self.reasoning_prompt):
@@ -128,6 +136,31 @@ class FormalPromptTests(unittest.TestCase):
         self.assertIn("values remain hidden until RETRIEVE", self.neutral_inventory_prompt)
         self.assertNotIn("use ADD before click[Buy Now]", self.neutral_inventory_prompt)
 
+    def test_neutral_horizon_adds_only_objective_task_scope(self) -> None:
+        horizon = (
+            "This episode has six sequential shopping sessions. Later-session "
+            "compatibility constraints may refer to products purchased in earlier "
+            "sessions."
+        )
+        forbidden = (
+            "use ADD before click[Buy Now]",
+            "At the start of every later shopping session",
+            "before choosing a compatible product",
+        )
+        for neutral, horizon_prompt in zip(
+            self.neutral_prompts,
+            self.neutral_horizon_prompts,
+        ):
+            self.assertNotIn(horizon, neutral)
+            self.assertEqual(horizon_prompt, neutral + " " + horizon)
+            for fragment in forbidden:
+                self.assertNotIn(fragment, horizon_prompt)
+        self.assertIn(
+            "key-only long-term memory inventory",
+            self.neutral_horizon_inventory_prompt,
+        )
+        self.assertIn(horizon, self.neutral_horizon_inventory_prompt)
+
     def test_prompt_mode_is_opt_in_and_validated(self) -> None:
         module = load_schemas_module()
         with patch.dict(os.environ, {}, clear=True):
@@ -143,6 +176,15 @@ class FormalPromptTests(unittest.TestCase):
             self.assertEqual(
                 module.agentmemory_action_system_prompt(),
                 module.AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL,
+            )
+        with patch.dict(
+            os.environ,
+            {"AGENTMEMORY_MEMORY_PROMPT_MODE": "neutral_horizon"},
+            clear=True,
+        ):
+            self.assertEqual(
+                module.agentmemory_action_system_prompt(),
+                module.AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON,
             )
         with patch.dict(
             os.environ,

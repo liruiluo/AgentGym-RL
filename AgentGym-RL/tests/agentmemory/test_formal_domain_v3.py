@@ -321,6 +321,10 @@ class FormalDomainV3Test(unittest.TestCase):
             expected_mode="neutral",
         )
         MODULE.validate_webshop_memory_prompt_mode({}, expected_mode="legacy")
+        MODULE.validate_webshop_memory_prompt_mode(
+            {"memory_prompt_mode": "neutral_horizon"},
+            expected_mode="neutral_horizon",
+        )
 
         with self.assertRaisesRegex(MODULE.FormalDomainV3Error, "disagree"):
             MODULE.validate_webshop_memory_prompt_mode(
