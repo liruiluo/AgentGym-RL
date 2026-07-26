@@ -333,6 +333,24 @@ class FormalDomainV3Test(unittest.TestCase):
                 expected_mode="neutral",
             )
 
+    def test_webshop_action_listing_mode_requires_server_rollout_parity(self):
+        MODULE.validate_webshop_action_listing_mode(
+            {"action_listing_mode": "unified"},
+            expected_mode="unified",
+        )
+        MODULE.validate_webshop_action_listing_mode({}, expected_mode="separate")
+
+        with self.assertRaisesRegex(MODULE.FormalDomainV3Error, "disagree"):
+            MODULE.validate_webshop_action_listing_mode(
+                {"action_listing_mode": "unified"},
+                expected_mode="separate",
+            )
+        with self.assertRaisesRegex(MODULE.FormalDomainV3Error, "missing"):
+            MODULE.validate_webshop_action_listing_mode(
+                {},
+                expected_mode="unified",
+            )
+
     def test_schema_mismatch_fails_closed(self):
         with self.assertRaisesRegex(MODULE.FormalDomainV3Error, "does not match"):
             MODULE.validate_formal_env_schema(

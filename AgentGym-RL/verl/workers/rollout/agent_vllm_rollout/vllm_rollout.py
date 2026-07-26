@@ -60,6 +60,7 @@ from verl.utils.agentgym.formal_domain_v3 import (
     build_formal_domain_step_v3,
     resolve_formal_runtime_contract,
     validate_formal_env_schema,
+    validate_webshop_action_listing_mode,
     validate_webshop_ltm_inventory_mode,
     validate_webshop_memory_prompt_mode,
 )
@@ -111,6 +112,7 @@ from verl.workers.rollout.schemas import (
     Message,
     RolloutHandler,
     _pre_process_inputs,
+    agentmemory_action_listing_mode,
     agentmemory_action_system_prompt,
     agentmemory_ltm_inventory_mode,
     agentmemory_memory_prompt_mode,
@@ -148,6 +150,7 @@ def _formal_runtime_contract_for_client(env_client) -> tuple[str, str, str]:
             "system_prompt",
             "ltm_inventory_mode",
             "memory_prompt_mode",
+            "action_listing_mode",
         )
         mismatches = [
             key
@@ -169,6 +172,10 @@ def _formal_runtime_contract_for_client(env_client) -> tuple[str, str, str]:
         validate_webshop_memory_prompt_mode(
             info_metadata,
             expected_mode=agentmemory_memory_prompt_mode(),
+        )
+        validate_webshop_action_listing_mode(
+            info_metadata,
+            expected_mode=agentmemory_action_listing_mode(),
         )
         return resolve_formal_runtime_contract(
             info_metadata,

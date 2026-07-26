@@ -41,6 +41,18 @@ def agentmemory_memory_prompt_mode() -> str:
     return mode
 
 
+AGENTMEMORY_ACTION_LISTING_MODES = ("separate", "unified")
+
+
+def agentmemory_action_listing_mode() -> str:
+    mode = os.environ.get("AGENTMEMORY_ACTION_LISTING_MODE", "separate").strip()
+    if mode not in AGENTMEMORY_ACTION_LISTING_MODES:
+        raise ValueError(
+            "AGENTMEMORY_ACTION_LISTING_MODE must be 'separate' or 'unified'."
+        )
+    return mode
+
+
 # The system prompt is built from three parts. The intro and the action-space
 # contract are identical in both modes; only the reply-format rule differs, so
 # that the rule never contradicts whether the chat template opened a <think>

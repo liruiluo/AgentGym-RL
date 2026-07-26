@@ -152,6 +152,24 @@ class FormalPromptTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "MEMORY_PROMPT_MODE"):
                 module.agentmemory_action_system_prompt()
 
+    def test_action_listing_mode_is_opt_in_and_validated(self) -> None:
+        module = load_schemas_module()
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(module.agentmemory_action_listing_mode(), "separate")
+        with patch.dict(
+            os.environ,
+            {"AGENTMEMORY_ACTION_LISTING_MODE": "unified"},
+            clear=True,
+        ):
+            self.assertEqual(module.agentmemory_action_listing_mode(), "unified")
+        with patch.dict(
+            os.environ,
+            {"AGENTMEMORY_ACTION_LISTING_MODE": "ranked"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "ACTION_LISTING_MODE"):
+                module.agentmemory_action_listing_mode()
+
     def test_reply_rules_match_thinking_mode(self) -> None:
         self.assertIn("Output excludes", self.no_thinking_prompt)
         self.assertIn("<think> blocks", self.no_thinking_prompt)
