@@ -11,6 +11,7 @@ FORMAL_DOMAIN_SCHEMA_V3 = "agentmemory_formal_step_v3"
 FORMAL_WEBSHOP_SCHEMA_V2 = "agentmemory_formal_step_v2"
 FORMAL_WEBSHOP_SURFACE_V2 = "memoryarena_webshop_native_v1"
 LTM_INVENTORY_MODES = ("hidden", "keys")
+MEMORY_PROMPT_MODES = ("legacy", "neutral")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
@@ -43,6 +44,35 @@ def validate_webshop_ltm_inventory_mode(
     if server_mode != expected_mode:
         raise FormalDomainV3Error(
             "WebShop server and rollout LTM inventory modes disagree: "
+            f"server={server_mode!r} rollout={expected_mode!r}"
+        )
+
+
+def validate_webshop_memory_prompt_mode(
+    metadata: Mapping[str, Any],
+    *,
+    expected_mode: str,
+) -> None:
+    """Keep the WebShop server, adapter, and rollout prompt on one mode."""
+
+    if expected_mode not in MEMORY_PROMPT_MODES:
+        raise FormalDomainV3Error(
+            f"unsupported rollout memory prompt mode: {expected_mode!r}"
+        )
+    server_mode = metadata.get("memory_prompt_mode")
+    if server_mode is None:
+        if expected_mode != "legacy":
+            raise FormalDomainV3Error(
+                "WebShop runtime metadata is missing memory_prompt_mode"
+            )
+        return
+    if server_mode not in MEMORY_PROMPT_MODES:
+        raise FormalDomainV3Error(
+            f"unsupported server memory prompt mode: {server_mode!r}"
+        )
+    if server_mode != expected_mode:
+        raise FormalDomainV3Error(
+            "WebShop server and rollout memory prompt modes disagree: "
             f"server={server_mode!r} rollout={expected_mode!r}"
         )
 

@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
+import os
+import sys
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCHEMAS_PATH = Path(__file__).resolve().parents[2] / "verl" / "workers" / "rollout" / "schemas.py"
@@ -34,6 +39,27 @@ def extract_static_string_assignments() -> dict[str, str]:
     return values
 
 
+def load_schemas_module():
+    module_name = "agentmemory_prompt_schema_for_test"
+    spec = importlib.util.spec_from_file_location(module_name, SCHEMAS_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    torch_stub = types.ModuleType("torch")
+    torch_stub.Tensor = object
+    transformers_stub = types.ModuleType("transformers")
+    transformers_stub.PreTrainedTokenizer = object
+    with patch.dict(
+        sys.modules,
+        {
+            module_name: module,
+            "torch": torch_stub,
+            "transformers": transformers_stub,
+        },
+    ):
+        spec.loader.exec_module(module)
+    return module
+
+
 class FormalPromptTests(unittest.TestCase):
     def setUp(self) -> None:
         values = extract_static_string_assignments()
@@ -42,6 +68,14 @@ class FormalPromptTests(unittest.TestCase):
         self.reasoning_prompt = values["AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING"]
         self.inventory_prompt = values[
             "AGENTMEMORY_ACTION_SYSTEM_PROMPT_LTM_KEY_INVENTORY"
+        ]
+        self.neutral_prompts = (
+            values["AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL"],
+            values["AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL"],
+            values["AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL"],
+        )
+        self.neutral_inventory_prompt = values[
+            "AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_LTM_KEY_INVENTORY"
         ]
 
     def test_both_prompts_have_native_action_contract(self) -> None:
@@ -67,6 +101,56 @@ class FormalPromptTests(unittest.TestCase):
                 "does not reject an otherwise correct purchase when ADD was skipped",
             ):
                 self.assertIn(fragment, prompt)
+
+    def test_neutral_prompts_keep_generic_tool_contract_without_timing_sop(self) -> None:
+        forbidden = (
+            "use ADD before click[Buy Now]",
+            "At the start of every later shopping session",
+            "before choosing a compatible product",
+        )
+        required = (
+            "search[keywords]",
+            "click[Buy Now]",
+            "ADD requires key:string",
+            "RETRIEVE requires query:string and top_k=3",
+            "matches text you previously wrote to long-term memory",
+            "Long-term memory persists across shopping sessions",
+            "remains hidden until RETRIEVE exposes it",
+        )
+        for prompt in self.neutral_prompts:
+            for fragment in required:
+                self.assertIn(fragment, prompt)
+            for fragment in forbidden:
+                self.assertNotIn(fragment, prompt)
+
+    def test_neutral_key_inventory_keeps_values_hidden(self) -> None:
+        self.assertIn("key-only long-term memory inventory", self.neutral_inventory_prompt)
+        self.assertIn("values remain hidden until RETRIEVE", self.neutral_inventory_prompt)
+        self.assertNotIn("use ADD before click[Buy Now]", self.neutral_inventory_prompt)
+
+    def test_prompt_mode_is_opt_in_and_validated(self) -> None:
+        module = load_schemas_module()
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                module.agentmemory_action_system_prompt(),
+                module.AGENTMEMORY_ACTION_SYSTEM_PROMPT,
+            )
+        with patch.dict(
+            os.environ,
+            {"AGENTMEMORY_MEMORY_PROMPT_MODE": "neutral"},
+            clear=True,
+        ):
+            self.assertEqual(
+                module.agentmemory_action_system_prompt(),
+                module.AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL,
+            )
+        with patch.dict(
+            os.environ,
+            {"AGENTMEMORY_MEMORY_PROMPT_MODE": "instruction"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "MEMORY_PROMPT_MODE"):
+                module.agentmemory_action_system_prompt()
 
     def test_reply_rules_match_thinking_mode(self) -> None:
         self.assertIn("Output excludes", self.no_thinking_prompt)

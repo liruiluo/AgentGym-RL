@@ -609,7 +609,9 @@ PAPER_SURFACE_REGISTRY = {
 # training stack: loading ``schemas.py`` only needs type-only dependencies,
 # which are stubbed when they are unavailable in an eval-only environment.
 def _load_legacy_webshop_system_prompt(
-    *, ltm_inventory_mode: str = "hidden"
+    *,
+    ltm_inventory_mode: str = "hidden",
+    memory_prompt_mode: str = "legacy",
 ) -> str:
     schemas_path = Path(__file__).resolve().parents[2] / "verl/workers/rollout/schemas.py"
     if not schemas_path.is_file():
@@ -641,7 +643,8 @@ def _load_legacy_webshop_system_prompt(
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         prompt = module.agentmemory_action_system_prompt(
-            ltm_inventory_mode=ltm_inventory_mode
+            ltm_inventory_mode=ltm_inventory_mode,
+            memory_prompt_mode=memory_prompt_mode,
         )
     finally:
         for name, original in original_modules.items():
@@ -2955,8 +2958,16 @@ class AgentMemoryEnvClient:
                 f"{inventory_mode!r}"
             )
         self.metadata["ltm_inventory_mode"] = inventory_mode
+        memory_prompt_mode = self.metadata.get("memory_prompt_mode", "legacy")
+        if memory_prompt_mode not in ("legacy", "neutral"):
+            raise EvalError(
+                "Native WebShop metadata has unsupported memory_prompt_mode: "
+                f"{memory_prompt_mode!r}"
+            )
+        self.metadata["memory_prompt_mode"] = memory_prompt_mode
         canonical_prompt = _load_legacy_webshop_system_prompt(
-            ltm_inventory_mode=inventory_mode
+            ltm_inventory_mode=inventory_mode,
+            memory_prompt_mode=memory_prompt_mode,
         )
         if system_prompt is None:
             self.metadata["system_prompt"] = canonical_prompt
@@ -2970,7 +2981,8 @@ class AgentMemoryEnvClient:
         if system_prompt != canonical_prompt:
             raise EvalError(
                 "Native WebShop metadata system_prompt disagrees with the "
-                f"canonical {inventory_mode!r} inventory rollout fallback"
+                f"canonical {inventory_mode!r} inventory / "
+                f"{memory_prompt_mode!r} memory-prompt rollout fallback"
             )
         expected = self.metadata.get("system_prompt_sha256")
         observed = hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()

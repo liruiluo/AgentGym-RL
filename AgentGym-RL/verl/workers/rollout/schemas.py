@@ -29,6 +29,18 @@ def agentmemory_ltm_inventory_mode() -> str:
     return mode
 
 
+AGENTMEMORY_MEMORY_PROMPT_MODES = ("legacy", "neutral")
+
+
+def agentmemory_memory_prompt_mode() -> str:
+    mode = os.environ.get("AGENTMEMORY_MEMORY_PROMPT_MODE", "legacy").strip()
+    if mode not in AGENTMEMORY_MEMORY_PROMPT_MODES:
+        raise ValueError(
+            "AGENTMEMORY_MEMORY_PROMPT_MODE must be 'legacy' or 'neutral'."
+        )
+    return mode
+
+
 # The system prompt is built from three parts. The intro and the action-space
 # contract are identical in both modes; only the reply-format rule differs, so
 # that the rule never contradicts whether the chat template opened a <think>
@@ -132,6 +144,21 @@ AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING = (
     + " "
     + _AGENTMEMORY_MEMORY_LIFECYCLE
 )
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL = (
+    _AGENTMEMORY_INTRO
+    + _AGENTMEMORY_REPLY_RULE_NO_THINKING
+    + _AGENTMEMORY_ACTION_CONTRACT
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL = (
+    _AGENTMEMORY_INTRO
+    + _AGENTMEMORY_REPLY_RULE_THINKING
+    + _AGENTMEMORY_ACTION_CONTRACT
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL = (
+    _AGENTMEMORY_INTRO
+    + _AGENTMEMORY_REPLY_RULE_REASONING
+    + _AGENTMEMORY_ACTION_CONTRACT
+)
 AGENTMEMORY_ACTION_SYSTEM_PROMPT_LTM_KEY_INVENTORY = (
     AGENTMEMORY_ACTION_SYSTEM_PROMPT
     + " "
@@ -147,9 +174,28 @@ AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_LTM_KEY_INVENTORY = (
     + " "
     + _AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT
 )
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_LTM_KEY_INVENTORY = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL
+    + " "
+    + _AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_LTM_KEY_INVENTORY = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL
+    + " "
+    + _AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_LTM_KEY_INVENTORY = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL
+    + " "
+    + _AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT
+)
 
 
-def agentmemory_action_system_prompt(*, ltm_inventory_mode: str | None = None) -> str:
+def agentmemory_action_system_prompt(
+    *,
+    ltm_inventory_mode: str | None = None,
+    memory_prompt_mode: str | None = None,
+) -> str:
     # Pick the reply rule that matches the active thinking mode so the prompt
     # never contradicts what the chat template does with <think>.
     inventory_mode = (
@@ -159,17 +205,37 @@ def agentmemory_action_system_prompt(*, ltm_inventory_mode: str | None = None) -
     )
     if inventory_mode not in ("hidden", "keys"):
         raise ValueError("ltm_inventory_mode must be 'hidden' or 'keys'.")
+    prompt_mode = (
+        agentmemory_memory_prompt_mode()
+        if memory_prompt_mode is None
+        else memory_prompt_mode
+    )
+    if prompt_mode not in AGENTMEMORY_MEMORY_PROMPT_MODES:
+        raise ValueError("memory_prompt_mode must be 'legacy' or 'neutral'.")
     key_inventory = inventory_mode == "keys"
+    neutral = prompt_mode == "neutral"
     if _agentmemory_thinking_enabled():
         if key_inventory:
+            if neutral:
+                return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_LTM_KEY_INVENTORY
             return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_LTM_KEY_INVENTORY
+        if neutral:
+            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL
         return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING
     if _agentmemory_reasoning_enabled():
         if key_inventory:
+            if neutral:
+                return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_LTM_KEY_INVENTORY
             return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_LTM_KEY_INVENTORY
+        if neutral:
+            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL
         return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING
     if key_inventory:
+        if neutral:
+            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_LTM_KEY_INVENTORY
         return AGENTMEMORY_ACTION_SYSTEM_PROMPT_LTM_KEY_INVENTORY
+    if neutral:
+        return AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL
     return AGENTMEMORY_ACTION_SYSTEM_PROMPT
 
 def _normalize_chat_template_token_ids(encoded) -> List[int]:

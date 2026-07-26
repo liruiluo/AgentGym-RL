@@ -315,6 +315,24 @@ class FormalDomainV3Test(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.FormalDomainV3Error, "missing"):
             MODULE.validate_webshop_ltm_inventory_mode({}, expected_mode="keys")
 
+    def test_webshop_memory_prompt_mode_requires_server_rollout_parity(self):
+        MODULE.validate_webshop_memory_prompt_mode(
+            {"memory_prompt_mode": "neutral"},
+            expected_mode="neutral",
+        )
+        MODULE.validate_webshop_memory_prompt_mode({}, expected_mode="legacy")
+
+        with self.assertRaisesRegex(MODULE.FormalDomainV3Error, "disagree"):
+            MODULE.validate_webshop_memory_prompt_mode(
+                {"memory_prompt_mode": "neutral"},
+                expected_mode="legacy",
+            )
+        with self.assertRaisesRegex(MODULE.FormalDomainV3Error, "missing"):
+            MODULE.validate_webshop_memory_prompt_mode(
+                {},
+                expected_mode="neutral",
+            )
+
     def test_schema_mismatch_fails_closed(self):
         with self.assertRaisesRegex(MODULE.FormalDomainV3Error, "does not match"):
             MODULE.validate_formal_env_schema(

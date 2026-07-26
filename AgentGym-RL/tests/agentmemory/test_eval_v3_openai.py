@@ -1678,6 +1678,7 @@ class EvalV3OpenAITest(unittest.TestCase):
         env = MODULE.AgentMemoryEnvClient("http://env.test", transport)
         self.assertEqual(env.system_prompt_source, "webshop_v2_rollout_fallback")
         self.assertEqual(env.metadata["ltm_inventory_mode"], "hidden")
+        self.assertEqual(env.metadata["memory_prompt_mode"], "legacy")
         self.assertNotIn("key-only long-term memory inventory", env.system_prompt)
         self.assertEqual(
             MODULE.extract_webshop_v2_action(
@@ -1743,6 +1744,38 @@ class EvalV3OpenAITest(unittest.TestCase):
             "ltm_inventory_mode": "values",
         }
         with self.assertRaisesRegex(MODULE.EvalError, "ltm_inventory_mode"):
+            MODULE.AgentMemoryEnvClient(
+                "http://env.test",
+                MODULE.JsonHttp(opener=_FakeOpen(metadata)),
+            )
+
+    def test_native_webshop_v2_derives_neutral_prompt_from_server_mode(self):
+        metadata = {
+            "surface": MODULE.WEBSHOP_V2_SURFACE,
+            "task_count": 1,
+            "memory_prompt_mode": "neutral",
+        }
+        env = MODULE.AgentMemoryEnvClient(
+            "http://env.test",
+            MODULE.JsonHttp(opener=_FakeOpen(metadata)),
+        )
+
+        self.assertEqual(env.metadata["memory_prompt_mode"], "neutral")
+        self.assertIn("ADD requires key:string", env.system_prompt)
+        self.assertIn("RETRIEVE requires query:string", env.system_prompt)
+        self.assertNotIn("use ADD before click[Buy Now]", env.system_prompt)
+        self.assertNotIn(
+            "At the start of every later shopping session",
+            env.system_prompt,
+        )
+
+    def test_native_webshop_v2_rejects_unknown_memory_prompt_mode(self):
+        metadata = {
+            "surface": MODULE.WEBSHOP_V2_SURFACE,
+            "task_count": 1,
+            "memory_prompt_mode": "instruction",
+        }
+        with self.assertRaisesRegex(MODULE.EvalError, "memory_prompt_mode"):
             MODULE.AgentMemoryEnvClient(
                 "http://env.test",
                 MODULE.JsonHttp(opener=_FakeOpen(metadata)),
