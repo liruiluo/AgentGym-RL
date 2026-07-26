@@ -1,8 +1,22 @@
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
 import unittest
 
-from verl.utils.agentgym.formal_training_metrics import summarize_formal_training_rows
+
+MODULE_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "verl"
+    / "utils"
+    / "agentgym"
+    / "formal_training_metrics.py"
+)
+SPEC = importlib.util.spec_from_file_location("formal_training_metrics_under_test", MODULE_PATH)
+assert SPEC is not None and SPEC.loader is not None
+MODULE = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(MODULE)
+summarize_formal_training_rows = MODULE.summarize_formal_training_rows
 
 
 def record(
@@ -301,6 +315,284 @@ class FormalTrainingMetricsTests(unittest.TestCase):
         self.assertAlmostEqual(summary["trajectory_return_mean"], 2.10)
         self.assertAlmostEqual(summary["immediate_reward_per_action_mean"], 0.525)
         self.assertAlmostEqual(summary["suffix_return_per_action_mean"], 1.55)
+
+    def test_first_valid_later_session_retrieve_can_be_empty(self) -> None:
+        step = record(
+            'RETRIEVE {"query":"missing","top_k":3}',
+            before=1,
+            after=1,
+            components=(("memory_retrieve_first_valid_later_session", 0.1),),
+            memory_ops=(
+                {
+                    "op": "RETRIEVE",
+                    "retrieved_count": 0,
+                    "retrieved_memory_ids": [],
+                },
+            ),
+        )
+        summary = summarize_formal_training_rows(
+            [row("empty", 0, 0.1, 0.1, 0.1, 0.2, step, terminal=True)]
+        )
+        self.assertEqual(summary["first_valid_later_session_retrieve_count"], 1.0)
+        self.assertEqual(
+            summary["empty_first_valid_later_session_retrieve_count"], 1.0
+        )
+        self.assertEqual(summary["nonempty_retrieve_count"], 0.0)
+        self.assertEqual(summary["relevant_retrieve_count"], 0.0)
+        self.assertEqual(summary["source_linked_retrieve_count"], 0.0)
+        self.assertEqual(summary["functional_memory_chain_count"], 0.0)
+
+    def test_memory_ids_prove_source_link_and_functional_chain(self) -> None:
+        rows = [
+            row(
+                "strict",
+                0,
+                0.01,
+                2.11,
+                2.11,
+                0.2,
+                record(
+                    'ADD {"key":"source","value":"ma_a"}',
+                    before=0,
+                    after=0,
+                    components=(("memory_add_first_valid_this_session", 0.01),),
+                    memory_ops=(
+                        {"op": "ADD", "memory_id": "mem_0000"},
+                    ),
+                ),
+            ),
+            row(
+                "strict",
+                1,
+                1.0,
+                2.10,
+                2.11,
+                1.0,
+                record(
+                    'BUY {"product_id":"B01"}',
+                    before=0,
+                    after=1,
+                    accepted=True,
+                    committed=True,
+                    advanced=True,
+                ),
+            ),
+            row(
+                "strict",
+                2,
+                0.1,
+                1.10,
+                2.11,
+                0.4,
+                record(
+                    'RETRIEVE {"query":"source","top_k":3}',
+                    before=1,
+                    after=1,
+                    components=(
+                        ("memory_retrieve_first_valid_later_session", 0.1),
+                    ),
+                    memory_ops=(
+                        {
+                            "op": "RETRIEVE",
+                            "retrieved_count": 1,
+                            "retrieved_memory_ids": ["mem_0000"],
+                        },
+                    ),
+                ),
+            ),
+            row(
+                "strict",
+                3,
+                1.0,
+                1.0,
+                2.11,
+                1.1,
+                record(
+                    'BUY {"product_id":"B02"}',
+                    before=1,
+                    after=2,
+                    accepted=True,
+                    committed=True,
+                    advanced=True,
+                    done=True,
+                ),
+                terminal=True,
+            ),
+        ]
+        summary = summarize_formal_training_rows(rows)
+        self.assertEqual(summary["first_valid_add_count"], 1.0)
+        self.assertEqual(summary["first_valid_later_session_retrieve_count"], 1.0)
+        self.assertEqual(
+            summary["empty_first_valid_later_session_retrieve_count"], 0.0
+        )
+        self.assertEqual(summary["nonempty_retrieve_count"], 1.0)
+        self.assertEqual(summary["relevant_retrieve_count"], 0.0)
+        self.assertEqual(
+            summary["source_memory_write_before_correct_buy_count"], 1.0
+        )
+        self.assertEqual(summary["source_linked_retrieve_count"], 1.0)
+        self.assertEqual(summary["functional_memory_chain_count"], 1.0)
+
+    def test_wrong_retrieved_memory_id_is_not_source_linked(self) -> None:
+        rows = [
+            row(
+                "wrong_id",
+                0,
+                0.0,
+                2.0,
+                2.0,
+                0.1,
+                record(
+                    'UPDATE {"memory_id":"mem_source","value":"ma_a"}',
+                    before=0,
+                    after=0,
+                    memory_ops=(
+                        {"op": "UPDATE", "memory_id": "mem_source"},
+                    ),
+                ),
+            ),
+            row(
+                "wrong_id",
+                1,
+                1.0,
+                2.0,
+                2.0,
+                1.0,
+                record(
+                    'BUY {"product_id":"B01"}',
+                    before=0,
+                    after=1,
+                    accepted=True,
+                    committed=True,
+                    advanced=True,
+                ),
+            ),
+            row(
+                "wrong_id",
+                2,
+                0.0,
+                1.0,
+                2.0,
+                0.2,
+                record(
+                    'RETRIEVE {"query":"other","top_k":3}',
+                    before=1,
+                    after=1,
+                    memory_ops=(
+                        {
+                            "op": "RETRIEVE",
+                            "retrieved_count": 1,
+                            "retrieved_memory_ids": ["mem_other"],
+                        },
+                    ),
+                ),
+            ),
+            row(
+                "wrong_id",
+                3,
+                1.0,
+                1.0,
+                2.0,
+                1.0,
+                record(
+                    'BUY {"product_id":"B02"}',
+                    before=1,
+                    after=2,
+                    accepted=True,
+                    committed=True,
+                    advanced=True,
+                    done=True,
+                ),
+                terminal=True,
+            ),
+        ]
+        summary = summarize_formal_training_rows(rows)
+        self.assertEqual(summary["nonempty_retrieve_count"], 1.0)
+        self.assertEqual(
+            summary["source_memory_write_before_correct_buy_count"], 1.0
+        )
+        self.assertEqual(summary["source_linked_retrieve_count"], 0.0)
+        self.assertEqual(summary["functional_memory_chain_count"], 0.0)
+
+    def test_retrieve_before_source_buy_cannot_form_strict_chain(self) -> None:
+        rows = [
+            row(
+                "wrong_order",
+                0,
+                0.0,
+                2.0,
+                2.0,
+                0.1,
+                record(
+                    'ADD {"key":"source","value":"ma_a"}',
+                    before=0,
+                    after=0,
+                    memory_ops=(
+                        {"op": "ADD", "memory_id": "mem_0000"},
+                    ),
+                ),
+            ),
+            row(
+                "wrong_order",
+                1,
+                0.0,
+                2.0,
+                2.0,
+                0.2,
+                record(
+                    'RETRIEVE {"query":"source","top_k":3}',
+                    before=1,
+                    after=1,
+                    memory_ops=(
+                        {
+                            "op": "RETRIEVE",
+                            "retrieved_count": 1,
+                            "retrieved_memory_ids": ["mem_0000"],
+                        },
+                    ),
+                ),
+            ),
+            row(
+                "wrong_order",
+                2,
+                1.0,
+                2.0,
+                2.0,
+                1.0,
+                record(
+                    'BUY {"product_id":"B01"}',
+                    before=0,
+                    after=1,
+                    accepted=True,
+                    committed=True,
+                    advanced=True,
+                ),
+            ),
+            row(
+                "wrong_order",
+                3,
+                1.0,
+                1.0,
+                2.0,
+                1.0,
+                record(
+                    'BUY {"product_id":"B02"}',
+                    before=1,
+                    after=2,
+                    accepted=True,
+                    committed=True,
+                    advanced=True,
+                    done=True,
+                ),
+                terminal=True,
+            ),
+        ]
+        summary = summarize_formal_training_rows(rows)
+        self.assertEqual(
+            summary["source_memory_write_before_correct_buy_count"], 1.0
+        )
+        self.assertEqual(summary["source_linked_retrieve_count"], 0.0)
+        self.assertEqual(summary["functional_memory_chain_count"], 0.0)
 
     def test_reports_positive_timeout_credit_separately(self) -> None:
         timeout = record(
