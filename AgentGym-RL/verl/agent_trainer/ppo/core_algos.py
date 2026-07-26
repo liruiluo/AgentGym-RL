@@ -962,6 +962,26 @@ def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):
     return token_level_scores - kl * kl_ratio
 
 
+def compute_policy_loss_elements(old_log_prob, log_prob, advantages, cliprange):
+    """Return the unreduced clipped PPO loss, clip indicator, and KL per token."""
+
+    negative_approx_kl = log_prob - old_log_prob
+    # Match the stability guard used by newer VERL: long-horizon agentic
+    # rollouts can occasionally produce extreme log-prob deltas, and
+    # torch.exp(log_prob - old_log_prob) then overflows before PPO clipping can
+    # help. Clamping keeps the ratio finite without changing the clipped PPO
+    # objective in the normal range.
+    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+    ratio = torch.exp(negative_approx_kl)
+    pg_losses = -advantages * ratio
+    pg_losses_clipped = -advantages * torch.clamp(
+        ratio, 1.0 - cliprange, 1.0 + cliprange
+    )
+    clipped_loss = torch.max(pg_losses, pg_losses_clipped)
+    clip_indicator = torch.gt(pg_losses_clipped, pg_losses).float()
+    return clipped_loss, clip_indicator, -negative_approx_kl
+
+
 def compute_policy_loss(old_log_prob, log_prob, advantages, eos_mask, cliprange):
     """Adapted from https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py#L1122
 
@@ -984,21 +1004,15 @@ def compute_policy_loss(old_log_prob, log_prob, advantages, eos_mask, cliprange)
             a float number indicating the fraction of policy gradient loss being clipped
 
     """
-    negative_approx_kl = log_prob - old_log_prob
-    # Match the stability guard used by newer VERL: long-horizon agentic
-    # rollouts can occasionally produce extreme log-prob deltas, and
-    # torch.exp(log_prob - old_log_prob) then overflows before PPO clipping can
-    # help. Clamping keeps the ratio finite without changing the clipped PPO
-    # objective in the normal range.
-    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
-    ratio = torch.exp(negative_approx_kl)
-    ppo_kl = verl_F.masked_mean(-negative_approx_kl, eos_mask)
-
-    pg_losses = -advantages * ratio
-    pg_losses2 = -advantages * torch.clamp(ratio, 1.0 - cliprange, 1.0 + cliprange)
-
-    pg_loss = verl_F.masked_mean(torch.max(pg_losses, pg_losses2), eos_mask)
-    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses).float(), eos_mask)
+    pg_losses, clip_indicator, token_kl = compute_policy_loss_elements(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        cliprange=cliprange,
+    )
+    pg_loss = verl_F.masked_mean(pg_losses, eos_mask)
+    pg_clipfrac = verl_F.masked_mean(clip_indicator, eos_mask)
+    ppo_kl = verl_F.masked_mean(token_kl, eos_mask)
     return pg_loss, pg_clipfrac, ppo_kl
 
 

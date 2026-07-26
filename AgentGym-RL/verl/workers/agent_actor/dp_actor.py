@@ -29,12 +29,19 @@ from verl.utils.torch_functional import logprobs_from_logits, masked_mean
 from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_unpad
 from verl.utils.seqlen_balancing import rearrange_micro_batches, get_reverse_idx
 from verl.workers.ppo_token_normalization import (
+    ActionWeightedMetricAccumulator,
+    GLOBAL_TOKEN_MEAN,
+    PER_ACTION_TOKEN_MEAN,
     PPO_BATCH_CONTRACT_META_KEY,
     TokenWeightedMetricAccumulator,
     distributed_sum,
     mask_padding_rows,
+    per_action_token_mean,
+    scale_action_mean_loss,
     scale_token_mean_loss,
+    valid_response_action_count,
     valid_response_token_count,
+    validate_policy_loss_aggregation,
     validate_worker_batch_readback,
 )
 import verl.utils.torch_functional as verl_F
@@ -232,6 +239,21 @@ class DataParallelPPOActor(BasePPOActor):
                 per_gpu_micro_batch_rows=self.config.ppo_micro_batch_size_per_gpu,
             )
 
+        loss_aggregation = validate_policy_loss_aggregation(
+            getattr(self.config, 'loss_aggregation', GLOBAL_TOKEN_MEAN)
+        )
+        if loss_aggregation == PER_ACTION_TOKEN_MEAN:
+            if float(self.config.entropy_coeff) != 0.0:
+                raise ValueError(
+                    "per_action_token_mean changes only the actor PPO surrogate; "
+                    "entropy_coeff must be 0 for this experiment."
+                )
+            if self.config.use_kl_loss and float(self.config.kl_loss_coef) != 0.0:
+                raise ValueError(
+                    "per_action_token_mean changes only the actor PPO surrogate; "
+                    "kl_loss_coef must be 0 for this experiment."
+                )
+
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         dataloader = batch.split(self.config.ppo_mini_batch_size)
@@ -243,6 +265,7 @@ class DataParallelPPOActor(BasePPOActor):
 
         metrics = {}
         token_metrics = TokenWeightedMetricAccumulator()
+        action_metrics = ActionWeightedMetricAccumulator()
         optimizer_steps = 0
         for _ in range(ppo_epochs):
             for data in dataloader:
@@ -264,6 +287,16 @@ class DataParallelPPOActor(BasePPOActor):
                 )
                 if global_token_count.item() <= 0:
                     raise ValueError("PPO actor mini-batch has no valid response tokens.")
+                global_action_count = None
+                if loss_aggregation == PER_ACTION_TOKEN_MEAN:
+                    global_action_count = distributed_sum(
+                        valid_response_action_count(mini_batch_response_mask),
+                        group=loss_group,
+                    )
+                    if global_action_count.item() <= 0:
+                        raise ValueError(
+                            "PPO actor mini-batch has no valid response actions."
+                        )
 
                 for data in micro_batches:
                     data = data.cuda()  # actor device is cpu when using offload
@@ -272,20 +305,39 @@ class DataParallelPPOActor(BasePPOActor):
                         data.get(core_algos.PPO_VALID_SAMPLE_MASK),
                     )
                     local_token_count = valid_response_token_count(response_mask)
+                    local_action_count = valid_response_action_count(response_mask)
                     old_log_prob = data['old_log_probs']
                     advantages = data['advantages']
 
                     entropy, log_prob = self._forward_micro_batch(
                         micro_batch=data, temperature=temperature
                     )
-                    pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob,
-                        advantages=advantages,
-                        eos_mask=response_mask,
-                        cliprange=self.config.clip_ratio,
+                    pg_loss_elements, clip_indicator, ppo_kl_elements = (
+                        core_algos.compute_policy_loss_elements(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            cliprange=self.config.clip_ratio,
+                        )
+                    )
+                    token_pg_loss = verl_F.masked_mean(
+                        pg_loss_elements, response_mask
+                    )
+                    action_pg_loss = per_action_token_mean(
+                        pg_loss_elements, response_mask
+                    )
+                    pg_clipfrac = verl_F.masked_mean(
+                        clip_indicator, response_mask
+                    )
+                    ppo_kl = verl_F.masked_mean(
+                        ppo_kl_elements, response_mask
                     )
                     entropy_loss = verl_F.masked_mean(entropy, response_mask)
+                    pg_loss = (
+                        action_pg_loss
+                        if loss_aggregation == PER_ACTION_TOKEN_MEAN
+                        else token_pg_loss
+                    )
                     policy_loss = pg_loss - entropy_loss * self.config.entropy_coeff
 
                     kl_metric_values = {}
@@ -302,22 +354,50 @@ class DataParallelPPOActor(BasePPOActor):
                             'actor/kl_coef': self.config.kl_loss_coef,
                         }
 
-                    loss = scale_token_mean_loss(
-                        policy_loss,
-                        local_token_count,
-                        global_token_count,
-                        group=loss_group,
-                    )
+                    if loss_aggregation == PER_ACTION_TOKEN_MEAN:
+                        loss = scale_action_mean_loss(
+                            policy_loss,
+                            local_action_count,
+                            global_action_count,
+                            group=loss_group,
+                        )
+                    else:
+                        loss = scale_token_mean_loss(
+                            policy_loss,
+                            local_token_count,
+                            global_token_count,
+                            group=loss_group,
+                        )
                     loss.backward()
+                    token_metric_values = {
+                        'actor/entropy_loss': entropy_loss.detach().item(),
+                        'actor/pg_loss_global_token_mean': (
+                            token_pg_loss.detach().item()
+                        ),
+                        'actor/pg_clipfrac': pg_clipfrac.detach().item(),
+                        'actor/ppo_kl': ppo_kl.detach().item(),
+                        **kl_metric_values,
+                    }
+                    action_metric_values = {
+                        'actor/pg_loss_per_action_token_mean': (
+                            action_pg_loss.detach().item()
+                        ),
+                    }
+                    if loss_aggregation == GLOBAL_TOKEN_MEAN:
+                        token_metric_values['actor/pg_loss'] = (
+                            token_pg_loss.detach().item()
+                        )
+                    else:
+                        action_metric_values['actor/pg_loss'] = (
+                            action_pg_loss.detach().item()
+                        )
                     token_metrics.add(
-                        {
-                            'actor/entropy_loss': entropy_loss.detach().item(),
-                            'actor/pg_loss': pg_loss.detach().item(),
-                            'actor/pg_clipfrac': pg_clipfrac.detach().item(),
-                            'actor/ppo_kl': ppo_kl.detach().item(),
-                            **kl_metric_values,
-                        },
+                        token_metric_values,
                         local_token_count,
+                    )
+                    action_metrics.add(
+                        action_metric_values,
+                        local_action_count,
                     )
 
                 grad_norm = self._optimizer_step()
@@ -327,6 +407,9 @@ class DataParallelPPOActor(BasePPOActor):
         metrics['actor/ppo_epochs'] = [float(ppo_epochs)]
         metrics['actor/optimizer_steps_per_update'] = [float(optimizer_steps)]
         metrics['actor/minibatches_per_epoch'] = [float(optimizer_steps / ppo_epochs)]
+        metrics['actor/loss_aggregation_per_action'] = [
+            float(loss_aggregation == PER_ACTION_TOKEN_MEAN)
+        ]
         if batch_readback is not None:
             metrics['actor/normalized_mini_batch_rows'] = [
                 float(batch_readback['normalized_mini_batch_rows'])
@@ -335,4 +418,5 @@ class DataParallelPPOActor(BasePPOActor):
                 float(batch_readback['per_gpu_micro_batch_rows'])
             ]
         metrics.update(token_metrics.reduce(group=metric_group))
+        metrics.update(action_metrics.reduce(group=metric_group))
         return metrics

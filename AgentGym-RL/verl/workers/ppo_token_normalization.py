@@ -12,6 +12,11 @@ import torch.distributed as dist
 
 LEGACY_ASYMMETRIC_BATCH_MODE = "legacy_asymmetric_config_compensation_v1"
 PPO_BATCH_CONTRACT_META_KEY = "ppo_batch_contract"
+GLOBAL_TOKEN_MEAN = "global_token_mean"
+PER_ACTION_TOKEN_MEAN = "per_action_token_mean"
+POLICY_LOSS_AGGREGATIONS = frozenset(
+    {GLOBAL_TOKEN_MEAN, PER_ACTION_TOKEN_MEAN}
+)
 
 _PER_GPU_MICRO_BATCH_FIELDS = (
     "actor",
@@ -375,6 +380,65 @@ def valid_response_token_count(response_mask: torch.Tensor) -> torch.Tensor:
     return response_mask.detach().sum(dtype=torch.float64)
 
 
+def valid_response_action_count(response_mask: torch.Tensor) -> torch.Tensor:
+    """Return the number of rows containing at least one response token."""
+
+    if response_mask.ndim != 2:
+        raise ValueError(
+            "response_mask must be rank-2 for action counting: "
+            f"shape={tuple(response_mask.shape)}."
+        )
+    return (response_mask.detach().sum(dim=-1) > 0).sum(dtype=torch.float64)
+
+
+def per_action_token_mean(
+    values: torch.Tensor,
+    response_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Mean over tokens within each non-empty row, then mean over rows."""
+
+    if values.ndim != 2 or response_mask.ndim != 2:
+        raise ValueError(
+            "values and response_mask must both be rank-2 tensors: "
+            f"values_shape={tuple(values.shape)} "
+            f"mask_shape={tuple(response_mask.shape)}."
+        )
+    if values.shape != response_mask.shape:
+        raise ValueError(
+            "values and response_mask must have identical shapes: "
+            f"values_shape={tuple(values.shape)} "
+            f"mask_shape={tuple(response_mask.shape)}."
+        )
+
+    mask = response_mask.to(device=values.device)
+    token_counts = mask.sum(dim=-1)
+    valid_actions = token_counts > 0
+    safe_values = torch.where(mask.bool(), values, 0.0)
+    row_means = safe_values.sum(dim=-1) / token_counts.clamp_min(1.0).to(
+        dtype=values.dtype
+    )
+    action_count = valid_actions.sum().to(dtype=values.dtype)
+    return torch.where(
+        valid_actions,
+        row_means,
+        torch.zeros_like(row_means),
+    ).sum() / action_count.clamp_min(1.0)
+
+
+def validate_policy_loss_aggregation(value: object) -> str:
+    """Normalize and validate the explicit actor policy-loss aggregation mode."""
+
+    if value is None:
+        return GLOBAL_TOKEN_MEAN
+    normalized = str(value).strip()
+    if normalized not in POLICY_LOSS_AGGREGATIONS:
+        raise ValueError(
+            "actor loss_aggregation must be one of "
+            f"{sorted(POLICY_LOSS_AGGREGATIONS)}, got {value!r}."
+        )
+    return normalized
+
+
 def distributed_sum(value: torch.Tensor, group=None) -> torch.Tensor:
     """All-reduce a detached tensor, with a single-process test fallback."""
 
@@ -418,12 +482,45 @@ def scale_token_mean_loss(
     return safe_local_mean * scale
 
 
+def scale_action_mean_loss(
+    local_mean_loss: torch.Tensor,
+    local_action_count: torch.Tensor,
+    global_action_count: torch.Tensor,
+    *,
+    group=None,
+) -> torch.Tensor:
+    """Scale a local action mean so rank averaging yields a global action mean."""
+
+    if not torch.isfinite(local_action_count) or local_action_count.item() < 0:
+        raise ValueError(
+            f"local action count is invalid: {local_action_count!r}."
+        )
+    if not torch.isfinite(global_action_count) or global_action_count.item() <= 0:
+        raise ValueError(
+            f"global action count is invalid: {global_action_count!r}."
+        )
+    local_count = local_action_count.to(
+        device=local_mean_loss.device, dtype=local_mean_loss.dtype
+    )
+    global_count = global_action_count.to(
+        device=local_mean_loss.device, dtype=local_mean_loss.dtype
+    )
+    safe_local_mean = torch.where(
+        local_count > 0,
+        local_mean_loss,
+        torch.zeros_like(local_mean_loss),
+    )
+    scale = distributed_world_size(group) * local_count / global_count
+    return safe_local_mean * scale
+
+
 class TokenWeightedMetricAccumulator:
     """Accumulate local token means and reduce them into global metrics."""
 
     def __init__(self) -> None:
         self._weighted_sums: Dict[str, torch.Tensor] = {}
         self._token_count: Optional[torch.Tensor] = None
+        self._unit_name = "token"
 
     def add(
         self,
@@ -439,7 +536,10 @@ class TokenWeightedMetricAccumulator:
                 dtype=torch.float64
             )
             if count.item() > 0 and not torch.isfinite(metric):
-                raise ValueError(f"non-finite PPO metric {key}: {metric!r}.")
+                raise ValueError(
+                    f"non-finite PPO {self._unit_name}-weighted metric "
+                    f"{key}: {metric!r}."
+                )
             weighted = torch.where(
                 count > 0, metric * count, torch.zeros_like(metric)
             )
@@ -457,11 +557,22 @@ class TokenWeightedMetricAccumulator:
         packed = distributed_sum(packed, group=group)
         count = packed[-1]
         if not torch.isfinite(count) or count.item() <= 0:
-            raise ValueError(f"global PPO metric token count is invalid: {count!r}.")
+            raise ValueError(
+                f"global PPO metric {self._unit_name} count is invalid: "
+                f"{count!r}."
+            )
         return {
             key: [(packed[index] / count).item()]
             for index, key in enumerate(keys)
         }
+
+
+class ActionWeightedMetricAccumulator(TokenWeightedMetricAccumulator):
+    """Accumulate local action means and reduce them into global metrics."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._unit_name = "action"
 
 
 def reduce_worker_metrics(
