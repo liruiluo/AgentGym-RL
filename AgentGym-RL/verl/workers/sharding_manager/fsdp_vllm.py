@@ -35,6 +35,12 @@ from .vllm_sync_evidence import (
     read_last_event,
     validate_sync_event,
 )
+from verl.workers.qwen35_weight_sync import (
+    map_actor_weight_name_for_vllm,
+    validate_qwen35_mapped_source_names,
+    validate_qwen35_vllm_load_coverage,
+)
+from verl.models.transformers.qwen3_5 import is_qwen3_5_model_type
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_PPO_LOGGING_LEVEL', 'WARN'))
@@ -46,16 +52,21 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                  module: FSDP,
                  inference_engine: LLM,
                  model_config,
-                 full_params: bool = False,
+                 sync_weight_format: str = 'dtensor',
+                 expected_source_names=None,
                  device_mesh: DeviceMesh = None):
         self.module = module
         self.inference_engine = inference_engine
         self.model_config = model_config
         self.device_mesh = device_mesh
 
-        # Full params
-        self.full_params = full_params
-        if full_params:
+        self.sync_weight_format = str(sync_weight_format).lower()
+        if self.sync_weight_format not in ('hf', 'dtensor'):
+            raise ValueError(f'Unsupported rollout sync format: {self.sync_weight_format}')
+        self.expected_source_names = tuple(expected_source_names or ())
+
+        self.full_params = self.sync_weight_format == 'hf'
+        if self.full_params:
             FSDP.set_state_dict_type(self.module,
                                      state_dict_type=StateDictType.FULL_STATE_DICT,
                                      state_dict_config=FullStateDictConfig(offload_to_cpu=True, rank0_only=False))
@@ -186,22 +197,11 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         return vllm_ps.get_tensor_model_parallel_group().device_group
 
     def __enter__(self):
-        if os.getenv('VERL_AGENTMEMORY_SKIP_VLLM_WEIGHT_SYNC', '0') == '1':
-            # Bounded AgentMemoryGym pilot compatibility path for official
-            # vLLM>=0.7: rollout engine is loaded from the same base checkpoint
-            # as the actor, and the run is one training step, so no updated
-            # actor weights need to be pushed before generation.
-            if hasattr(self.inference_engine, 'wake_up'):
-                try:
-                    self.inference_engine.wake_up()
-                except Exception as exc:
-                    logger.warning('vLLM wake_up skipped/failed under skip-sync mode: %s', exc)
-            return self
         log_gpu_memory_usage('Before state_dict() in sharding manager memory', logger=logger)
         params = self.module.state_dict()
         log_gpu_memory_usage('After state_dict() in sharding manager memory', logger=logger)
         # Copy, not share memory
-        load_format = 'hf' if self.full_params else 'dtensor'
+        load_format = self.sync_weight_format
         if vllm_version in ('0.4.2', '0.5.4', '0.6.3'):
             self.inference_engine.sync_model_weights(params, load_format=load_format)
         else:
@@ -231,11 +231,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                     raise AttributeError(
                         'Unsupported vLLM engine: neither apply_model nor model_executor is available')
             elif load_format == 'hf':
-                def clean_name(name):
-                    for prefix in ('_fsdp_wrapped_module.', 'module.'):
-                        if name.startswith(prefix):
-                            name = name[len(prefix):]
-                    return name
+                model_type = str(getattr(self.model_config, 'model_type', ''))
 
                 def materialize_hf_weights():
                     weights = []
@@ -244,7 +240,17 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                             tensor = tensor.full_tensor()
                         if hasattr(tensor, 'detach'):
                             tensor = tensor.detach()
-                        weights.append((clean_name(name), tensor.cpu()))
+                        weights.append((
+                            map_actor_weight_name_for_vllm(
+                                name, model_type=model_type
+                            ),
+                            tensor.cpu(),
+                        ))
+                    if is_qwen3_5_model_type(model_type):
+                        validate_qwen35_mapped_source_names(
+                            (name for name, _ in weights),
+                            expected_names=self.expected_source_names,
+                        )
                     return weights
 
                 def load_hf_weights(model, weights):
@@ -255,7 +261,15 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                         loaded_count = len(loaded)
                     except Exception:
                         loaded_count = len(list(loaded)) if loaded is not None else -1
-                    return {'model': model.__class__.__name__, 'loaded_count': loaded_count}
+                    result = {'model': model.__class__.__name__, 'loaded_count': loaded_count}
+                    if is_qwen3_5_model_type(model_type):
+                        result.update(validate_qwen35_vllm_load_coverage(
+                            loaded_names=loaded,
+                            target_parameter_names=(
+                                name for name, _ in model.named_parameters(remove_duplicate=False)
+                            ),
+                        ))
+                    return result
 
                 if hasattr(llm_engine, 'apply_model'):
                     sync_dir = os.getenv('VERL_AGENTMEMORY_HF_SYNC_DIR') or os.getenv('RAY_TMPDIR') or '/tmp'
@@ -263,6 +277,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
                     sync_file = os.path.join(sync_dir, f'agentmemory_hf_sync_rank{rank}_pid{os.getpid()}.pt')
                     hf_weights = materialize_hf_weights()
+                    expected_source_names = self.expected_source_names
                     evidence_enabled = bool(self._sync_evidence_dir)
                     if evidence_enabled:
                         global_steps, sync_id = self._next_sync_identity()
@@ -274,10 +289,22 @@ class FSDPVLLMShardingManager(BaseShardingManager):
 
                     def agentmemory_load_hf_from_file(model):
                         import torch as _torch
+                        from verl.models.transformers.qwen3_5 import (
+                            is_qwen3_5_model_type as _is_qwen3_5_model_type,
+                        )
+                        from verl.workers.qwen35_weight_sync import (
+                            validate_qwen35_mapped_source_names as _validate_source_names,
+                            validate_qwen35_vllm_load_coverage as _validate_load_coverage,
+                        )
                         from verl.workers.sharding_manager.vllm_sync_evidence import (
                             bounded_tensor_fingerprint as _bounded_tensor_fingerprint,
                         )
                         weights = _torch.load(sync_file, map_location='cpu', weights_only=False)
+                        if _is_qwen3_5_model_type(model_type):
+                            _validate_source_names(
+                                (name for name, _ in weights),
+                                expected_names=expected_source_names,
+                            )
                         loaded_source = (
                             _bounded_tensor_fingerprint(weights) if evidence_enabled else None)
                         if not hasattr(model, 'load_weights'):
@@ -288,6 +315,13 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                         except Exception:
                             loaded_count = len(list(loaded)) if loaded is not None else -1
                         result = {'model': model.__class__.__name__, 'loaded_count': loaded_count}
+                        if _is_qwen3_5_model_type(model_type):
+                            result.update(_validate_load_coverage(
+                                loaded_names=loaded,
+                                target_parameter_names=(
+                                    name for name, _ in model.named_parameters(remove_duplicate=False)
+                                ),
+                            ))
                         if evidence_enabled:
                             result.update({
                                 'sync_id': sync_id,
@@ -348,13 +382,6 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             torch.cuda.set_rng_state(self.gen_random_states)
 
     def __exit__(self, exc_type, exc_value, traceback):
-        if os.getenv('VERL_AGENTMEMORY_SKIP_VLLM_WEIGHT_SYNC', '0') == '1':
-            if hasattr(self.inference_engine, 'sleep'):
-                try:
-                    self.inference_engine.sleep(level=1)
-                except Exception as exc:
-                    logger.warning('vLLM sleep skipped/failed under skip-sync mode: %s', exc)
-            return False
         log_gpu_memory_usage('Before vllm offload in sharding manager', logger=logger)
         # TODO(ZSL): check this
         if vllm_version in ('0.4.2', '0.5.4', '0.6.3'):

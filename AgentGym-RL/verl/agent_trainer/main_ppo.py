@@ -29,12 +29,14 @@ def _ray_runtime_env_vars():
     # hide shell exports such as VLLM_USE_V1=0.
     for key in (
         'VLLM_USE_V1',
+        'VLLM_ENABLE_V1_MULTIPROCESSING',
         'VLLM_ATTENTION_BACKEND',
         'VLLM_WORKER_MULTIPROC_METHOD',
         'VLLM_USE_MODELSCOPE',
         'VLLM_ALLOW_INSECURE_SERIALIZATION',
-        'VERL_AGENTMEMORY_SKIP_VLLM_WEIGHT_SYNC',
         'VERL_AGENTMEMORY_HF_SYNC_DIR',
+        'VERL_AGENTMEMORY_VLLM_SYNC_EVIDENCE_DIR',
+        'VERL_AGENTMEMORY_REQUIRE_VLLM_POST_UPDATE_CHANGE',
         'VERL_PPO_LOGGING_LEVEL',
         'AGENTMEMORY_DATA_PATH',
         'AGENTMEMORY_SPLIT',
@@ -52,7 +54,21 @@ def _ray_runtime_env_vars():
     for key, value in os.environ.items():
         if key.startswith("AGENTMEMORY_") and value is not None:
             env.setdefault(key, value)
+    _validate_agentmemory_sync_env(env)
     return env
+
+
+def _validate_agentmemory_sync_env(env):
+    sync_dir_key = 'VERL_AGENTMEMORY_VLLM_SYNC_EVIDENCE_DIR'
+    require_key = 'VERL_AGENTMEMORY_REQUIRE_VLLM_POST_UPDATE_CHANGE'
+    require_change = env.get(require_key)
+    if require_change not in (None, '0', '1'):
+        raise RuntimeError(f'{require_key} must be 0 or 1')
+    sync_dir = env.get(sync_dir_key)
+    if sync_dir is not None and not os.path.isabs(sync_dir):
+        raise RuntimeError(f'{sync_dir_key} must be an absolute path')
+    if require_change == '1' and not sync_dir:
+        raise RuntimeError(f'{require_key}=1 requires {sync_dir_key}')
 
 
 @hydra.main(config_path='config', config_name='ppo_trainer', version_base=None)

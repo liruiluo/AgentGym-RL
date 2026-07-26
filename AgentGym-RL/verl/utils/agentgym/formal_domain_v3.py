@@ -171,6 +171,9 @@ def build_formal_domain_step_v3(
         "generation_eos_token_ids": [
             int(token) for token in generation_record["configured_eos_token_ids"]
         ],
+        "tokenizer_primary_eos_token_id": generation_record[
+            "primary_eos_token_id"
+        ],
         "tokenizer_pad_token_id": generation_record["tokenizer_pad_token_id"],
         "generation_token_ids_are_exact": generation_token_ids_are_exact,
         "backend_token_ids_are_exact": backend_token_ids_are_exact,
@@ -207,6 +210,7 @@ def validate_formal_domain_step_v3(record: Mapping[str, Any]) -> None:
         "raw_prior_messages_visible",
         "generation_token_ids_are_exact",
         "backend_token_ids_are_exact",
+        "tokenizer_primary_eos_token_id",
         "truncated",
         "sample_excluded",
         "system_prompt",

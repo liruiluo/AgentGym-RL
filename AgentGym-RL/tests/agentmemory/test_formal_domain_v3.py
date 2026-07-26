@@ -54,6 +54,7 @@ def generation_record():
         "stop_reason": None,
         "backend_source": "vllm",
         "configured_eos_token_ids": [1],
+        "primary_eos_token_id": 1,
         "tokenizer_pad_token_id": 0,
         "token_ids_are_exact": True,
         "backend_token_ids_are_exact": True,

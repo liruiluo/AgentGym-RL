@@ -31,16 +31,25 @@ def apply_monkey_patch_to_qwen2():
     Qwen2FlashAttention2.forward = qwen2_flash_attn_forward
 
 
+def apply_monkey_patch_to_qwen3_5():
+    from verl.models.transformers.qwen3_5 import apply_qwen3_5_packed_forward_patch
+
+    apply_qwen3_5_packed_forward_patch()
+
+
 _PATCH_NAME_TO_FUNC = {
     'llama': apply_monkey_patch_to_llama,
     'qwen2': apply_monkey_patch_to_qwen2,
+    'qwen3_5': apply_monkey_patch_to_qwen3_5,
+    'qwen3_5_text': apply_monkey_patch_to_qwen3_5,
 }
 
 from transformers import PretrainedConfig
 
 
 def apply_monkey_patch(config: PretrainedConfig, verbose=True):
-    if not is_transformers_version_in_range("4.45.0", "4.47.1"):
+    is_qwen3_5 = config.model_type in {'qwen3_5', 'qwen3_5_text'}
+    if not is_qwen3_5 and not is_transformers_version_in_range("4.45.0", "4.47.1"):
         raise AssertionError("The installed `transformers` version doesn't support ulysses patch. "
                              "Please install a version between 4.45.0 and 4.47.1 to use this ulysses feature.")
     success_apply_monkey_patch = False

@@ -37,6 +37,11 @@ from verl.workers.ppo_token_normalization import (
     valid_response_token_count,
     validate_worker_batch_readback,
 )
+from verl.models.transformers.qwen3_5 import is_qwen3_5_model_type
+from verl.workers.qwen35_runtime import (
+    model_type_from_module,
+    qwen3_5_packed_forward_kwargs,
+)
 import verl.utils.torch_functional as verl_F
 
 from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
@@ -60,6 +65,17 @@ class DataParallelPPOActor(BasePPOActor):
         print(f'Actor use_remove_padding={self.use_remove_padding}')
         self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
+        self.use_fused_kernels = bool(self.config.get('use_fused_kernels', False))
+        if self.use_fused_kernels:
+            model_type = model_type_from_module(self.actor_module)
+            if not is_qwen3_5_model_type(model_type):
+                raise NotImplementedError(
+                    "This AgentGym-RL fused PPO backport currently supports "
+                    f"only Qwen3.5, got model_type={model_type!r}."
+                )
+            if not self.use_remove_padding:
+                raise ValueError("Qwen3.5 fused PPO requires use_remove_padding=true.")
+        print(f'Actor use_fused_kernels={self.use_fused_kernels}')
 
         self.compute_entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=True)
 
@@ -77,8 +93,9 @@ class DataParallelPPOActor(BasePPOActor):
             position_ids = micro_batch['position_ids']
 
             if self.use_remove_padding:
-                input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1),
-                                                           attention_mask)  # input_ids_rmpad (total_nnz, ...)
+                input_ids_rmpad, indices, cu_seqlens, *_ = unpad_input(
+                    input_ids.unsqueeze(-1), attention_mask
+                )  # input_ids_rmpad (total_nnz, ...)
                 input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
 
                 # unpad the position_ids to align the rotary
@@ -99,19 +116,41 @@ class DataParallelPPOActor(BasePPOActor):
                 input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
 
                 # only pass input_ids and position_ids to enable flash_attn_varlen
-                output = self.actor_module(input_ids=input_ids_rmpad,
-                                           attention_mask=None,
-                                           position_ids=position_ids_rmpad,
-                                           use_cache=False)  # prevent model thinks we are generating
-                logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+                packed_forward_kwargs = qwen3_5_packed_forward_kwargs(
+                    self.actor_module,
+                    cu_seqlens,
+                    self.ulysses_sequence_parallel_size,
+                )
+                if self.use_fused_kernels:
+                    output = self.actor_module(
+                        input_ids=input_ids_rmpad,
+                        attention_mask=None,
+                        position_ids=position_ids_rmpad,
+                        use_cache=False,
+                        _verl_fused_ppo=True,
+                        shift_labels=input_ids_rmpad_rolled.unsqueeze(0),
+                        temperature=float(temperature),
+                        **packed_forward_kwargs,
+                    )
+                    log_probs = output.log_probs.squeeze(0)
+                    entropy_rmpad = output.entropy.squeeze(0)
+                else:
+                    output = self.actor_module(
+                        input_ids=input_ids_rmpad,
+                        attention_mask=None,
+                        position_ids=position_ids_rmpad,
+                        use_cache=False,
+                        **packed_forward_kwargs,
+                    )  # prevent model thinks we are generating
+                    logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
 
-                logits_rmpad.div_(temperature)
+                    logits_rmpad.div_(temperature)
 
-                # compute entropy
-                entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
+                    # compute entropy
+                    entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
 
-                # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
-                log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
+                    # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
+                    log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
 
                 # gather log_prob if sp > 1
                 if self.use_ulysses_sp:

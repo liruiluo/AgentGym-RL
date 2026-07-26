@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import time
 from typing import Dict, List, Any, Tuple
 
@@ -24,6 +25,46 @@ from ray.experimental.state.api import get_actor
 from verl.single_controller.base import WorkerGroup, ResourcePool, ClassWithInitArgs, Worker
 
 __all__ = ['Worker']
+
+
+def _agentmemory_worker_runtime_env_vars():
+    env = {}
+    for key in (
+        'VLLM_USE_V1',
+        'VLLM_ENABLE_V1_MULTIPROCESSING',
+        'VLLM_ATTENTION_BACKEND',
+        'VLLM_WORKER_MULTIPROC_METHOD',
+        'VLLM_USE_MODELSCOPE',
+        'VLLM_ALLOW_INSECURE_SERIALIZATION',
+        'VERL_AGENTMEMORY_HF_SYNC_DIR',
+        'VERL_AGENTMEMORY_VLLM_SYNC_EVIDENCE_DIR',
+        'VERL_AGENTMEMORY_REQUIRE_VLLM_POST_UPDATE_CHANGE',
+        'VERL_PPO_LOGGING_LEVEL',
+        'AGENTMEMORY_DATA_PATH',
+        'AGENTMEMORY_SPLIT',
+        'AGENTMEMORY_SPLIT_DIR',
+        'AGENTMEMORY_CATALOG_INDEX_PATH',
+        'HYDRA_FULL_ERROR',
+        'WANDB_MODE',
+    ):
+        value = os.environ.get(key)
+        if value is not None:
+            env[key] = value
+    for key, value in os.environ.items():
+        if key.startswith('AGENTMEMORY_') and value is not None:
+            env.setdefault(key, value)
+
+    sync_dir_key = 'VERL_AGENTMEMORY_VLLM_SYNC_EVIDENCE_DIR'
+    require_key = 'VERL_AGENTMEMORY_REQUIRE_VLLM_POST_UPDATE_CHANGE'
+    require_change = env.get(require_key)
+    if require_change not in (None, '0', '1'):
+        raise RuntimeError(f'{require_key} must be 0 or 1')
+    sync_dir = env.get(sync_dir_key)
+    if sync_dir is not None and not os.path.isabs(sync_dir):
+        raise RuntimeError(f'{sync_dir_key} must be an absolute path')
+    if require_change == '1' and not sync_dir:
+        raise RuntimeError(f'{require_key}=1 requires {sync_dir_key}')
+    return env
 
 
 def get_random_string(length: int) -> str:
@@ -244,34 +285,7 @@ class RayWorkerGroup(WorkerGroup):
                     env_vars['MASTER_ADDR'] = self._master_addr
                     env_vars['MASTER_PORT'] = self._master_port
 
-                # Preserve selected shell/runtime knobs in every actor. This is
-                # required for vLLM engine selection (for example VLLM_USE_V1=0)
-                # because vLLM reads them at import/engine-construction time.
-                for key in (
-                    'VLLM_USE_V1',
-                    'VLLM_ATTENTION_BACKEND',
-                    'VLLM_WORKER_MULTIPROC_METHOD',
-                    'VLLM_USE_MODELSCOPE',
-        'VLLM_ALLOW_INSECURE_SERIALIZATION',
-                    'VERL_AGENTMEMORY_SKIP_VLLM_WEIGHT_SYNC',
-                    'VERL_AGENTMEMORY_HF_SYNC_DIR',
-                    'VERL_PPO_LOGGING_LEVEL',
-                    'AGENTMEMORY_DATA_PATH',
-                    'AGENTMEMORY_SPLIT',
-                    'AGENTMEMORY_SPLIT_DIR',
-                    'AGENTMEMORY_CATALOG_INDEX_PATH',
-                    'HYDRA_FULL_ERROR',
-                    'WANDB_MODE',
-                ):
-                    value = os.environ.get(key)
-                    if value is not None:
-                        env_vars[key] = value
-                # Keep Ray actors aligned with main_task for active
-                # AgentMemoryGym runtime settings. Missing these can silently
-                # split the worker and environment contracts.
-                for key, value in os.environ.items():
-                    if key.startswith("AGENTMEMORY_") and value is not None:
-                        env_vars.setdefault(key, value)
+                env_vars.update(_agentmemory_worker_runtime_env_vars())
 
                 import re
                 cia_name = type(ray_cls_with_init.cls).__name__

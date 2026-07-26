@@ -21,7 +21,16 @@ import torch.nn as nn
 # TODO(sgm): HF may supported more than listed here, we should add more after testing
 from transformers import LlamaConfig, MistralConfig, GemmaConfig, Qwen2Config
 
-_REOVEPAD_MODELS = {'llama': LlamaConfig, 'mistral': MistralConfig, 'gemma': GemmaConfig, 'qwen2': Qwen2Config}
+_REOVEPAD_MODELS = {
+    'llama': LlamaConfig,
+    'mistral': MistralConfig,
+    'gemma': GemmaConfig,
+    'qwen2': Qwen2Config,
+    # Qwen3.5 is loaded from a multimodal checkpoint as its text-only causal
+    # model. Both names can therefore reach this validation boundary.
+    'qwen3_5': None,
+    'qwen3_5_text': None,
+}
 
 
 def check_model_support_rmpad(model_type: str):
