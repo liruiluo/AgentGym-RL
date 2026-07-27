@@ -1762,7 +1762,8 @@ class EvalV3OpenAITest(unittest.TestCase):
 
         self.assertEqual(env.metadata["memory_prompt_mode"], "neutral")
         self.assertIn("ADD requires key:string", env.system_prompt)
-        self.assertIn("RETRIEVE requires query:string", env.system_prompt)
+        self.assertIn("RETRIEVE accepts exactly one lookup field", env.system_prompt)
+        self.assertIn("memory_id:string for exact readback", env.system_prompt)
         self.assertNotIn("use ADD before click[Buy Now]", env.system_prompt)
         self.assertNotIn(
             "At the start of every later shopping session",

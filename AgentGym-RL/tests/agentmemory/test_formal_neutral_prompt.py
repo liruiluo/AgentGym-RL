@@ -94,7 +94,8 @@ class FormalPromptTests(unittest.TestCase):
                 "click[value]",
                 "click[Buy Now]",
                 "ADD requires key:string",
-                "RETRIEVE requires query:string and top_k=3",
+                "RETRIEVE accepts exactly one lookup field",
+                "memory_id:string for exact readback",
                 "Current-session trace clears",
                 "Long-term memory persists across shopping sessions",
             ):
@@ -120,8 +121,9 @@ class FormalPromptTests(unittest.TestCase):
             "search[keywords]",
             "click[Buy Now]",
             "ADD requires key:string",
-            "RETRIEVE requires query:string and top_k=3",
-            "matches text you previously wrote to long-term memory",
+            "RETRIEVE accepts exactly one lookup field",
+            "memory_id:string for exact readback",
+            "reads only text you previously wrote to long-term memory",
             "Long-term memory persists across shopping sessions",
             "remains hidden until RETRIEVE exposes it",
         )
