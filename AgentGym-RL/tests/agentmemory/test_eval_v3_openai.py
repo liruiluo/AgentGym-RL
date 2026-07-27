@@ -1793,6 +1793,32 @@ class EvalV3OpenAITest(unittest.TestCase):
             env.system_prompt,
         )
 
+    def test_native_webshop_v2_derives_responsibility_prompt_from_server_mode(self):
+        metadata = {
+            "surface": MODULE.WEBSHOP_V2_SURFACE,
+            "task_count": 1,
+            "memory_prompt_mode": "neutral_horizon_responsibility",
+        }
+        env = MODULE.AgentMemoryEnvClient(
+            "http://env.test",
+            MODULE.JsonHttp(opener=_FakeOpen(metadata)),
+        )
+        sentence = (
+            "Across shopping sessions, you are responsible for preserving and "
+            "accessing any facts needed for later decisions."
+        )
+
+        self.assertEqual(
+            env.metadata["memory_prompt_mode"],
+            "neutral_horizon_responsibility",
+        )
+        self.assertEqual(env.system_prompt.count(sentence), 1)
+        self.assertNotIn("use ADD before click[Buy Now]", env.system_prompt)
+        self.assertNotIn(
+            "At the start of every later shopping session",
+            env.system_prompt,
+        )
+
     def test_native_webshop_v2_rejects_unknown_memory_prompt_mode(self):
         metadata = {
             "surface": MODULE.WEBSHOP_V2_SURFACE,

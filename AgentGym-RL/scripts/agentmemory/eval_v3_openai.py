@@ -2959,7 +2959,12 @@ class AgentMemoryEnvClient:
             )
         self.metadata["ltm_inventory_mode"] = inventory_mode
         memory_prompt_mode = self.metadata.get("memory_prompt_mode", "legacy")
-        if memory_prompt_mode not in ("legacy", "neutral", "neutral_horizon"):
+        if memory_prompt_mode not in (
+            "legacy",
+            "neutral",
+            "neutral_horizon",
+            "neutral_horizon_responsibility",
+        ):
             raise EvalError(
                 "Native WebShop metadata has unsupported memory_prompt_mode: "
                 f"{memory_prompt_mode!r}"

@@ -85,6 +85,23 @@ class FormalPromptTests(unittest.TestCase):
         self.neutral_horizon_inventory_prompt = values[
             "AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON_LTM_KEY_INVENTORY"
         ]
+        self.responsibility = values[
+            "_AGENTMEMORY_CROSS_SESSION_MEMORY_RESPONSIBILITY"
+        ]
+        self.neutral_horizon_responsibility_prompts = (
+            values[
+                "AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON_RESPONSIBILITY"
+            ],
+            values[
+                "AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_HORIZON_RESPONSIBILITY"
+            ],
+            values[
+                "AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_HORIZON_RESPONSIBILITY"
+            ],
+        )
+        self.neutral_horizon_responsibility_inventory_prompt = values[
+            "AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON_RESPONSIBILITY_LTM_KEY_INVENTORY"
+        ]
 
     def test_both_prompts_have_native_action_contract(self) -> None:
         for prompt in (self.no_thinking_prompt, self.thinking_prompt, self.reasoning_prompt):
@@ -163,6 +180,37 @@ class FormalPromptTests(unittest.TestCase):
         )
         self.assertIn(horizon, self.neutral_horizon_inventory_prompt)
 
+    def test_neutral_horizon_responsibility_adds_one_non_sop_sentence(self) -> None:
+        self.assertEqual(
+            self.responsibility,
+            "Across shopping sessions, you are responsible for preserving and "
+            "accessing any facts needed for later decisions.",
+        )
+        for horizon_prompt, responsibility_prompt in zip(
+            self.neutral_horizon_prompts,
+            self.neutral_horizon_responsibility_prompts,
+        ):
+            self.assertEqual(
+                responsibility_prompt,
+                horizon_prompt + " " + self.responsibility,
+            )
+            self.assertEqual(responsibility_prompt.count(self.responsibility), 1)
+            self.assertNotIn("use ADD before click[Buy Now]", responsibility_prompt)
+            self.assertNotIn(
+                "At the start of every later shopping session",
+                responsibility_prompt,
+            )
+        self.assertIn(
+            "key-only long-term memory inventory",
+            self.neutral_horizon_responsibility_inventory_prompt,
+        )
+        self.assertEqual(
+            self.neutral_horizon_responsibility_inventory_prompt.count(
+                self.responsibility
+            ),
+            1,
+        )
+
     def test_prompt_mode_is_opt_in_and_validated(self) -> None:
         module = load_schemas_module()
         with patch.dict(os.environ, {}, clear=True):
@@ -187,6 +235,19 @@ class FormalPromptTests(unittest.TestCase):
             self.assertEqual(
                 module.agentmemory_action_system_prompt(),
                 module.AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON,
+            )
+        with patch.dict(
+            os.environ,
+            {
+                "AGENTMEMORY_MEMORY_PROMPT_MODE": (
+                    "neutral_horizon_responsibility"
+                )
+            },
+            clear=True,
+        ):
+            self.assertEqual(
+                module.agentmemory_action_system_prompt(),
+                module.AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON_RESPONSIBILITY,
             )
         with patch.dict(
             os.environ,
