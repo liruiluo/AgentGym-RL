@@ -12,9 +12,10 @@ PROMPT_MODE=neutral_horizon_responsibility
 ACTION_MODE=unified
 PRESENTATION_RANDOMIZATION=${AGENTMEMORY_PRESENTATION_RANDOMIZATION_MODE:-candidate_order_v1}
 PRESENTATION_SEED=${AGENTMEMORY_PRESENTATION_SEED:-20260728}
-PROMPT_LENGTH=61440
-RESPONSE_LENGTH=2048
-MODEL_LENGTH=65536
+PROMPT_LENGTH=${AGENTMEMORY_MAX_PROMPT_LENGTH:-124928}
+RESPONSE_LENGTH=${AGENTMEMORY_MAX_RESPONSE_LENGTH:-2048}
+MODEL_LENGTH=${AGENTMEMORY_MAX_MODEL_LENGTH:-131072}
+CONTEXT_SLACK=${AGENTMEMORY_CONTEXT_SLACK:-4096}
 
 RUN_ID=${AGENTMEMORY_EVAL_RUN_ID:-amg_dataset_randomization_${PRESENTATION_RANDOMIZATION}_q35_1c_r30_n8_$(date -u +%Y%m%dT%H%M%SZ)}
 RUN_DIR=$PT/agentmemorygym-evals/$RUN_ID
@@ -57,8 +58,14 @@ if [ "$ENV_PORT" -lt 1 ] || [ "$ENV_PORT" -gt 65535 ]; then
   echo "FATAL invalid ENV_PORT=$ENV_PORT" >&2
   exit 79
 fi
-if [ "$((PROMPT_LENGTH + RESPONSE_LENGTH))" -gt "$MODEL_LENGTH" ]; then
-  echo "FATAL prompt/response widths exceed model context" >&2
+for context_var in PROMPT_LENGTH RESPONSE_LENGTH MODEL_LENGTH CONTEXT_SLACK; do
+  context_value=${!context_var}
+  case "$context_value" in
+    ''|*[!0-9]*) echo "FATAL invalid $context_var=$context_value" >&2; exit 79 ;;
+  esac
+done
+if [ "$((PROMPT_LENGTH + RESPONSE_LENGTH + CONTEXT_SLACK))" -gt "$MODEL_LENGTH" ]; then
+  echo "FATAL prompt/response widths do not leave context slack" >&2
   exit 79
 fi
 
@@ -116,6 +123,14 @@ for path in \
   "$MODEL/config.json" "$CLEANUP_TOOL" "$FROZEN_RUNNER"; do
   [ -s "$path" ] || { echo "FATAL missing input: $path" >&2; exit 72; }
 done
+NATIVE_MODEL_LENGTH=$(jq -r '.text_config.max_position_embeddings // .max_position_embeddings // empty' "$MODEL/config.json")
+case "$NATIVE_MODEL_LENGTH" in
+  ''|*[!0-9]*) echo "FATAL missing model native context length" >&2; exit 72 ;;
+esac
+if [ "$MODEL_LENGTH" -gt "$NATIVE_MODEL_LENGTH" ]; then
+  echo "FATAL requested model context $MODEL_LENGTH exceeds native context $NATIVE_MODEL_LENGTH" >&2
+  exit 79
+fi
 [ -d "$PYTHON_OVERLAY/spacy" ] && [ -d "$PYTHON_OVERLAY/en_core_web_lg" ] || {
   echo "FATAL missing Python dependency overlay: $PYTHON_OVERLAY" >&2
   exit 72
@@ -224,7 +239,7 @@ printf 'outer_base_commit=%s\nouter_head=%s\ninner_commit=%s\nouter_clean=1\ninn
 printf '%s\n' "cold_start_real_six_session_strict_memory_chain_qwen35_sopgate_unified_1card" > "$RUN_DIR/purpose"
 printf '%s\n' "panel_hash=$(jq -r '.panel.panel_hash' "$PANEL_MANIFEST")" > "$RUN_DIR/protocol.txt"
 printf '%s\n' \
-  "model=Qwen3.5-4B prompt=react+generic-memory-timing+unified-listing reasoning=allowed thinking=off price_seed=233 replicas=8 max_rounds=30 temperature=1 top_p=1 n=1 memory_shaping=off ltm_inventory_mode=$MODE ltm_transition_notice_mode=$NOTICE_MODE memory_prompt_mode=$PROMPT_MODE action_listing_mode=$ACTION_MODE presentation_randomization=$PRESENTATION_RANDOMIZATION presentation_seed=$PRESENTATION_SEED prompt_length=$PROMPT_LENGTH response_length=$RESPONSE_LENGTH model_length=$MODEL_LENGTH retrieve_lookup_modes=query,memory_id" \
+  "model=Qwen3.5-4B prompt=react+generic-memory-timing+unified-listing reasoning=allowed thinking=off price_seed=233 replicas=8 max_rounds=30 temperature=1 top_p=1 n=1 memory_shaping=off ltm_inventory_mode=$MODE ltm_transition_notice_mode=$NOTICE_MODE memory_prompt_mode=$PROMPT_MODE action_listing_mode=$ACTION_MODE presentation_randomization=$PRESENTATION_RANDOMIZATION presentation_seed=$PRESENTATION_SEED prompt_length=$PROMPT_LENGTH response_length=$RESPONSE_LENGTH model_length=$MODEL_LENGTH context_slack=$CONTEXT_SLACK native_model_length=$NATIVE_MODEL_LENGTH retrieve_lookup_modes=query,memory_id" \
   >> "$RUN_DIR/protocol.txt"
 
 mkdir -p "$EVIDENCE_DIR"
