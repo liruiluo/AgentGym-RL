@@ -41,6 +41,9 @@ JAVA_HOME_PERSIST=$WS/runtime/jre11-conda
 LUCENE_MANIFEST=$AUD/original_lucene_index_files.sha256
 FROZEN_RUNNER=$WS/experiments/launcher_tools/run_frozen_launcher.sh
 CLEANUP_TOOL=$WS/experiments/launcher_tools/cleanup_owned_ray_vllm.py
+TOKEN_ANALYZER=$SOURCE_WT/experiments/analysis/analyze_rollout_prompt_tokens.py
+BEHAVIOR_ANALYZER=$SOURCE_WT/experiments/analysis/analyze_webshop_rollouts.py
+RUN_ANALYSIS_TOOLS=$RUN_DIR/analysis_tools
 
 mkdir -p "$RUN_DIR"
 if [ "${AGENTMEMORY_FROZEN_LAUNCHER:-0}" != "1" ]; then
@@ -120,7 +123,8 @@ trap cleanup EXIT INT TERM
 
 for path in \
   "$PANEL_MANIFEST" "$PANEL_IDS" "$PANEL_DATA/agentmemory_test.json" \
-  "$MODEL/config.json" "$CLEANUP_TOOL" "$FROZEN_RUNNER"; do
+  "$MODEL/config.json" "$CLEANUP_TOOL" "$FROZEN_RUNNER" \
+  "$TOKEN_ANALYZER" "$BEHAVIOR_ANALYZER"; do
   [ -s "$path" ] || { echo "FATAL missing input: $path" >&2; exit 72; }
 done
 NATIVE_MODEL_LENGTH=$(jq -r '.text_config.max_position_embeddings // .max_position_embeddings // empty' "$MODEL/config.json")
@@ -154,6 +158,11 @@ test -z "$(git -C "$SOURCE_WT" status --porcelain)" || {
 test -z "$(git -C "$SOURCE_WT/AgentGym" status --porcelain)" || {
   echo "FATAL inner source worktree is dirty" >&2; exit 73;
 }
+
+mkdir -p "$RUN_ANALYSIS_TOOLS"
+install -m 0755 "$TOKEN_ANALYZER" "$RUN_ANALYSIS_TOOLS/analyze_rollout_prompt_tokens.py"
+install -m 0755 "$BEHAVIOR_ANALYZER" "$RUN_ANALYSIS_TOOLS/analyze_webshop_rollouts.py"
+sha256sum "$RUN_ANALYSIS_TOOLS"/*.py > "$RUN_DIR/analysis_tools.sha256"
 
 PANEL_MANIFEST="$PANEL_MANIFEST" PANEL_IDS="$PANEL_IDS" PANEL_DATA="$PANEL_DATA" \
   /opt/conda/envs/py312/bin/python3 - <<'PY'
@@ -227,6 +236,7 @@ sha256sum "$0" "$PANEL_MANIFEST" "$PANEL_IDS" "$GATE" \
   "$SOURCE_WT/AgentGym-RL/verl/workers/rollout/agent_vllm_rollout/vllm_rollout.py" \
   "$SOURCE_WT/AgentGym/agentenv-agentmemory/agentenv_agentmemory/memoryarena_webshop_env.py" \
   "$SOURCE_WT/AgentGym/agentenv-agentmemory/agentenv_agentmemory/reward_hierarchy.py" \
+  "$TOKEN_ANALYZER" "$BEHAVIOR_ANALYZER" \
   > "$RUN_DIR/launch_inputs.sha256"
 sha256sum "$Q35_T/AgentGym-RL/verl/agent_trainer/main_generation.py" >> "$RUN_DIR/launch_inputs.sha256"
 {
@@ -346,4 +356,13 @@ printf '%s\n' "$rc" > "$OUT/exit_code"
 date -u +%FT%TZ > "$OUT/finished_at"
 [ "$rc" -eq 0 ] || exit "$rc"
 grep -E '^(Avg|Pass|Progress)@8:' "$OUT/generation.log" > "$OUT/metrics.txt" || true
+"$Q35_Q/bin/python" "$RUN_ANALYSIS_TOOLS/analyze_rollout_prompt_tokens.py" \
+  --run-dir "$RUN_DIR" --model "$MODEL" --runtime-source "$Q35_T/AgentGym-RL" \
+  --reply-mode reasoning --expected-replicas 8 \
+  --output "$RUN_DIR/prompt_token_telemetry.json"
+"$Q35_Q/bin/python" "$RUN_ANALYSIS_TOOLS/analyze_webshop_rollouts.py" \
+  --run-dir "$RUN_DIR" --expected-replicas 8 \
+  --output "$RUN_DIR/webshop_rollout_analysis.json"
+sha256sum "$RUN_DIR/prompt_token_telemetry.json" \
+  "$RUN_DIR/webshop_rollout_analysis.json" > "$RUN_DIR/analysis_outputs.sha256"
 echo "[eval] completed mode=$MODE"
