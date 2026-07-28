@@ -4,7 +4,7 @@ set -euo pipefail
 PT=/home/ai-jingyan-train/luolirui.1/post-train
 WS=$PT/agentmemorygym-rl-workspace
 SOURCE_WT=$WS/worktrees/AgentGym-RL-dataset-randomization-20260728
-OUTER_COMMIT=d6363a8186dc5095aaf254ca843e350638c1f45a
+OUTER_COMMIT=d82e864c5cd359503effad825b321737afb00e37
 INNER_COMMIT=cd519266b6b6147687fd72876b460b4a7f720acd
 MODE=keys
 NOTICE_MODE=state
