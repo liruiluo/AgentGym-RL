@@ -117,8 +117,11 @@ done
 test -x "$Q35_Q/bin/python"
 test -d "$Q35_BRIDGE"
 test -d "$Q35_T/AgentGym-RL"
-test "$(git -C "$SOURCE_WT" rev-parse HEAD)" = "$OUTER_COMMIT" || {
-  echo "FATAL outer source commit drift" >&2; exit 73;
+test "$(git -C "$SOURCE_WT" rev-parse --verify "$OUTER_COMMIT^{commit}")" = "$OUTER_COMMIT" || {
+  echo "FATAL outer source base commit missing" >&2; exit 73;
+}
+test -z "$(git -C "$SOURCE_WT" diff --name-only "$OUTER_COMMIT" -- AgentGym AgentGym-RL)" || {
+  echo "FATAL outer source code drift from pinned base" >&2; exit 73;
 }
 test "$(git -C "$SOURCE_WT/AgentGym" rev-parse HEAD)" = "$INNER_COMMIT" || {
   echo "FATAL inner source commit drift" >&2; exit 73;
@@ -208,8 +211,9 @@ sha256sum "$Q35_T/AgentGym-RL/verl/agent_trainer/main_generation.py" >> "$RUN_DI
   sha256sum "$MODEL/config.json"
   find "$MODEL" -maxdepth 1 -type f -name 'model*.safetensors' -printf '%f %s bytes\n' | sort
 } > "$RUN_DIR/model.identity"
-printf 'outer_commit=%s\ninner_commit=%s\nouter_clean=1\ninner_clean=1\n' \
-  "$OUTER_COMMIT" "$INNER_COMMIT" > "$RUN_DIR/source_identity.txt"
+SOURCE_OUTER_HEAD=$(git -C "$SOURCE_WT" rev-parse HEAD)
+printf 'outer_base_commit=%s\nouter_head=%s\ninner_commit=%s\nouter_clean=1\ninner_clean=1\n' \
+  "$OUTER_COMMIT" "$SOURCE_OUTER_HEAD" "$INNER_COMMIT" > "$RUN_DIR/source_identity.txt"
 printf '%s\n' "cold_start_real_six_session_strict_memory_chain_qwen35_sopgate_unified_1card" > "$RUN_DIR/purpose"
 printf '%s\n' "panel_hash=$(jq -r '.panel.panel_hash' "$PANEL_MANIFEST")" > "$RUN_DIR/protocol.txt"
 printf '%s\n' \
