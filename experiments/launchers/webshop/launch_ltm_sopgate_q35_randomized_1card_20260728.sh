@@ -12,6 +12,9 @@ PROMPT_MODE=neutral_horizon_responsibility
 ACTION_MODE=unified
 PRESENTATION_RANDOMIZATION=${AGENTMEMORY_PRESENTATION_RANDOMIZATION_MODE:-candidate_order_v1}
 PRESENTATION_SEED=${AGENTMEMORY_PRESENTATION_SEED:-20260728}
+PROMPT_LENGTH=61440
+RESPONSE_LENGTH=2048
+MODEL_LENGTH=65536
 
 RUN_ID=${AGENTMEMORY_EVAL_RUN_ID:-amg_dataset_randomization_${PRESENTATION_RANDOMIZATION}_q35_1c_r30_n8_$(date -u +%Y%m%dT%H%M%SZ)}
 RUN_DIR=$PT/agentmemorygym-evals/$RUN_ID
@@ -52,6 +55,10 @@ case "$ENV_PORT" in
 esac
 if [ "$ENV_PORT" -lt 1 ] || [ "$ENV_PORT" -gt 65535 ]; then
   echo "FATAL invalid ENV_PORT=$ENV_PORT" >&2
+  exit 79
+fi
+if [ "$((PROMPT_LENGTH + RESPONSE_LENGTH))" -gt "$MODEL_LENGTH" ]; then
+  echo "FATAL prompt/response widths exceed model context" >&2
   exit 79
 fi
 
@@ -217,7 +224,7 @@ printf 'outer_base_commit=%s\nouter_head=%s\ninner_commit=%s\nouter_clean=1\ninn
 printf '%s\n' "cold_start_real_six_session_strict_memory_chain_qwen35_sopgate_unified_1card" > "$RUN_DIR/purpose"
 printf '%s\n' "panel_hash=$(jq -r '.panel.panel_hash' "$PANEL_MANIFEST")" > "$RUN_DIR/protocol.txt"
 printf '%s\n' \
-  "model=Qwen3.5-4B prompt=react+generic-memory-timing+unified-listing reasoning=allowed thinking=off price_seed=233 replicas=8 max_rounds=30 temperature=1 top_p=1 n=1 memory_shaping=off ltm_inventory_mode=$MODE ltm_transition_notice_mode=$NOTICE_MODE memory_prompt_mode=$PROMPT_MODE action_listing_mode=$ACTION_MODE presentation_randomization=$PRESENTATION_RANDOMIZATION presentation_seed=$PRESENTATION_SEED retrieve_lookup_modes=query,memory_id" \
+  "model=Qwen3.5-4B prompt=react+generic-memory-timing+unified-listing reasoning=allowed thinking=off price_seed=233 replicas=8 max_rounds=30 temperature=1 top_p=1 n=1 memory_shaping=off ltm_inventory_mode=$MODE ltm_transition_notice_mode=$NOTICE_MODE memory_prompt_mode=$PROMPT_MODE action_listing_mode=$ACTION_MODE presentation_randomization=$PRESENTATION_RANDOMIZATION presentation_seed=$PRESENTATION_SEED prompt_length=$PROMPT_LENGTH response_length=$RESPONSE_LENGTH model_length=$MODEL_LENGTH retrieve_lookup_modes=query,memory_id" \
   >> "$RUN_DIR/protocol.txt"
 
 mkdir -p "$EVIDENCE_DIR"
@@ -304,17 +311,18 @@ echo "[eval] starting mode=$MODE model=$MODEL"
 set +e
 PYTHONPATH="$Q35_Q/lib/python3.12/site-packages:$Q35_BRIDGE:$Q35_T/AgentGym-RL:$Q35_T/AgentGym/agentenv:$Q35_T/AgentGym/agentenv-agentmemory:$PYTHONPATH" "$Q35_Q/bin/python" -m verl.agent_trainer.main_generation \
   data.path="$PANEL_DATA" data.prompt_key=item_id data.batch_size=16 \
-  data.max_prompt_length=32256 data.max_response_length=2048 data.n_samples=8 \
+  data.max_prompt_length="$PROMPT_LENGTH" data.max_response_length="$RESPONSE_LENGTH" data.n_samples=8 \
   agentgym.task_name=agentmemory agentgym.env_addr="http://127.0.0.1:$ENV_PORT" \
   agentgym.timeout=600 agentgym.max_retries=2 agentgym.max_rounds=30 \
   +agentgym.max_concurrent=16 model.path="$MODEL" +model.use_remove_padding=true \
   trainer.nnodes=1 trainer.n_gpus_per_node=1 \
   rollout.name=vllm rollout.tensor_model_parallel_size=1 rollout.gpu_memory_utilization=0.72 \
   +rollout.sync_weight_format=hf +rollout.vllm_init_load_format=dummy \
-  rollout.load_format=dummy_hf rollout.max_model_len=36864 \
+  rollout.load_format=dummy_hf rollout.max_model_len="$MODEL_LENGTH" \
   rollout.max_num_batched_tokens=32768 rollout.max_num_seqs=16 rollout.max_tokens=1024 \
   rollout.temperature=1.0 rollout.top_p=1.0 rollout.n=1 \
   +rollout.enable_sleep_mode=true \
+  hydra.run.dir="$OUT/hydra" \
   rollout.rollout_log_dir="$OUT/executer_logs" \
   > "$OUT/generation.log" 2>&1
 rc=$?
