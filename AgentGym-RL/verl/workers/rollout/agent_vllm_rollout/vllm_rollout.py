@@ -109,6 +109,7 @@ from verl.workers.rollout.agent_vllm_rollout.formal_buy_transition import (
 )
 from verl.workers.rollout.agent_vllm_rollout.vllm_runtime_config import (
     resolve_official_vllm_compilation_config,
+    restore_training_triton_cache_after_vllm,
 )
 from verl.workers.rollout.schemas import (
     Message,
@@ -633,6 +634,13 @@ class vLLMRollout(BaseRollout):
                 flush=True,
             )
             self.inference_engine = LLM(**official_vllm_kwargs)
+            training_triton_cache = restore_training_triton_cache_after_vllm()
+            if training_triton_cache is not None:
+                print(
+                    "AgentMemoryGym training Triton cache: "
+                    + json.dumps(training_triton_cache, sort_keys=True),
+                    flush=True,
+                )
             llm_engine = getattr(self.inference_engine, 'llm_engine', None)
             engine_core = getattr(llm_engine, 'engine_core', None)
             engine_client_type = type(engine_core).__name__

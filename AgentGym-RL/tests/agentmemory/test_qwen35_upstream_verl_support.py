@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -156,6 +158,103 @@ class OfficialVllmRuntimeConfigTests(unittest.TestCase):
         self.assertIn(
             "official_vllm_kwargs['compilation_config']", source
         )
+
+    @staticmethod
+    def _fake_dynamic_triton():
+        class CacheKnob:
+            @property
+            def dir(self):
+                return os.environ.get("TRITON_CACHE_DIR", "/default/triton")
+
+        return types.SimpleNamespace(
+            __version__="3.6.0",
+            knobs=types.SimpleNamespace(cache=CacheKnob()),
+        )
+
+    def test_training_triton_cache_is_opt_in(self):
+        module = self._load_runtime_config()
+        with patch.dict(os.environ, {}, clear=True):
+            result = module.restore_training_triton_cache_after_vllm(
+                triton_module=self._fake_dynamic_triton()
+            )
+            self.assertIsNone(result)
+            self.assertNotIn("TRITON_CACHE_DIR", os.environ)
+            self.assertNotIn("FLA_CACHE_RESULTS", os.environ)
+
+    def test_training_triton_cache_requires_absolute_path(self):
+        module = self._load_runtime_config()
+        with patch.dict(
+            os.environ,
+            {"VERL_TRAINING_TRITON_CACHE_DIR": "relative/cache"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "absolute"):
+                module.restore_training_triton_cache_after_vllm(
+                    triton_module=self._fake_dynamic_triton()
+                )
+
+    def test_training_triton_cache_restores_runtime_knob(self):
+        module = self._load_runtime_config()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            cache_dir = Path(temporary_directory) / "stable-triton"
+            with patch.dict(
+                os.environ,
+                {
+                    "VERL_TRAINING_TRITON_CACHE_DIR": str(cache_dir),
+                    "FLA_CACHE_RESULTS": "0",
+                },
+                clear=True,
+            ):
+                result = module.restore_training_triton_cache_after_vllm(
+                    triton_module=self._fake_dynamic_triton()
+                )
+                self.assertTrue(cache_dir.is_dir())
+                stable_dir = str(cache_dir.resolve())
+                self.assertEqual(os.environ["TRITON_CACHE_DIR"], stable_dir)
+                self.assertEqual(os.environ["FLA_CACHE_RESULTS"], "1")
+                self.assertEqual(result["requested_dir"], stable_dir)
+                self.assertEqual(result["runtime_dir"], stable_dir)
+                self.assertEqual(result["triton_version"], "3.6.0")
+
+    def test_training_triton_cache_fails_on_runtime_mismatch(self):
+        module = self._load_runtime_config()
+        fake_triton = types.SimpleNamespace(
+            __version__="3.6.0",
+            knobs=types.SimpleNamespace(
+                cache=types.SimpleNamespace(dir="/unexpected/triton")
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            cache_dir = Path(temporary_directory) / "stable-triton"
+            with patch.dict(
+                os.environ,
+                {"VERL_TRAINING_TRITON_CACHE_DIR": str(cache_dir)},
+                clear=True,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "did not take effect"):
+                    module.restore_training_triton_cache_after_vllm(
+                        triton_module=fake_triton
+                    )
+
+    def test_training_triton_cache_restore_order_and_env_propagation(self):
+        rollout_source = _VLLM_ROLLOUT.read_text(encoding="utf-8")
+        engine_init = rollout_source.index(
+            "self.inference_engine = LLM(**official_vllm_kwargs)"
+        )
+        cache_restore = rollout_source.index(
+            "restore_training_triton_cache_after_vllm(", engine_init
+        )
+        engine_client = rollout_source.index(
+            "llm_engine = getattr(self.inference_engine", engine_init
+        )
+        self.assertLess(engine_init, cache_restore)
+        self.assertLess(cache_restore, engine_client)
+
+        for path in (_MAIN_PPO, _RAY_BASE):
+            source = path.read_text(encoding="utf-8")
+            with self.subTest(path=path):
+                self.assertIn("'VERL_TRAINING_TRITON_CACHE_DIR'", source)
+                self.assertIn("'FLA_CACHE_RESULTS'", source)
 
 
 class Qwen35RuntimeContractTests(unittest.TestCase):

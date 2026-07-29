@@ -255,6 +255,8 @@ class RayWorkerGroup(WorkerGroup):
         'VLLM_ALLOW_INSECURE_SERIALIZATION',
                     'VERL_AGENTMEMORY_HF_SYNC_DIR',
                     'VERL_PPO_LOGGING_LEVEL',
+                    'VERL_TRAINING_TRITON_CACHE_DIR',
+                    'FLA_CACHE_RESULTS',
                     'AGENTMEMORY_DATA_PATH',
                     'AGENTMEMORY_SPLIT',
                     'AGENTMEMORY_SPLIT_DIR',
@@ -265,6 +267,8 @@ class RayWorkerGroup(WorkerGroup):
                     value = os.environ.get(key)
                     if value is not None:
                         env_vars[key] = value
+                if env_vars.get('VERL_TRAINING_TRITON_CACHE_DIR'):
+                    env_vars['FLA_CACHE_RESULTS'] = '1'
                 # Keep Ray actors aligned with main_task for active
                 # AgentMemoryGym runtime settings. Missing these can silently
                 # split the worker and environment contracts.

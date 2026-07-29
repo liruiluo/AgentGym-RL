@@ -35,6 +35,8 @@ def _ray_runtime_env_vars():
         'VLLM_ALLOW_INSECURE_SERIALIZATION',
         'VERL_AGENTMEMORY_HF_SYNC_DIR',
         'VERL_PPO_LOGGING_LEVEL',
+        'VERL_TRAINING_TRITON_CACHE_DIR',
+        'FLA_CACHE_RESULTS',
         'AGENTMEMORY_DATA_PATH',
         'AGENTMEMORY_SPLIT',
         'AGENTMEMORY_SPLIT_DIR',
@@ -45,6 +47,8 @@ def _ray_runtime_env_vars():
         value = os.environ.get(key)
         if value is not None:
             env[key] = value
+    if env.get('VERL_TRAINING_TRITON_CACHE_DIR'):
+        env['FLA_CACHE_RESULTS'] = '1'
     # Positive-control and curriculum knobs can be added faster than this
     # whitelist is updated. Ray runtime_env is otherwise a silent prompt/action
     # contract footgun, so forward every explicit AgentMemoryGym knob.
