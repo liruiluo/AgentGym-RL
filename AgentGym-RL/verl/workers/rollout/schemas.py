@@ -20,6 +20,46 @@ def _agentmemory_reasoning_enabled() -> bool:
     return os.environ.get("AGENTMEMORY_ALLOW_REASONING", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
+def agentmemory_ltm_inventory_mode() -> str:
+    mode = os.environ.get("AGENTMEMORY_LTM_INVENTORY_MODE", "hidden").strip()
+    if mode not in ("hidden", "keys"):
+        raise ValueError(
+            "AGENTMEMORY_LTM_INVENTORY_MODE must be 'hidden' or 'keys'."
+        )
+    return mode
+
+
+AGENTMEMORY_MEMORY_PROMPT_MODES = (
+    "legacy",
+    "neutral",
+    "neutral_horizon",
+    "neutral_horizon_responsibility",
+)
+
+
+def agentmemory_memory_prompt_mode() -> str:
+    mode = os.environ.get("AGENTMEMORY_MEMORY_PROMPT_MODE", "legacy").strip()
+    if mode not in AGENTMEMORY_MEMORY_PROMPT_MODES:
+        raise ValueError(
+            "AGENTMEMORY_MEMORY_PROMPT_MODE must be one of: "
+            + ", ".join(AGENTMEMORY_MEMORY_PROMPT_MODES)
+            + "."
+        )
+    return mode
+
+
+AGENTMEMORY_ACTION_LISTING_MODES = ("separate", "unified")
+
+
+def agentmemory_action_listing_mode() -> str:
+    mode = os.environ.get("AGENTMEMORY_ACTION_LISTING_MODE", "separate").strip()
+    if mode not in AGENTMEMORY_ACTION_LISTING_MODES:
+        raise ValueError(
+            "AGENTMEMORY_ACTION_LISTING_MODE must be 'separate' or 'unified'."
+        )
+    return mode
+
+
 # The system prompt is built from three parts. The intro and the action-space
 # contract are identical in both modes; only the reply-format rule differs, so
 # that the rule never contradicts whether the chat template opened a <think>
@@ -69,9 +109,11 @@ _AGENTMEMORY_ACTION_CONTRACT = (
     "Memory tools use one uppercase name followed by one JSON object. ADD requires key:string "
     "and value:string and returns a new memory_id while storing exactly the text you wrote. "
     "UPDATE requires memory_id:string and value:string and replaces that memory value. DELETE "
-    "requires memory_id:string and removes it. RETRIEVE requires query:string and top_k=3 and "
-    "matches text you previously wrote to long-term memory with ADD (facts carried over from "
-    "earlier sessions), not the current page or catalog, exposing matches as visible C# items. "
+    "requires memory_id:string and removes it. RETRIEVE accepts exactly one lookup field: "
+    "query:string for BM25 text matching with optional top_k:int (default 3), or "
+    "memory_id:string for exact readback of that entry. It reads only text you previously wrote "
+    "to long-term memory with ADD (facts carried over from earlier sessions), not the current "
+    "page or catalog, exposing retrieved entries as visible C# items. "
     "SUMMARY requires text:string and a non-empty source_ids:list[string] of visible S#/C# ids "
     "and replaces active context with that summary. FILTER requires exactly one non-empty "
     "keep_ids:list[string] or drop_ids:list[string], plus scope set to active, session, or all, "
@@ -89,6 +131,26 @@ _AGENTMEMORY_MEMORY_LIFECYCLE = (
     "shopping session, use RETRIEVE to expose the relevant prior-purchase memories before "
     "choosing a compatible product. The environment does not perform these memory actions "
     "for you, and it does not reject an otherwise correct purchase when ADD was skipped."
+)
+
+_AGENTMEMORY_TASK_HORIZON = (
+    "This episode has six sequential shopping sessions. Later-session compatibility "
+    "constraints may refer to products purchased in earlier sessions."
+)
+
+_AGENTMEMORY_CROSS_SESSION_MEMORY_RESPONSIBILITY = (
+    "Across shopping sessions, you are responsible for preserving and accessing any "
+    "facts needed for later decisions."
+)
+
+_AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT = (
+    "The observation includes a key-only long-term memory inventory when that interface "
+    "variant is enabled. It lists only the memory_id and a policy-authored lookup key; memory "
+    "values remain hidden until RETRIEVE. In this variant each key must be a single ASCII "
+    "lookup label of at most 24 letters, digits, spaces, underscores, or hyphens, without a "
+    "leading or trailing separator; put product identity and compatibility facts in value, "
+    "not key. RETRIEVE matches "
+    "both the key and value of memories previously written with ADD."
 )
 
 # Full prompts for each mode: same intro and action contract, different reply rule.
@@ -113,15 +175,191 @@ AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING = (
     + " "
     + _AGENTMEMORY_MEMORY_LIFECYCLE
 )
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL = (
+    _AGENTMEMORY_INTRO
+    + _AGENTMEMORY_REPLY_RULE_NO_THINKING
+    + _AGENTMEMORY_ACTION_CONTRACT
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL = (
+    _AGENTMEMORY_INTRO
+    + _AGENTMEMORY_REPLY_RULE_THINKING
+    + _AGENTMEMORY_ACTION_CONTRACT
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL = (
+    _AGENTMEMORY_INTRO
+    + _AGENTMEMORY_REPLY_RULE_REASONING
+    + _AGENTMEMORY_ACTION_CONTRACT
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL
+    + " "
+    + _AGENTMEMORY_TASK_HORIZON
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_HORIZON = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL
+    + " "
+    + _AGENTMEMORY_TASK_HORIZON
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_HORIZON = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL
+    + " "
+    + _AGENTMEMORY_TASK_HORIZON
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON_RESPONSIBILITY = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON
+    + " "
+    + _AGENTMEMORY_CROSS_SESSION_MEMORY_RESPONSIBILITY
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_HORIZON_RESPONSIBILITY = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_HORIZON
+    + " "
+    + _AGENTMEMORY_CROSS_SESSION_MEMORY_RESPONSIBILITY
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_HORIZON_RESPONSIBILITY = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_HORIZON
+    + " "
+    + _AGENTMEMORY_CROSS_SESSION_MEMORY_RESPONSIBILITY
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_LTM_KEY_INVENTORY = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT
+    + " "
+    + _AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_LTM_KEY_INVENTORY = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING
+    + " "
+    + _AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_LTM_KEY_INVENTORY = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING
+    + " "
+    + _AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_LTM_KEY_INVENTORY = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL
+    + " "
+    + _AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_LTM_KEY_INVENTORY = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL
+    + " "
+    + _AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_LTM_KEY_INVENTORY = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL
+    + " "
+    + _AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON_LTM_KEY_INVENTORY = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON
+    + " "
+    + _AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_HORIZON_LTM_KEY_INVENTORY = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_HORIZON
+    + " "
+    + _AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_HORIZON_LTM_KEY_INVENTORY = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_HORIZON
+    + " "
+    + _AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON_RESPONSIBILITY_LTM_KEY_INVENTORY = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON_RESPONSIBILITY
+    + " "
+    + _AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_HORIZON_RESPONSIBILITY_LTM_KEY_INVENTORY = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_HORIZON_RESPONSIBILITY
+    + " "
+    + _AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_HORIZON_RESPONSIBILITY_LTM_KEY_INVENTORY = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_HORIZON_RESPONSIBILITY
+    + " "
+    + _AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT
+)
 
 
-def agentmemory_action_system_prompt() -> str:
+def agentmemory_action_system_prompt(
+    *,
+    ltm_inventory_mode: str | None = None,
+    memory_prompt_mode: str | None = None,
+) -> str:
     # Pick the reply rule that matches the active thinking mode so the prompt
     # never contradicts what the chat template does with <think>.
+    inventory_mode = (
+        agentmemory_ltm_inventory_mode()
+        if ltm_inventory_mode is None
+        else ltm_inventory_mode
+    )
+    if inventory_mode not in ("hidden", "keys"):
+        raise ValueError("ltm_inventory_mode must be 'hidden' or 'keys'.")
+    prompt_mode = (
+        agentmemory_memory_prompt_mode()
+        if memory_prompt_mode is None
+        else memory_prompt_mode
+    )
+    if prompt_mode not in AGENTMEMORY_MEMORY_PROMPT_MODES:
+        raise ValueError(
+            "memory_prompt_mode must be one of: "
+            + ", ".join(AGENTMEMORY_MEMORY_PROMPT_MODES)
+            + "."
+        )
+    key_inventory = inventory_mode == "keys"
+    neutral = prompt_mode in AGENTMEMORY_MEMORY_PROMPT_MODES[1:]
+    neutral_horizon = prompt_mode in (
+        "neutral_horizon",
+        "neutral_horizon_responsibility",
+    )
+    responsibility = prompt_mode == "neutral_horizon_responsibility"
     if _agentmemory_thinking_enabled():
+        if key_inventory:
+            if responsibility:
+                return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_HORIZON_RESPONSIBILITY_LTM_KEY_INVENTORY
+            if neutral_horizon:
+                return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_HORIZON_LTM_KEY_INVENTORY
+            if neutral:
+                return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_LTM_KEY_INVENTORY
+            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_LTM_KEY_INVENTORY
+        if responsibility:
+            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_HORIZON_RESPONSIBILITY
+        if neutral_horizon:
+            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_HORIZON
+        if neutral:
+            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL
         return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING
     if _agentmemory_reasoning_enabled():
+        if key_inventory:
+            if responsibility:
+                return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_HORIZON_RESPONSIBILITY_LTM_KEY_INVENTORY
+            if neutral_horizon:
+                return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_HORIZON_LTM_KEY_INVENTORY
+            if neutral:
+                return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_LTM_KEY_INVENTORY
+            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_LTM_KEY_INVENTORY
+        if responsibility:
+            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_HORIZON_RESPONSIBILITY
+        if neutral_horizon:
+            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_HORIZON
+        if neutral:
+            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL
         return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING
+    if key_inventory:
+        if responsibility:
+            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON_RESPONSIBILITY_LTM_KEY_INVENTORY
+        if neutral_horizon:
+            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON_LTM_KEY_INVENTORY
+        if neutral:
+            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_LTM_KEY_INVENTORY
+        return AGENTMEMORY_ACTION_SYSTEM_PROMPT_LTM_KEY_INVENTORY
+    if responsibility:
+        return AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON_RESPONSIBILITY
+    if neutral_horizon:
+        return AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON
+    if neutral:
+        return AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL
     return AGENTMEMORY_ACTION_SYSTEM_PROMPT
 
 def _normalize_chat_template_token_ids(encoded) -> List[int]:

@@ -301,6 +301,65 @@ class FormalDomainV3Test(unittest.TestCase):
                 webshop_v2_system_prompt="webshop prompt",
             )
 
+    def test_webshop_ltm_inventory_mode_requires_prompt_server_parity(self):
+        MODULE.validate_webshop_ltm_inventory_mode(
+            {"ltm_inventory_mode": "keys"},
+            expected_mode="keys",
+        )
+        MODULE.validate_webshop_ltm_inventory_mode({}, expected_mode="hidden")
+
+        with self.assertRaisesRegex(MODULE.FormalDomainV3Error, "disagree"):
+            MODULE.validate_webshop_ltm_inventory_mode(
+                {"ltm_inventory_mode": "keys"},
+                expected_mode="hidden",
+            )
+        with self.assertRaisesRegex(MODULE.FormalDomainV3Error, "missing"):
+            MODULE.validate_webshop_ltm_inventory_mode({}, expected_mode="keys")
+
+    def test_webshop_memory_prompt_mode_requires_server_rollout_parity(self):
+        MODULE.validate_webshop_memory_prompt_mode(
+            {"memory_prompt_mode": "neutral"},
+            expected_mode="neutral",
+        )
+        MODULE.validate_webshop_memory_prompt_mode({}, expected_mode="legacy")
+        MODULE.validate_webshop_memory_prompt_mode(
+            {"memory_prompt_mode": "neutral_horizon"},
+            expected_mode="neutral_horizon",
+        )
+        MODULE.validate_webshop_memory_prompt_mode(
+            {"memory_prompt_mode": "neutral_horizon_responsibility"},
+            expected_mode="neutral_horizon_responsibility",
+        )
+
+        with self.assertRaisesRegex(MODULE.FormalDomainV3Error, "disagree"):
+            MODULE.validate_webshop_memory_prompt_mode(
+                {"memory_prompt_mode": "neutral"},
+                expected_mode="legacy",
+            )
+        with self.assertRaisesRegex(MODULE.FormalDomainV3Error, "missing"):
+            MODULE.validate_webshop_memory_prompt_mode(
+                {},
+                expected_mode="neutral",
+            )
+
+    def test_webshop_action_listing_mode_requires_server_rollout_parity(self):
+        MODULE.validate_webshop_action_listing_mode(
+            {"action_listing_mode": "unified"},
+            expected_mode="unified",
+        )
+        MODULE.validate_webshop_action_listing_mode({}, expected_mode="separate")
+
+        with self.assertRaisesRegex(MODULE.FormalDomainV3Error, "disagree"):
+            MODULE.validate_webshop_action_listing_mode(
+                {"action_listing_mode": "unified"},
+                expected_mode="separate",
+            )
+        with self.assertRaisesRegex(MODULE.FormalDomainV3Error, "missing"):
+            MODULE.validate_webshop_action_listing_mode(
+                {},
+                expected_mode="unified",
+            )
+
     def test_schema_mismatch_fails_closed(self):
         with self.assertRaisesRegex(MODULE.FormalDomainV3Error, "does not match"):
             MODULE.validate_formal_env_schema(

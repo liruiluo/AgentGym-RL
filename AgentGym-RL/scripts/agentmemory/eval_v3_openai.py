@@ -608,7 +608,11 @@ PAPER_SURFACE_REGISTRY = {
 # that contract changes. The lightweight evaluator still avoids importing the
 # training stack: loading ``schemas.py`` only needs type-only dependencies,
 # which are stubbed when they are unavailable in an eval-only environment.
-def _load_legacy_webshop_system_prompt() -> str:
+def _load_legacy_webshop_system_prompt(
+    *,
+    ltm_inventory_mode: str = "hidden",
+    memory_prompt_mode: str = "legacy",
+) -> str:
     schemas_path = Path(__file__).resolve().parents[2] / "verl/workers/rollout/schemas.py"
     if not schemas_path.is_file():
         raise RuntimeError(f"missing canonical AgentMemory prompt schema: {schemas_path}")
@@ -638,7 +642,10 @@ def _load_legacy_webshop_system_prompt() -> str:
             raise RuntimeError(f"cannot load canonical prompt schema: {schemas_path}")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        prompt = module.AGENTMEMORY_ACTION_SYSTEM_PROMPT
+        prompt = module.agentmemory_action_system_prompt(
+            ltm_inventory_mode=ltm_inventory_mode,
+            memory_prompt_mode=memory_prompt_mode,
+        )
     finally:
         for name, original in original_modules.items():
             if original is sentinel:
@@ -651,7 +658,9 @@ def _load_legacy_webshop_system_prompt() -> str:
     return prompt
 
 
-LEGACY_WEBSHOP_SYSTEM_PROMPT = _load_legacy_webshop_system_prompt()
+LEGACY_WEBSHOP_SYSTEM_PROMPT = _load_legacy_webshop_system_prompt(
+    ltm_inventory_mode="hidden"
+)
 LEGACY_WEBSHOP_MAX_POLICY_TURNS = 56
 
 
@@ -2942,19 +2951,43 @@ class AgentMemoryEnvClient:
             self.metadata["system_prompt_source"] = "server_metadata"
             return
 
+        inventory_mode = self.metadata.get("ltm_inventory_mode", "hidden")
+        if inventory_mode not in ("hidden", "keys"):
+            raise EvalError(
+                "Native WebShop metadata has unsupported ltm_inventory_mode: "
+                f"{inventory_mode!r}"
+            )
+        self.metadata["ltm_inventory_mode"] = inventory_mode
+        memory_prompt_mode = self.metadata.get("memory_prompt_mode", "legacy")
+        if memory_prompt_mode not in (
+            "legacy",
+            "neutral",
+            "neutral_horizon",
+            "neutral_horizon_responsibility",
+        ):
+            raise EvalError(
+                "Native WebShop metadata has unsupported memory_prompt_mode: "
+                f"{memory_prompt_mode!r}"
+            )
+        self.metadata["memory_prompt_mode"] = memory_prompt_mode
+        canonical_prompt = _load_legacy_webshop_system_prompt(
+            ltm_inventory_mode=inventory_mode,
+            memory_prompt_mode=memory_prompt_mode,
+        )
         if system_prompt is None:
-            self.metadata["system_prompt"] = LEGACY_WEBSHOP_SYSTEM_PROMPT
+            self.metadata["system_prompt"] = canonical_prompt
             self.metadata["system_prompt_sha256"] = hashlib.sha256(
-                LEGACY_WEBSHOP_SYSTEM_PROMPT.encode("utf-8")
+                canonical_prompt.encode("utf-8")
             ).hexdigest()
             self.metadata["system_prompt_source"] = "webshop_v2_rollout_fallback"
             return
         if not isinstance(system_prompt, str) or not system_prompt.strip():
             raise EvalError("Native WebShop system_prompt must be non-empty text")
-        if system_prompt != LEGACY_WEBSHOP_SYSTEM_PROMPT:
+        if system_prompt != canonical_prompt:
             raise EvalError(
                 "Native WebShop metadata system_prompt disagrees with the "
-                "canonical rollout fallback"
+                f"canonical {inventory_mode!r} inventory / "
+                f"{memory_prompt_mode!r} memory-prompt rollout fallback"
             )
         expected = self.metadata.get("system_prompt_sha256")
         observed = hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()

@@ -1677,6 +1677,9 @@ class EvalV3OpenAITest(unittest.TestCase):
         transport = MODULE.JsonHttp(opener=fake)
         env = MODULE.AgentMemoryEnvClient("http://env.test", transport)
         self.assertEqual(env.system_prompt_source, "webshop_v2_rollout_fallback")
+        self.assertEqual(env.metadata["ltm_inventory_mode"], "hidden")
+        self.assertEqual(env.metadata["memory_prompt_mode"], "legacy")
+        self.assertNotIn("key-only long-term memory inventory", env.system_prompt)
         self.assertEqual(
             MODULE.extract_webshop_v2_action(
                 "Thought: search\n\nAction:\nsearch[wireless headphones]"
@@ -1718,6 +1721,115 @@ class EvalV3OpenAITest(unittest.TestCase):
             if method == "POST" and url.endswith("/step")
         ]
         self.assertEqual(step_requests[-1]["action"], "search[item]")
+
+    def test_native_webshop_v2_derives_key_inventory_prompt_from_server(self):
+        metadata = {
+            "surface": MODULE.WEBSHOP_V2_SURFACE,
+            "task_count": 1,
+            "ltm_inventory_mode": "keys",
+        }
+        env = MODULE.AgentMemoryEnvClient(
+            "http://env.test",
+            MODULE.JsonHttp(opener=_FakeOpen(metadata)),
+        )
+
+        self.assertEqual(env.metadata["ltm_inventory_mode"], "keys")
+        self.assertIn("key-only long-term memory inventory", env.system_prompt)
+        self.assertIn("at most 24", env.system_prompt)
+
+    def test_native_webshop_v2_rejects_unknown_inventory_mode(self):
+        metadata = {
+            "surface": MODULE.WEBSHOP_V2_SURFACE,
+            "task_count": 1,
+            "ltm_inventory_mode": "values",
+        }
+        with self.assertRaisesRegex(MODULE.EvalError, "ltm_inventory_mode"):
+            MODULE.AgentMemoryEnvClient(
+                "http://env.test",
+                MODULE.JsonHttp(opener=_FakeOpen(metadata)),
+            )
+
+    def test_native_webshop_v2_derives_neutral_prompt_from_server_mode(self):
+        metadata = {
+            "surface": MODULE.WEBSHOP_V2_SURFACE,
+            "task_count": 1,
+            "memory_prompt_mode": "neutral",
+        }
+        env = MODULE.AgentMemoryEnvClient(
+            "http://env.test",
+            MODULE.JsonHttp(opener=_FakeOpen(metadata)),
+        )
+
+        self.assertEqual(env.metadata["memory_prompt_mode"], "neutral")
+        self.assertIn("ADD requires key:string", env.system_prompt)
+        self.assertIn("RETRIEVE accepts exactly one lookup field", env.system_prompt)
+        self.assertIn("memory_id:string for exact readback", env.system_prompt)
+        self.assertNotIn("use ADD before click[Buy Now]", env.system_prompt)
+        self.assertNotIn(
+            "At the start of every later shopping session",
+            env.system_prompt,
+        )
+
+    def test_native_webshop_v2_derives_neutral_horizon_prompt_from_server_mode(self):
+        metadata = {
+            "surface": MODULE.WEBSHOP_V2_SURFACE,
+            "task_count": 1,
+            "memory_prompt_mode": "neutral_horizon",
+        }
+        env = MODULE.AgentMemoryEnvClient(
+            "http://env.test",
+            MODULE.JsonHttp(opener=_FakeOpen(metadata)),
+        )
+
+        self.assertEqual(env.metadata["memory_prompt_mode"], "neutral_horizon")
+        self.assertIn("six sequential shopping sessions", env.system_prompt)
+        self.assertIn(
+            "may refer to products purchased in earlier sessions",
+            env.system_prompt,
+        )
+        self.assertNotIn("use ADD before click[Buy Now]", env.system_prompt)
+        self.assertNotIn(
+            "At the start of every later shopping session",
+            env.system_prompt,
+        )
+
+    def test_native_webshop_v2_derives_responsibility_prompt_from_server_mode(self):
+        metadata = {
+            "surface": MODULE.WEBSHOP_V2_SURFACE,
+            "task_count": 1,
+            "memory_prompt_mode": "neutral_horizon_responsibility",
+        }
+        env = MODULE.AgentMemoryEnvClient(
+            "http://env.test",
+            MODULE.JsonHttp(opener=_FakeOpen(metadata)),
+        )
+        sentence = (
+            "Across shopping sessions, you are responsible for preserving and "
+            "accessing any facts needed for later decisions."
+        )
+
+        self.assertEqual(
+            env.metadata["memory_prompt_mode"],
+            "neutral_horizon_responsibility",
+        )
+        self.assertEqual(env.system_prompt.count(sentence), 1)
+        self.assertNotIn("use ADD before click[Buy Now]", env.system_prompt)
+        self.assertNotIn(
+            "At the start of every later shopping session",
+            env.system_prompt,
+        )
+
+    def test_native_webshop_v2_rejects_unknown_memory_prompt_mode(self):
+        metadata = {
+            "surface": MODULE.WEBSHOP_V2_SURFACE,
+            "task_count": 1,
+            "memory_prompt_mode": "instruction",
+        }
+        with self.assertRaisesRegex(MODULE.EvalError, "memory_prompt_mode"):
+            MODULE.AgentMemoryEnvClient(
+                "http://env.test",
+                MODULE.JsonHttp(opener=_FakeOpen(metadata)),
+            )
 
     def test_native_webshop_v2_rejects_prompt_drift(self):
         with self.assertRaisesRegex(MODULE.EvalError, "disagrees"):
