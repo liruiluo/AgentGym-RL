@@ -23,15 +23,22 @@ class _ActorConfig(dict):
             raise AttributeError(name) from exc
 
 
-def _micro_batch(device: torch.device) -> dict[str, torch.Tensor]:
-    valid_lengths = [18_000, 16_000, 17_000, 29_929]
-    response_lengths = [400, 400, 400, 628]
+def _micro_batch(
+    device: torch.device,
+    *,
+    repeat: int,
+) -> dict[str, torch.Tensor]:
+    if repeat <= 0:
+        raise ValueError(f"repeat must be positive, got {repeat}.")
+    valid_lengths = [18_000, 16_000, 17_000, 29_929] * repeat
+    response_lengths = [400, 400, 400, 628] * repeat
     sequence_length = 32_000
     response_width = 2_048
     prompt_width = sequence_length - response_width
-    input_ids = torch.zeros(4, sequence_length, dtype=torch.long)
+    batch_rows = len(valid_lengths)
+    input_ids = torch.zeros(batch_rows, sequence_length, dtype=torch.long)
     attention_mask = torch.zeros_like(input_ids)
-    responses = torch.zeros(4, response_width, dtype=torch.long)
+    responses = torch.zeros(batch_rows, response_width, dtype=torch.long)
     response_mask = torch.zeros_like(responses)
 
     for row, (valid_length, response_length) in enumerate(
@@ -63,6 +70,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="Repeat the historical four-row OOM block for larger micro-batch stress.",
+    )
     args = parser.parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -93,12 +106,19 @@ def main() -> None:
         actor_module=model,
     )
     actor.compute_entropy_from_logits = verl_F.entropy_from_logits
-    micro_batch = _micro_batch(device)
+    micro_batch = _micro_batch(device, repeat=args.repeat)
     packed_tokens = int(micro_batch["attention_mask"].sum().item())
     response_tokens = int(micro_batch["response_mask"].sum().item())
-    if packed_tokens != 80_929 or response_tokens != 1_828:
+    expected_packed_tokens = 80_929 * args.repeat
+    expected_response_tokens = 1_828 * args.repeat
+    if (
+        packed_tokens != expected_packed_tokens
+        or response_tokens != expected_response_tokens
+    ):
         raise RuntimeError(
-            f"historical shape mismatch: packed={packed_tokens} response={response_tokens}"
+            "historical shape mismatch: "
+            f"packed={packed_tokens}/{expected_packed_tokens} "
+            f"response={response_tokens}/{expected_response_tokens}"
         )
 
     torch.cuda.empty_cache()
@@ -134,6 +154,8 @@ def main() -> None:
         "status": "pass",
         "device": str(device),
         "model": args.model,
+        "batch_rows": int(micro_batch["input_ids"].shape[0]),
+        "historical_block_repeat": args.repeat,
         "packed_tokens": packed_tokens,
         "selected_response_tokens": response_tokens,
         "projection_reduction_ratio": packed_tokens / response_tokens,
