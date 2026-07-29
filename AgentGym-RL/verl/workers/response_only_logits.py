@@ -94,9 +94,20 @@ def build_response_projection_plan(
     if padding_only:
         raw_selected = raw_selected_mask.nonzero(as_tuple=False)
         if raw_selected.numel() == 0:
-            raise ValueError(
-                "padding-only response projection has no raw response token "
-                "for its dummy FSDP forward."
+            # Actor updates clear transport-padding response masks before the
+            # distributed forward. Keep one packed hidden state so every FSDP
+            # rank still executes the same LM-head forward/backward collectives.
+            dummy_flat_position = unpadded_indices[0].to(dtype=torch.long)
+            dummy_label = input_ids.reshape(-1)[dummy_flat_position].reshape(1)
+            return ResponseProjectionPlan(
+                packed_predecessor_positions=torch.zeros(
+                    1, dtype=torch.long, device=unpadded_indices.device
+                ),
+                labels=dummy_label.to(dtype=torch.long),
+                response_mask=torch.zeros_like(raw_selected_mask),
+                output_response_mask=output_response_mask,
+                padding_only=True,
+                packed_token_count=int(unpadded_indices.numel()),
             )
         selected_mask = torch.zeros_like(raw_selected_mask)
         first_row, first_column = raw_selected[0]

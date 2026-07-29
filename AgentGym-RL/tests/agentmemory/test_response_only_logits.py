@@ -188,6 +188,23 @@ class ResponseProjectionPlanTest(unittest.TestCase):
             torch.equal(selected_logits.grad, torch.zeros_like(selected_logits))
         )
 
+    def test_padding_only_microbatch_survives_precleared_response_mask(self):
+        input_ids, attention_mask, responses, response_mask, indices = _fixture()
+        plan = build_response_projection_plan(
+            unpadded_indices=indices,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            responses=responses,
+            response_mask=torch.zeros_like(response_mask),
+            valid_sample_mask=torch.zeros(2, dtype=torch.bool),
+        )
+
+        self.assertTrue(plan.padding_only)
+        self.assertEqual(plan.labels.numel(), 1)
+        self.assertEqual(plan.packed_predecessor_positions.tolist(), [0])
+        self.assertEqual(plan.response_mask.sum().item(), 0)
+        self.assertEqual(plan.output_response_mask.sum().item(), 0)
+
     def test_mixed_valid_and_padding_rows_project_only_valid_responses(self):
         input_ids, attention_mask, responses, response_mask, indices = _fixture()
         plan = build_response_projection_plan(
