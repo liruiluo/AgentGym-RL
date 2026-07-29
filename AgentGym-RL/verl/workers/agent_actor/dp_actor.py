@@ -45,6 +45,7 @@ from verl.workers.qwen35_runtime import (
 from verl.workers.response_only_logits import (
     build_response_projection_plan,
     scatter_response_outputs,
+    zero_padding_response_outputs,
 )
 import verl.utils.torch_functional as verl_F
 
@@ -135,16 +136,15 @@ class DataParallelPPOActor(BasePPOActor):
                     self.ulysses_sequence_parallel_size,
                 )
                 if self.use_response_only_logits:
-                    response_mask = mask_padding_rows(
-                        micro_batch['response_mask'],
-                        micro_batch.get(core_algos.PPO_VALID_SAMPLE_MASK),
-                    )
                     projection = build_response_projection_plan(
                         unpadded_indices=indices,
                         input_ids=input_ids,
                         attention_mask=attention_mask,
                         responses=micro_batch['responses'],
-                        response_mask=response_mask,
+                        response_mask=micro_batch['response_mask'],
+                        valid_sample_mask=micro_batch.get(
+                            core_algos.PPO_VALID_SAMPLE_MASK
+                        ),
                     )
                     output = self.actor_module(
                         input_ids=input_ids_rmpad,
@@ -165,21 +165,34 @@ class DataParallelPPOActor(BasePPOActor):
                             f"shape: logits={tuple(selected_logits.shape)} "
                             f"expected={expected_shape}."
                         )
-                    selected_logits.div_(temperature)
-                    selected_entropy = self.compute_entropy_from_logits(selected_logits)
-                    selected_log_probs = logprobs_from_logits(
-                        logits=selected_logits,
-                        labels=projection.labels,
-                    )
-                    entropy = scatter_response_outputs(
-                        selected_entropy,
-                        projection.response_mask,
-                    )
-                    log_probs = scatter_response_outputs(
-                        selected_log_probs,
-                        projection.response_mask,
-                    )
-                    if not self._response_only_readback_logged:
+                    if projection.padding_only:
+                        zero_outputs = zero_padding_response_outputs(
+                            selected_logits,
+                            projection.output_response_mask,
+                        )
+                        entropy = zero_outputs
+                        log_probs = zero_outputs
+                    else:
+                        selected_logits.div_(temperature)
+                        selected_entropy = self.compute_entropy_from_logits(
+                            selected_logits
+                        )
+                        selected_log_probs = logprobs_from_logits(
+                            logits=selected_logits,
+                            labels=projection.labels,
+                        )
+                        entropy = scatter_response_outputs(
+                            selected_entropy,
+                            projection.response_mask,
+                        )
+                        log_probs = scatter_response_outputs(
+                            selected_log_probs,
+                            projection.response_mask,
+                        )
+                    if (
+                        not projection.padding_only
+                        and not self._response_only_readback_logged
+                    ):
                         selected_count = projection.labels.numel()
                         role = 'actor' if self.actor_optimizer is not None else 'reference'
                         print(

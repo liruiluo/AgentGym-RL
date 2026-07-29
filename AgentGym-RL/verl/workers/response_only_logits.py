@@ -11,6 +11,8 @@ class ResponseProjectionPlan(NamedTuple):
     packed_predecessor_positions: torch.Tensor
     labels: torch.Tensor
     response_mask: torch.Tensor
+    output_response_mask: torch.Tensor
+    padding_only: bool
     packed_token_count: int
 
 
@@ -21,6 +23,7 @@ def build_response_projection_plan(
     attention_mask: torch.Tensor,
     responses: torch.Tensor,
     response_mask: torch.Tensor,
+    valid_sample_mask: torch.Tensor | None = None,
 ) -> ResponseProjectionPlan:
     """Map valid response labels to their predecessor states in a packed sequence.
 
@@ -64,7 +67,43 @@ def build_response_projection_plan(
             f"sequence_length={sequence_length} response_length={response_length}."
         )
 
-    selected_mask = response_mask.to(dtype=torch.bool)
+    raw_selected_mask = response_mask.to(dtype=torch.bool)
+    if valid_sample_mask is None:
+        output_response_mask = raw_selected_mask
+        padding_only = False
+    else:
+        if (
+            valid_sample_mask.ndim != 1
+            or valid_sample_mask.shape[0] != input_ids.shape[0]
+        ):
+            raise ValueError(
+                "valid_sample_mask must be one-dimensional and match the batch: "
+                f"mask_shape={tuple(valid_sample_mask.shape)} "
+                f"batch_size={input_ids.shape[0]}."
+            )
+        if not torch.all((valid_sample_mask == 0) | (valid_sample_mask == 1)):
+            raise ValueError("valid_sample_mask must be binary.")
+        valid_rows = valid_sample_mask.to(
+            device=response_mask.device, dtype=torch.bool
+        )
+        output_response_mask = raw_selected_mask & valid_rows.unsqueeze(-1)
+        has_valid_rows = bool(torch.any(valid_rows).item())
+        has_output_tokens = bool(torch.any(output_response_mask).item())
+        padding_only = not has_valid_rows and not has_output_tokens
+
+    if padding_only:
+        raw_selected = raw_selected_mask.nonzero(as_tuple=False)
+        if raw_selected.numel() == 0:
+            raise ValueError(
+                "padding-only response projection has no raw response token "
+                "for its dummy FSDP forward."
+            )
+        selected_mask = torch.zeros_like(raw_selected_mask)
+        first_row, first_column = raw_selected[0]
+        selected_mask[first_row, first_column] = True
+    else:
+        selected_mask = output_response_mask
+
     selected = selected_mask.nonzero(as_tuple=False)
     if selected.numel() == 0:
         raise ValueError("response-only projection found no valid response tokens.")
@@ -107,6 +146,8 @@ def build_response_projection_plan(
         packed_predecessor_positions=packed_positions.to(dtype=torch.long),
         labels=labels,
         response_mask=selected_mask,
+        output_response_mask=output_response_mask,
+        padding_only=padding_only,
         packed_token_count=int(unpadded_indices.numel()),
     )
 
@@ -127,3 +168,20 @@ def scatter_response_outputs(
             f"values={selected_values.numel()} mask={expected}."
         )
     return selected_values.new_zeros(mask.shape).masked_scatter(mask, selected_values)
+
+
+def zero_padding_response_outputs(
+    selected_logits: torch.Tensor,
+    output_response_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Return graph-connected zeros for a transport-padding-only microbatch."""
+
+    if selected_logits.ndim != 2 or selected_logits.shape[0] != 1:
+        raise ValueError(
+            "padding-only projection must keep exactly one dummy logit row: "
+            f"logits_shape={tuple(selected_logits.shape)}."
+        )
+    if torch.any(output_response_mask):
+        raise ValueError("padding-only output mask must not contain valid tokens.")
+    dependency = selected_logits.float().sum() * 0.0
+    return dependency.expand(output_response_mask.shape)

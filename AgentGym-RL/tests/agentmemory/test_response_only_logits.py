@@ -7,6 +7,7 @@ import torch
 from verl.workers.response_only_logits import (
     build_response_projection_plan,
     scatter_response_outputs,
+    zero_padding_response_outputs,
 )
 
 
@@ -156,6 +157,65 @@ class ResponseProjectionPlanTest(unittest.TestCase):
                 attention_mask=attention_mask,
                 responses=responses,
                 response_mask=no_response,
+            )
+
+    def test_padding_only_microbatch_keeps_one_graph_connected_dummy_token(self):
+        input_ids, attention_mask, responses, response_mask, indices = _fixture()
+        plan = build_response_projection_plan(
+            unpadded_indices=indices,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            responses=responses,
+            response_mask=response_mask,
+            valid_sample_mask=torch.zeros(2, dtype=torch.bool),
+        )
+
+        self.assertTrue(plan.padding_only)
+        self.assertEqual(plan.labels.tolist(), [21])
+        self.assertEqual(plan.response_mask.sum().item(), 1)
+        self.assertEqual(plan.output_response_mask.sum().item(), 0)
+
+        selected_logits = torch.randn(1, 64, requires_grad=True)
+        outputs = zero_padding_response_outputs(
+            selected_logits,
+            plan.output_response_mask,
+        )
+        self.assertEqual(tuple(outputs.shape), tuple(response_mask.shape))
+        self.assertTrue(torch.equal(outputs, torch.zeros_like(outputs)))
+        outputs.sum().backward()
+        self.assertIsNotNone(selected_logits.grad)
+        self.assertTrue(
+            torch.equal(selected_logits.grad, torch.zeros_like(selected_logits))
+        )
+
+    def test_mixed_valid_and_padding_rows_project_only_valid_responses(self):
+        input_ids, attention_mask, responses, response_mask, indices = _fixture()
+        plan = build_response_projection_plan(
+            unpadded_indices=indices,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            responses=responses,
+            response_mask=response_mask,
+            valid_sample_mask=torch.tensor([1, 0], dtype=torch.bool),
+        )
+
+        self.assertFalse(plan.padding_only)
+        self.assertEqual(plan.labels.tolist(), [21, 22])
+        self.assertEqual(
+            plan.output_response_mask.tolist(),
+            [[True, True, False], [False, False, False]],
+        )
+
+    def test_valid_rows_without_response_tokens_still_fail_closed(self):
+        input_ids, attention_mask, responses, response_mask, indices = _fixture()
+        with self.assertRaisesRegex(ValueError, "no valid response"):
+            build_response_projection_plan(
+                unpadded_indices=indices,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                responses=responses,
+                response_mask=torch.zeros_like(response_mask),
+                valid_sample_mask=torch.tensor([1, 0], dtype=torch.bool),
             )
 
     def test_oom_shape_projects_only_response_positions(self):
