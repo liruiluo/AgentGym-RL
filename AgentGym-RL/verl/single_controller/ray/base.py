@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import time
 from typing import Dict, List, Any, Tuple
 
@@ -24,6 +25,21 @@ from ray.experimental.state.api import get_actor
 from verl.single_controller.base import WorkerGroup, ResourcePool, ClassWithInitArgs, Worker
 
 __all__ = ['Worker']
+
+
+def _apply_training_triton_cache_env(env_vars):
+    requested = env_vars.get('VERL_TRAINING_TRITON_CACHE_DIR')
+    if not requested:
+        return
+    expanded = os.path.expanduser(requested)
+    if not os.path.isabs(expanded):
+        raise RuntimeError(
+            'VERL_TRAINING_TRITON_CACHE_DIR must resolve to an absolute path'
+        )
+    stable_dir = os.path.realpath(expanded)
+    env_vars['VERL_TRAINING_TRITON_CACHE_DIR'] = stable_dir
+    env_vars['TRITON_CACHE_DIR'] = stable_dir
+    env_vars['FLA_CACHE_RESULTS'] = '1'
 
 
 def get_random_string(length: int) -> str:
@@ -267,8 +283,7 @@ class RayWorkerGroup(WorkerGroup):
                     value = os.environ.get(key)
                     if value is not None:
                         env_vars[key] = value
-                if env_vars.get('VERL_TRAINING_TRITON_CACHE_DIR'):
-                    env_vars['FLA_CACHE_RESULTS'] = '1'
+                _apply_training_triton_cache_env(env_vars)
                 # Keep Ray actors aligned with main_task for active
                 # AgentMemoryGym runtime settings. Missing these can silently
                 # split the worker and environment contracts.
@@ -406,7 +421,6 @@ with code written in separate ray.Actors.
 
 from unittest.mock import patch
 from verl.single_controller.base.decorator import MAGIC_ATTR
-import os
 
 
 def _bind_workers_method_to_parent(cls, key, user_defined_cls):

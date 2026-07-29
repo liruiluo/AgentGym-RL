@@ -120,6 +120,26 @@ class OfficialVllmRuntimeConfigTests(unittest.TestCase):
             _VLLM_RUNTIME_CONFIG, "official_vllm_runtime_config_under_test"
         )
 
+    @staticmethod
+    def _load_main_ppo():
+        fake_ray = types.ModuleType("ray")
+        fake_ray.remote = lambda **_kwargs: lambda function: function
+        fake_hydra = types.ModuleType("hydra")
+        fake_hydra.main = lambda **_kwargs: lambda function: function
+        fake_trainer = types.ModuleType(
+            "verl.agent_trainer.ppo.ray_trainer"
+        )
+        fake_trainer.RayPPOTrainer = object
+        with patch.dict(
+            sys.modules,
+            {
+                "ray": fake_ray,
+                "hydra": fake_hydra,
+                "verl.agent_trainer.ppo.ray_trainer": fake_trainer,
+            },
+        ):
+            return _load_module(_MAIN_PPO, "main_ppo_cache_env_under_test")
+
     def test_current_verl_cudagraph_default(self):
         module = self._load_runtime_config()
         self.assertEqual(
@@ -236,6 +256,33 @@ class OfficialVllmRuntimeConfigTests(unittest.TestCase):
                         triton_module=fake_triton
                     )
 
+    def test_ray_runtime_env_sets_actual_triton_cache_for_all_workers(self):
+        module = self._load_main_ppo()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            cache_dir = Path(temporary_directory) / "stable-triton"
+            with patch.dict(
+                os.environ,
+                {"VERL_TRAINING_TRITON_CACHE_DIR": str(cache_dir)},
+                clear=True,
+            ):
+                env = module._ray_runtime_env_vars()
+            stable_dir = str(cache_dir.resolve())
+            self.assertEqual(
+                env["VERL_TRAINING_TRITON_CACHE_DIR"], stable_dir
+            )
+            self.assertEqual(env["TRITON_CACHE_DIR"], stable_dir)
+            self.assertEqual(env["FLA_CACHE_RESULTS"], "1")
+
+    def test_ray_runtime_env_rejects_relative_triton_cache(self):
+        module = self._load_main_ppo()
+        with patch.dict(
+            os.environ,
+            {"VERL_TRAINING_TRITON_CACHE_DIR": "relative/cache"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "absolute"):
+                module._ray_runtime_env_vars()
+
     def test_training_triton_cache_restore_order_and_env_propagation(self):
         rollout_source = _VLLM_ROLLOUT.read_text(encoding="utf-8")
         engine_init = rollout_source.index(
@@ -254,7 +301,9 @@ class OfficialVllmRuntimeConfigTests(unittest.TestCase):
             source = path.read_text(encoding="utf-8")
             with self.subTest(path=path):
                 self.assertIn("'VERL_TRAINING_TRITON_CACHE_DIR'", source)
+                self.assertIn("['TRITON_CACHE_DIR'] = stable_dir", source)
                 self.assertIn("'FLA_CACHE_RESULTS'", source)
+                self.assertIn("_apply_training_triton_cache_env(", source)
 
 
 class Qwen35RuntimeContractTests(unittest.TestCase):

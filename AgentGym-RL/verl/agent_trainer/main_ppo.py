@@ -22,6 +22,21 @@ import ray
 import hydra
 
 
+def _apply_training_triton_cache_env(env):
+    requested = env.get('VERL_TRAINING_TRITON_CACHE_DIR')
+    if not requested:
+        return
+    expanded = os.path.expanduser(requested)
+    if not os.path.isabs(expanded):
+        raise RuntimeError(
+            'VERL_TRAINING_TRITON_CACHE_DIR must resolve to an absolute path'
+        )
+    stable_dir = os.path.realpath(expanded)
+    env['VERL_TRAINING_TRITON_CACHE_DIR'] = stable_dir
+    env['TRITON_CACHE_DIR'] = stable_dir
+    env['FLA_CACHE_RESULTS'] = '1'
+
+
 def _ray_runtime_env_vars():
     env = {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}
     # AgentMemoryGym / JD 9N compatibility knobs must reach Ray workers before
@@ -47,8 +62,7 @@ def _ray_runtime_env_vars():
         value = os.environ.get(key)
         if value is not None:
             env[key] = value
-    if env.get('VERL_TRAINING_TRITON_CACHE_DIR'):
-        env['FLA_CACHE_RESULTS'] = '1'
+    _apply_training_triton_cache_env(env)
     # Positive-control and curriculum knobs can be added faster than this
     # whitelist is updated. Ray runtime_env is otherwise a silent prompt/action
     # contract footgun, so forward every explicit AgentMemoryGym knob.
