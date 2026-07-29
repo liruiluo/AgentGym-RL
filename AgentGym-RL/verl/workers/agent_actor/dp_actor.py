@@ -37,7 +37,15 @@ from verl.workers.ppo_token_normalization import (
     valid_response_token_count,
     validate_worker_batch_readback,
 )
-from verl.workers.qwen35_runtime import qwen3_5_packed_forward_kwargs
+from verl.models.transformers.qwen3_5 import is_qwen3_5_model_type
+from verl.workers.qwen35_runtime import (
+    model_type_from_module,
+    qwen3_5_packed_forward_kwargs,
+)
+from verl.workers.response_only_logits import (
+    build_response_projection_plan,
+    scatter_response_outputs,
+)
 import verl.utils.torch_functional as verl_F
 
 from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
@@ -61,6 +69,26 @@ class DataParallelPPOActor(BasePPOActor):
         print(f'Actor use_remove_padding={self.use_remove_padding}')
         self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
+        self.use_response_only_logits = bool(
+            self.config.get('use_response_only_logits', False)
+        )
+        if self.use_response_only_logits:
+            model_type = model_type_from_module(self.actor_module)
+            if not is_qwen3_5_model_type(model_type):
+                raise NotImplementedError(
+                    "Response-only PPO logits currently support only Qwen3.5, "
+                    f"got model_type={model_type!r}."
+                )
+            if not self.use_remove_padding:
+                raise ValueError(
+                    "Response-only PPO logits require use_remove_padding=true."
+                )
+            if self.ulysses_sequence_parallel_size != 1:
+                raise NotImplementedError(
+                    "Response-only PPO logits require Ulysses sequence parallel size 1."
+                )
+        print(f'Actor use_response_only_logits={self.use_response_only_logits}')
+        self._response_only_readback_logged = False
 
         self.compute_entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=True)
 
@@ -106,44 +134,101 @@ class DataParallelPPOActor(BasePPOActor):
                     cu_seqlens,
                     self.ulysses_sequence_parallel_size,
                 )
-                output = self.actor_module(
-                    input_ids=input_ids_rmpad,
-                    attention_mask=None,
-                    position_ids=position_ids_rmpad,
-                    use_cache=False,
-                    **packed_forward_kwargs,
-                )  # prevent model thinks we are generating
-                logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+                if self.use_response_only_logits:
+                    response_mask = mask_padding_rows(
+                        micro_batch['response_mask'],
+                        micro_batch.get(core_algos.PPO_VALID_SAMPLE_MASK),
+                    )
+                    projection = build_response_projection_plan(
+                        unpadded_indices=indices,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        responses=micro_batch['responses'],
+                        response_mask=response_mask,
+                    )
+                    output = self.actor_module(
+                        input_ids=input_ids_rmpad,
+                        attention_mask=None,
+                        position_ids=position_ids_rmpad,
+                        use_cache=False,
+                        logits_to_keep=projection.packed_predecessor_positions,
+                        **packed_forward_kwargs,
+                    )
+                    selected_logits = output.logits.squeeze(0)
+                    expected_shape = (
+                        projection.labels.numel(),
+                        selected_logits.shape[-1],
+                    )
+                    if tuple(selected_logits.shape) != expected_shape:
+                        raise RuntimeError(
+                            "Qwen3.5 response-only LM head returned an unexpected "
+                            f"shape: logits={tuple(selected_logits.shape)} "
+                            f"expected={expected_shape}."
+                        )
+                    selected_logits.div_(temperature)
+                    selected_entropy = self.compute_entropy_from_logits(selected_logits)
+                    selected_log_probs = logprobs_from_logits(
+                        logits=selected_logits,
+                        labels=projection.labels,
+                    )
+                    entropy = scatter_response_outputs(
+                        selected_entropy,
+                        projection.response_mask,
+                    )
+                    log_probs = scatter_response_outputs(
+                        selected_log_probs,
+                        projection.response_mask,
+                    )
+                    if not self._response_only_readback_logged:
+                        selected_count = projection.labels.numel()
+                        role = 'actor' if self.actor_optimizer is not None else 'reference'
+                        print(
+                            "Response-only PPO logits readback: "
+                            f"role={role} packed_tokens={projection.packed_token_count} "
+                            f"selected_response_tokens={selected_count} "
+                            "projection_reduction_ratio="
+                            f"{projection.packed_token_count / selected_count:.6f}"
+                        )
+                        self._response_only_readback_logged = True
+                else:
+                    output = self.actor_module(
+                        input_ids=input_ids_rmpad,
+                        attention_mask=None,
+                        position_ids=position_ids_rmpad,
+                        use_cache=False,
+                        **packed_forward_kwargs,
+                    )  # prevent model thinks we are generating
+                    logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
 
-                logits_rmpad.div_(temperature)
+                    logits_rmpad.div_(temperature)
 
-                # compute entropy
-                entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
+                    # compute entropy
+                    entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
 
-                # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
-                log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
+                    # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
+                    log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
 
-                # gather log_prob if sp > 1
-                if self.use_ulysses_sp:
-                    # gather and unpad for the ulysses sp
-                    log_probs = gather_outpus_and_unpad(log_probs, gather_dim=0, unpad_dim=0, padding_size=pad_size)
-                    entropy_rmpad = gather_outpus_and_unpad(entropy_rmpad,
-                                                            gather_dim=0,
-                                                            unpad_dim=0,
-                                                            padding_size=pad_size)
-                # pad back to (bsz, seqlen)
-                full_entropy = pad_input(hidden_states=entropy_rmpad.unsqueeze(-1),
-                                         indices=indices,
-                                         batch=batch_size,
-                                         seqlen=seqlen)
-                full_log_probs = pad_input(hidden_states=log_probs.unsqueeze(-1),
-                                           indices=indices,
-                                           batch=batch_size,
-                                           seqlen=seqlen)
+                    # gather log_prob if sp > 1
+                    if self.use_ulysses_sp:
+                        # gather and unpad for the ulysses sp
+                        log_probs = gather_outpus_and_unpad(log_probs, gather_dim=0, unpad_dim=0, padding_size=pad_size)
+                        entropy_rmpad = gather_outpus_and_unpad(entropy_rmpad,
+                                                                gather_dim=0,
+                                                                unpad_dim=0,
+                                                                padding_size=pad_size)
+                    # pad back to (bsz, seqlen)
+                    full_entropy = pad_input(hidden_states=entropy_rmpad.unsqueeze(-1),
+                                             indices=indices,
+                                             batch=batch_size,
+                                             seqlen=seqlen)
+                    full_log_probs = pad_input(hidden_states=log_probs.unsqueeze(-1),
+                                               indices=indices,
+                                               batch=batch_size,
+                                               seqlen=seqlen)
 
-                # only return response part:
-                entropy = full_entropy.squeeze(-1)[:, -response_length - 1:-1]  # (bsz, response_length)
-                log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1:-1]  # (bsz, response_length)
+                    # only return response part:
+                    entropy = full_entropy.squeeze(-1)[:, -response_length - 1:-1]  # (bsz, response_length)
+                    log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1:-1]  # (bsz, response_length)
 
             else:  # not using rmpad and no ulysses sp
                 output = self.actor_module(input_ids=input_ids,
@@ -194,6 +279,10 @@ class DataParallelPPOActor(BasePPOActor):
         use_dynamic_bsz = data.meta_info['use_dynamic_bsz']
 
         select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids']
+        if self.use_response_only_logits:
+            select_keys.append('response_mask')
+            if core_algos.PPO_VALID_SAMPLE_MASK in data.batch.keys():
+                select_keys.append(core_algos.PPO_VALID_SAMPLE_MASK)
         batch = data.select(batch_keys=select_keys).batch
 
         if use_dynamic_bsz:
