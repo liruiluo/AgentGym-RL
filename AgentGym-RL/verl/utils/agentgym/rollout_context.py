@@ -17,6 +17,7 @@ from verl.utils.agentgym.formal_domain_v3 import (
     FORMAL_DOMAIN_SCHEMA_V3,
     FORMAL_WEBSHOP_SCHEMA_V2,
     FormalDomainV3Error,
+    canonical_unicode_contains,
     validate_formal_domain_step_v3,
 )
 
@@ -1078,7 +1079,9 @@ def _validate_formal_step_record(
         raise ValueError(
             f"Formal prompt exposes raw prior messages at row {row_index}."
         )
-    if record["latest_observation"] not in record["visible_prompt"]:
+    if not canonical_unicode_contains(
+        record["visible_prompt"], record["latest_observation"]
+    ):
         raise ValueError(
             f"Formal visible prompt omits the latest observation at row {row_index}."
         )

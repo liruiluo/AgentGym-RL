@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import sys
@@ -447,6 +448,42 @@ class FormalDomainRolloutV3Test(unittest.TestCase):
         record["single_observation_prompt_digest"] = "c" * 64
         with self.assertRaisesRegex(ValueError, "one latest observation"):
             validate_one_record(record)
+
+    def test_runtime_validator_accepts_canonical_unicode_prompt_roundtrip(self):
+        decomposed = "BEAUTe\u0301DERM latest observation."
+        composed = "BEAUT\u00e9DERM latest observation."
+        for record_factory in (packed_webshop_v2_record, packed_v3_record):
+            with self.subTest(schema=record_factory.__name__):
+                record = record_factory()
+                record["latest_observation"] = decomposed
+                system_prompt = record.get("system_prompt", "tools")
+                record["visible_prompt"] = (
+                    f"<system>{system_prompt}</system>\n{composed}"
+                )
+                summary = validate_one_record(record)
+                self.assertEqual(summary["valid_rows"], 1)
+
+    def test_runtime_validator_accepts_canonical_unicode_system_prompt(self):
+        record = packed_v3_record()
+        decomposed = "Use the CAFE\u0301 tool contract."
+        composed = "Use the CAF\u00c9 tool contract."
+        record["system_prompt"] = decomposed
+        record["system_prompt_sha256"] = hashlib.sha256(
+            decomposed.encode("utf-8")
+        ).hexdigest()
+        record["visible_prompt"] = (
+            f"<system>{composed}</system>\n{record['latest_observation']}"
+        )
+        summary = validate_one_record(record)
+        self.assertEqual(summary["valid_rows"], 1)
+
+    def test_runtime_validator_still_rejects_missing_latest_observation(self):
+        for record_factory in (packed_webshop_v2_record, packed_v3_record):
+            with self.subTest(schema=record_factory.__name__):
+                record = record_factory()
+                record["latest_observation"] = "Actually missing observation."
+                with self.assertRaisesRegex(ValueError, "omits the latest observation"):
+                    validate_one_record(record)
 
     def test_runtime_validator_rejects_server_raw_action_drift(self):
         record = packed_v3_record()

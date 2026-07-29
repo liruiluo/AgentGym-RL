@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import math
 import re
+import unicodedata
 from copy import deepcopy
 from typing import Any, Mapping, Sequence
 
@@ -23,6 +24,12 @@ _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 class FormalDomainV3Error(ValueError):
     pass
+
+
+def canonical_unicode_contains(text: str, fragment: str) -> bool:
+    """Compare decoded prompt text across canonically equivalent Unicode forms."""
+
+    return unicodedata.normalize("NFC", fragment) in unicodedata.normalize("NFC", text)
 
 
 def validate_webshop_ltm_inventory_mode(
@@ -348,9 +355,11 @@ def validate_formal_domain_step_v3(record: Mapping[str, Any]) -> None:
         raise FormalDomainV3Error("latest_observation must be non-empty text")
     if not isinstance(record.get("visible_prompt"), str) or not record["visible_prompt"]:
         raise FormalDomainV3Error("visible_prompt must be non-empty text")
-    if system_prompt not in record["visible_prompt"]:
+    if not canonical_unicode_contains(record["visible_prompt"], system_prompt):
         raise FormalDomainV3Error("visible_prompt omits the server system prompt")
-    if record["latest_observation"] not in record["visible_prompt"]:
+    if not canonical_unicode_contains(
+        record["visible_prompt"], record["latest_observation"]
+    ):
         raise FormalDomainV3Error("visible_prompt omits the latest observation")
     contract_sha256 = str(record["contract_sha256"])
     if _SHA256_RE.fullmatch(contract_sha256) is None:
