@@ -15,6 +15,7 @@
 Note that we don't combine the main with ray_trainer as ray_trainer is used by other main.
 """
 from verl.agent_trainer.ppo.ray_trainer import RayPPOTrainer
+from verl.agent_trainer.reference_policy import should_create_reference_policy
 
 import os
 
@@ -113,11 +114,13 @@ def main_task(config):
 
     from verl.agent_trainer.ppo.ray_trainer import ResourcePoolManager, Role
 
+    use_reference_policy = should_create_reference_policy(config)
     role_worker_mapping = {
         Role.ActorRollout: ray.remote(ActorRolloutRefWorker),
         Role.Critic: ray.remote(CriticWorker),
-        Role.RefPolicy: ray.remote(ActorRolloutRefWorker)
     }
+    if use_reference_policy:
+        role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
 
     global_pool_id = 'global_pool'
     resource_pool_spec = {
@@ -126,8 +129,14 @@ def main_task(config):
     mapping = {
         Role.ActorRollout: global_pool_id,
         Role.Critic: global_pool_id,
-        Role.RefPolicy: global_pool_id,
     }
+    if use_reference_policy:
+        mapping[Role.RefPolicy] = global_pool_id
+
+    print(
+        f'[main_task] reference_policy_enabled={use_reference_policy}',
+        flush=True,
+    )
 
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 

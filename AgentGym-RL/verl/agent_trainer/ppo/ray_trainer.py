@@ -143,7 +143,8 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     response_mask = data.batch['response_mask']
 
     # compute kl between ref_policy and current policy
-    if 'ref_log_prob' in data.batch.keys():
+    kl_measured = 'ref_log_prob' in data.batch.keys()
+    if kl_measured:
         kld = core_algos.kl_penalty(data.batch['old_log_probs'], data.batch['ref_log_prob'],
                                     kl_penalty=kl_penalty)  # (batch_size, response_length)
         kld = kld * response_mask
@@ -162,7 +163,11 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     kl_ctrl.update(current_kl=current_kl, n_steps=int(valid_samples.sum().item()))
     data.batch['token_level_rewards'] = token_level_rewards
 
-    metrics = {'critic/kl': current_kl, 'critic/kl_coeff': beta}
+    metrics = {
+        'critic/kl': current_kl,
+        'critic/kl_coeff': beta,
+        'critic/kl_measured': float(kl_measured),
+    }
 
     return data, metrics
 
@@ -1605,7 +1610,11 @@ class RayPPOTrainer(object):
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
-                metrics = {}
+                metrics = {
+                    'trainer/reference_policy_enabled': float(
+                        self.use_reference_policy
+                    ),
+                }
                 timing_raw = {}
                 formal_readback_active = (
                     formal_readback_target_steps is not None
@@ -1732,7 +1741,11 @@ class RayPPOTrainer(object):
                             'ppo_batch/actor_per_gpu_micro_batch_rows': self.ppo_batch_contract['per_gpu_micro_batches']['actor'],
                             'ppo_batch/critic_per_gpu_micro_batch_rows': self.ppo_batch_contract['per_gpu_micro_batches']['critic'],
                             'ppo_batch/critic_forward_per_gpu_micro_batch_rows': self.ppo_batch_contract['per_gpu_micro_batches']['critic_forward'],
-                            'ppo_batch/reference_logprob_per_gpu_micro_batch_rows': self.ppo_batch_contract['per_gpu_micro_batches']['reference_logprob'],
+                            'ppo_batch/reference_logprob_per_gpu_micro_batch_rows': (
+                                self.ppo_batch_contract['per_gpu_micro_batches']['reference_logprob']
+                                if self.use_reference_policy
+                                else 0
+                            ),
                             'ppo_batch/rollout_logprob_per_gpu_micro_batch_rows': self.ppo_batch_contract['per_gpu_micro_batches']['rollout_logprob'],
                             'ppo_batch/local_rows': expected_steps['local_rows'],
                             'ppo_batch/expected_minibatches_per_epoch': expected_steps['minibatches_per_epoch'],

@@ -182,6 +182,9 @@ algorithm:
     kl_coef: 0.001
 
 trainer:
+  # Keep the legacy reference worker by default. A formal zero-KL run may set
+  # this true to skip its mathematically unused forward pass.
+  skip_reference_policy_when_kl_disabled: False
   total_epochs: 30
   total_training_steps: null
   project_name: verl_examples
