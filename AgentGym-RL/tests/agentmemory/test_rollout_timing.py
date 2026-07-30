@@ -91,7 +91,7 @@ def test_analyze_rollout_timing_documents_separates_known_savings():
         "schema_version": SCHEMA_VERSION,
         "global_step": 2,
         "rank": 0,
-        "rollout_rounds_wall_seconds": 16.0,
+        "rollout_rounds_wall_seconds": 17.0,
         "rounds": [
             {
                 "generation_wall_seconds": 8.0,
@@ -129,10 +129,10 @@ def test_analyze_rollout_timing_documents_separates_known_savings():
 
     summary = analyze_rollout_timing_documents([document])
     rank = summary["rank_summaries"][0]
-    assert rank["observed_synchronous_core_seconds"] == pytest.approx(16.0)
-    assert rank["no_sleep_core_seconds"] == pytest.approx(14.0)
+    assert rank["observed_synchronous_core_seconds"] == pytest.approx(17.0)
+    assert rank["no_sleep_core_seconds"] == pytest.approx(15.0)
     assert rank["environment_parallel_wall_seconds"] == pytest.approx(0.75)
     assert rank["optimistic_dependency_bound_seconds"] == pytest.approx(8.5)
     assert summary["global"]["optimistic_dependency_speedup"] == pytest.approx(
-        16.0 / 8.5
+        17.0 / 8.5
     )
