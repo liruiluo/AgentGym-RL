@@ -111,6 +111,10 @@ from verl.workers.rollout.agent_vllm_rollout.vllm_runtime_config import (
     resolve_official_vllm_compilation_config,
     restore_training_triton_cache_after_vllm,
 )
+from verl.workers.rollout.agent_vllm_rollout.rollout_timing import (
+    request_output_timing_record,
+    write_rollout_timing_sidecar,
+)
 from verl.workers.rollout.schemas import (
     Message,
     RolloutHandler,
@@ -1506,6 +1510,17 @@ class vLLMRollout(BaseRollout):
         sampling_kwargs: dict,
         global_steps,
     ) -> DataProto:
+        timing_root = os.environ.get("AGENTMEMORY_ROLLOUT_TIMING_DIR", "").strip()
+        timing_required = _env_flag("AGENTMEMORY_ROLLOUT_TIMING_REQUIRED")
+        timing_enabled = bool(timing_root)
+        if timing_required and not timing_enabled:
+            raise RuntimeError(
+                "AGENTMEMORY_ROLLOUT_TIMING_REQUIRED=1 requires "
+                "AGENTMEMORY_ROLLOUT_TIMING_DIR."
+            )
+        function_started = time.perf_counter()
+        reset_records = []
+        timing_rounds = []
         parent_indices = []
         flat_task_rounds = []
         flat_done_flags = []
@@ -1535,6 +1550,14 @@ class vLLMRollout(BaseRollout):
                     rollout_handler.formal_system_prompt_source,
                 ) = _formal_runtime_contract_for_client(env_clients[idx])
                 _agentmemory_debug(f"reset_done idx={idx} item_id={rollout_handler.item_id} seconds={time.time() - reset_started:.2f}")
+                if timing_enabled:
+                    reset_records.append(
+                        {
+                            "rollout_index": idx,
+                            "item_id": rollout_handler.item_id,
+                            "wall_seconds": time.time() - reset_started,
+                        }
+                    )
             except FormalRuntimeEvidenceError:
                 raise
             except Exception as e:
@@ -1545,8 +1568,10 @@ class vLLMRollout(BaseRollout):
 
         rounds = 0
         all_done_flag = False
+        rollout_rounds_started = time.perf_counter()
         rollout_bar = tqdm(total=max_policy_turns, desc="Running AgentMemory policy turns", disable=torch.distributed.get_rank() != 0)
         while rounds < max_policy_turns and not all_done_flag:
+            round_started = time.perf_counter()
             generation_prompt_idxs = []
             not_done_idxs = []
             for idx, rollout_handler in enumerate(rollout_handler_ls):
@@ -1576,11 +1601,13 @@ class vLLMRollout(BaseRollout):
             _agentmemory_debug(f"round_start round={rounds + 1}/{max_policy_turns} active={len(not_done_idxs)}")
             if len(not_done_idxs) == 0:
                 break
+            generation_started = time.perf_counter()
             with self.update_sampling_params(**sampling_kwargs):
                 output = self._generate_token_ids(
                     generation_prompt_idxs=generation_prompt_idxs,
                     sampling_params=self.sampling_params,
                 )
+            generation_wall_seconds = time.perf_counter() - generation_started
             generation_records = self._output_generation_records(
                 output,
                 self.sampling_params,
@@ -1592,8 +1619,34 @@ class vLLMRollout(BaseRollout):
                     f"active={len(not_done_idxs)} outputs={len(generation_records)}."
                 )
             response_ids = [record["token_ids"] for record in generation_records]
+            request_timing_records = []
+            if timing_enabled:
+                if not isinstance(output, list) or len(output) != len(not_done_idxs):
+                    raise RuntimeError(
+                        "AgentMemory rollout timing requires one official-vLLM "
+                        "RequestOutput per active trajectory."
+                    )
+                for i, idx in enumerate(not_done_idxs):
+                    timing_record = request_output_timing_record(output[i])
+                    if timing_required and not timing_record["available"]:
+                        raise RuntimeError(
+                            "AgentMemory rollout timing is missing valid official-vLLM "
+                            f"request metrics for rollout_index={idx}: {timing_record}"
+                        )
+                    request_timing_records.append(
+                        {
+                            "rollout_index": idx,
+                            "item_id": rollout_handler_ls[idx].item_id,
+                            "prompt_token_count": len(generation_prompt_idxs[i]),
+                            "response_token_count": len(response_ids[i]),
+                            "vllm_timing": timing_record,
+                        }
+                    )
             all_done_flag = True
+            sleep_started = time.perf_counter()
             time.sleep(self.config.send_interval)
+            sleep_wall_seconds = time.perf_counter() - sleep_started
+            environment_steps = []
             for i, idx in enumerate(not_done_idxs):
                 prompt_token_ids = generation_prompt_idxs[i]
                 action_token_ids = response_ids[i]
@@ -1664,7 +1717,17 @@ class vLLMRollout(BaseRollout):
                     _agentmemory_debug(f"step_start round={rounds + 1} local_i={i} idx={idx} item_id={rollout_handler_ls[idx].item_id}")
                     step_started = time.time()
                     step_output = env_clients[idx].step(content)
-                    _agentmemory_debug(f"step_done round={rounds + 1} local_i={i} idx={idx} item_id={rollout_handler_ls[idx].item_id} seconds={time.time() - step_started:.2f} reward={step_output.reward} done={step_output.done}")
+                    step_wall_seconds = time.time() - step_started
+                    _agentmemory_debug(f"step_done round={rounds + 1} local_i={i} idx={idx} item_id={rollout_handler_ls[idx].item_id} seconds={step_wall_seconds:.2f} reward={step_output.reward} done={step_output.done}")
+                    if timing_enabled:
+                        environment_steps.append(
+                            {
+                                "rollout_index": idx,
+                                "item_id": rollout_handler_ls[idx].item_id,
+                                "wall_seconds": step_wall_seconds,
+                                "done": bool(step_output.done),
+                            }
+                        )
                     state, rollout_handler_ls[idx].score, rollout_handler_ls[idx].done = (
                         step_output.state,
                         step_output.reward,
@@ -1915,9 +1978,22 @@ class vLLMRollout(BaseRollout):
                         if state_aware_group_uid:
                             uid_overrides.append(exact_state_uid)
                     print(f"AgentMemory rollout step error: {e} item id = {rollout_handler_ls[idx].item_id}")
+            if timing_enabled:
+                timing_rounds.append(
+                    {
+                        "round": rounds + 1,
+                        "active_count": len(not_done_idxs),
+                        "generation_wall_seconds": generation_wall_seconds,
+                        "sleep_wall_seconds": sleep_wall_seconds,
+                        "environment_steps": environment_steps,
+                        "requests": request_timing_records,
+                        "round_wall_seconds": time.perf_counter() - round_started,
+                    }
+                )
             rounds += 1
             rollout_bar.update(1)
         rollout_bar.close()
+        rollout_rounds_wall_seconds = time.perf_counter() - rollout_rounds_started
 
         from agentenv_agentmemory.reward_hierarchy import (
             bind_max_round_timeout_failure,
@@ -2151,6 +2227,40 @@ class vLLMRollout(BaseRollout):
                     f"uids={len(uid_overrides)} rollout_rows={len(output)}"
                 )
             output.non_tensor_batch["rollout_uid"] = np.array(uid_overrides, dtype=object)
+        if timing_enabled:
+            try:
+                rank = (
+                    torch.distributed.get_rank()
+                    if torch.distributed.is_initialized()
+                    else 0
+                )
+                if global_steps is None:
+                    raise RuntimeError(
+                        "AgentMemory rollout timing requires a global step."
+                    )
+                timing_path = write_rollout_timing_sidecar(
+                    timing_root,
+                    global_step=int(global_steps),
+                    rank=rank,
+                    payload={
+                        "configured_send_interval_seconds": float(
+                            self.config.send_interval
+                        ),
+                        "max_policy_turns": int(max_policy_turns),
+                        "trajectory_count": len(rollout_handler_ls),
+                        "reset_records": reset_records,
+                        "rounds": timing_rounds,
+                        "round_count": len(timing_rounds),
+                        "rollout_rounds_wall_seconds": rollout_rounds_wall_seconds,
+                        "function_wall_seconds": time.perf_counter()
+                        - function_started,
+                    },
+                )
+                _agentmemory_debug(f"rollout_timing_write_done path={timing_path}")
+            except Exception as exc:
+                if timing_required:
+                    raise
+                print(f"AgentMemory rollout timing write failed: {exc}", flush=True)
         return output
 
 
