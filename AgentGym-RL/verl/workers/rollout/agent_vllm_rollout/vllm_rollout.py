@@ -113,6 +113,7 @@ from verl.workers.rollout.agent_vllm_rollout.vllm_runtime_config import (
 )
 from verl.workers.rollout.agent_vllm_rollout.rollout_timing import (
     request_output_timing_record,
+    validate_request_metrics_config,
     write_rollout_timing_sidecar,
 )
 from verl.workers.rollout.schemas import (
@@ -547,6 +548,11 @@ class vLLMRollout(BaseRollout):
                                                   num_tp_per_train_tp=num_tp_per_train_tp)
 
         self._official_vllm = vllm_version not in ('0.3.1', '0.4.2', '0.5.4', '0.6.3')
+        validate_request_metrics_config(
+            timing_required=_env_flag("AGENTMEMORY_ROLLOUT_TIMING_REQUIRED"),
+            official_vllm=self._official_vllm,
+            disable_log_stats=bool(rollout_config.disable_log_stats),
+        )
         if not self._official_vllm:
             assert not (
                 not rollout_config.enforce_eager
@@ -634,6 +640,7 @@ class vLLMRollout(BaseRollout):
                 f'enforce_eager={bool(rollout_config.enforce_eager)} '
                 f'free_cache_engine={bool(rollout_config.free_cache_engine)} '
                 f'enable_sleep_mode={bool(rollout_config.get("enable_sleep_mode", False))} '
+                f'disable_log_stats={bool(rollout_config.disable_log_stats)} '
                 f'compilation_config={compilation_config}',
                 flush=True,
             )

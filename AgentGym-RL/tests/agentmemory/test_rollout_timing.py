@@ -7,6 +7,7 @@ from verl.workers.rollout.agent_vllm_rollout.rollout_timing import (
     SCHEMA_VERSION,
     analyze_rollout_timing_documents,
     request_output_timing_record,
+    validate_request_metrics_config,
     write_rollout_timing_sidecar,
 )
 
@@ -14,7 +15,7 @@ from verl.workers.rollout.agent_vllm_rollout.rollout_timing import (
 def _request_output(*, request_id="7", corrupted=False):
     metrics = SimpleNamespace(
         num_generation_tokens=12,
-        arrival_time=10.0,
+        arrival_time=1_800_000_000.0,
         queued_ts=10.1,
         scheduled_ts=10.2,
         first_token_ts=10.5,
@@ -30,10 +31,12 @@ def test_request_output_timing_record_derives_durations():
 
     assert record["available"] is True
     assert record["request_id"] == "7"
-    assert record["queue_seconds"] == pytest.approx(0.2)
-    assert record["time_to_first_token_seconds"] == pytest.approx(0.5)
+    assert record["queue_seconds"] == pytest.approx(0.1)
+    assert record["prefill_seconds"] == pytest.approx(0.3)
     assert record["decode_seconds"] == pytest.approx(1.5)
-    assert record["request_seconds"] == pytest.approx(2.0)
+    assert record["inference_seconds"] == pytest.approx(1.8)
+    assert record["engine_core_seconds"] == pytest.approx(1.9)
+    assert record["first_token_latency_seconds"] == pytest.approx(0.5)
 
 
 def test_request_output_timing_record_rejects_corrupt_or_missing_metrics():
@@ -45,6 +48,26 @@ def test_request_output_timing_record_rejects_corrupt_or_missing_metrics():
     record = request_output_timing_record(_request_output(corrupted=True))
     assert record["available"] is False
     assert record["is_corrupted"] is True
+
+
+def test_required_timing_rejects_disabled_or_legacy_metrics():
+    with pytest.raises(RuntimeError, match="disable_log_stats=false"):
+        validate_request_metrics_config(
+            timing_required=True,
+            official_vllm=True,
+            disable_log_stats=True,
+        )
+    with pytest.raises(RuntimeError, match="official vLLM"):
+        validate_request_metrics_config(
+            timing_required=True,
+            official_vllm=False,
+            disable_log_stats=False,
+        )
+    validate_request_metrics_config(
+        timing_required=True,
+        official_vllm=True,
+        disable_log_stats=False,
+    )
 
 
 def test_write_rollout_timing_sidecar_is_atomic_and_versioned(tmp_path):
@@ -80,11 +103,11 @@ def test_analyze_rollout_timing_documents_separates_known_savings():
                 "requests": [
                     {
                         "rollout_index": 0,
-                        "vllm_timing": {"available": True, "request_seconds": 8.0},
+                        "vllm_timing": {"available": True, "engine_core_seconds": 8.0},
                     },
                     {
                         "rollout_index": 1,
-                        "vllm_timing": {"available": True, "request_seconds": 1.0},
+                        "vllm_timing": {"available": True, "engine_core_seconds": 1.0},
                     },
                 ],
             },
@@ -97,7 +120,7 @@ def test_analyze_rollout_timing_documents_separates_known_savings():
                 "requests": [
                     {
                         "rollout_index": 1,
-                        "vllm_timing": {"available": True, "request_seconds": 6.0},
+                        "vllm_timing": {"available": True, "engine_core_seconds": 6.0},
                     }
                 ],
             },

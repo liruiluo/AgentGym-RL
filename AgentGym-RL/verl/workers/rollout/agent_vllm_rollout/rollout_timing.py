@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-SCHEMA_VERSION = "agentmemory_rollout_timing_v1"
+SCHEMA_VERSION = "agentmemory_rollout_timing_v2"
 _REQUEST_TIMESTAMP_FIELDS = (
     "arrival_time",
     "queued_ts",
@@ -23,6 +23,25 @@ def _finite_float(value: Any) -> float | None:
     return result if math.isfinite(result) else None
 
 
+def validate_request_metrics_config(
+    *,
+    timing_required: bool,
+    official_vllm: bool,
+    disable_log_stats: bool,
+) -> None:
+    if not timing_required:
+        return
+    if not official_vllm:
+        raise RuntimeError(
+            "Required AgentMemory rollout timing needs official vLLM request metrics."
+        )
+    if disable_log_stats:
+        raise RuntimeError(
+            "AGENTMEMORY_ROLLOUT_TIMING_REQUIRED=1 requires "
+            "actor_rollout_ref.rollout.disable_log_stats=false."
+        )
+
+
 def request_output_timing_record(request_output: Any) -> dict[str, Any]:
     """Extract stable, JSON-safe timing fields from an official vLLM output."""
 
@@ -38,17 +57,23 @@ def request_output_timing_record(request_output: Any) -> dict[str, Any]:
         field: _finite_float(getattr(metrics, field, None))
         for field in _REQUEST_TIMESTAMP_FIELDS
     }
-    arrival = timestamps["arrival_time"]
     scheduled = timestamps["scheduled_ts"]
+    queued = timestamps["queued_ts"]
     first_token = timestamps["first_token_ts"]
     last_token = timestamps["last_token_ts"]
+    first_token_latency = _finite_float(
+        getattr(metrics, "first_token_latency", None)
+    )
     corrupted = bool(getattr(metrics, "is_corrupted", False))
+    # vLLM 0.24 records arrival_time with time.time(), while the engine-core
+    # timestamps use time.monotonic(). Only compare or subtract timestamps
+    # from the same engine-core clock.
     ordered = (
-        arrival is not None
+        queued is not None
         and scheduled is not None
         and first_token is not None
         and last_token is not None
-        and 0.0 < arrival <= scheduled <= first_token <= last_token
+        and 0.0 < queued <= scheduled <= first_token <= last_token
     )
 
     record: dict[str, Any] = {
@@ -58,15 +83,17 @@ def request_output_timing_record(request_output: Any) -> dict[str, Any]:
             getattr(metrics, "num_generation_tokens", 0)
         ),
         "is_corrupted": corrupted,
+        "first_token_latency_seconds": first_token_latency,
         **timestamps,
     }
     if ordered:
         record.update(
             {
-                "queue_seconds": scheduled - arrival,
-                "time_to_first_token_seconds": first_token - arrival,
+                "queue_seconds": scheduled - queued,
+                "prefill_seconds": first_token - scheduled,
                 "decode_seconds": last_token - first_token,
-                "request_seconds": last_token - arrival,
+                "inference_seconds": last_token - scheduled,
+                "engine_core_seconds": last_token - queued,
             }
         )
     else:
@@ -139,11 +166,12 @@ def analyze_rollout_timing_documents(
                 if not timing.get("available"):
                     unavailable_request_count += 1
                     continue
+                request_and_environment_seconds = float(
+                    timing["engine_core_seconds"]
+                ) + environment_by_index.get(rollout_index, 0.0)
                 per_trajectory[rollout_index] = per_trajectory.get(
                     rollout_index, 0.0
-                ) + float(timing["request_seconds"]) + environment_by_index.get(
-                    rollout_index, 0.0
-                )
+                ) + request_and_environment_seconds
 
         if unavailable_request_count:
             dependency_bound = None
@@ -182,7 +210,7 @@ def analyze_rollout_timing_documents(
     actual = global_max("rollout_rounds_wall_seconds")
     optimistic = global_max("optimistic_dependency_bound_seconds")
     return {
-        "schema_version": "agentmemory_rollout_critical_path_summary_v1",
+        "schema_version": "agentmemory_rollout_critical_path_summary_v2",
         "rank_count": len(rank_summaries),
         "rank_summaries": rank_summaries,
         "global": {
