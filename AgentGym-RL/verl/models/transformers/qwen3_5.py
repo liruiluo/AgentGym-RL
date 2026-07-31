@@ -45,7 +45,7 @@ class Qwen3_5ResponseFusedPPOOutput:
     """Selected-token PPO outputs without a full-vocabulary logits tensor."""
 
     log_probs: torch.Tensor
-    entropy: torch.Tensor
+    entropy: Optional[torch.Tensor]
 
 
 def is_qwen3_5_model_type(model_type: str) -> bool:
@@ -101,6 +101,7 @@ def qwen3_5_text_response_fused_ppo_forward(
     response_positions: Optional[torch.LongTensor] = None,
     response_labels: Optional[torch.LongTensor] = None,
     response_fused_kernel_backend: str = "triton",
+    calculate_entropy: bool = True,
     cu_seqlens: Optional[torch.LongTensor] = None,
     cu_seqlens_cpu: Optional[torch.LongTensor] = None,
     **kwargs,
@@ -185,6 +186,8 @@ def qwen3_5_text_response_fused_ppo_forward(
             float(temperature),
             "none",
         )
+        if not calculate_entropy:
+            entropy = None
     else:
         from verl.utils.experimental.torch_functional import FusedLinearForPPO
 
@@ -193,6 +196,7 @@ def qwen3_5_text_response_fused_ppo_forward(
             vocab_weights=vocab_weights,
             input_ids=labels,
             temperature=float(temperature),
+            compute_entropy=calculate_entropy,
         )
     return Qwen3_5ResponseFusedPPOOutput(
         log_probs=log_probs,

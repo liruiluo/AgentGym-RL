@@ -29,13 +29,16 @@ def _fused_linear_for_ppo_fwd(
     vocab_weights: torch.FloatTensor,
     input_ids: torch.LongTensor,
     temperature: float = 1.0,
-) -> tuple[torch.FloatTensor, torch.FloatTensor]:
+    compute_entropy: bool = True,
+) -> tuple[torch.FloatTensor, Optional[torch.FloatTensor]]:
     logits = (hidden_states @ vocab_weights.t()) / temperature
     orig_dtype = logits.dtype
     logits = logits.to(torch.float32)
 
-    probs = logits.softmax(dim=-1)
-    entropy = torch.logsumexp(logits, dim=-1) - torch.sum(probs * logits, dim=-1)
+    entropy = None
+    if compute_entropy:
+        probs = logits.softmax(dim=-1)
+        entropy = torch.logsumexp(logits, dim=-1) - torch.sum(probs * logits, dim=-1)
 
     if _FLASH_ATTN_CROSS_ENTROPY_AVAILABLE:
         per_token_entropy_loss = cross_entropy_loss(logits, input_ids)[0]
@@ -46,7 +49,7 @@ def _fused_linear_for_ppo_fwd(
         token_log_probs = log_probs.gather(-1, input_ids.unsqueeze(-1)).squeeze(-1)
 
     assert token_log_probs.dtype == torch.float32
-    return token_log_probs, entropy.to(orig_dtype)
+    return token_log_probs, None if entropy is None else entropy.to(orig_dtype)
 
 
 def _fused_linear_for_ppo_bwd(
@@ -93,7 +96,8 @@ class FusedLinearForPPOFunction(torch.autograd.Function):
         input_ids: torch.LongTensor,
         temperature: float = 1.0,
         chunk_size: int = 512,
-    ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
+        compute_entropy: bool = True,
+    ) -> tuple[torch.FloatTensor, Optional[torch.FloatTensor]]:
         ctx.set_materialize_grads(False)
 
         # Cast to a 2D tensor of the shape [T, D] for ease of working
@@ -115,7 +119,9 @@ class FusedLinearForPPOFunction(torch.autograd.Function):
         output_requires_grad = hidden_states.requires_grad or vocab_weights.requires_grad
         # Logits are upcasted to fp32 before computing log_probs, which are also fp32
         log_probs = torch.zeros(T, device=hidden_states.device, dtype=torch.float32, requires_grad=output_requires_grad)
-        entropy = hidden_states.new_zeros(T, requires_grad=output_requires_grad)
+        entropy = None
+        if compute_entropy:
+            entropy = hidden_states.new_zeros(T, requires_grad=output_requires_grad)
 
         # Perform forward one chunk at a time
         for chunk_start in range(0, T, chunk_size):
@@ -126,14 +132,17 @@ class FusedLinearForPPOFunction(torch.autograd.Function):
                 vocab_weights=vocab_weights,
                 input_ids=input_ids[chunk_start:chunk_end],
                 temperature=temperature,
+                compute_entropy=compute_entropy,
             )
             log_probs[chunk_start:chunk_end] = chunk_log_probs
-            entropy[chunk_start:chunk_end] = chunk_entropy
+            if entropy is not None:
+                entropy[chunk_start:chunk_end] = chunk_entropy
 
         # Cast the output back to the original input dimension
         if orig_ndim == 3:
             log_probs = log_probs.view(orig_batch_size, -1)
-            entropy = entropy.view(orig_batch_size, -1)
+            if entropy is not None:
+                entropy = entropy.view(orig_batch_size, -1)
 
         ctx.save_for_backward(hidden_states, vocab_weights, input_ids)
         ctx.orig_batch_size = orig_batch_size
@@ -205,6 +214,7 @@ class FusedLinearForPPOFunction(torch.autograd.Function):
             None,  # input_ids
             None,  # temperature
             None,  # chunk_size
+            None,  # compute_entropy
         )
 
 
@@ -220,7 +230,8 @@ class FusedLinearForPPO(torch.nn.Module):
         vocab_weights: torch.FloatTensor,
         input_ids: torch.LongTensor,
         temperature: float = 1.0,
-    ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
+        compute_entropy: bool = True,
+    ) -> tuple[torch.FloatTensor, Optional[torch.FloatTensor]]:
         input_ids = input_ids.to(torch.int64)
         return FusedLinearForPPOFunction.apply(
             hidden_states,
@@ -228,4 +239,5 @@ class FusedLinearForPPO(torch.nn.Module):
             input_ids,
             temperature,
             self.chunk_size,
+            compute_entropy,
         )

@@ -16,7 +16,7 @@ Single Process Actor
 """
 
 import itertools
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 from torch import nn
@@ -122,7 +122,12 @@ class DataParallelPPOActor(BasePPOActor):
 
         self.compute_entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=True)
 
-    def _forward_micro_batch(self, micro_batch, temperature) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _forward_micro_batch(
+        self,
+        micro_batch,
+        temperature,
+        calculate_entropy: bool = True,
+    ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
         """
         Returns: 
             entropy: # (bs, response_len)
@@ -190,6 +195,7 @@ class DataParallelPPOActor(BasePPOActor):
                                 self.response_fused_kernel_backend
                             ),
                             temperature=float(temperature),
+                            calculate_entropy=calculate_entropy,
                             **packed_forward_kwargs,
                         )
                         selected_log_probs = output.log_probs
@@ -197,29 +203,41 @@ class DataParallelPPOActor(BasePPOActor):
                         expected_shape = (projection.labels.numel(),)
                         if (
                             tuple(selected_log_probs.shape) != expected_shape
-                            or tuple(selected_entropy.shape) != expected_shape
+                            or (
+                                calculate_entropy
+                                and (
+                                    selected_entropy is None
+                                    or tuple(selected_entropy.shape) != expected_shape
+                                )
+                            )
+                            or (not calculate_entropy and selected_entropy is not None)
                         ):
                             raise RuntimeError(
                                 "Qwen3.5 response-fused head returned an "
                                 "unexpected shape: "
                                 f"log_probs={tuple(selected_log_probs.shape)} "
-                                f"entropy={tuple(selected_entropy.shape)} "
+                                "entropy="
+                                f"{None if selected_entropy is None else tuple(selected_entropy.shape)} "
                                 f"expected={expected_shape}."
                             )
                         if projection.padding_only:
-                            entropy = zero_padding_selected_outputs(
-                                selected_entropy,
-                                projection.output_response_mask,
-                            )
+                            entropy = None
+                            if selected_entropy is not None:
+                                entropy = zero_padding_selected_outputs(
+                                    selected_entropy,
+                                    projection.output_response_mask,
+                                )
                             log_probs = zero_padding_selected_outputs(
                                 selected_log_probs,
                                 projection.output_response_mask,
                             )
                         else:
-                            entropy = scatter_response_outputs(
-                                selected_entropy,
-                                projection.response_mask,
-                            )
+                            entropy = None
+                            if selected_entropy is not None:
+                                entropy = scatter_response_outputs(
+                                    selected_entropy,
+                                    projection.response_mask,
+                                )
                             log_probs = scatter_response_outputs(
                                 selected_log_probs,
                                 projection.response_mask,
@@ -252,21 +270,25 @@ class DataParallelPPOActor(BasePPOActor):
                                 selected_logits,
                                 projection.output_response_mask,
                             )
-                            entropy = zero_outputs
+                            entropy = zero_outputs if calculate_entropy else None
                             log_probs = zero_outputs
                         else:
                             selected_logits.div_(temperature)
-                            selected_entropy = self.compute_entropy_from_logits(
-                                selected_logits
-                            )
+                            selected_entropy = None
+                            if calculate_entropy:
+                                selected_entropy = self.compute_entropy_from_logits(
+                                    selected_logits
+                                )
                             selected_log_probs = logprobs_from_logits(
                                 logits=selected_logits,
                                 labels=projection.labels,
                             )
-                            entropy = scatter_response_outputs(
-                                selected_entropy,
-                                projection.response_mask,
-                            )
+                            entropy = None
+                            if selected_entropy is not None:
+                                entropy = scatter_response_outputs(
+                                    selected_entropy,
+                                    projection.response_mask,
+                                )
                             log_probs = scatter_response_outputs(
                                 selected_log_probs,
                                 projection.response_mask,
@@ -300,7 +322,9 @@ class DataParallelPPOActor(BasePPOActor):
                     logits_rmpad.div_(temperature)
 
                     # compute entropy
-                    entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
+                    entropy_rmpad = None
+                    if calculate_entropy:
+                        entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
@@ -309,22 +333,27 @@ class DataParallelPPOActor(BasePPOActor):
                     if self.use_ulysses_sp:
                         # gather and unpad for the ulysses sp
                         log_probs = gather_outpus_and_unpad(log_probs, gather_dim=0, unpad_dim=0, padding_size=pad_size)
-                        entropy_rmpad = gather_outpus_and_unpad(entropy_rmpad,
-                                                                gather_dim=0,
-                                                                unpad_dim=0,
-                                                                padding_size=pad_size)
+                        if entropy_rmpad is not None:
+                            entropy_rmpad = gather_outpus_and_unpad(entropy_rmpad,
+                                                                    gather_dim=0,
+                                                                    unpad_dim=0,
+                                                                    padding_size=pad_size)
                     # pad back to (bsz, seqlen)
-                    full_entropy = pad_input(hidden_states=entropy_rmpad.unsqueeze(-1),
-                                             indices=indices,
-                                             batch=batch_size,
-                                             seqlen=seqlen)
+                    full_entropy = None
+                    if entropy_rmpad is not None:
+                        full_entropy = pad_input(hidden_states=entropy_rmpad.unsqueeze(-1),
+                                                 indices=indices,
+                                                 batch=batch_size,
+                                                 seqlen=seqlen)
                     full_log_probs = pad_input(hidden_states=log_probs.unsqueeze(-1),
                                                indices=indices,
                                                batch=batch_size,
                                                seqlen=seqlen)
 
                     # only return response part:
-                    entropy = full_entropy.squeeze(-1)[:, -response_length - 1:-1]  # (bsz, response_length)
+                    entropy = None
+                    if full_entropy is not None:
+                        entropy = full_entropy.squeeze(-1)[:, -response_length - 1:-1]  # (bsz, response_length)
                     log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1:-1]  # (bsz, response_length)
 
             else:  # not using rmpad and no ulysses sp
@@ -336,7 +365,9 @@ class DataParallelPPOActor(BasePPOActor):
                 logits.div_(temperature)
                 logits = logits[:, -response_length - 1:-1, :]  # (bsz, response_length, vocab_size)
                 log_probs = logprobs_from_logits(logits, micro_batch['responses'])
-                entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
+                entropy = None
+                if calculate_entropy:
+                    entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
 
             return entropy, log_probs
 
@@ -392,7 +423,11 @@ class DataParallelPPOActor(BasePPOActor):
         log_probs_lst = []
         for micro_batch in micro_batches:
             with torch.no_grad():
-                _, log_probs = self._forward_micro_batch(micro_batch, temperature=temperature)
+                _, log_probs = self._forward_micro_batch(
+                    micro_batch,
+                    temperature=temperature,
+                    calculate_entropy=False,
+                )
             log_probs_lst.append(log_probs)
         log_probs = torch.concat(log_probs_lst, dim=0)
 
@@ -481,8 +516,12 @@ class DataParallelPPOActor(BasePPOActor):
                         eos_mask=response_mask,
                         cliprange=self.config.clip_ratio,
                     )
+                    if entropy is None:
+                        raise RuntimeError("PPO actor update requires entropy readback.")
                     entropy_loss = verl_F.masked_mean(entropy, response_mask)
-                    policy_loss = pg_loss - entropy_loss * self.config.entropy_coeff
+                    policy_loss = pg_loss
+                    if self.config.entropy_coeff != 0:
+                        policy_loss = policy_loss - entropy_loss * self.config.entropy_coeff
 
                     kl_metric_values = {}
                     if self.config.use_kl_loss:

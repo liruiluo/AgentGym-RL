@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from dataclasses import is_dataclass
 import unittest
+from unittest.mock import patch
 
 import torch
 from torch.distributed.utils import _apply_to_tensors
 
 from verl.models.transformers.qwen3_5 import Qwen3_5ResponseFusedPPOOutput
+from verl.utils.experimental import torch_functional as experimental_torch
 from verl.workers.response_only_logits import (
     build_response_projection_plan,
     scatter_response_outputs,
@@ -35,6 +37,60 @@ class ResponseFusedOutputContractTest(unittest.TestCase):
             {id(tensor) for tensor in visited},
             {id(log_probs), id(entropy)},
         )
+
+    def test_fsdp_accepts_logprob_only_output(self):
+        log_probs = torch.randn(3, requires_grad=True)
+        output = Qwen3_5ResponseFusedPPOOutput(
+            log_probs=log_probs,
+            entropy=None,
+        )
+        visited = []
+
+        transformed = _apply_to_tensors(
+            lambda tensor: visited.append(tensor) or tensor,
+            output,
+        )
+
+        self.assertTrue(is_dataclass(transformed))
+        self.assertEqual([id(tensor) for tensor in visited], [id(log_probs)])
+
+
+class FusedLinearEntropyGateTest(unittest.TestCase):
+    def test_logprob_only_forward_preserves_values_and_gradients(self):
+        torch.manual_seed(17)
+        hidden_with_entropy = torch.randn(7, 5, requires_grad=True)
+        weight_with_entropy = torch.randn(13, 5, requires_grad=True)
+        hidden_logprob_only = hidden_with_entropy.detach().clone().requires_grad_(True)
+        weight_logprob_only = weight_with_entropy.detach().clone().requires_grad_(True)
+        labels = torch.tensor([0, 2, 4, 6, 8, 10, 12])
+        fused = experimental_torch.FusedLinearForPPO(chunk_size=3)
+
+        with patch.object(
+            experimental_torch,
+            "_FLASH_ATTN_CROSS_ENTROPY_AVAILABLE",
+            False,
+        ):
+            log_probs_with_entropy, entropy = fused(
+                hidden_with_entropy,
+                weight_with_entropy,
+                labels,
+                compute_entropy=True,
+            )
+            log_probs_only, skipped_entropy = fused(
+                hidden_logprob_only,
+                weight_logprob_only,
+                labels,
+                compute_entropy=False,
+            )
+
+        self.assertIsNotNone(entropy)
+        self.assertIsNone(skipped_entropy)
+        torch.testing.assert_close(log_probs_only, log_probs_with_entropy)
+
+        (-log_probs_with_entropy.mean()).backward()
+        (-log_probs_only.mean()).backward()
+        torch.testing.assert_close(hidden_logprob_only.grad, hidden_with_entropy.grad)
+        torch.testing.assert_close(weight_logprob_only.grad, weight_with_entropy.grad)
 
 
 def _fixture():
