@@ -1,15 +1,40 @@
 from __future__ import annotations
 
+from dataclasses import is_dataclass
 import unittest
 
 import torch
+from torch.distributed.utils import _apply_to_tensors
 
+from verl.models.transformers.qwen3_5 import Qwen3_5ResponseFusedPPOOutput
 from verl.workers.response_only_logits import (
     build_response_projection_plan,
     scatter_response_outputs,
     zero_padding_response_outputs,
     zero_padding_selected_outputs,
 )
+
+
+class ResponseFusedOutputContractTest(unittest.TestCase):
+    def test_fsdp_can_discover_output_tensors(self):
+        log_probs = torch.randn(3, requires_grad=True)
+        entropy = torch.randn(3, requires_grad=True)
+        output = Qwen3_5ResponseFusedPPOOutput(
+            log_probs=log_probs,
+            entropy=entropy,
+        )
+        visited = []
+
+        transformed = _apply_to_tensors(
+            lambda tensor: visited.append(tensor) or tensor,
+            output,
+        )
+
+        self.assertTrue(is_dataclass(transformed))
+        self.assertEqual(
+            {id(tensor) for tensor in visited},
+            {id(log_probs), id(entropy)},
+        )
 
 
 def _fixture():

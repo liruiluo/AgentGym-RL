@@ -20,6 +20,7 @@ VERL's fused linear cross-entropy kernels, without changing ordinary HF model
 forwards.
 """
 
+from dataclasses import dataclass
 from importlib import import_module
 from inspect import signature
 from typing import Optional
@@ -39,12 +40,12 @@ RESPONSE_FUSED_KERNEL_BACKENDS = frozenset({"torch", "triton"})
 _ORIGINAL_CAUSAL_LM_FORWARD_ATTR = "_verl_qwen35_original_forward"
 
 
+@dataclass
 class Qwen3_5ResponseFusedPPOOutput:
     """Selected-token PPO outputs without a full-vocabulary logits tensor."""
 
-    def __init__(self, *, log_probs: torch.Tensor, entropy: torch.Tensor):
-        self.log_probs = log_probs
-        self.entropy = entropy
+    log_probs: torch.Tensor
+    entropy: torch.Tensor
 
 
 def is_qwen3_5_model_type(model_type: str) -> bool:
