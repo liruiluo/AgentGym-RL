@@ -36,6 +36,10 @@ from verl.workers.ppo_token_normalization import (
     valid_response_token_count,
     validate_worker_batch_readback,
 )
+from verl.workers.fsdp_gradient_accumulation import (
+    fsdp_gradient_sync_context,
+    should_defer_fsdp_gradient_sync,
+)
 from verl.workers.qwen35_runtime import qwen3_5_packed_forward_kwargs
 
 from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
@@ -82,6 +86,14 @@ class DataParallelPPOCritic(BasePPOCritic):
         print(f'Critic use_remove_padding={self.use_remove_padding}')
 
         self.ulysses_sequence_parallel_size = self.config.get('ulysses_sequence_parallel_size', 1)
+        fsdp_config = self.config.model.get('fsdp_config', {})
+        self.use_no_sync_for_gradient_accumulation = bool(
+            fsdp_config.get('use_no_sync_for_gradient_accumulation', False)
+        )
+        print(
+            'Critic use_no_sync_for_gradient_accumulation='
+            f'{self.use_no_sync_for_gradient_accumulation}'
+        )
 
     def _forward_micro_batch(self, micro_batch):
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
@@ -209,6 +221,7 @@ class DataParallelPPOCritic(BasePPOCritic):
 
         token_metrics = TokenWeightedMetricAccumulator()
         optimizer_steps = 0
+        deferred_sync_micro_batches = 0
         for _ in range(ppo_epochs):
             for data in dataloader:
                 mini_batch = data
@@ -230,41 +243,53 @@ class DataParallelPPOCritic(BasePPOCritic):
                 if global_token_count.item() <= 0:
                     raise ValueError("PPO critic mini-batch has no valid response tokens.")
 
-                for data in micro_batches:
-                    data = data.cuda()  # critic device is cpu when using offload
-                    values = data['values']
-                    returns = data['returns']
-                    eos_mask = mask_padding_rows(
-                        data['response_mask'],
-                        data.get(core_algos.PPO_VALID_SAMPLE_MASK),
+                for micro_batch_index, data in enumerate(micro_batches):
+                    is_last_micro_batch = micro_batch_index == len(micro_batches) - 1
+                    defer_sync = should_defer_fsdp_gradient_sync(
+                        self.critic_module,
+                        enabled=self.use_no_sync_for_gradient_accumulation,
+                        is_last_micro_batch=is_last_micro_batch,
                     )
-                    local_token_count = valid_response_token_count(eos_mask)
-                    vpreds = _select_response_state_values(
-                        self._forward_micro_batch(data), eos_mask
-                    )
+                    deferred_sync_micro_batches += int(defer_sync)
+                    with fsdp_gradient_sync_context(
+                        self.critic_module,
+                        enabled=self.use_no_sync_for_gradient_accumulation,
+                        is_last_micro_batch=is_last_micro_batch,
+                    ):
+                        data = data.cuda()  # critic device is cpu when using offload
+                        values = data['values']
+                        returns = data['returns']
+                        eos_mask = mask_padding_rows(
+                            data['response_mask'],
+                            data.get(core_algos.PPO_VALID_SAMPLE_MASK),
+                        )
+                        local_token_count = valid_response_token_count(eos_mask)
+                        vpreds = _select_response_state_values(
+                            self._forward_micro_batch(data), eos_mask
+                        )
 
-                    vf_loss, vf_clipfrac = core_algos.compute_value_loss(
-                        vpreds=vpreds,
-                        values=values,
-                        returns=returns,
-                        eos_mask=eos_mask,
-                        cliprange_value=self.config.cliprange_value,
-                    )
-                    loss = scale_token_mean_loss(
-                        vf_loss,
-                        local_token_count,
-                        global_token_count,
-                        group=loss_group,
-                    )
-                    loss.backward()
-                    token_metrics.add(
-                        {
-                            'critic/vf_loss': vf_loss.detach().item(),
-                            'critic/vf_clipfrac': vf_clipfrac.detach().item(),
-                            'critic/vpred_mean': masked_mean(vpreds, eos_mask).detach().item(),
-                        },
-                        local_token_count,
-                    )
+                        vf_loss, vf_clipfrac = core_algos.compute_value_loss(
+                            vpreds=vpreds,
+                            values=values,
+                            returns=returns,
+                            eos_mask=eos_mask,
+                            cliprange_value=self.config.cliprange_value,
+                        )
+                        loss = scale_token_mean_loss(
+                            vf_loss,
+                            local_token_count,
+                            global_token_count,
+                            group=loss_group,
+                        )
+                        loss.backward()
+                        token_metrics.add(
+                            {
+                                'critic/vf_loss': vf_loss.detach().item(),
+                                'critic/vf_clipfrac': vf_clipfrac.detach().item(),
+                                'critic/vpred_mean': masked_mean(vpreds, eos_mask).detach().item(),
+                            },
+                            local_token_count,
+                        )
 
                 grad_norm = self._optimizer_step()
                 optimizer_steps += 1
@@ -273,6 +298,12 @@ class DataParallelPPOCritic(BasePPOCritic):
         metrics['critic/ppo_epochs'] = [float(ppo_epochs)]
         metrics['critic/optimizer_steps_per_update'] = [float(optimizer_steps)]
         metrics['critic/minibatches_per_epoch'] = [float(optimizer_steps / ppo_epochs)]
+        metrics['critic/fsdp_no_sync_gradient_accumulation'] = [
+            float(self.use_no_sync_for_gradient_accumulation)
+        ]
+        metrics['critic/deferred_gradient_sync_microbatches'] = [
+            float(deferred_sync_micro_batches)
+        ]
         if batch_readback is not None:
             metrics['critic/normalized_mini_batch_rows'] = [
                 float(batch_readback['normalized_mini_batch_rows'])

@@ -44,6 +44,9 @@ actor_rollout_ref:
       warmup_style: constant  # select from constant/cosine
       total_training_steps: -1  # must be override by program
     fsdp_config:
+      # Defer reduce-scatter until the final accumulation microbatch. This can
+      # improve throughput at the cost of retaining unsharded gradients.
+      use_no_sync_for_gradient_accumulation: False
       wrap_policy:
         # transformer_layer_cls_to_wrap: None
         min_num_params: 0
@@ -120,6 +123,7 @@ critic:
     enable_gradient_checkpointing: True
     use_remove_padding: False
     fsdp_config:
+      use_no_sync_for_gradient_accumulation: False
       param_offload: False
       grad_offload: False
       optimizer_offload: False
