@@ -42,13 +42,26 @@ def qwen3_5_packed_forward_kwargs(module, cu_seqlens, sequence_parallel_size: in
 
     if not is_qwen3_5_model_type(model_type_from_module(module)):
         return {}
-    if sequence_parallel_size != 1:
+    if sequence_parallel_size not in (1, 2):
         raise NotImplementedError(
-            "AgentGym-RL Qwen3.5 currently validates remove-padding with "
-            "Ulysses sequence parallel size 1. Use four-way FSDP data "
-            "parallelism; gate SP>1 separately before enabling it."
+            "AgentGym-RL Qwen3.5 currently validates Ulysses sequence "
+            "parallel sizes 1 and 2 only."
         )
     cu_seqlens = cu_seqlens.to(dtype=torch.long)
+    if sequence_parallel_size > 1:
+        packed_token_count = int(cu_seqlens[-1].item())
+        padding_size = (
+            sequence_parallel_size - packed_token_count % sequence_parallel_size
+        ) % sequence_parallel_size
+        if padding_size:
+            cu_seqlens = torch.cat(
+                (
+                    cu_seqlens,
+                    cu_seqlens.new_tensor(
+                        [packed_token_count + padding_size], dtype=torch.long
+                    ),
+                )
+            )
     return {
         "cu_seqlens": cu_seqlens,
         "cu_seqlens_cpu": cu_seqlens.detach().cpu(),
@@ -70,10 +83,10 @@ def validate_qwen3_5_training_runtime(
             "Qwen3.5 formal PPO requires use_remove_padding=true; the padded "
             "fallback is too slow for a scalable B200 run."
         )
-    if sequence_parallel_size != 1:
+    if sequence_parallel_size not in (1, 2):
         raise NotImplementedError(
-            "Qwen3.5 SP>1 is not enabled in AgentGym-RL until its context-"
-            "parallel path passes a separate B200 gate."
+            "Qwen3.5 currently validates Ulysses sequence parallel sizes 1 "
+            "and 2 only."
         )
 
     versions = {"torch": torch.__version__}
@@ -119,6 +132,36 @@ def validate_qwen3_5_training_runtime(
     versions["packed_gdn_cu_seqlens"] = True
     versions["packed_conv_seq_idx"] = True
     versions["packed_flash_position_ids"] = True
+    if sequence_parallel_size > 1:
+        if "cp_context" not in inspect.signature(
+            chunk_gated_delta_rule
+        ).parameters:
+            raise RuntimeError(
+                "Qwen3.5 Ulysses SP requires FLA gated-delta cp_context support."
+            )
+        try:
+            from fla.ops.cp.comm import (
+                conv_cp_send_recv_bwd,
+                conv_cp_send_recv_fwd,
+            )
+            from fla.ops.cp.context import build_cp_context
+        except ImportError as exc:
+            raise RuntimeError(
+                "Qwen3.5 Ulysses SP requires FLA context-parallel helpers."
+            ) from exc
+        if not all(
+            callable(function)
+            for function in (
+                build_cp_context,
+                conv_cp_send_recv_fwd,
+                conv_cp_send_recv_bwd,
+            )
+        ):
+            raise RuntimeError(
+                "Qwen3.5 Ulysses SP found non-callable FLA context-parallel helpers."
+            )
+        versions["ulysses_context_parallel"] = True
+        versions["ulysses_sequence_parallel_size"] = sequence_parallel_size
 
     capability = torch.cuda.get_device_capability()
     versions["cuda_capability"] = f"{capability[0]}.{capability[1]}"

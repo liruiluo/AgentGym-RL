@@ -47,6 +47,24 @@ class _FakeTensor:
     def to(self, *, dtype=None):
         return _FakeTensor(self.values, dtype=dtype, device=self.device)
 
+    def __getitem__(self, index):
+        values = self.values[index]
+        if isinstance(index, slice):
+            return _FakeTensor(values, dtype=self.dtype, device=self.device)
+        return _FakeTensor([values], dtype=self.dtype, device=self.device)
+
+    def item(self):
+        if len(self.values) != 1:
+            raise ValueError("only one-element fake tensors can be scalars")
+        return self.values[0]
+
+    def new_tensor(self, values, *, dtype=None):
+        return _FakeTensor(
+            values,
+            dtype=self.dtype if dtype is None else dtype,
+            device=self.device,
+        )
+
     def detach(self):
         return self
 
@@ -311,6 +329,11 @@ class Qwen35RuntimeContractTests(unittest.TestCase):
         fake_torch = types.ModuleType("torch")
         fake_torch.__version__ = "test"
         fake_torch.long = "long"
+        fake_torch.cat = lambda tensors: _FakeTensor(
+            [value for tensor in tensors for value in tensor.values],
+            dtype=tensors[0].dtype,
+            device=tensors[0].device,
+        )
         fake_model = types.ModuleType("verl.models.transformers.qwen3_5")
         fake_model.is_qwen3_5_model_type = lambda value: value in {
             "qwen3_5",
@@ -338,16 +361,38 @@ class Qwen35RuntimeContractTests(unittest.TestCase):
         self.assertEqual(result["cu_seqlens"].dtype, "long")
         self.assertEqual(result["cu_seqlens_cpu"].device, "cpu")
 
-    def test_sp_greater_than_one_remains_fail_closed(self):
+    def test_sp_two_appends_an_independent_padding_boundary(self):
         module = self._load_runtime()
         wrapped = types.SimpleNamespace(
             config=types.SimpleNamespace(model_type="qwen3_5_text")
         )
-        with self.assertRaisesRegex(NotImplementedError, "SP>1"):
+        result = module.qwen3_5_packed_forward_kwargs(
+            wrapped,
+            _FakeTensor([0, 3, 7], dtype="int32"),
+            2,
+        )
+        self.assertEqual(result["cu_seqlens"].values, [0, 3, 7, 8])
+        self.assertEqual(result["cu_seqlens"].dtype, "long")
+        self.assertEqual(result["cu_seqlens_cpu"].values, [0, 3, 7, 8])
+        self.assertEqual(result["cu_seqlens_cpu"].device, "cpu")
+
+        aligned = module.qwen3_5_packed_forward_kwargs(
+            wrapped,
+            _FakeTensor([0, 4], dtype="int32"),
+            2,
+        )
+        self.assertEqual(aligned["cu_seqlens"].values, [0, 4])
+
+    def test_sp_four_remains_fail_closed(self):
+        module = self._load_runtime()
+        wrapped = types.SimpleNamespace(
+            config=types.SimpleNamespace(model_type="qwen3_5_text")
+        )
+        with self.assertRaisesRegex(NotImplementedError, "sizes 1 and 2"):
             module.qwen3_5_packed_forward_kwargs(
                 wrapped,
                 _FakeTensor([0, 4]),
-                2,
+                4,
             )
 
     def test_runtime_gate_names_all_three_packed_kernel_interfaces(self):

@@ -5,6 +5,9 @@ from __future__ import annotations
 from typing import NamedTuple
 
 import torch
+import torch.distributed as dist
+
+from verl.utils.ulysses import get_ulysses_sequence_parallel_group
 
 
 class ResponseProjectionPlan(NamedTuple):
@@ -14,6 +17,18 @@ class ResponseProjectionPlan(NamedTuple):
     output_response_mask: torch.Tensor
     padding_only: bool
     packed_token_count: int
+
+
+class SequenceParallelResponseProjectionPlan(NamedTuple):
+    local_predecessor_positions: torch.Tensor
+    labels: torch.Tensor
+    response_mask: torch.Tensor
+    output_response_mask: torch.Tensor
+    padding_only: bool
+    local_selected_response_tokens: int
+    global_selected_response_tokens: int
+    packed_shard_start: int
+    packed_shard_end: int
 
 
 def build_response_projection_plan(
@@ -161,6 +176,130 @@ def build_response_projection_plan(
         padding_only=padding_only,
         packed_token_count=int(unpadded_indices.numel()),
     )
+
+
+def shard_response_projection_plan(
+    plan: ResponseProjectionPlan,
+    *,
+    sequence_parallel_size: int,
+    sequence_parallel_rank: int,
+    padding_size: int,
+) -> SequenceParallelResponseProjectionPlan:
+    """Map global packed response positions onto one Ulysses token shard."""
+
+    if isinstance(sequence_parallel_size, bool) or sequence_parallel_size <= 0:
+        raise ValueError("sequence_parallel_size must be a positive integer.")
+    if (
+        isinstance(sequence_parallel_rank, bool)
+        or sequence_parallel_rank < 0
+        or sequence_parallel_rank >= sequence_parallel_size
+    ):
+        raise ValueError(
+            "sequence_parallel_rank must be in [0, sequence_parallel_size)."
+        )
+    if isinstance(padding_size, bool) or padding_size < 0:
+        raise ValueError("padding_size must be a non-negative integer.")
+
+    padded_token_count = plan.packed_token_count + padding_size
+    if padded_token_count % sequence_parallel_size != 0:
+        raise ValueError(
+            "padded packed-token count must be divisible by sequence parallel size: "
+            f"tokens={plan.packed_token_count} padding={padding_size} "
+            f"sp={sequence_parallel_size}."
+        )
+    shard_size = padded_token_count // sequence_parallel_size
+    if shard_size <= 0:
+        raise ValueError("each sequence-parallel rank must receive at least one token.")
+    shard_start = sequence_parallel_rank * shard_size
+    shard_end = shard_start + shard_size
+
+    global_selected_count = 0 if plan.padding_only else int(plan.labels.numel())
+    local_response_mask = torch.zeros_like(plan.output_response_mask, dtype=torch.bool)
+    if not plan.padding_only:
+        if plan.packed_predecessor_positions.numel() != plan.labels.numel():
+            raise ValueError(
+                "response positions and labels must have identical lengths before sharding."
+            )
+        selected_coordinates = plan.response_mask.to(dtype=torch.bool).nonzero(
+            as_tuple=False
+        )
+        if selected_coordinates.shape[0] != plan.labels.numel():
+            raise ValueError(
+                "response_mask token count must match response positions before sharding."
+            )
+        owned = (
+            (plan.packed_predecessor_positions >= shard_start)
+            & (plan.packed_predecessor_positions < shard_end)
+        )
+        local_positions = (
+            plan.packed_predecessor_positions[owned] - shard_start
+        ).to(dtype=torch.long)
+        local_labels = plan.labels[owned]
+        local_coordinates = selected_coordinates[owned]
+        if local_coordinates.numel() > 0:
+            local_response_mask[
+                local_coordinates[:, 0], local_coordinates[:, 1]
+            ] = True
+        local_selected_count = int(owned.sum().item())
+    else:
+        local_positions = plan.packed_predecessor_positions.new_empty(
+            (0,), dtype=torch.long
+        )
+        local_labels = plan.labels.new_empty((0,), dtype=torch.long)
+        local_selected_count = 0
+
+    if local_selected_count == 0:
+        # Every FSDP rank must keep the LM head in the graph even when its token
+        # shard owns no response. The dummy row is multiplied by zero downstream.
+        local_positions = plan.packed_predecessor_positions.new_zeros(
+            (1,), dtype=torch.long
+        )
+        local_labels = plan.labels[:1].to(dtype=torch.long)
+        if local_labels.numel() != 1:
+            raise ValueError("response projection has no label for its dummy token.")
+        padding_only = True
+    else:
+        padding_only = False
+
+    return SequenceParallelResponseProjectionPlan(
+        local_predecessor_positions=local_positions,
+        labels=local_labels,
+        response_mask=local_response_mask,
+        output_response_mask=local_response_mask,
+        padding_only=padding_only,
+        local_selected_response_tokens=local_selected_count,
+        global_selected_response_tokens=global_selected_count,
+        packed_shard_start=shard_start,
+        packed_shard_end=shard_end,
+    )
+
+
+class _MergeSequenceParallelResponseOutputs(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, local_outputs: torch.Tensor, group: dist.ProcessGroup):
+        ctx.group = group
+        ctx.sequence_parallel_size = dist.get_world_size(group=group)
+        merged = local_outputs.contiguous().clone()
+        dist.all_reduce(merged, op=dist.ReduceOp.SUM, group=group)
+        return merged
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        # The same gathered loss is evaluated on every SP rank. FSDP averages
+        # parameter gradients across those ranks, so preserve VERL's Ulysses
+        # gather convention by scaling the owner gradient by the SP world size.
+        return grad_output * ctx.sequence_parallel_size, None
+
+
+def merge_sequence_parallel_response_outputs(
+    local_outputs: torch.Tensor,
+) -> torch.Tensor:
+    """Merge disjoint response grids while preserving Ulysses gradients."""
+
+    group = get_ulysses_sequence_parallel_group()
+    if group is None:
+        return local_outputs
+    return _MergeSequenceParallelResponseOutputs.apply(local_outputs, group)
 
 
 def scatter_response_outputs(

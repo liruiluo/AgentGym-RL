@@ -28,7 +28,11 @@ from verl import DataProto
 from verl.agent_trainer.ppo import core_algos
 from verl.workers.agent_actor import BasePPOActor
 from verl.utils.torch_functional import logprobs_from_logits, masked_mean
-from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_unpad
+from verl.utils.ulysses import (
+    gather_outpus_and_unpad,
+    get_ulysses_sequence_parallel_rank,
+    ulysses_pad_and_slice_inputs,
+)
 from verl.utils.seqlen_balancing import rearrange_micro_batches, get_reverse_idx
 from verl.workers.ppo_token_normalization import (
     PPO_BATCH_CONTRACT_META_KEY,
@@ -47,7 +51,9 @@ from verl.workers.qwen35_runtime import (
 )
 from verl.workers.response_only_logits import (
     build_response_projection_plan,
+    merge_sequence_parallel_response_outputs,
     scatter_response_outputs,
+    shard_response_projection_plan,
     zero_padding_response_outputs,
 )
 import verl.utils.torch_functional as verl_F
@@ -87,9 +93,10 @@ class DataParallelPPOActor(BasePPOActor):
                 raise ValueError(
                     "Response-only PPO logits require use_remove_padding=true."
                 )
-            if self.ulysses_sequence_parallel_size != 1:
+            if self.ulysses_sequence_parallel_size not in (1, 2):
                 raise NotImplementedError(
-                    "Response-only PPO logits require Ulysses sequence parallel size 1."
+                    "Response-only PPO logits currently validate Ulysses sequence "
+                    "parallel sizes 1 and 2 only."
                 )
         print(f'Actor use_response_only_logits={self.use_response_only_logits}')
         self._response_only_readback_logged = False
@@ -127,6 +134,7 @@ class DataParallelPPOActor(BasePPOActor):
                 input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)  # (1, total_nnz)
 
                 # pad and slice the inputs if sp > 1
+                pad_size = 0
                 if self.use_ulysses_sp:
                     input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad_and_slice_inputs(input_ids_rmpad, \
                                                                                                 position_ids_rmpad, \
@@ -153,17 +161,30 @@ class DataParallelPPOActor(BasePPOActor):
                             core_algos.PPO_VALID_SAMPLE_MASK
                         ),
                     )
+                    if self.use_ulysses_sp:
+                        local_projection = shard_response_projection_plan(
+                            projection,
+                            sequence_parallel_size=self.ulysses_sequence_parallel_size,
+                            sequence_parallel_rank=get_ulysses_sequence_parallel_rank(),
+                            padding_size=pad_size,
+                        )
+                    else:
+                        local_projection = projection
                     output = self.actor_module(
                         input_ids=input_ids_rmpad,
                         attention_mask=None,
                         position_ids=position_ids_rmpad,
                         use_cache=False,
-                        logits_to_keep=projection.packed_predecessor_positions,
+                        logits_to_keep=(
+                            local_projection.local_predecessor_positions
+                            if self.use_ulysses_sp
+                            else local_projection.packed_predecessor_positions
+                        ),
                         **packed_forward_kwargs,
                     )
                     selected_logits = output.logits.squeeze(0)
                     expected_shape = (
-                        projection.labels.numel(),
+                        local_projection.labels.numel(),
                         selected_logits.shape[-1],
                     )
                     if tuple(selected_logits.shape) != expected_shape:
@@ -172,10 +193,10 @@ class DataParallelPPOActor(BasePPOActor):
                             f"shape: logits={tuple(selected_logits.shape)} "
                             f"expected={expected_shape}."
                         )
-                    if projection.padding_only:
+                    if local_projection.padding_only:
                         zero_outputs = zero_padding_response_outputs(
                             selected_logits,
-                            projection.output_response_mask,
+                            local_projection.output_response_mask,
                         )
                         entropy = zero_outputs
                         log_probs = zero_outputs
@@ -186,16 +207,19 @@ class DataParallelPPOActor(BasePPOActor):
                         )
                         selected_log_probs = logprobs_from_logits(
                             logits=selected_logits,
-                            labels=projection.labels,
+                            labels=local_projection.labels,
                         )
                         entropy = scatter_response_outputs(
                             selected_entropy,
-                            projection.response_mask,
+                            local_projection.response_mask,
                         )
                         log_probs = scatter_response_outputs(
                             selected_log_probs,
-                            projection.response_mask,
+                            local_projection.response_mask,
                         )
+                    if self.use_ulysses_sp:
+                        entropy = merge_sequence_parallel_response_outputs(entropy)
+                        log_probs = merge_sequence_parallel_response_outputs(log_probs)
                     if (
                         not projection.padding_only
                         and not self._response_only_readback_logged
@@ -206,6 +230,7 @@ class DataParallelPPOActor(BasePPOActor):
                             "Response-only PPO logits readback: "
                             f"role={role} packed_tokens={projection.packed_token_count} "
                             f"selected_response_tokens={selected_count} "
+                            f"sequence_parallel_size={self.ulysses_sequence_parallel_size} "
                             "projection_reduction_ratio="
                             f"{projection.packed_token_count / selected_count:.6f}"
                         )

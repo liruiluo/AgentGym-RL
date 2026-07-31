@@ -6,7 +6,9 @@ import torch
 
 from verl.workers.response_only_logits import (
     build_response_projection_plan,
+    merge_sequence_parallel_response_outputs,
     scatter_response_outputs,
+    shard_response_projection_plan,
     zero_padding_response_outputs,
 )
 
@@ -49,6 +51,91 @@ class ResponseProjectionPlanTest(unittest.TestCase):
             plan.packed_predecessor_positions.tolist(),
             [2, 3, 8, 9, 10],
         )
+
+    def test_sequence_parallel_shards_preserve_local_positions_and_grid(self):
+        input_ids, attention_mask, responses, response_mask, indices = _fixture()
+        plan = build_response_projection_plan(
+            unpadded_indices=indices,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            responses=responses,
+            response_mask=response_mask,
+        )
+
+        rank_zero = shard_response_projection_plan(
+            plan,
+            sequence_parallel_size=2,
+            sequence_parallel_rank=0,
+            padding_size=0,
+        )
+        rank_one = shard_response_projection_plan(
+            plan,
+            sequence_parallel_size=2,
+            sequence_parallel_rank=1,
+            padding_size=0,
+        )
+
+        self.assertEqual(rank_zero.local_predecessor_positions.tolist(), [2, 3])
+        self.assertEqual(rank_zero.labels.tolist(), [21, 22])
+        self.assertEqual(
+            rank_zero.response_mask.tolist(),
+            [[True, True, False], [False, False, False]],
+        )
+        self.assertEqual(rank_one.local_predecessor_positions.tolist(), [2, 3, 4])
+        self.assertEqual(rank_one.labels.tolist(), [41, 42, 43])
+        self.assertEqual(
+            rank_one.response_mask.tolist(),
+            [[False, False, False], [True, True, True]],
+        )
+        self.assertEqual(rank_zero.global_selected_response_tokens, 5)
+        self.assertEqual(rank_one.global_selected_response_tokens, 5)
+
+    def test_sequence_parallel_empty_shard_keeps_graph_dummy(self):
+        input_ids, attention_mask, responses, response_mask, indices = _fixture()
+        plan = build_response_projection_plan(
+            unpadded_indices=indices,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            responses=responses,
+            response_mask=response_mask,
+        )
+
+        empty_rank = shard_response_projection_plan(
+            plan,
+            sequence_parallel_size=3,
+            sequence_parallel_rank=1,
+            padding_size=0,
+        )
+
+        self.assertTrue(empty_rank.padding_only)
+        self.assertEqual(empty_rank.local_selected_response_tokens, 0)
+        self.assertEqual(empty_rank.local_predecessor_positions.tolist(), [0])
+        self.assertEqual(empty_rank.labels.tolist(), [21])
+        self.assertFalse(torch.any(empty_rank.output_response_mask))
+
+    def test_sequence_parallel_sharding_validates_padding_contract(self):
+        input_ids, attention_mask, responses, response_mask, indices = _fixture()
+        plan = build_response_projection_plan(
+            unpadded_indices=indices,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            responses=responses,
+            response_mask=response_mask,
+        )
+        with self.assertRaisesRegex(ValueError, "divisible"):
+            shard_response_projection_plan(
+                plan,
+                sequence_parallel_size=5,
+                sequence_parallel_rank=0,
+                padding_size=0,
+            )
+
+    def test_sequence_parallel_merge_is_identity_without_group(self):
+        local = torch.randn(2, 3, requires_grad=True)
+        merged = merge_sequence_parallel_response_outputs(local)
+        self.assertIs(merged, local)
+        merged.sum().backward()
+        self.assertTrue(torch.equal(local.grad, torch.ones_like(local)))
 
     def test_scatter_preserves_response_grid_and_gradient(self):
         mask = torch.tensor([[1, 1, 0], [1, 1, 1]], dtype=torch.bool)
