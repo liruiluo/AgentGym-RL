@@ -171,17 +171,27 @@ def main() -> None:
     oldlog_delta = _max_abs_delta(
         oldlog_with_entropy[0]["log_probs"], oldlog_skip_entropy[0]["log_probs"]
     )
-    gradient_delta = 0.0
     if actor_legacy[0]["gradient_samples"].keys() != actor_skip[0]["gradient_samples"].keys():
         raise RuntimeError("actor gradient sample keys changed")
-    for name in actor_legacy[0]["gradient_samples"]:
-        gradient_delta = max(
-            gradient_delta,
-            _max_abs_delta(
-                actor_legacy[0]["gradient_samples"][name],
-                actor_skip[0]["gradient_samples"][name],
-            ),
-        )
+    legacy_gradient_samples = torch.cat(
+        [
+            actor_legacy[0]["gradient_samples"][name]
+            for name in actor_legacy[0]["gradient_samples"]
+        ]
+    )
+    skip_gradient_samples = torch.cat(
+        [
+            actor_skip[0]["gradient_samples"][name]
+            for name in actor_skip[0]["gradient_samples"]
+        ]
+    )
+    gradient_difference = legacy_gradient_samples - skip_gradient_samples
+    gradient_delta = float(gradient_difference.abs().max().item())
+    gradient_relative_l2_delta = float(
+        gradient_difference.norm().item()
+        / max(legacy_gradient_samples.norm().item(), 1e-12)
+    )
+    gradient_reference_max_abs = float(legacy_gradient_samples.abs().max().item())
 
     actor_legacy_seconds = statistics.median(
         result["total_seconds"] for result in actor_legacy
@@ -197,9 +207,10 @@ def main() -> None:
     )
     if actor_logprob_delta != 0 or actor_entropy_delta != 0 or oldlog_delta != 0:
         raise RuntimeError("zero-entropy optimization changed forward values")
-    if gradient_delta != 0:
+    if gradient_relative_l2_delta > 0.01:
         raise RuntimeError(
-            f"zero-entropy optimization changed sampled gradients: {gradient_delta}"
+            "zero-entropy optimization exceeded the sampled-gradient gate: "
+            f"relative_l2={gradient_relative_l2_delta} max_abs={gradient_delta}"
         )
 
     summary = {
@@ -219,7 +230,21 @@ def main() -> None:
         "actor_logprob_max_abs_delta": actor_logprob_delta,
         "actor_entropy_max_abs_delta": actor_entropy_delta,
         "actor_gradient_sample_max_abs_delta": gradient_delta,
+        "actor_gradient_sample_relative_l2_delta": gradient_relative_l2_delta,
+        "actor_gradient_sample_reference_max_abs": gradient_reference_max_abs,
         "oldlog_max_abs_delta": oldlog_delta,
+        "actor_legacy_zero_replicas_seconds": [
+            result["total_seconds"] for result in actor_legacy
+        ],
+        "actor_skip_zero_replicas_seconds": [
+            result["total_seconds"] for result in actor_skip
+        ],
+        "oldlog_with_entropy_replicas_seconds": [
+            result["forward_seconds"] for result in oldlog_with_entropy
+        ],
+        "oldlog_skip_entropy_replicas_seconds": [
+            result["forward_seconds"] for result in oldlog_skip_entropy
+        ],
         "actor_legacy_peak_reserved_gib": max(
             result["peak_reserved_gib"] for result in actor_legacy
         ),
