@@ -127,16 +127,36 @@ class OfficialVllmRuntimeConfigTests(unittest.TestCase):
         fake_ray.remote = lambda **_kwargs: lambda function: function
         fake_hydra = types.ModuleType("hydra")
         fake_hydra.main = lambda **_kwargs: lambda function: function
+        fake_verl = types.ModuleType("verl")
+        fake_verl.__path__ = []
+        fake_agent_trainer = types.ModuleType("verl.agent_trainer")
+        fake_agent_trainer.__path__ = []
+        fake_ppo = types.ModuleType("verl.agent_trainer.ppo")
+        fake_ppo.__path__ = []
         fake_trainer = types.ModuleType(
             "verl.agent_trainer.ppo.ray_trainer"
         )
         fake_trainer.RayPPOTrainer = object
+        fake_reference_policy = types.ModuleType(
+            "verl.agent_trainer.reference_policy"
+        )
+        fake_reference_policy.should_create_reference_policy = (
+            lambda _config: False
+        )
+        fake_verl.agent_trainer = fake_agent_trainer
+        fake_agent_trainer.ppo = fake_ppo
+        fake_ppo.ray_trainer = fake_trainer
+        fake_agent_trainer.reference_policy = fake_reference_policy
         with patch.dict(
             sys.modules,
             {
                 "ray": fake_ray,
                 "hydra": fake_hydra,
+                "verl": fake_verl,
+                "verl.agent_trainer": fake_agent_trainer,
+                "verl.agent_trainer.ppo": fake_ppo,
                 "verl.agent_trainer.ppo.ray_trainer": fake_trainer,
+                "verl.agent_trainer.reference_policy": fake_reference_policy,
             },
         ):
             return _load_module(_MAIN_PPO, "main_ppo_cache_env_under_test")
