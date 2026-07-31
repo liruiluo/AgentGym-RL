@@ -179,6 +179,57 @@ class OfficialVllmRuntimeConfigTests(unittest.TestCase):
             "official_vllm_kwargs['compilation_config']", source
         )
 
+    def test_prefix_cache_readback_and_telemetry(self):
+        module = self._load_runtime_config()
+        engine = types.SimpleNamespace(
+            llm_engine=types.SimpleNamespace(
+                vllm_config=types.SimpleNamespace(
+                    cache_config=types.SimpleNamespace(
+                        enable_prefix_caching=True
+                    )
+                )
+            )
+        )
+        self.assertIs(
+            module.read_official_vllm_prefix_caching(engine), True
+        )
+
+        outputs = [
+            types.SimpleNamespace(num_cached_tokens=64),
+            types.SimpleNamespace(num_cached_tokens=96),
+        ]
+        self.assertEqual(
+            module.summarize_prefix_cache_outputs(
+                outputs, prompt_token_counts=[128, 256]
+            ),
+            {
+                "requests": 2,
+                "prompt_tokens": 384,
+                "cached_tokens": 160,
+                "hit_fraction": 160 / 384,
+            },
+        )
+
+    def test_prefix_cache_telemetry_rejects_missing_counts(self):
+        module = self._load_runtime_config()
+        with self.assertRaisesRegex(RuntimeError, "num_cached_tokens"):
+            module.summarize_prefix_cache_outputs(
+                [types.SimpleNamespace(num_cached_tokens=None)],
+                prompt_token_counts=[128],
+            )
+
+    def test_rollout_forwards_prefix_cache_with_default_off(self):
+        source = _VLLM_ROLLOUT.read_text(encoding="utf-8")
+        self.assertIn(
+            "rollout_config.get('enable_prefix_caching', False)", source
+        )
+        self.assertIn(
+            "enable_prefix_caching=self._prefix_cache_requested", source
+        )
+        self.assertIn(
+            "Official vLLM prefix-cache readback mismatch", source
+        )
+
     @staticmethod
     def _fake_dynamic_triton():
         class CacheKnob:

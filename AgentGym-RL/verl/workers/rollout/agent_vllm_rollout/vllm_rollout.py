@@ -108,8 +108,10 @@ from verl.workers.rollout.agent_vllm_rollout.formal_buy_transition import (
     validate_formal_buy_transition,
 )
 from verl.workers.rollout.agent_vllm_rollout.vllm_runtime_config import (
+    read_official_vllm_prefix_caching,
     resolve_official_vllm_compilation_config,
     restore_training_triton_cache_after_vllm,
+    summarize_prefix_cache_outputs,
 )
 from verl.workers.rollout.schemas import (
     Message,
@@ -531,6 +533,15 @@ class vLLMRollout(BaseRollout):
         assert tensor_parallel_size <= torch.distributed.get_world_size(), \
             "tensor parallel size should be less than or equal to the world size"
         max_num_batched_tokens = self.config.get('max_num_batched_tokens', 8192)
+        self._prefix_cache_requested = bool(
+            rollout_config.get('enable_prefix_caching', False)
+        )
+        self._prefix_cache_telemetry = {
+            "batches": 0,
+            "requests": 0,
+            "prompt_tokens": 0,
+            "cached_tokens": 0,
+        }
 
         if kwargs.get('train_tp', None) is not None:
             # deployed with megatron
@@ -603,6 +614,7 @@ class vLLMRollout(BaseRollout):
                 max_num_seqs=rollout_config.get('max_num_seqs', None),
                 disable_log_stats=rollout_config.disable_log_stats,
                 enable_chunked_prefill=rollout_config.enable_chunked_prefill,
+                enable_prefix_caching=self._prefix_cache_requested,
                 enable_sleep_mode=rollout_config.get('enable_sleep_mode', False),
                 block_size=rollout_config.get('block_size', None),
                 language_model_only=rollout_config.get('language_model_only', False),
@@ -630,10 +642,26 @@ class vLLMRollout(BaseRollout):
                 f'enforce_eager={bool(rollout_config.enforce_eager)} '
                 f'free_cache_engine={bool(rollout_config.free_cache_engine)} '
                 f'enable_sleep_mode={bool(rollout_config.get("enable_sleep_mode", False))} '
+                f'enable_prefix_caching={self._prefix_cache_requested} '
                 f'compilation_config={compilation_config}',
                 flush=True,
             )
             self.inference_engine = LLM(**official_vllm_kwargs)
+            prefix_cache_readback = read_official_vllm_prefix_caching(
+                self.inference_engine
+            )
+            if prefix_cache_readback is not self._prefix_cache_requested:
+                raise RuntimeError(
+                    "Official vLLM prefix-cache readback mismatch: "
+                    f"requested={self._prefix_cache_requested} "
+                    f"readback={prefix_cache_readback!r}"
+                )
+            print(
+                "AgentMemoryGym official vLLM prefix-cache readback: "
+                f"requested={self._prefix_cache_requested} "
+                f"effective={prefix_cache_readback}",
+                flush=True,
+            )
             training_triton_cache = restore_training_triton_cache_after_vllm()
             if training_triton_cache is not None:
                 print(
@@ -740,11 +768,40 @@ class vLLMRollout(BaseRollout):
     def _generate_token_ids(self, generation_prompt_idxs, sampling_params):
         if self._official_vllm:
             prompts = [{"prompt_token_ids": list(ids)} for ids in generation_prompt_idxs]
-            return self.inference_engine.generate(
+            outputs = self.inference_engine.generate(
                 prompts=prompts,
                 sampling_params=sampling_params,
                 use_tqdm=False,
             )
+            if self._prefix_cache_requested:
+                batch_stats = summarize_prefix_cache_outputs(
+                    outputs,
+                    prompt_token_counts=[len(ids) for ids in generation_prompt_idxs],
+                )
+                telemetry = self._prefix_cache_telemetry
+                telemetry["batches"] += 1
+                for key in ("requests", "prompt_tokens", "cached_tokens"):
+                    telemetry[key] += int(batch_stats[key])
+                cumulative_fraction = (
+                    telemetry["cached_tokens"] / telemetry["prompt_tokens"]
+                    if telemetry["prompt_tokens"]
+                    else 0.0
+                )
+                print(
+                    "AgentMemoryGym vLLM prefix-cache telemetry: "
+                    + json.dumps(
+                        {
+                            "batch": batch_stats,
+                            "cumulative": {
+                                **telemetry,
+                                "hit_fraction": cumulative_fraction,
+                            },
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            return outputs
         return self.inference_engine.generate(
             prompts=None,
             prompt_token_ids=generation_prompt_idxs,

@@ -12,6 +12,57 @@ from typing import Any
 TRAINING_TRITON_CACHE_ENV = "VERL_TRAINING_TRITON_CACHE_DIR"
 
 
+def read_official_vllm_prefix_caching(inference_engine: Any) -> bool | None:
+    """Read the effective prefix-cache switch from an official vLLM engine."""
+    llm_engine = getattr(inference_engine, "llm_engine", None)
+    vllm_config = getattr(llm_engine, "vllm_config", None)
+    cache_config = getattr(vllm_config, "cache_config", None)
+    value = getattr(cache_config, "enable_prefix_caching", None)
+    return value if type(value) is bool else None
+
+
+def summarize_prefix_cache_outputs(
+    outputs: Sequence[Any],
+    *,
+    prompt_token_counts: Sequence[int],
+) -> dict[str, int | float]:
+    """Summarize vLLM RequestOutput cache telemetry for one generation call."""
+    if len(outputs) != len(prompt_token_counts):
+        raise ValueError(
+            "vLLM prefix-cache telemetry output/prompt count mismatch: "
+            f"outputs={len(outputs)} prompts={len(prompt_token_counts)}"
+        )
+
+    cached_tokens = 0
+    for output in outputs:
+        cached = getattr(output, "num_cached_tokens", None)
+        if type(cached) is not int:
+            raise RuntimeError(
+                "Enabled vLLM prefix caching requires integer "
+                "RequestOutput.num_cached_tokens telemetry."
+            )
+        if cached < 0:
+            raise RuntimeError(
+                f"vLLM returned negative num_cached_tokens={cached}."
+            )
+        cached_tokens += cached
+
+    prompt_tokens = sum(int(count) for count in prompt_token_counts)
+    if cached_tokens > prompt_tokens:
+        raise RuntimeError(
+            "vLLM prefix-cache telemetry exceeds prompt tokens: "
+            f"cached={cached_tokens} prompt={prompt_tokens}"
+        )
+    return {
+        "requests": len(outputs),
+        "prompt_tokens": prompt_tokens,
+        "cached_tokens": cached_tokens,
+        "hit_fraction": (
+            cached_tokens / prompt_tokens if prompt_tokens else 0.0
+        ),
+    }
+
+
 def resolve_official_vllm_compilation_config(
     *,
     enforce_eager: bool,
