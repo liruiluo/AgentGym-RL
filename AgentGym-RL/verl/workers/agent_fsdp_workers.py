@@ -315,7 +315,8 @@ class ActorRolloutRefWorker(Worker):
             mixed_precision=mixed_precision,
             sync_module_states=True,
             device_mesh=self.device_mesh,
-            forward_prefetch=False)
+            forward_prefetch=bool(
+                fsdp_config.get('forward_prefetch', False)))
 
         log_gpu_memory_usage('After Actor FSDP init', logger=logger)
 
@@ -864,7 +865,8 @@ class CriticWorker(Worker):
                              sharding_strategy=sharding_strategy,
                              mixed_precision=mixed_precision,
                              sync_module_states=True,
-                             forward_prefetch=False,
+                             forward_prefetch=bool(
+                                 fsdp_config.get('forward_prefetch', False)),
                              device_mesh=self.device_mesh,
                              cpu_offload=None)
 
