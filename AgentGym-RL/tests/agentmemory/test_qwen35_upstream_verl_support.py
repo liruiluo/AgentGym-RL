@@ -123,6 +123,7 @@ class OfficialVllmRuntimeConfigTests(unittest.TestCase):
     @staticmethod
     def _load_main_ppo():
         fake_ray = types.ModuleType("ray")
+        fake_ray.ObjectRef = object
         fake_ray.remote = lambda **_kwargs: lambda function: function
         fake_hydra = types.ModuleType("hydra")
         fake_hydra.main = lambda **_kwargs: lambda function: function
