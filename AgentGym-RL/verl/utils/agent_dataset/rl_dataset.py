@@ -107,7 +107,7 @@ class RLHFDataset(Dataset):
             )
 
     def _read_files_and_tokenize(self):
-        if self.procedural_index_source is not None:
+        if getattr(self, "procedural_index_source", None) is not None:
             self.dataframe = None
             print(
                 "procedural index dataset: "
@@ -118,7 +118,7 @@ class RLHFDataset(Dataset):
         print(f"dataset len: {len(self.dataframe)}")
 
     def resume_dataset_state(self):
-        if self.procedural_index_source is not None:
+        if getattr(self, "procedural_index_source", None) is not None:
             self.serialize_dataset = False
             return
         self.serialize_dataset = not hasattr(self, "original_data_file")
@@ -129,12 +129,12 @@ class RLHFDataset(Dataset):
             print(r"old dataloader ckpt file is used, please train from scratch for better ckpt performance")
 
     def __len__(self):
-        if self.procedural_index_source is not None:
+        if getattr(self, "procedural_index_source", None) is not None:
             return len(self.procedural_index_source)
         return len(self.dataframe)
 
     def _build_messages(self, example: dict):
-        if self.procedural_index_source is not None:
+        if getattr(self, "procedural_index_source", None) is not None:
             example["data_source"] = "agentmemory"
         else:
             example["data_source"] = example[self.prompt_key].split("_")[0]
@@ -147,7 +147,7 @@ class RLHFDataset(Dataset):
         """
         Note that we also return the raw_input_ids so that it can be combined with other chat template
         """
-        if self.procedural_index_source is not None:
+        if getattr(self, "procedural_index_source", None) is not None:
             row_dict = self.procedural_index_source.row_for_position(item)
         else:
             row_dict = self.dataframe[item]
@@ -181,7 +181,10 @@ class RLHFDataset(Dataset):
         if not self.serialize_dataset:
             state = self.__dict__.copy()
 
-            if "dataframe" in state and self.procedural_index_source is None:
+            if (
+                "dataframe" in state
+                and getattr(self, "procedural_index_source", None) is None
+            ):
                 del state["dataframe"]
             return state
 

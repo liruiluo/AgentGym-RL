@@ -3,10 +3,13 @@ import pickle
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import dill
 import numpy as np
 import torch
+
+from verl.utils.agent_dataset.rl_dataset import RLHFDataset
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -63,6 +66,21 @@ def _keyword_literal(call, name):
 
 
 class NativeCheckpointTrustedLoadTest(unittest.TestCase):
+    def test_legacy_rlhf_dataset_without_procedural_attribute_can_resume(self):
+        dataset = RLHFDataset.__new__(RLHFDataset)
+        dataset.original_data_file = "legacy.json"
+        dataset.serialize_dataset = True
+        self.assertFalse(hasattr(dataset, "procedural_index_source"))
+
+        with mock.patch.object(
+            RLHFDataset,
+            "_read_files_and_tokenize",
+        ) as read_files:
+            dataset.resume_dataset_state()
+
+        self.assertFalse(dataset.serialize_dataset)
+        read_files.assert_called_once_with()
+
     def test_dill_dataloader_checkpoint_round_trips_resume_state(self):
         generator = torch.Generator().manual_seed(17)
         loader = torch.utils.data.DataLoader(
