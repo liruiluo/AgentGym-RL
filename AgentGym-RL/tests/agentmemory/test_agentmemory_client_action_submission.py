@@ -22,7 +22,7 @@ def procedural_metadata():
         "accepted_index_domain": "all_nonnegative_integers",
         "memory_prompt_mode": "neutral",
         "provider": {
-            "schema": "agentmemory_verified_natural_chain_provider_v3",
+            "schema": "agentmemory_verified_natural_chain_provider_v4",
             "provider_mode": "reseeded_stream",
             "task_count": 64,
             "accepted_index_domain": "all_nonnegative_integers",
@@ -41,6 +41,10 @@ def procedural_metadata():
             },
             "human_review_required": False,
             "llm_judge_required": False,
+            "task_prompt_product_identity": "complete_native_title",
+            "target_asin_in_task_prompt": False,
+            "native_search_result_asin_handles_visible": True,
+            "native_click_action_uses_asin_handle": True,
         },
     }
 
@@ -164,6 +168,15 @@ class ProceduralAgentMemoryClientContractTest(unittest.TestCase):
             ),
             "llm_judge": lambda value: value["provider"].update(
                 llm_judge_required=True
+            ),
+            "target_asin_leak": lambda value: value["provider"].update(
+                target_asin_in_task_prompt=True
+            ),
+            "hidden_search_handles": lambda value: value["provider"].update(
+                native_search_result_asin_handles_visible=False
+            ),
+            "non_native_click": lambda value: value["provider"].update(
+                native_click_action_uses_asin_handle=False
             ),
             "provider_mode": lambda value: value.update(provider_mode="fixed_window"),
             "task_count": lambda value: value["provider"].update(task_count=62),

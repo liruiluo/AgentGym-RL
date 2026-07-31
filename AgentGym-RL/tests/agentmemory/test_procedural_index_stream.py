@@ -56,7 +56,7 @@ def server_metadata(*, generator_seed: int = 233) -> dict:
         "memory_prompt_mode": "neutral",
         "reward_contract": {"correct_purchase": 1.0},
         "provider": {
-            "schema": "agentmemory_verified_natural_chain_provider_v3",
+            "schema": "agentmemory_verified_natural_chain_provider_v4",
             "provider_mode": PROVIDER_MODE_RESEEDED_STREAM,
             "task_count": 64,
             "accepted_index_domain": "all_nonnegative_integers",
@@ -78,6 +78,10 @@ def server_metadata(*, generator_seed: int = 233) -> dict:
             },
             "human_review_required": False,
             "llm_judge_required": False,
+            "task_prompt_product_identity": "complete_native_title",
+            "target_asin_in_task_prompt": False,
+            "native_search_result_asin_handles_visible": True,
+            "native_click_action_uses_asin_handle": True,
         },
         "backend": {
             "price_seed": 233,
@@ -213,6 +217,24 @@ class ProceduralIndexSourceTests(unittest.TestCase):
         ] = 198
         with self.assertRaisesRegex(ProceduralIndexError, "stream epoch"):
             source.validate_server_metadata(bad_stream)
+        for field, value, error in (
+            ("target_asin_in_task_prompt", True, "target ASIN"),
+            (
+                "native_search_result_asin_handles_visible",
+                False,
+                "search-result ASIN handles",
+            ),
+            (
+                "native_click_action_uses_asin_handle",
+                False,
+                r"click\[ASIN\]",
+            ),
+        ):
+            with self.subTest(field=field):
+                bad_native_contract = deepcopy(metadata)
+                bad_native_contract["provider"][field] = value
+                with self.assertRaisesRegex(ProceduralIndexError, error):
+                    source.validate_server_metadata(bad_native_contract)
 
     def test_batch_indices_preserve_complete_adjacent_orbits(self) -> None:
         validate_paired_batch_indices([200, 201, 202, 203])

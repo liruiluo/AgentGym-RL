@@ -328,7 +328,7 @@ class ProceduralIndexSource:
         provider = metadata.get("provider")
         if not isinstance(provider, Mapping):
             raise ProceduralIndexError("server metadata is missing provider")
-        if provider.get("schema") != "agentmemory_verified_natural_chain_provider_v3":
+        if provider.get("schema") != "agentmemory_verified_natural_chain_provider_v4":
             raise ProceduralIndexError("server provider schema is unsupported")
         if provider.get("provider_mode") != self.provider_mode:
             raise ProceduralIndexError(
@@ -348,6 +348,16 @@ class ProceduralIndexSource:
             raise ProceduralIndexError("server unexpectedly requires human review")
         if provider.get("llm_judge_required") is not False:
             raise ProceduralIndexError("server unexpectedly requires an LLM judge")
+        if provider.get("task_prompt_product_identity") != "complete_native_title":
+            raise ProceduralIndexError("server task prompt identity is unsupported")
+        if provider.get("target_asin_in_task_prompt") is not False:
+            raise ProceduralIndexError("server task prompt leaks the target ASIN")
+        if provider.get("native_search_result_asin_handles_visible") is not True:
+            raise ProceduralIndexError(
+                "server no longer exposes native search-result ASIN handles"
+            )
+        if provider.get("native_click_action_uses_asin_handle") is not True:
+            raise ProceduralIndexError("server no longer uses native click[ASIN]")
         semantic_period_orbits = provider.get("semantic_period_orbits")
         semantic_period_tasks = provider.get("semantic_period_tasks")
         if (
