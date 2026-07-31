@@ -196,3 +196,20 @@ def zero_padding_response_outputs(
         raise ValueError("padding-only output mask must not contain valid tokens.")
     dependency = selected_logits.float().sum() * 0.0
     return dependency.expand(output_response_mask.shape)
+
+
+def zero_padding_selected_outputs(
+    selected_values: torch.Tensor,
+    output_response_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Return graph-connected zeros from one fused dummy-token output."""
+
+    if selected_values.ndim != 1 or selected_values.numel() != 1:
+        raise ValueError(
+            "padding-only fused projection must keep one dummy value: "
+            f"values_shape={tuple(selected_values.shape)}."
+        )
+    if torch.any(output_response_mask):
+        raise ValueError("padding-only output mask must not contain valid tokens.")
+    dependency = selected_values.float().sum() * 0.0
+    return dependency.expand(output_response_mask.shape)

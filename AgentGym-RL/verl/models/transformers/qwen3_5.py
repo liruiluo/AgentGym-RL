@@ -11,12 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Packed-sequence training forwards for Qwen3.5.
+"""Packed-sequence and response-only fused PPO forwards for Qwen3.5.
 
 This is a focused backport of verl commits 3ba8181 and 6a6242f.  AgentGym-RL
-uses the text-only Qwen3.5 model for actor and critic training, so the
-multimodal wrapper and fused PPO-head paths from current verl are intentionally
-kept out of this compatibility module.
+uses the text-only Qwen3.5 model for actor and critic training. The private
+response-only dispatch combines AgentGym-RL's response-position selection with
+VERL's fused linear cross-entropy kernels, without changing ordinary HF model
+forwards.
 """
 
 from importlib import import_module
@@ -34,6 +35,16 @@ from verl.utils.ulysses import (
 
 
 QWEN35_MODEL_TYPES = frozenset({"qwen3_5", "qwen3_5_text"})
+RESPONSE_FUSED_KERNEL_BACKENDS = frozenset({"torch", "triton"})
+_ORIGINAL_CAUSAL_LM_FORWARD_ATTR = "_verl_qwen35_original_forward"
+
+
+class Qwen3_5ResponseFusedPPOOutput:
+    """Selected-token PPO outputs without a full-vocabulary logits tensor."""
+
+    def __init__(self, *, log_probs: torch.Tensor, entropy: torch.Tensor):
+        self.log_probs = log_probs
+        self.entropy = entropy
 
 
 def is_qwen3_5_model_type(model_type: str) -> bool:
@@ -49,16 +60,143 @@ def apply_qwen3_5_packed_forward_patch() -> bool:
 
     from transformers.models.qwen3_5.modeling_qwen3_5 import (
         Qwen3_5DecoderLayer,
+        Qwen3_5ForCausalLM,
         Qwen3_5GatedDeltaNet,
     )
 
     already_patched = (
         Qwen3_5DecoderLayer.forward is qwen3_5_decoder_layer_forward
         and Qwen3_5GatedDeltaNet.forward is qwen3_5_gated_delta_net_forward
+        and Qwen3_5ForCausalLM.forward is qwen3_5_causal_lm_forward_dispatch
     )
+    if not hasattr(Qwen3_5ForCausalLM, _ORIGINAL_CAUSAL_LM_FORWARD_ATTR):
+        setattr(
+            Qwen3_5ForCausalLM,
+            _ORIGINAL_CAUSAL_LM_FORWARD_ATTR,
+            Qwen3_5ForCausalLM.forward,
+        )
     Qwen3_5DecoderLayer.forward = qwen3_5_decoder_layer_forward
     Qwen3_5GatedDeltaNet.forward = qwen3_5_gated_delta_net_forward
+    Qwen3_5ForCausalLM.forward = qwen3_5_causal_lm_forward_dispatch
     return not already_patched
+
+
+def qwen3_5_causal_lm_forward_dispatch(self, *args, **kwargs):
+    """Route only explicitly marked PPO calls through the fused response head."""
+
+    use_response_fused_ppo = bool(
+        kwargs.pop("_verl_response_fused_ppo", False)
+    )
+    if use_response_fused_ppo:
+        return qwen3_5_text_response_fused_ppo_forward(self, *args, **kwargs)
+    original_forward = getattr(type(self), _ORIGINAL_CAUSAL_LM_FORWARD_ATTR)
+    return original_forward(self, *args, **kwargs)
+
+
+def qwen3_5_text_response_fused_ppo_forward(
+    self,
+    input_ids: Optional[torch.LongTensor] = None,
+    temperature: float = 1.0,
+    response_positions: Optional[torch.LongTensor] = None,
+    response_labels: Optional[torch.LongTensor] = None,
+    response_fused_kernel_backend: str = "triton",
+    cu_seqlens: Optional[torch.LongTensor] = None,
+    cu_seqlens_cpu: Optional[torch.LongTensor] = None,
+    **kwargs,
+) -> Qwen3_5ResponseFusedPPOOutput:
+    """Project selected response states directly to PPO log-prob and entropy."""
+
+    if input_ids is None or input_ids.ndim != 2 or input_ids.shape[0] != 1:
+        raise ValueError(
+            "Qwen3.5 response-fused PPO requires one packed input row, got "
+            f"{None if input_ids is None else tuple(input_ids.shape)}."
+        )
+    if not isinstance(temperature, (int, float)) or float(temperature) <= 0:
+        raise ValueError(
+            "Qwen3.5 response-fused PPO requires a positive scalar temperature."
+        )
+    if response_positions is None or response_labels is None:
+        raise ValueError(
+            "Qwen3.5 response-fused PPO requires response positions and labels."
+        )
+    if response_positions.ndim != 1 or response_labels.ndim != 1:
+        raise ValueError("Response positions and labels must both be rank-1.")
+    if response_positions.shape != response_labels.shape:
+        raise ValueError(
+            "Response positions and labels must have identical shapes: "
+            f"positions={tuple(response_positions.shape)} "
+            f"labels={tuple(response_labels.shape)}."
+        )
+    if response_positions.numel() == 0:
+        raise ValueError("Response-fused PPO received no selected tokens.")
+
+    backend = str(response_fused_kernel_backend).lower()
+    if backend not in RESPONSE_FUSED_KERNEL_BACKENDS:
+        raise ValueError(
+            "Unsupported response-fused PPO backend "
+            f"{response_fused_kernel_backend!r}; expected one of "
+            f"{sorted(RESPONSE_FUSED_KERNEL_BACKENDS)}."
+        )
+    if cu_seqlens is not None:
+        kwargs["cu_seqlens"] = cu_seqlens
+    if cu_seqlens_cpu is not None:
+        kwargs["cu_seqlens_cpu"] = cu_seqlens_cpu
+    kwargs.pop("logits_to_keep", None)
+
+    outputs = self.model(input_ids=input_ids, **kwargs)
+    hidden_states = outputs[0]
+    if hidden_states.ndim != 3 or hidden_states.shape[0] != 1:
+        raise RuntimeError(
+            "Qwen3.5 packed model returned an unexpected hidden-state shape: "
+            f"{tuple(hidden_states.shape)}."
+        )
+
+    positions = response_positions.to(
+        device=hidden_states.device,
+        dtype=torch.long,
+    ).contiguous()
+    labels = response_labels.to(
+        device=hidden_states.device,
+        dtype=torch.long,
+    ).contiguous()
+    if torch.any(positions < 0) or torch.any(positions >= hidden_states.shape[1]):
+        raise ValueError(
+            "A response predecessor position falls outside the packed hidden states."
+        )
+    selected_hidden = hidden_states.squeeze(0).index_select(0, positions).contiguous()
+
+    vocab_weights = self.lm_head.weight
+    if hasattr(vocab_weights, "full_tensor"):
+        vocab_weights = vocab_weights.full_tensor()
+    if not vocab_weights.is_contiguous():
+        raise RuntimeError("Qwen3.5 LM-head weights must be contiguous for fused PPO.")
+    if torch.any(labels < 0) or torch.any(labels >= vocab_weights.shape[0]):
+        raise ValueError("A response label falls outside the model vocabulary.")
+    selected_hidden = selected_hidden.to(vocab_weights.dtype)
+
+    if backend == "triton":
+        from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
+
+        log_probs, entropy = linear_cross_entropy(
+            selected_hidden,
+            vocab_weights,
+            labels,
+            float(temperature),
+            "none",
+        )
+    else:
+        from verl.utils.experimental.torch_functional import FusedLinearForPPO
+
+        log_probs, entropy = FusedLinearForPPO()(
+            hidden_states=selected_hidden,
+            vocab_weights=vocab_weights,
+            input_ids=labels,
+            temperature=float(temperature),
+        )
+    return Qwen3_5ResponseFusedPPOOutput(
+        log_probs=log_probs,
+        entropy=entropy,
+    )
 
 
 def _call_accepts_kwarg(fn, name: str) -> bool:

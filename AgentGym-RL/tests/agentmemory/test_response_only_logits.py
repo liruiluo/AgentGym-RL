@@ -8,6 +8,7 @@ from verl.workers.response_only_logits import (
     build_response_projection_plan,
     scatter_response_outputs,
     zero_padding_response_outputs,
+    zero_padding_selected_outputs,
 )
 
 
@@ -204,6 +205,18 @@ class ResponseProjectionPlanTest(unittest.TestCase):
         self.assertEqual(plan.packed_predecessor_positions.tolist(), [0])
         self.assertEqual(plan.response_mask.sum().item(), 0)
         self.assertEqual(plan.output_response_mask.sum().item(), 0)
+
+    def test_padding_only_fused_outputs_keep_graph_connection(self):
+        output_mask = torch.zeros(2, 3, dtype=torch.bool)
+        selected = torch.randn(1, requires_grad=True)
+
+        outputs = zero_padding_selected_outputs(selected, output_mask)
+
+        self.assertEqual(tuple(outputs.shape), tuple(output_mask.shape))
+        self.assertTrue(torch.equal(outputs, torch.zeros_like(outputs)))
+        outputs.sum().backward()
+        self.assertIsNotNone(selected.grad)
+        self.assertTrue(torch.equal(selected.grad, torch.zeros_like(selected)))
 
     def test_mixed_valid_and_padding_rows_project_only_valid_responses(self):
         input_ids, attention_mask, responses, response_mask, indices = _fixture()

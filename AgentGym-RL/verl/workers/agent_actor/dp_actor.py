@@ -37,7 +37,10 @@ from verl.workers.ppo_token_normalization import (
     valid_response_token_count,
     validate_worker_batch_readback,
 )
-from verl.models.transformers.qwen3_5 import is_qwen3_5_model_type
+from verl.models.transformers.qwen3_5 import (
+    RESPONSE_FUSED_KERNEL_BACKENDS,
+    is_qwen3_5_model_type,
+)
 from verl.workers.qwen35_runtime import (
     model_type_from_module,
     qwen3_5_packed_forward_kwargs,
@@ -46,6 +49,7 @@ from verl.workers.response_only_logits import (
     build_response_projection_plan,
     scatter_response_outputs,
     zero_padding_response_outputs,
+    zero_padding_selected_outputs,
 )
 import verl.utils.torch_functional as verl_F
 
@@ -73,6 +77,26 @@ class DataParallelPPOActor(BasePPOActor):
         self.use_response_only_logits = bool(
             self.config.get('use_response_only_logits', False)
         )
+        self.use_response_fused_kernels = bool(
+            self.config.get('use_response_fused_kernels', False)
+        )
+        self.response_fused_kernel_backend = str(
+            self.config.get('response_fused_kernel_backend', 'triton')
+        ).lower()
+        if self.use_response_fused_kernels and not self.use_response_only_logits:
+            raise ValueError(
+                "Response-fused PPO kernels require use_response_only_logits=true."
+            )
+        if (
+            self.use_response_fused_kernels
+            and self.response_fused_kernel_backend
+            not in RESPONSE_FUSED_KERNEL_BACKENDS
+        ):
+            raise ValueError(
+                "Unsupported response-fused PPO backend "
+                f"{self.response_fused_kernel_backend!r}; expected one of "
+                f"{sorted(RESPONSE_FUSED_KERNEL_BACKENDS)}."
+            )
         if self.use_response_only_logits:
             model_type = model_type_from_module(self.actor_module)
             if not is_qwen3_5_model_type(model_type):
@@ -89,6 +113,11 @@ class DataParallelPPOActor(BasePPOActor):
                     "Response-only PPO logits require Ulysses sequence parallel size 1."
                 )
         print(f'Actor use_response_only_logits={self.use_response_only_logits}')
+        print(
+            'Actor use_response_fused_kernels='
+            f'{self.use_response_fused_kernels} '
+            f'backend={self.response_fused_kernel_backend}'
+        )
         self._response_only_readback_logged = False
 
         self.compute_entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=True)
@@ -146,49 +175,102 @@ class DataParallelPPOActor(BasePPOActor):
                             core_algos.PPO_VALID_SAMPLE_MASK
                         ),
                     )
-                    output = self.actor_module(
-                        input_ids=input_ids_rmpad,
-                        attention_mask=None,
-                        position_ids=position_ids_rmpad,
-                        use_cache=False,
-                        logits_to_keep=projection.packed_predecessor_positions,
-                        **packed_forward_kwargs,
-                    )
-                    selected_logits = output.logits.squeeze(0)
-                    expected_shape = (
-                        projection.labels.numel(),
-                        selected_logits.shape[-1],
-                    )
-                    if tuple(selected_logits.shape) != expected_shape:
-                        raise RuntimeError(
-                            "Qwen3.5 response-only LM head returned an unexpected "
-                            f"shape: logits={tuple(selected_logits.shape)} "
-                            f"expected={expected_shape}."
+                    if self.use_response_fused_kernels:
+                        output = self.actor_module(
+                            input_ids=input_ids_rmpad,
+                            attention_mask=None,
+                            position_ids=position_ids_rmpad,
+                            use_cache=False,
+                            _verl_response_fused_ppo=True,
+                            response_positions=(
+                                projection.packed_predecessor_positions
+                            ),
+                            response_labels=projection.labels,
+                            response_fused_kernel_backend=(
+                                self.response_fused_kernel_backend
+                            ),
+                            temperature=float(temperature),
+                            **packed_forward_kwargs,
                         )
-                    if projection.padding_only:
-                        zero_outputs = zero_padding_response_outputs(
-                            selected_logits,
-                            projection.output_response_mask,
-                        )
-                        entropy = zero_outputs
-                        log_probs = zero_outputs
+                        selected_log_probs = output.log_probs
+                        selected_entropy = output.entropy
+                        expected_shape = (projection.labels.numel(),)
+                        if (
+                            tuple(selected_log_probs.shape) != expected_shape
+                            or tuple(selected_entropy.shape) != expected_shape
+                        ):
+                            raise RuntimeError(
+                                "Qwen3.5 response-fused head returned an "
+                                "unexpected shape: "
+                                f"log_probs={tuple(selected_log_probs.shape)} "
+                                f"entropy={tuple(selected_entropy.shape)} "
+                                f"expected={expected_shape}."
+                            )
+                        if projection.padding_only:
+                            entropy = zero_padding_selected_outputs(
+                                selected_entropy,
+                                projection.output_response_mask,
+                            )
+                            log_probs = zero_padding_selected_outputs(
+                                selected_log_probs,
+                                projection.output_response_mask,
+                            )
+                        else:
+                            entropy = scatter_response_outputs(
+                                selected_entropy,
+                                projection.response_mask,
+                            )
+                            log_probs = scatter_response_outputs(
+                                selected_log_probs,
+                                projection.response_mask,
+                            )
                     else:
-                        selected_logits.div_(temperature)
-                        selected_entropy = self.compute_entropy_from_logits(
-                            selected_logits
+                        output = self.actor_module(
+                            input_ids=input_ids_rmpad,
+                            attention_mask=None,
+                            position_ids=position_ids_rmpad,
+                            use_cache=False,
+                            logits_to_keep=(
+                                projection.packed_predecessor_positions
+                            ),
+                            **packed_forward_kwargs,
                         )
-                        selected_log_probs = logprobs_from_logits(
-                            logits=selected_logits,
-                            labels=projection.labels,
+                        selected_logits = output.logits.squeeze(0)
+                        expected_shape = (
+                            projection.labels.numel(),
+                            selected_logits.shape[-1],
                         )
-                        entropy = scatter_response_outputs(
-                            selected_entropy,
-                            projection.response_mask,
-                        )
-                        log_probs = scatter_response_outputs(
-                            selected_log_probs,
-                            projection.response_mask,
-                        )
+                        if tuple(selected_logits.shape) != expected_shape:
+                            raise RuntimeError(
+                                "Qwen3.5 response-only LM head returned an "
+                                "unexpected shape: "
+                                f"logits={tuple(selected_logits.shape)} "
+                                f"expected={expected_shape}."
+                            )
+                        if projection.padding_only:
+                            zero_outputs = zero_padding_response_outputs(
+                                selected_logits,
+                                projection.output_response_mask,
+                            )
+                            entropy = zero_outputs
+                            log_probs = zero_outputs
+                        else:
+                            selected_logits.div_(temperature)
+                            selected_entropy = self.compute_entropy_from_logits(
+                                selected_logits
+                            )
+                            selected_log_probs = logprobs_from_logits(
+                                logits=selected_logits,
+                                labels=projection.labels,
+                            )
+                            entropy = scatter_response_outputs(
+                                selected_entropy,
+                                projection.response_mask,
+                            )
+                            log_probs = scatter_response_outputs(
+                                selected_log_probs,
+                                projection.response_mask,
+                            )
                     if (
                         not projection.padding_only
                         and not self._response_only_readback_logged
@@ -199,6 +281,8 @@ class DataParallelPPOActor(BasePPOActor):
                             "Response-only PPO logits readback: "
                             f"role={role} packed_tokens={projection.packed_token_count} "
                             f"selected_response_tokens={selected_count} "
+                            "fused_backend="
+                            f"{self.response_fused_kernel_backend if self.use_response_fused_kernels else 'none'} "
                             "projection_reduction_ratio="
                             f"{projection.packed_token_count / selected_count:.6f}"
                         )

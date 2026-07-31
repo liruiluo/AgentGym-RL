@@ -20,6 +20,8 @@ actor_rollout_ref:
     enable_gradient_checkpointing: True
     use_remove_padding: False
     use_response_only_logits: False
+    use_response_fused_kernels: False
+    response_fused_kernel_backend: triton
   actor:
     strategy: fsdp  # This is for backward-compatibility
     ppo_mini_batch_size: 256
@@ -37,6 +39,8 @@ actor_rollout_ref:
     shuffle: False
     ulysses_sequence_parallel_size: 1 # sp size
     use_response_only_logits: ${actor_rollout_ref.model.use_response_only_logits}
+    use_response_fused_kernels: ${actor_rollout_ref.model.use_response_fused_kernels}
+    response_fused_kernel_backend: ${actor_rollout_ref.model.response_fused_kernel_backend}
     optim:
       lr: 1e-6
       lr_warmup_steps_ratio: 0.  # the total steps will be injected during runtime
@@ -63,6 +67,8 @@ actor_rollout_ref:
     log_prob_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
     ulysses_sequence_parallel_size: ${actor_rollout_ref.actor.ulysses_sequence_parallel_size} # sp size
     use_response_only_logits: ${actor_rollout_ref.model.use_response_only_logits}
+    use_response_fused_kernels: ${actor_rollout_ref.model.use_response_fused_kernels}
+    response_fused_kernel_backend: ${actor_rollout_ref.model.response_fused_kernel_backend}
   agentgym:
       task_name: textcraft # Training task name of AgentGym.
       env_addr: 'http://localhost:5000' # URL of the AgentGym environment server.

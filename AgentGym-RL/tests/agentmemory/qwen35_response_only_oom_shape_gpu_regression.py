@@ -76,6 +76,16 @@ def main() -> None:
         default=1,
         help="Repeat the historical four-row OOM block for larger micro-batch stress.",
     )
+    parser.add_argument(
+        "--fused",
+        action="store_true",
+        help="Use the response-only fused PPO head instead of selected logits.",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=("torch", "triton"),
+        default="triton",
+    )
     args = parser.parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -102,6 +112,8 @@ def main() -> None:
             use_remove_padding=True,
             ulysses_sequence_parallel_size=1,
             use_response_only_logits=True,
+            use_response_fused_kernels=args.fused,
+            response_fused_kernel_backend=args.backend,
         ),
         actor_module=model,
     )
@@ -156,6 +168,8 @@ def main() -> None:
         "model": args.model,
         "batch_rows": int(micro_batch["input_ids"].shape[0]),
         "historical_block_repeat": args.repeat,
+        "response_fused_kernels": args.fused,
+        "response_fused_kernel_backend": args.backend if args.fused else None,
         "packed_tokens": packed_tokens,
         "selected_response_tokens": response_tokens,
         "projection_reduction_ratio": packed_tokens / response_tokens,
