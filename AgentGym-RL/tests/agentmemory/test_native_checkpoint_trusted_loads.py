@@ -140,7 +140,7 @@ class NativeCheckpointTrustedLoadTest(unittest.TestCase):
         }
         self.assertEqual(
             explicit_trusted_loads,
-            {"fsdp:extra_state_dict", "trainer:train_dataloader"},
+            {"fsdp:extra_state_dict", "trainer:dataloader_state"},
         )
 
     def test_model_and_optimizer_loads_keep_weights_only_default(self):
