@@ -81,12 +81,9 @@ def main() -> None:
                 continue
             flat = parameter.grad.detach().flatten()
             count = min(64, flat.numel())
-            indices = torch.linspace(
-                0,
-                flat.numel() - 1,
-                steps=count,
-                device=flat.device,
-            ).to(torch.long)
+            indices = torch.arange(count, device=flat.device, dtype=torch.long)
+            if count > 1:
+                indices = indices * (flat.numel() - 1) // (count - 1)
             samples[name] = flat.index_select(0, indices).float().cpu()
             if len(samples) == 12:
                 break
