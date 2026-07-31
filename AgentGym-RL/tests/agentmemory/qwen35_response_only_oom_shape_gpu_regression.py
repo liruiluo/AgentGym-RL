@@ -86,6 +86,10 @@ def main() -> None:
         choices=("torch", "triton"),
         default="triton",
     )
+    parser.add_argument(
+        "--tensor-output",
+        help="Optional path for selected response log-probability and entropy tensors.",
+    )
     args = parser.parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -162,6 +166,21 @@ def main() -> None:
     if finite_gradient_parameters == 0 or nonzero_gradient_parameters == 0:
         raise RuntimeError("response-only backward produced no parameter gradients")
 
+    if args.tensor_output:
+        valid_response_mask = micro_batch["response_mask"].bool()
+        torch.save(
+            {
+                "log_probs": log_probs[valid_response_mask].detach().float().cpu(),
+                "entropy": entropy[valid_response_mask].detach().float().cpu(),
+                "loss": loss.detach().float().cpu(),
+                "packed_tokens": packed_tokens,
+                "response_tokens": response_tokens,
+                "fused": args.fused,
+                "backend": args.backend if args.fused else None,
+            },
+            args.tensor_output,
+        )
+
     result = {
         "status": "pass",
         "device": str(device),
@@ -189,6 +208,7 @@ def main() -> None:
         "loss": float(loss.detach().item()),
         "finite_gradient_parameters": finite_gradient_parameters,
         "nonzero_gradient_parameters": nonzero_gradient_parameters,
+        "tensor_output": args.tensor_output,
     }
     print(json.dumps(result, sort_keys=True))
 
