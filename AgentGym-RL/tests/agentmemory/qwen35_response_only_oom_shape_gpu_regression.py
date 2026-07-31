@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import json
 import time
 
@@ -90,6 +91,27 @@ def main() -> None:
         "--tensor-output",
         help="Optional path for selected response log-probability and entropy tensors.",
     )
+    parser.add_argument(
+        "--skip-entropy",
+        action="store_true",
+        help="Skip entropy in the model forward, as compute_log_prob does.",
+    )
+    parser.add_argument(
+        "--entropy-coeff",
+        type=float,
+        default=0.001,
+        help="Entropy coefficient used by the synthetic backward loss.",
+    )
+    parser.add_argument(
+        "--attach-zero-entropy",
+        action="store_true",
+        help="Keep 0 * entropy in the graph to reproduce the legacy zero-coefficient path.",
+    )
+    parser.add_argument(
+        "--forward-only",
+        action="store_true",
+        help="Measure a no-grad log-probability forward without backward.",
+    )
     args = parser.parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -139,20 +161,40 @@ def main() -> None:
 
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(device)
+    torch.cuda.synchronize(device)
     forward_started = time.perf_counter()
-    entropy, log_probs = actor._forward_micro_batch(micro_batch, temperature=1.0)
+    grad_context = torch.no_grad() if args.forward_only else nullcontext()
+    with grad_context:
+        entropy, log_probs = actor._forward_micro_batch(
+            micro_batch,
+            temperature=1.0,
+            calculate_entropy=not args.skip_entropy,
+        )
+    torch.cuda.synchronize(device)
     forward_seconds = time.perf_counter() - forward_started
     if not torch.isfinite(log_probs[micro_batch["response_mask"].bool()]).all():
         raise RuntimeError("response-only log probabilities are non-finite")
-    if not torch.isfinite(entropy[micro_batch["response_mask"].bool()]).all():
-        raise RuntimeError("response-only entropy is non-finite")
+    if args.skip_entropy:
+        if entropy is not None:
+            raise RuntimeError("skip-entropy forward unexpectedly returned entropy")
+    elif entropy is None or not torch.isfinite(
+        entropy[micro_batch["response_mask"].bool()]
+    ).all():
+        raise RuntimeError("response-only entropy is missing or non-finite")
 
-    loss = -(
-        (log_probs + 0.001 * entropy) * micro_batch["response_mask"]
-    ).sum() / response_tokens
-    backward_started = time.perf_counter()
-    loss.backward()
-    backward_seconds = time.perf_counter() - backward_started
+    loss_terms = log_probs
+    if entropy is not None and (
+        args.entropy_coeff != 0 or args.attach_zero_entropy
+    ):
+        loss_terms = loss_terms + args.entropy_coeff * entropy
+    loss = -(loss_terms * micro_batch["response_mask"]).sum() / response_tokens
+    backward_seconds = 0.0
+    if not args.forward_only:
+        torch.cuda.synchronize(device)
+        backward_started = time.perf_counter()
+        loss.backward()
+        torch.cuda.synchronize(device)
+        backward_seconds = time.perf_counter() - backward_started
     finite_gradient_parameters = 0
     nonzero_gradient_parameters = 0
     for parameter in model.parameters():
@@ -163,7 +205,9 @@ def main() -> None:
         finite_gradient_parameters += 1
         if parameter.grad.detach().abs().sum().item() > 0:
             nonzero_gradient_parameters += 1
-    if finite_gradient_parameters == 0 or nonzero_gradient_parameters == 0:
+    if not args.forward_only and (
+        finite_gradient_parameters == 0 or nonzero_gradient_parameters == 0
+    ):
         raise RuntimeError("response-only backward produced no parameter gradients")
 
     if args.tensor_output:
@@ -171,7 +215,11 @@ def main() -> None:
         torch.save(
             {
                 "log_probs": log_probs[valid_response_mask].detach().float().cpu(),
-                "entropy": entropy[valid_response_mask].detach().float().cpu(),
+                "entropy": (
+                    None
+                    if entropy is None
+                    else entropy[valid_response_mask].detach().float().cpu()
+                ),
                 "loss": loss.detach().float().cpu(),
                 "packed_tokens": packed_tokens,
                 "response_tokens": response_tokens,
@@ -189,6 +237,10 @@ def main() -> None:
         "historical_block_repeat": args.repeat,
         "response_fused_kernels": args.fused,
         "response_fused_kernel_backend": args.backend if args.fused else None,
+        "calculate_entropy": not args.skip_entropy,
+        "entropy_coeff": args.entropy_coeff,
+        "attach_zero_entropy": args.attach_zero_entropy,
+        "forward_only": args.forward_only,
         "packed_tokens": packed_tokens,
         "selected_response_tokens": response_tokens,
         "projection_reduction_ratio": packed_tokens / response_tokens,
