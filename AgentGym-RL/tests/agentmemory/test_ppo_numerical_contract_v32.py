@@ -19,6 +19,7 @@ from verl.workers.ppo_token_normalization import (
     optimizer_step_readback,
     scale_token_mean_loss,
     summarize_dynamic_micro_batches,
+    validate_dynamic_batch_token_caps,
     valid_response_token_count,
     validate_worker_batch_readback,
 )
@@ -353,7 +354,7 @@ class BatchContractTest(unittest.TestCase):
             "rollout_logprob": True,
         }
         token_caps = {
-            "actor": 81920,
+            "actor": 131072,
             "critic": 163840,
             "critic_forward": 262144,
             "reference_logprob": 131072,
@@ -383,6 +384,47 @@ class BatchContractTest(unittest.TestCase):
         self.assertEqual(
             optimizer_step_readback(contract, 648)["actor_optimizer_steps"],
             2,
+        )
+
+    def test_dynamic_batch_token_cap_covers_padded_sequence(self):
+        roles = {
+            "actor": True,
+            "critic": True,
+            "critic_forward": True,
+            "reference_logprob": False,
+            "rollout_logprob": True,
+        }
+        caps = {
+            "actor": 131072,
+            "critic": 163840,
+            "critic_forward": 262144,
+            "reference_logprob": 131072,
+            "rollout_logprob": 131072,
+        }
+        sequence_parallel_sizes = {role: 1 for role in roles}
+        validate_dynamic_batch_token_caps(
+            dynamic_roles=roles,
+            dynamic_max_token_lens=caps,
+            sequence_parallel_sizes=sequence_parallel_sizes,
+            padded_sequence_length=126976,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "actor.*effective token cap.*81920.*126976"
+        ):
+            validate_dynamic_batch_token_caps(
+                dynamic_roles=roles,
+                dynamic_max_token_lens=dict(caps, actor=81920),
+                sequence_parallel_sizes=sequence_parallel_sizes,
+                padded_sequence_length=126976,
+            )
+
+    def test_dynamic_batch_token_cap_accounts_for_sequence_parallelism(self):
+        validate_dynamic_batch_token_caps(
+            dynamic_roles={"actor": True},
+            dynamic_max_token_lens={"actor": 65536},
+            sequence_parallel_sizes={"actor": 2},
+            padded_sequence_length=126976,
         )
 
     def test_dynamic_batch_contract_requires_all_enabled_caps(self):

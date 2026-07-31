@@ -67,6 +67,7 @@ from verl.workers.ppo_token_normalization import (
     PPO_BATCH_CONTRACT_META_KEY,
     build_legacy_asymmetric_batch_contract,
     optimizer_step_readback,
+    validate_dynamic_batch_token_caps,
 )
 from abc import ABC, abstractmethod
 
@@ -1355,6 +1356,29 @@ class RayPPOTrainer(object):
                 expected_per_gpu_micro_batches=expected_micro_by_role,
                 dynamic_roles=dynamic_roles,
                 dynamic_max_token_lens=dynamic_max_token_lens,
+            )
+            actor_sp = config.actor_rollout_ref.actor.get(
+                'ulysses_sequence_parallel_size', 1
+            )
+            critic_sp = config.critic.get('ulysses_sequence_parallel_size', 1)
+            validate_dynamic_batch_token_caps(
+                dynamic_roles=self.ppo_batch_contract['dynamic_roles'],
+                dynamic_max_token_lens=self.ppo_batch_contract[
+                    'dynamic_max_token_lens'
+                ],
+                sequence_parallel_sizes={
+                    'actor': actor_sp,
+                    'critic': critic_sp,
+                    'critic_forward': critic_sp,
+                    'reference_logprob': config.actor_rollout_ref.ref.get(
+                        'ulysses_sequence_parallel_size', 1
+                    ),
+                    'rollout_logprob': actor_sp,
+                },
+                padded_sequence_length=(
+                    config.data.max_prompt_length
+                    + config.data.max_response_length
+                ),
             )
 
         print("[validate_config] All configuration checks passed successfully!")

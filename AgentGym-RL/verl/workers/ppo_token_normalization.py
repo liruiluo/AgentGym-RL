@@ -36,6 +36,51 @@ def _positive_int(value, name: str) -> int:
     return parsed
 
 
+def validate_dynamic_batch_token_caps(
+    *,
+    dynamic_roles: Mapping[str, bool],
+    dynamic_max_token_lens: Mapping[str, int],
+    sequence_parallel_sizes: Mapping[str, int],
+    padded_sequence_length: int,
+) -> None:
+    """Fail before rollout when a dynamic role cannot hold one padded row.
+
+    VERL's dynamic partitioner requires the effective per-worker token cap
+    (per-GPU cap times sequence-parallel size) to cover the input tensor width.
+    Agent rollouts retain a fixed padded width even when their valid-token
+    counts are much smaller, so a projection from observed token counts alone
+    is insufficient for this contract.
+    """
+
+    padded_length = _positive_int(
+        padded_sequence_length, "padded_sequence_length"
+    )
+    for role, enabled in dynamic_roles.items():
+        if not enabled:
+            continue
+        if role not in dynamic_max_token_lens:
+            raise ValueError(
+                f"dynamic role {role!r} requires a max token length per GPU."
+            )
+        if role not in sequence_parallel_sizes:
+            raise ValueError(
+                f"dynamic role {role!r} requires a sequence-parallel size."
+            )
+        cap = _positive_int(
+            dynamic_max_token_lens[role], f"{role}_max_token_len_per_gpu"
+        )
+        sp_size = _positive_int(
+            sequence_parallel_sizes[role], f"{role}_sequence_parallel_size"
+        )
+        effective_cap = cap * sp_size
+        if effective_cap < padded_length:
+            raise ValueError(
+                f"dynamic role {role!r} effective token cap must cover the "
+                f"padded sequence length: {cap} * {sp_size} = "
+                f"{effective_cap} < {padded_length}."
+            )
+
+
 def build_legacy_asymmetric_batch_contract(
     *,
     actor_mini_batch_size: int,
