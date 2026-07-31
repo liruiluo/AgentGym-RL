@@ -67,6 +67,7 @@ from verl.workers.ppo_token_normalization import (
     PPO_BATCH_CONTRACT_META_KEY,
     build_legacy_asymmetric_batch_contract,
     optimizer_step_readback,
+    validate_dynamic_batch_token_caps,
 )
 from abc import ABC, abstractmethod
 
@@ -1268,42 +1269,62 @@ class RayPPOTrainer(object):
                     "When using sequence parallelism for critic, you must enable `use_remove_padding`."
 
         if task_name == 'agentmemory' and self.use_critic:
-            if config.actor_rollout_ref.actor.use_dynamic_bsz or config.critic.use_dynamic_bsz:
-                raise ValueError(
-                    "The v32 AgentMemory PPO numerical contract requires static "
-                    "per-GPU micro-batches for exact readback."
-                )
+            dynamic_roles = {
+                'actor': bool(config.actor_rollout_ref.actor.use_dynamic_bsz),
+                'critic': bool(config.critic.use_dynamic_bsz),
+                'critic_forward': bool(config.critic.use_dynamic_bsz),
+                'reference_logprob': bool(
+                    config.actor_rollout_ref.ref.log_prob_use_dynamic_bsz
+                ),
+                'rollout_logprob': bool(
+                    config.actor_rollout_ref.rollout.log_prob_use_dynamic_bsz
+                ),
+            }
+            dynamic_max_token_lens = {
+                'actor': config.actor_rollout_ref.actor.ppo_max_token_len_per_gpu,
+                'critic': config.critic.ppo_max_token_len_per_gpu,
+                'critic_forward': config.critic.forward_max_token_len_per_gpu,
+                'reference_logprob': config.actor_rollout_ref.ref.log_prob_max_token_len_per_gpu,
+                'rollout_logprob': config.actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu,
+            }
             expected_micro_by_role = None
-            expected_micro_by_role_raw = os.environ.get(
-                'VERL_PPO_EXPECTED_PER_GPU_MICRO_BATCHES'
-            )
-            if expected_micro_by_role_raw is not None:
-                try:
-                    expected_micro_by_role = json.loads(
-                        expected_micro_by_role_raw
-                    )
-                except json.JSONDecodeError as exc:
-                    raise ValueError(
-                        "VERL_PPO_EXPECTED_PER_GPU_MICRO_BATCHES must be a "
-                        "JSON object."
-                    ) from exc
-                if not isinstance(expected_micro_by_role, dict):
-                    raise ValueError(
-                        "VERL_PPO_EXPECTED_PER_GPU_MICRO_BATCHES must decode "
-                        "to a JSON object."
-                    )
-                expected_micro = None
-            else:
-                expected_micro_raw = os.environ.get(
-                    'VERL_PPO_EXPECTED_PER_GPU_MICRO_BATCH_SIZE', '2'
+            expected_micro = None
+            if not any(dynamic_roles.values()):
+                expected_micro_by_role_raw = os.environ.get(
+                    'VERL_PPO_EXPECTED_PER_GPU_MICRO_BATCHES'
                 )
-                try:
-                    expected_micro = int(expected_micro_raw)
-                except ValueError as exc:
-                    raise ValueError(
-                        "VERL_PPO_EXPECTED_PER_GPU_MICRO_BATCH_SIZE must be a "
-                        f"positive integer, got {expected_micro_raw!r}."
-                    ) from exc
+                if expected_micro_by_role_raw is not None:
+                    try:
+                        expected_micro_by_role = json.loads(
+                            expected_micro_by_role_raw
+                        )
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(
+                            "VERL_PPO_EXPECTED_PER_GPU_MICRO_BATCHES must be a "
+                            "JSON object."
+                        ) from exc
+                    if not isinstance(expected_micro_by_role, dict):
+                        raise ValueError(
+                            "VERL_PPO_EXPECTED_PER_GPU_MICRO_BATCHES must decode "
+                            "to a JSON object."
+                        )
+                    expected_micro = None
+                else:
+                    expected_micro_raw = os.environ.get(
+                        'VERL_PPO_EXPECTED_PER_GPU_MICRO_BATCH_SIZE', '2'
+                    )
+                    try:
+                        expected_micro = int(expected_micro_raw)
+                    except ValueError as exc:
+                        raise ValueError(
+                            "VERL_PPO_EXPECTED_PER_GPU_MICRO_BATCH_SIZE must be a "
+                            f"positive integer, got {expected_micro_raw!r}."
+                        ) from exc
+            else:
+                print(
+                    "AgentMemory PPO dynamic-batch contract: "
+                    f"roles={dynamic_roles} max_token_lens={dynamic_max_token_lens}"
+                )
             self.ppo_batch_contract = build_legacy_asymmetric_batch_contract(
                 actor_mini_batch_size=config.actor_rollout_ref.actor.ppo_mini_batch_size,
                 critic_mini_batch_size=config.critic.ppo_mini_batch_size,
@@ -1333,6 +1354,31 @@ class RayPPOTrainer(object):
                 critic_ppo_epochs=config.critic.ppo_epochs,
                 expected_per_gpu_micro_batch_size=expected_micro,
                 expected_per_gpu_micro_batches=expected_micro_by_role,
+                dynamic_roles=dynamic_roles,
+                dynamic_max_token_lens=dynamic_max_token_lens,
+            )
+            actor_sp = config.actor_rollout_ref.actor.get(
+                'ulysses_sequence_parallel_size', 1
+            )
+            critic_sp = config.critic.get('ulysses_sequence_parallel_size', 1)
+            validate_dynamic_batch_token_caps(
+                dynamic_roles=self.ppo_batch_contract['dynamic_roles'],
+                dynamic_max_token_lens=self.ppo_batch_contract[
+                    'dynamic_max_token_lens'
+                ],
+                sequence_parallel_sizes={
+                    'actor': actor_sp,
+                    'critic': critic_sp,
+                    'critic_forward': critic_sp,
+                    'reference_logprob': config.actor_rollout_ref.ref.get(
+                        'ulysses_sequence_parallel_size', 1
+                    ),
+                    'rollout_logprob': actor_sp,
+                },
+                padded_sequence_length=(
+                    config.data.max_prompt_length
+                    + config.data.max_response_length
+                ),
             )
 
         print("[validate_config] All configuration checks passed successfully!")
@@ -1752,6 +1798,26 @@ class RayPPOTrainer(object):
                             'ppo_batch/expected_actor_optimizer_steps': expected_steps['actor_optimizer_steps'],
                             'ppo_batch/expected_critic_optimizer_steps': expected_steps['critic_optimizer_steps'],
                         })
+                        dynamic_roles = self.ppo_batch_contract.get(
+                            'dynamic_roles', {}
+                        )
+                        dynamic_caps = self.ppo_batch_contract.get(
+                            'dynamic_max_token_lens', {}
+                        )
+                        for role in (
+                            'actor',
+                            'critic',
+                            'critic_forward',
+                            'reference_logprob',
+                            'rollout_logprob',
+                        ):
+                            metrics[f'ppo_batch/dynamic_{role}'] = float(
+                                bool(dynamic_roles.get(role, False))
+                            )
+                            if role in dynamic_caps:
+                                metrics[
+                                    f'ppo_batch/{role}_max_token_len_per_gpu'
+                                ] = float(dynamic_caps[role])
 
                     # recompute old_log_probs
                     with _timer('old_log_prob', timing_raw):

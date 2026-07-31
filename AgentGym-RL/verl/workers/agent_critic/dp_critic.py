@@ -15,6 +15,8 @@
 Implement a multiprocess PPOCritic
 """
 import itertools
+import json
+import os
 
 import torch
 from torch import nn, optim
@@ -33,6 +35,7 @@ from verl.workers.ppo_token_normalization import (
     distributed_sum,
     mask_padding_rows,
     scale_token_mean_loss,
+    summarize_dynamic_micro_batches,
     valid_response_token_count,
     validate_worker_batch_readback,
 )
@@ -82,6 +85,10 @@ class DataParallelPPOCritic(BasePPOCritic):
         print(f'Critic use_remove_padding={self.use_remove_padding}')
 
         self.ulysses_sequence_parallel_size = self.config.get('ulysses_sequence_parallel_size', 1)
+        self._dynamic_bsz_readback = os.environ.get(
+            'AGENTMEMORY_DYNAMIC_BSZ_READBACK', '0'
+        ) == '1'
+        self._dynamic_value_calls = 0
 
     def _forward_micro_batch(self, micro_batch):
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
@@ -159,6 +166,23 @@ class DataParallelPPOCritic(BasePPOCritic):
             # split using dynamic bsz
             max_token_len = data.meta_info['max_token_len'] * self.ulysses_sequence_parallel_size
             micro_batches, indices = rearrange_micro_batches(batch=batch, max_token_len=max_token_len)
+            if self._dynamic_bsz_readback:
+                self._dynamic_value_calls += 1
+                summary = summarize_dynamic_micro_batches(micro_batches)
+                summary.update({
+                    'call': self._dynamic_value_calls,
+                    'max_token_len': int(max_token_len),
+                    'rank': (
+                        torch.distributed.get_rank()
+                        if torch.distributed.is_initialized()
+                        else 0
+                    ),
+                    'role': 'critic_forward',
+                })
+                print(
+                    "AgentMemory PPO dynamic-batch readback: "
+                    + json.dumps(summary, sort_keys=True)
+                )
         else:
             micro_batches = batch.split(micro_batch_size)
 
@@ -209,12 +233,17 @@ class DataParallelPPOCritic(BasePPOCritic):
 
         token_metrics = TokenWeightedMetricAccumulator()
         optimizer_steps = 0
+        dynamic_summaries = []
         for _ in range(ppo_epochs):
             for data in dataloader:
                 mini_batch = data
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
+                    if self._dynamic_bsz_readback:
+                        dynamic_summaries.append(
+                            summarize_dynamic_micro_batches(micro_batches)
+                        )
                 else:
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
@@ -277,11 +306,52 @@ class DataParallelPPOCritic(BasePPOCritic):
             metrics['critic/normalized_mini_batch_rows'] = [
                 float(batch_readback['normalized_mini_batch_rows'])
             ]
-            metrics['critic/per_gpu_micro_batch_rows'] = [
-                float(batch_readback['per_gpu_micro_batch_rows'])
+            metrics['critic/dynamic_bsz'] = [
+                float(batch_readback['dynamic_bsz'])
             ]
-            metrics['critic/forward_per_gpu_micro_batch_rows'] = [
-                float(batch_readback['forward_per_gpu_micro_batch_rows'])
+            metrics['critic/dynamic_forward_bsz'] = [
+                float(batch_readback['dynamic_forward_bsz'])
             ]
+            if 'per_gpu_micro_batch_rows' in batch_readback:
+                metrics['critic/per_gpu_micro_batch_rows'] = [
+                    float(batch_readback['per_gpu_micro_batch_rows'])
+                ]
+            if 'forward_per_gpu_micro_batch_rows' in batch_readback:
+                metrics['critic/forward_per_gpu_micro_batch_rows'] = [
+                    float(batch_readback['forward_per_gpu_micro_batch_rows'])
+                ]
+        if dynamic_summaries:
+            summary = {
+                'micro_batches': sum(
+                    item['micro_batches'] for item in dynamic_summaries
+                ),
+                'token_load_min': min(
+                    item['token_load_min'] for item in dynamic_summaries
+                ),
+                'token_load_max': max(
+                    item['token_load_max'] for item in dynamic_summaries
+                ),
+                'token_load_total': sum(
+                    item['token_load_total'] for item in dynamic_summaries
+                ),
+                'rows_min': min(item['rows_min'] for item in dynamic_summaries),
+                'rows_max': max(item['rows_max'] for item in dynamic_summaries),
+                'rank': (
+                    torch.distributed.get_rank()
+                    if torch.distributed.is_initialized()
+                    else 0
+                ),
+                'role': 'critic',
+            }
+            summary['token_load_mean'] = (
+                summary['token_load_total'] / summary['micro_batches']
+            )
+            print(
+                "AgentMemory PPO dynamic-batch readback: "
+                + json.dumps(summary, sort_keys=True)
+            )
+            for name, value in summary.items():
+                if name not in {'rank', 'role'}:
+                    metrics[f'critic/dynamic_{name}'] = [float(value)]
         metrics.update(token_metrics.reduce(group=metric_group))
         return metrics

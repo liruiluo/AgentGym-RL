@@ -7,15 +7,19 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel
+from tensordict import TensorDict
 
 from verl.agent_trainer.ppo import core_algos
 from verl.utils import torch_functional as verl_F
+from verl.utils.seqlen_balancing import rearrange_micro_batches
 from verl.workers.ppo_token_normalization import (
     build_legacy_asymmetric_batch_contract,
     distributed_sum,
     mask_padding_rows,
     optimizer_step_readback,
     scale_token_mean_loss,
+    summarize_dynamic_micro_batches,
+    validate_dynamic_batch_token_caps,
     valid_response_token_count,
     validate_worker_batch_readback,
 )
@@ -340,6 +344,117 @@ class BatchContractTest(unittest.TestCase):
             _batch_contract(
                 expected_per_gpu_micro_batches=configured,
             )
+
+    def test_dynamic_batch_contract_keeps_optimizer_readback(self):
+        dynamic_roles = {
+            "actor": True,
+            "critic": True,
+            "critic_forward": True,
+            "reference_logprob": True,
+            "rollout_logprob": True,
+        }
+        token_caps = {
+            "actor": 131072,
+            "critic": 163840,
+            "critic_forward": 262144,
+            "reference_logprob": 131072,
+            "rollout_logprob": 131072,
+        }
+        contract = _batch_contract(
+            expected_per_gpu_micro_batch_size=None,
+            dynamic_roles=dynamic_roles,
+            dynamic_max_token_lens=token_caps,
+        )
+        actor = validate_worker_batch_readback(
+            contract,
+            role="actor",
+            normalized_mini_batch_rows=64,
+            per_gpu_micro_batch_rows=999,
+        )
+        critic = validate_worker_batch_readback(
+            contract,
+            role="critic",
+            normalized_mini_batch_rows=64,
+            per_gpu_micro_batch_rows=999,
+            forward_per_gpu_micro_batch_rows=999,
+        )
+        self.assertTrue(actor["dynamic_bsz"])
+        self.assertNotIn("per_gpu_micro_batch_rows", actor)
+        self.assertTrue(critic["dynamic_forward_bsz"])
+        self.assertEqual(
+            optimizer_step_readback(contract, 648)["actor_optimizer_steps"],
+            2,
+        )
+
+    def test_dynamic_batch_token_cap_covers_padded_sequence(self):
+        roles = {
+            "actor": True,
+            "critic": True,
+            "critic_forward": True,
+            "reference_logprob": False,
+            "rollout_logprob": True,
+        }
+        caps = {
+            "actor": 131072,
+            "critic": 163840,
+            "critic_forward": 262144,
+            "reference_logprob": 131072,
+            "rollout_logprob": 131072,
+        }
+        sequence_parallel_sizes = {role: 1 for role in roles}
+        validate_dynamic_batch_token_caps(
+            dynamic_roles=roles,
+            dynamic_max_token_lens=caps,
+            sequence_parallel_sizes=sequence_parallel_sizes,
+            padded_sequence_length=126976,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "actor.*effective token cap.*81920.*126976"
+        ):
+            validate_dynamic_batch_token_caps(
+                dynamic_roles=roles,
+                dynamic_max_token_lens=dict(caps, actor=81920),
+                sequence_parallel_sizes=sequence_parallel_sizes,
+                padded_sequence_length=126976,
+            )
+
+    def test_dynamic_batch_token_cap_accounts_for_sequence_parallelism(self):
+        validate_dynamic_batch_token_caps(
+            dynamic_roles={"actor": True},
+            dynamic_max_token_lens={"actor": 65536},
+            sequence_parallel_sizes={"actor": 2},
+            padded_sequence_length=126976,
+        )
+
+    def test_dynamic_batch_contract_requires_all_enabled_caps(self):
+        with self.assertRaisesRegex(ValueError, "require a max token length"):
+            _batch_contract(
+                expected_per_gpu_micro_batch_size=None,
+                dynamic_roles={"actor": True},
+                dynamic_max_token_lens={},
+            )
+
+    def test_dynamic_batch_partition_and_summary(self):
+        lengths = [10, 8, 4, 2]
+        attention_mask = torch.zeros((4, 10), dtype=torch.long)
+        for row, length in enumerate(lengths):
+            attention_mask[row, :length] = 1
+        batch = TensorDict(
+            {
+                "attention_mask": attention_mask,
+                "input_ids": torch.arange(40).reshape(4, 10),
+            },
+            batch_size=[4],
+        )
+        micro_batches, indices = rearrange_micro_batches(
+            batch, max_token_len=12
+        )
+        self.assertEqual(sorted(i for group in indices for i in group), list(range(4)))
+        summary = summarize_dynamic_micro_batches(micro_batches)
+        self.assertEqual(summary["micro_batches"], 2)
+        self.assertEqual(summary["token_load_total"], sum(lengths))
+        self.assertEqual(summary["rows_total"], 4)
 
 
 class DistributedTokenMeanTest(unittest.TestCase):

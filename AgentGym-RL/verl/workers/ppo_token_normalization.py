@@ -36,6 +36,51 @@ def _positive_int(value, name: str) -> int:
     return parsed
 
 
+def validate_dynamic_batch_token_caps(
+    *,
+    dynamic_roles: Mapping[str, bool],
+    dynamic_max_token_lens: Mapping[str, int],
+    sequence_parallel_sizes: Mapping[str, int],
+    padded_sequence_length: int,
+) -> None:
+    """Fail before rollout when a dynamic role cannot hold one padded row.
+
+    VERL's dynamic partitioner requires the effective per-worker token cap
+    (per-GPU cap times sequence-parallel size) to cover the input tensor width.
+    Agent rollouts retain a fixed padded width even when their valid-token
+    counts are much smaller, so a projection from observed token counts alone
+    is insufficient for this contract.
+    """
+
+    padded_length = _positive_int(
+        padded_sequence_length, "padded_sequence_length"
+    )
+    for role, enabled in dynamic_roles.items():
+        if not enabled:
+            continue
+        if role not in dynamic_max_token_lens:
+            raise ValueError(
+                f"dynamic role {role!r} requires a max token length per GPU."
+            )
+        if role not in sequence_parallel_sizes:
+            raise ValueError(
+                f"dynamic role {role!r} requires a sequence-parallel size."
+            )
+        cap = _positive_int(
+            dynamic_max_token_lens[role], f"{role}_max_token_len_per_gpu"
+        )
+        sp_size = _positive_int(
+            sequence_parallel_sizes[role], f"{role}_sequence_parallel_size"
+        )
+        effective_cap = cap * sp_size
+        if effective_cap < padded_length:
+            raise ValueError(
+                f"dynamic role {role!r} effective token cap must cover the "
+                f"padded sequence length: {cap} * {sp_size} = "
+                f"{effective_cap} < {padded_length}."
+            )
+
+
 def build_legacy_asymmetric_batch_contract(
     *,
     actor_mini_batch_size: int,
@@ -50,6 +95,8 @@ def build_legacy_asymmetric_batch_contract(
     critic_ppo_epochs: int,
     expected_per_gpu_micro_batch_size: Optional[int] = None,
     expected_per_gpu_micro_batches: Optional[Mapping[str, int]] = None,
+    dynamic_roles: Optional[Mapping[str, bool]] = None,
+    dynamic_max_token_lens: Optional[Mapping[str, int]] = None,
 ) -> dict:
     """Validate and describe the legacy flattened-row compensation mode.
 
@@ -114,6 +161,48 @@ def build_legacy_asymmetric_batch_contract(
         name: _positive_int(per_gpu_micro_batches[name], f"{name}_per_gpu")
         for name in _PER_GPU_MICRO_BATCH_FIELDS
     }
+    if dynamic_roles is None:
+        dynamic_roles = {
+            name: False for name in _PER_GPU_MICRO_BATCH_FIELDS
+        }
+    else:
+        dynamic_roles = {
+            name: bool(dynamic_roles.get(name, False))
+            for name in _PER_GPU_MICRO_BATCH_FIELDS
+        }
+    if dynamic_max_token_lens is None:
+        dynamic_max_token_lens = {}
+    else:
+        unknown_dynamic_caps = set(dynamic_max_token_lens) - set(
+            _PER_GPU_MICRO_BATCH_FIELDS
+        )
+        if unknown_dynamic_caps:
+            raise ValueError(
+                "dynamic_max_token_lens contains unknown roles: "
+                f"{sorted(unknown_dynamic_caps)}."
+            )
+        dynamic_max_token_lens = {
+            name: _positive_int(value, f"{name}_max_token_len_per_gpu")
+            for name, value in dynamic_max_token_lens.items()
+        }
+    missing_dynamic_caps = {
+        name
+        for name, enabled in dynamic_roles.items()
+        if enabled and name not in dynamic_max_token_lens
+    }
+    if missing_dynamic_caps:
+        raise ValueError(
+            "dynamic roles require a max token length per GPU: "
+            f"{sorted(missing_dynamic_caps)}."
+        )
+    if any(dynamic_roles.values()) and (
+        expected_per_gpu_micro_batch_size is not None
+        or expected_per_gpu_micro_batches is not None
+    ):
+        raise ValueError(
+            "static per-GPU micro-batch readback declarations cannot be used "
+            "when dynamic batching is enabled."
+        )
     if (
         expected_per_gpu_micro_batch_size is not None
         and expected_per_gpu_micro_batches is not None
@@ -186,12 +275,12 @@ def build_legacy_asymmetric_batch_contract(
             "deprecated global micro-batch fields must be null when per-GPU "
             f"fields are selected: {non_null_legacy}."
         )
-    if actor_local % parsed_micro["actor"] != 0:
+    if not dynamic_roles["actor"] and actor_local % parsed_micro["actor"] != 0:
         raise ValueError(
             f"actor local mini-batch {actor_local} is not divisible by "
             f"actor per-GPU micro-batch {parsed_micro['actor']}."
         )
-    if critic_local % parsed_micro["critic"] != 0:
+    if not dynamic_roles["critic"] and critic_local % parsed_micro["critic"] != 0:
         raise ValueError(
             f"critic local mini-batch {critic_local} is not divisible by "
             f"critic per-GPU micro-batch {parsed_micro['critic']}."
@@ -212,6 +301,8 @@ def build_legacy_asymmetric_batch_contract(
         "expected_per_gpu_micro_batch_size": expected_micro,
         "expected_per_gpu_micro_batches": expected_micro_by_role,
         "per_gpu_micro_batches": parsed_micro,
+        "dynamic_roles": dynamic_roles,
+        "dynamic_max_token_lens": dynamic_max_token_lens,
     }
 
 
@@ -278,40 +369,77 @@ def validate_worker_batch_readback(
     actual_mini = _positive_int(
         normalized_mini_batch_rows, f"{role}.normalized_mini_batch_rows"
     )
-    expected_micro = _positive_int(
-        contract["per_gpu_micro_batches"][role],
-        f"contract.per_gpu_micro_batches.{role}",
-    )
-    actual_micro = _positive_int(
-        per_gpu_micro_batch_rows, f"{role}.per_gpu_micro_batch_rows"
-    )
-    if actual_mini != expected_mini or actual_micro != expected_micro:
+    dynamic_role = bool(contract.get("dynamic_roles", {}).get(role, False))
+    if actual_mini != expected_mini:
         raise ValueError(
             f"{role} worker batch readback mismatch: "
-            f"mini expected={expected_mini} actual={actual_mini}; "
-            f"micro expected={expected_micro} actual={actual_micro}."
+            f"mini expected={expected_mini} actual={actual_mini}."
         )
 
     readback = {
         "normalized_mini_batch_rows": actual_mini,
-        "per_gpu_micro_batch_rows": actual_micro,
+        "dynamic_bsz": dynamic_role,
     }
-    if role == "critic":
-        expected_forward = _positive_int(
-            contract["per_gpu_micro_batches"]["critic_forward"],
-            "contract.per_gpu_micro_batches.critic_forward",
+    if not dynamic_role:
+        expected_micro = _positive_int(
+            contract["per_gpu_micro_batches"][role],
+            f"contract.per_gpu_micro_batches.{role}",
         )
-        actual_forward = _positive_int(
-            forward_per_gpu_micro_batch_rows,
-            "critic.forward_per_gpu_micro_batch_rows",
+        actual_micro = _positive_int(
+            per_gpu_micro_batch_rows, f"{role}.per_gpu_micro_batch_rows"
         )
-        if actual_forward != expected_forward:
+        if actual_micro != expected_micro:
             raise ValueError(
-                "critic forward micro-batch readback mismatch: "
-                f"expected={expected_forward} actual={actual_forward}."
+                f"{role} worker micro-batch readback mismatch: "
+                f"expected={expected_micro} actual={actual_micro}."
             )
-        readback["forward_per_gpu_micro_batch_rows"] = actual_forward
+        readback["per_gpu_micro_batch_rows"] = actual_micro
+    if role == "critic":
+        forward_dynamic = bool(
+            contract.get("dynamic_roles", {}).get(
+                "critic_forward", dynamic_role
+            )
+        )
+        readback["dynamic_forward_bsz"] = forward_dynamic
+        if not forward_dynamic:
+            expected_forward = _positive_int(
+                contract["per_gpu_micro_batches"]["critic_forward"],
+                "contract.per_gpu_micro_batches.critic_forward",
+            )
+            actual_forward = _positive_int(
+                forward_per_gpu_micro_batch_rows,
+                "critic.forward_per_gpu_micro_batch_rows",
+            )
+            if actual_forward != expected_forward:
+                raise ValueError(
+                    "critic forward micro-batch readback mismatch: "
+                    f"expected={expected_forward} actual={actual_forward}."
+                )
+            readback["forward_per_gpu_micro_batch_rows"] = actual_forward
     return readback
+
+
+def summarize_dynamic_micro_batches(micro_batches) -> dict:
+    """Summarize token and row loads emitted by VERL dynamic batching."""
+
+    if not micro_batches:
+        raise ValueError("dynamic batching produced no micro-batches")
+    token_loads = []
+    row_counts = []
+    for micro_batch in micro_batches:
+        attention_mask = micro_batch["attention_mask"]
+        token_loads.append(int(attention_mask.sum().item()))
+        row_counts.append(int(attention_mask.shape[0]))
+    return {
+        "micro_batches": len(micro_batches),
+        "token_load_min": min(token_loads),
+        "token_load_max": max(token_loads),
+        "token_load_mean": sum(token_loads) / len(token_loads),
+        "token_load_total": sum(token_loads),
+        "rows_min": min(row_counts),
+        "rows_max": max(row_counts),
+        "rows_total": sum(row_counts),
+    }
 
 
 def select_response_values(
