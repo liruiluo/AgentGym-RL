@@ -37,6 +37,17 @@ from verl.agent_trainer.ppo import core_algos
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.agent_dataset.rl_dataset import RLHFDataset, collate_fn
+from verl.utils.agent_dataset.procedural_index import (
+    PROCEDURAL_STREAM_CHECKPOINT_SCHEMA,
+    PROVIDER_MODE_RESEEDED_STREAM,
+    StatefulProceduralStreamSampler,
+    build_stream_checkpoint,
+    generation_non_tensor_keys,
+    promote_data_idx_for_rollout,
+    restore_stream_checkpoint,
+    validate_paired_batch_indices,
+    validate_rollout_parent_coverage,
+)
 from verl.utils.agentgym.rollout_context import (
     AGENTMEMORY_ACTION_TEXT,
     AGENTMEMORY_EXACT_STATE_UID,
@@ -1346,8 +1357,30 @@ class RayPPOTrainer(object):
             data_config=self.config.data,
             agentgym_config=self.config.actor_rollout_ref.agentgym,
         )
+        procedural_source = self.train_dataset.procedural_index_source
+        self.procedural_stream_identity = None
+        if procedural_source is not None:
+            if procedural_source.provider_mode != PROVIDER_MODE_RESEEDED_STREAM:
+                raise ValueError(
+                    "PPO procedural training requires provider_mode="
+                    "'reseeded_stream'; fixed_window is reserved for bounded "
+                    "generation and evaluation"
+                )
+            if self.config.data.shuffle:
+                raise ValueError(
+                    "reseeded procedural index streams require data.shuffle=false; "
+                    "the generator already randomizes semantic coordinates"
+                )
+            procedural_source.validate_training_batch_size(
+                self.config.data.train_batch_size
+            )
+            sampler = StatefulProceduralStreamSampler(procedural_source)
+            self.procedural_stream_identity = procedural_source.training_identity(
+                server_metadata=self.train_dataset.env_client.metadata,
+                train_batch_size=self.config.data.train_batch_size,
+            )
         # use sampler for better ckpt resume
-        if self.config.data.shuffle:
+        elif self.config.data.shuffle:
             train_dataloader_generator = torch.Generator()
             train_dataloader_generator.manual_seed(self.config.data.get('seed', 1))
             sampler = RandomSampler(data_source=self.train_dataset, generator=train_dataloader_generator)
@@ -1473,10 +1506,24 @@ class RayPPOTrainer(object):
                                            self.global_steps,
                                            remove_previous_ckpt=self.config.trainer.remove_previous_ckpt_in_save)
 
-        # save dataloader
+        # Legacy datasets serialize the DataLoader. Procedural streams keep the
+        # freshly validated dataset/client and checkpoint only an identity-bound
+        # sampler cursor.
         dataloader_local_path = os.path.join(local_global_step_folder, 'data.pt')
         import dill
-        torch.save(self.train_dataloader, dataloader_local_path, pickle_module=dill)
+        if self.procedural_stream_identity is not None:
+            sampler = self.train_dataloader.sampler
+            if not isinstance(sampler, StatefulProceduralStreamSampler):
+                raise RuntimeError(
+                    "procedural stream DataLoader lost its stateful sampler"
+                )
+            dataloader_state = build_stream_checkpoint(
+                sampler,
+                self.procedural_stream_identity,
+            )
+        else:
+            dataloader_state = self.train_dataloader
+        torch.save(dataloader_state, dataloader_local_path, pickle_module=dill)
 
         # latest checkpointed iteration tracker (for atomic usage)
         local_latest_checkpointed_iteration = os.path.join(self.config.trainer.default_local_dir,
@@ -1543,9 +1590,35 @@ class RayPPOTrainer(object):
         # TODO: from remote not implemented yet
         dataloader_local_path = os.path.join(global_step_folder, 'data.pt')
         # Native VERL checkpoints are trusted and serialize the DataLoader.
-        self.train_dataloader = torch.load(dataloader_local_path, weights_only=False)
-        if isinstance(self.train_dataloader.dataset, RLHFDataset):
-            self.train_dataloader.dataset.resume_dataset_state()
+        dataloader_state = torch.load(dataloader_local_path, weights_only=False)
+        if self.procedural_stream_identity is not None:
+            if not isinstance(dataloader_state, dict):
+                raise RuntimeError(
+                    "procedural resume refuses a legacy whole-DataLoader checkpoint"
+                )
+            sampler = self.train_dataloader.sampler
+            if not isinstance(sampler, StatefulProceduralStreamSampler):
+                raise RuntimeError(
+                    "current procedural DataLoader lost its stateful sampler"
+                )
+            restore_stream_checkpoint(
+                sampler,
+                self.procedural_stream_identity,
+                dataloader_state,
+            )
+        else:
+            if (
+                isinstance(dataloader_state, dict)
+                and dataloader_state.get("schema")
+                == PROCEDURAL_STREAM_CHECKPOINT_SCHEMA
+            ):
+                raise RuntimeError(
+                    "procedural stream checkpoint cannot resume with the current "
+                    "non-procedural data configuration"
+                )
+            self.train_dataloader = dataloader_state
+            if isinstance(self.train_dataloader.dataset, RLHFDataset):
+                self.train_dataloader.dataset.resume_dataset_state()
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
@@ -1624,7 +1697,19 @@ class RayPPOTrainer(object):
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
                 # pop those keys for generation
-                gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'], non_tensor_batch_keys=['item_id', 'raw_prompt'])
+                gen_batch = batch.pop(
+                    batch_keys=['input_ids', 'attention_mask', 'position_ids'],
+                    non_tensor_batch_keys=generation_non_tensor_keys(
+                        batch.non_tensor_batch
+                    ),
+                )
+                # The environment reset index is an explicit data contract.  Do
+                # not rely on parsing a numeric suffix from item_id.
+                promote_data_idx_for_rollout(gen_batch.non_tensor_batch)
+                if self.procedural_stream_identity is not None:
+                    validate_paired_batch_indices(
+                        gen_batch.non_tensor_batch["rollout_data_indices"]
+                    )
                 # Preserve driver-global source identities across DP dispatch.
                 # Rollout workers must return these values as parent indices;
                 # worker-local indices are ambiguous after per-rank splitting.
@@ -1644,6 +1729,14 @@ class RayPPOTrainer(object):
                     # generate a batch
                     with _timer('gen', timing_raw):
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                    if self.procedural_stream_identity is not None:
+                        validate_rollout_parent_coverage(
+                            gen_batch_output.non_tensor_batch,
+                            expected_parent_count=len(gen_batch),
+                            expected_replicas=int(
+                                self.config.actor_rollout_ref.rollout.n
+                            ),
+                        )
 
                     if self.config.algorithm.adv_estimator == 'remax':
                         with _timer('gen_max', timing_raw):

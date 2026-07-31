@@ -10,6 +10,14 @@ data:
   return_raw_input_ids: False  # This should be set to true when the tokenizer between policy and rm differs
   return_raw_chat: True
   shuffle: True
+  # When enabled, no JSON task manifest is loaded. The sampler emits absolute
+  # AgentMemoryGym indices and the environment generates/verifies tasks on reset.
+  procedural_index:
+    enabled: False
+    provider_mode: reseeded_stream
+    task_count: null
+    start_index: 0
+    item_id_prefix: agentmemory
 
 actor_rollout_ref:
   hybrid_engine: True

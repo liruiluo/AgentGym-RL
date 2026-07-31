@@ -31,6 +31,10 @@ from transformers import PreTrainedTokenizer, ProcessorMixin
 import verl.utils.torch_functional as verl_F
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.agentgym.client import init_env_client
+from verl.utils.agent_dataset.procedural_index import (
+    ProceduralIndexSource,
+    procedural_index_source_from_config,
+)
 logger = logging.getLogger(__name__)
 
 
@@ -62,7 +66,7 @@ class RLHFDataset(Dataset):
 
     def __init__(
         self,
-        data_file: str,
+        data_file: Optional[str],
         tokenizer: PreTrainedTokenizer,
         data_config: DictConfig,
         agentgym_config: DictConfig,
@@ -91,15 +95,32 @@ class RLHFDataset(Dataset):
         self.need_tools_kwargs = data_config.get("need_tools_kwargs", False)
         self.filter_prompts = data_config.get("filter_prompts", True)
         self.serialize_dataset = False
+        self.procedural_index_source: Optional[ProceduralIndexSource] = (
+            procedural_index_source_from_config(data_config)
+        )
         self._read_files_and_tokenize()
         # get agentgym client
         self.env_client = init_env_client(self.agentgym_config)
+        if self.procedural_index_source is not None:
+            self.procedural_index_source.validate_server_metadata(
+                self.env_client.metadata
+            )
 
     def _read_files_and_tokenize(self):
+        if self.procedural_index_source is not None:
+            self.dataframe = None
+            print(
+                "procedural index dataset: "
+                f"{self.procedural_index_source.metadata()}"
+            )
+            return
         self.dataframe = datasets.load_dataset("json", data_files=self.data_file)["train"]
         print(f"dataset len: {len(self.dataframe)}")
 
     def resume_dataset_state(self):
+        if self.procedural_index_source is not None:
+            self.serialize_dataset = False
+            return
         self.serialize_dataset = not hasattr(self, "original_data_file")
         # resume dataframe if not it's serialized in data.pt
         if not self.serialize_dataset:
@@ -108,10 +129,15 @@ class RLHFDataset(Dataset):
             print(r"old dataloader ckpt file is used, please train from scratch for better ckpt performance")
 
     def __len__(self):
+        if self.procedural_index_source is not None:
+            return len(self.procedural_index_source)
         return len(self.dataframe)
 
     def _build_messages(self, example: dict):
-        example["data_source"] = example[self.prompt_key].split("_")[0]
+        if self.procedural_index_source is not None:
+            example["data_source"] = "agentmemory"
+        else:
+            example["data_source"] = example[self.prompt_key].split("_")[0]
         messages = [{"role": "user", "content": self.env_client.conversation_start[0]["value"]},
                      {"role": "assistant", "content": self.env_client.conversation_start[1]["value"]}]
         prompt_with_chat_template = "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\n" + self.env_client.conversation_start[0]["value"] + "<|im_end|>\n<|im_start|>assistant\n" + self.env_client.conversation_start[1]["value"] + "<|im_end|>"
@@ -121,7 +147,10 @@ class RLHFDataset(Dataset):
         """
         Note that we also return the raw_input_ids so that it can be combined with other chat template
         """
-        row_dict: dict = self.dataframe[item]
+        if self.procedural_index_source is not None:
+            row_dict = self.procedural_index_source.row_for_position(item)
+        else:
+            row_dict = self.dataframe[item]
         
         messages, prompt_with_chat_template = self._build_messages(row_dict)
 
@@ -152,7 +181,7 @@ class RLHFDataset(Dataset):
         if not self.serialize_dataset:
             state = self.__dict__.copy()
 
-            if "dataframe" in state:
+            if "dataframe" in state and self.procedural_index_source is None:
                 del state["dataframe"]
             return state
 

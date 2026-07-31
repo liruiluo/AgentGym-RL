@@ -1,9 +1,48 @@
 from __future__ import annotations
 
 import unittest
+from copy import deepcopy
+from unittest.mock import Mock, patch
 
 from agentenv.controller.types import ActionFormat
-from agentenv.envs.agentmemory import AgentMemoryAdapter, AgentMemoryEnvClient
+from agentenv.envs.agentmemory import (
+    AgentMemoryAdapter,
+    AgentMemoryEnvClient,
+    build_procedural_conversation_start,
+)
+
+
+def procedural_metadata():
+    return {
+        "surface": "agentmemory_webshop_procedural_natural_chain_train_v1",
+        "source": "agentmemory_programmatic_generator",
+        "paper_eligible": False,
+        "task_count": 64,
+        "provider_mode": "reseeded_stream",
+        "accepted_index_domain": "all_nonnegative_integers",
+        "memory_prompt_mode": "neutral",
+        "provider": {
+            "schema": "agentmemory_verified_natural_chain_provider_v3",
+            "provider_mode": "reseeded_stream",
+            "task_count": 64,
+            "accepted_index_domain": "all_nonnegative_integers",
+            "candidate_count_per_phase": 2,
+            "phase_count_per_task": 6,
+            "semantic_period_orbits": 100,
+            "semantic_period_tasks": 200,
+            "reseeded_stream": {
+                "tasks_per_seed_epoch": 200,
+                "orbits_per_seed_epoch": 100,
+                "counterfactual_pair_never_crosses_seed_epoch": True,
+                "seed_epoch_zero_uses_base_seed": True,
+                "collision_free_within_complete_seed_epoch": True,
+                "semantic_uniqueness_guaranteed_through_task_index": 199,
+                "cross_seed_epoch_semantic_uniqueness_guaranteed": False,
+            },
+            "human_review_required": False,
+            "llm_judge_required": False,
+        },
+    }
 
 
 class AgentMemoryClientActionSubmissionTest(unittest.TestCase):
@@ -92,6 +131,72 @@ class AgentMemoryClientActionSubmissionTest(unittest.TestCase):
                 "parser_status": "raw_fallback",
             },
         )
+
+
+class ProceduralAgentMemoryClientContractTest(unittest.TestCase):
+    def test_prompt_names_the_generated_surface_without_claiming_memoryarena_parity(
+        self,
+    ) -> None:
+        prompt = build_procedural_conversation_start(
+            ActionFormat.REACT,
+            "neutral",
+        )[0]["value"]
+        self.assertIn("programmatically generated AgentMemoryGym WebShop", prompt)
+        self.assertIn("six separate shopping sessions", prompt)
+        self.assertNotIn("original MemoryArena WebShop", prompt)
+        self.assertNotIn("paper", prompt.casefold())
+
+    def test_bad_procedural_metadata_is_rejected_before_environment_creation(
+        self,
+    ) -> None:
+        mutations = {
+            "source": lambda value: value.update(source="frozen_memoryarena"),
+            "paper": lambda value: value.update(paper_eligible=True),
+            "schema": lambda value: value["provider"].update(schema="unknown"),
+            "candidate_count": lambda value: value["provider"].update(
+                candidate_count_per_phase=5
+            ),
+            "phase_count": lambda value: value["provider"].update(
+                phase_count_per_task=5
+            ),
+            "human_gate": lambda value: value["provider"].update(
+                human_review_required=True
+            ),
+            "llm_judge": lambda value: value["provider"].update(
+                llm_judge_required=True
+            ),
+            "provider_mode": lambda value: value.update(provider_mode="fixed_window"),
+            "task_count": lambda value: value["provider"].update(task_count=62),
+            "accepted_index_domain": lambda value: value["provider"].update(
+                accepted_index_domain="bounded"
+            ),
+            "semantic_period": lambda value: value["provider"].update(
+                semantic_period_tasks=198
+            ),
+            "stream_epoch": lambda value: value["provider"][
+                "reseeded_stream"
+            ].update(tasks_per_seed_epoch=198),
+        }
+        for name, mutate in mutations.items():
+            metadata = deepcopy(procedural_metadata())
+            mutate(metadata)
+            post = Mock()
+            with (
+                self.subTest(case=name),
+                patch.object(
+                    AgentMemoryEnvClient,
+                    "get_metadata",
+                    return_value=metadata,
+                ),
+                patch("agentenv.envs.agentmemory.requests.post", post),
+                self.assertRaises(RuntimeError),
+            ):
+                AgentMemoryEnvClient(
+                    "http://procedural.invalid",
+                    None,
+                    action_format=ActionFormat.REACT,
+                )
+            post.assert_not_called()
 
 
 if __name__ == "__main__":
