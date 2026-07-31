@@ -16,6 +16,8 @@ Single Process Actor
 """
 
 import itertools
+import json
+import os
 from typing import Tuple
 
 import torch
@@ -34,6 +36,7 @@ from verl.workers.ppo_token_normalization import (
     distributed_sum,
     mask_padding_rows,
     scale_token_mean_loss,
+    summarize_dynamic_micro_batches,
     valid_response_token_count,
     validate_worker_batch_readback,
 )
@@ -90,6 +93,10 @@ class DataParallelPPOActor(BasePPOActor):
                 )
         print(f'Actor use_response_only_logits={self.use_response_only_logits}')
         self._response_only_readback_logged = False
+        self._dynamic_bsz_readback = os.environ.get(
+            'AGENTMEMORY_DYNAMIC_BSZ_READBACK', '0'
+        ) == '1'
+        self._dynamic_logprob_calls = 0
 
         self.compute_entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=True)
 
@@ -302,6 +309,23 @@ class DataParallelPPOActor(BasePPOActor):
             # split using dynamic bsz
             max_token_len = data.meta_info['max_token_len'] * self.ulysses_sequence_parallel_size
             micro_batches, indices = rearrange_micro_batches(batch=batch, max_token_len=max_token_len)
+            if self._dynamic_bsz_readback:
+                self._dynamic_logprob_calls += 1
+                summary = summarize_dynamic_micro_batches(micro_batches)
+                summary.update({
+                    'call': self._dynamic_logprob_calls,
+                    'max_token_len': int(max_token_len),
+                    'rank': (
+                        torch.distributed.get_rank()
+                        if torch.distributed.is_initialized()
+                        else 0
+                    ),
+                    'role': 'reference_logprob' if self.actor_optimizer is None else 'rollout_logprob',
+                })
+                print(
+                    "AgentMemory PPO dynamic-batch readback: "
+                    + json.dumps(summary, sort_keys=True)
+                )
         else:
             micro_batches = batch.split(micro_batch_size)
 
@@ -356,12 +380,17 @@ class DataParallelPPOActor(BasePPOActor):
         metrics = {}
         token_metrics = TokenWeightedMetricAccumulator()
         optimizer_steps = 0
+        dynamic_summaries = []
         for _ in range(ppo_epochs):
             for data in dataloader:
                 mini_batch = data
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
+                    if self._dynamic_bsz_readback:
+                        dynamic_summaries.append(
+                            summarize_dynamic_micro_batches(micro_batches)
+                        )
                 else:
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
@@ -443,8 +472,45 @@ class DataParallelPPOActor(BasePPOActor):
             metrics['actor/normalized_mini_batch_rows'] = [
                 float(batch_readback['normalized_mini_batch_rows'])
             ]
-            metrics['actor/per_gpu_micro_batch_rows'] = [
-                float(batch_readback['per_gpu_micro_batch_rows'])
+            metrics['actor/dynamic_bsz'] = [
+                float(batch_readback['dynamic_bsz'])
             ]
+            if 'per_gpu_micro_batch_rows' in batch_readback:
+                metrics['actor/per_gpu_micro_batch_rows'] = [
+                    float(batch_readback['per_gpu_micro_batch_rows'])
+                ]
+        if dynamic_summaries:
+            summary = {
+                'micro_batches': sum(
+                    item['micro_batches'] for item in dynamic_summaries
+                ),
+                'token_load_min': min(
+                    item['token_load_min'] for item in dynamic_summaries
+                ),
+                'token_load_max': max(
+                    item['token_load_max'] for item in dynamic_summaries
+                ),
+                'token_load_total': sum(
+                    item['token_load_total'] for item in dynamic_summaries
+                ),
+                'rows_min': min(item['rows_min'] for item in dynamic_summaries),
+                'rows_max': max(item['rows_max'] for item in dynamic_summaries),
+                'rank': (
+                    torch.distributed.get_rank()
+                    if torch.distributed.is_initialized()
+                    else 0
+                ),
+                'role': 'actor',
+            }
+            summary['token_load_mean'] = (
+                summary['token_load_total'] / summary['micro_batches']
+            )
+            print(
+                "AgentMemory PPO dynamic-batch readback: "
+                + json.dumps(summary, sort_keys=True)
+            )
+            for name, value in summary.items():
+                if name not in {'rank', 'role'}:
+                    metrics[f'actor/dynamic_{name}'] = [float(value)]
         metrics.update(token_metrics.reduce(group=metric_group))
         return metrics

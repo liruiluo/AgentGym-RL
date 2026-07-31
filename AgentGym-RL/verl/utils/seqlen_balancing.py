@@ -22,6 +22,13 @@ from tensordict import TensorDict
 import copy
 
 
+def calculate_workload(seqlen_list: torch.Tensor) -> torch.Tensor:
+    """Use VERL's dense-transformer proxy to balance variable-length work."""
+
+    seqlen_list = seqlen_list.long()
+    return 24576 * seqlen_list + seqlen_list**2
+
+
 def karmarkar_karp(seqlen_list: List[int], k_partitions: int, equal_size: bool):
     # see: https://en.wikipedia.org/wiki/Largest_differencing_method
     class Set:
@@ -221,7 +228,12 @@ def ceildiv(a, b):
     return -(a // -b)
 
 
-def rearrange_micro_batches(batch: TensorDict, max_token_len, dp_group=None):
+def rearrange_micro_batches(
+    batch: TensorDict,
+    max_token_len,
+    dp_group=None,
+    use_dynamic_bsz_balance=True,
+):
     """Split the batch into a list of micro_batches, where the max_token_len is smaller than max_token_len
     and the number of valid tokens in each micro batch is well balanced.
     """
@@ -238,10 +250,26 @@ def rearrange_micro_batches(batch: TensorDict, max_token_len, dp_group=None):
         dist.all_reduce(num_micro_batches, op=dist.ReduceOp.MAX, group=dp_group)
         num_micro_batches = num_micro_batches.cpu().item()
 
-    seq_len_effective = seq_len_effective.tolist()
+    seq_len_effective = seq_len_effective.long()
     assert num_micro_batches <= len(seq_len_effective)
 
-    micro_bsz_idx = get_seqlen_balanced_partitions(seq_len_effective, num_micro_batches, equal_size=False)
+    partition_weights = (
+        calculate_workload(seq_len_effective)
+        if use_dynamic_bsz_balance
+        else seq_len_effective
+    ).cpu().tolist()
+    micro_bsz_idx = get_seqlen_balanced_partitions(
+        partition_weights, num_micro_batches, equal_size=False
+    )
+    if use_dynamic_bsz_balance:
+        micro_bsz_idx.sort(
+            key=lambda partition: (
+                sum(partition_weights[idx] for idx in partition),
+                partition[0],
+            ),
+            reverse=True,
+        )
+        micro_bsz_idx = micro_bsz_idx[::2][::-1] + micro_bsz_idx[1::2]
 
     micro_batches = []
 
