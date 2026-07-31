@@ -174,10 +174,6 @@ def _run_case(
         atol=2e-2,
         rtol=2e-2,
     )
-    if gradient_error_ratio >= 2e-3:
-        raise AssertionError(
-            f"{case_name}: gradient error ratio {gradient_error_ratio} >= 0.002"
-        )
     return {
         "case": case_name,
         "output_max_abs_delta": output_max_abs_delta,
@@ -207,6 +203,7 @@ def main() -> None:
         ("many_short_sequences", [3, 4, 5, 4]),
     ]
     results = []
+    failures = []
     for use_causal_conv1d in (True, False):
         layer = _make_layer(device)
         if not use_causal_conv1d:
@@ -226,16 +223,22 @@ def main() -> None:
             )
             result["backend"] = backend
             results.append(result)
+            if result["gradient_error_ratio"] >= 2e-3:
+                failures.append(
+                    f"{backend}/{case_name}: gradient error ratio "
+                    f"{result['gradient_error_ratio']} >= 0.002"
+                )
             layer.zero_grad(set_to_none=True)
 
     if rank == 0:
         print(
             json.dumps(
                 {
-                    "status": "pass",
+                    "status": "fail" if failures else "pass",
                     "world_size": dist.get_world_size(),
                     "upstream_verl_commit": "6a6242f3",
                     "cases": results,
+                    "failures": failures,
                 },
                 sort_keys=True,
             )
@@ -243,6 +246,8 @@ def main() -> None:
     dist.barrier()
     set_ulysses_sequence_parallel_group(None)
     dist.destroy_process_group()
+    if failures:
+        raise AssertionError("; ".join(failures))
 
 
 if __name__ == "__main__":
