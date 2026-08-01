@@ -7,6 +7,7 @@ import os
 import sys
 import types
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -347,6 +348,7 @@ def load_trainer_functions(validate_calls):
         "AGENTMEMORY_TRAJECTORY_UID": "agentmemory_trajectory_uid",
         "DataProto": FakeDataProto,
         "core_algos": core_algos,
+        "nullcontext": nullcontext,
         "os": os,
         "requires_formal_trajectory_metadata": lambda data: True,
         "torch": torch,

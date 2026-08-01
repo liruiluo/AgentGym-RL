@@ -19,7 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 import os
 import uuid
 import json
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Type, Dict
@@ -193,7 +193,14 @@ def _mask_ppo_padding_samples(data: DataProto) -> None:
     data.batch['response_mask'] = response_mask * valid_samples.unsqueeze(-1).to(response_mask.dtype)
 
 
-def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1):
+def compute_advantage(
+    data: DataProto,
+    adv_estimator,
+    gamma=1.0,
+    lam=1.0,
+    num_repeat=1,
+    timing_raw=None,
+):
     # prepare response group
     # TODO: add other ways to estimate advantages
     if adv_estimator == 'gae':
@@ -201,54 +208,64 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         runtime_evidence_required = _agentmemory_env_flag(
             "AGENTMEMORY_REQUIRE_FORMAL_RUNTIME_EVIDENCE"
         )
-        formal_groups = validate_formal_trajectory_metadata(
-            data,
-            expected_replicas=int(num_repeat),
-            require=formal_required or runtime_evidence_required,
-            require_runtime_evidence=runtime_evidence_required,
-            expected_suffix_credit=(
-                False if formal_required or runtime_evidence_required else None
-            ),
-        )
+        with (
+            _timer("adv_compute_formal_validate", timing_raw)
+            if timing_raw is not None
+            else nullcontext()
+        ):
+            formal_groups = validate_formal_trajectory_metadata(
+                data,
+                expected_replicas=int(num_repeat),
+                require=formal_required or runtime_evidence_required,
+                require_runtime_evidence=runtime_evidence_required,
+                expected_suffix_credit=(
+                    False if formal_required or runtime_evidence_required else None
+                ),
+            )
         values = data.batch['values']
         response_mask = data.batch['response_mask']
         token_level_rewards = data.batch['token_level_rewards']
-        if formal_groups is None:
-            advantages, returns = core_algos.compute_gae_advantage_return(
-                token_level_rewards=token_level_rewards,
-                values=values,
-                eos_mask=response_mask,
-                gamma=gamma,
-                lam=lam,
-            )
-        else:
-            done_flags = data.non_tensor_batch.get("rollout_done_flags")
-            if done_flags is None:
-                raise RuntimeError(
-                    "Formal trajectory GAE requires one environment done flag per action row."
+        with (
+            _timer("adv_compute_gae", timing_raw)
+            if timing_raw is not None
+            else nullcontext()
+        ):
+            if formal_groups is None:
+                advantages, returns = core_algos.compute_gae_advantage_return(
+                    token_level_rewards=token_level_rewards,
+                    values=values,
+                    eos_mask=response_mask,
+                    gamma=gamma,
+                    lam=lam,
                 )
-            advantages, returns = core_algos.compute_trajectory_gae_advantage_return(
-                token_level_rewards=token_level_rewards,
-                values=values,
-                eos_mask=response_mask,
-                trajectory_uids=data.non_tensor_batch[AGENTMEMORY_TRAJECTORY_UID],
-                trajectory_row_uids=data.non_tensor_batch[
-                    AGENTMEMORY_TRAJECTORY_ROW_UID
-                ],
-                trajectory_row_orders=data.batch[
-                    AGENTMEMORY_TRAJECTORY_ROW_ORDER
-                ],
-                trajectory_terminals=data.batch[AGENTMEMORY_TRAJECTORY_TERMINAL],
-                done_flags=done_flags,
-                sample_mask=_get_ppo_valid_sample_mask(data),
-                gamma=gamma,
-                lam=lam,
-                immediate_rewards=data.batch[AGENTMEMORY_IMMEDIATE_REWARD],
-                advantage_normalization="none",
-            )
-            data.meta_info[
-                "agentmemory_actor_advantage_mode"
-            ] = "standard_trajectory_gae"
+            else:
+                done_flags = data.non_tensor_batch.get("rollout_done_flags")
+                if done_flags is None:
+                    raise RuntimeError(
+                        "Formal trajectory GAE requires one environment done flag per action row."
+                    )
+                advantages, returns = core_algos.compute_trajectory_gae_advantage_return(
+                    token_level_rewards=token_level_rewards,
+                    values=values,
+                    eos_mask=response_mask,
+                    trajectory_uids=data.non_tensor_batch[AGENTMEMORY_TRAJECTORY_UID],
+                    trajectory_row_uids=data.non_tensor_batch[
+                        AGENTMEMORY_TRAJECTORY_ROW_UID
+                    ],
+                    trajectory_row_orders=data.batch[
+                        AGENTMEMORY_TRAJECTORY_ROW_ORDER
+                    ],
+                    trajectory_terminals=data.batch[AGENTMEMORY_TRAJECTORY_TERMINAL],
+                    done_flags=done_flags,
+                    sample_mask=_get_ppo_valid_sample_mask(data),
+                    gamma=gamma,
+                    lam=lam,
+                    immediate_rewards=data.batch[AGENTMEMORY_IMMEDIATE_REWARD],
+                    advantage_normalization="none",
+                )
+                data.meta_info[
+                    "agentmemory_actor_advantage_mode"
+                ] = "standard_trajectory_gae"
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
     elif adv_estimator == 'grpo':
@@ -1721,15 +1738,16 @@ class RayPPOTrainer(object):
                         if formal_required or runtime_evidence_required
                         else None
                     )
-                    validate_formal_trajectory_metadata(
-                        gen_batch_output,
-                        expected_replicas=int(
-                            self.config.actor_rollout_ref.rollout.n
-                        ),
-                        require=formal_required or runtime_evidence_required,
-                        require_runtime_evidence=runtime_evidence_required,
-                        expected_suffix_credit=expected_suffix_credit,
-                    )
+                    with _timer('formal_validate_post_gen', timing_raw):
+                        validate_formal_trajectory_metadata(
+                            gen_batch_output,
+                            expected_replicas=int(
+                                self.config.actor_rollout_ref.rollout.n
+                            ),
+                            require=formal_required or runtime_evidence_required,
+                            require_runtime_evidence=runtime_evidence_required,
+                            expected_suffix_credit=expected_suffix_credit,
+                        )
                     # Align source samples with rollout outputs. Standard tasks repeat each
                     # source n times; AgentMemoryGym can return one independent training
                     # sample per agent action and provides rollout_parent_indices.
@@ -1758,15 +1776,16 @@ class RayPPOTrainer(object):
                     # Note that this breaks the order of data inside the batch.
                     # Please take care when you implement group based adv computation such as GRPO and rloo
                     self._balance_batch(batch, metrics=metrics)
-                    validate_formal_trajectory_metadata(
-                        batch,
-                        expected_replicas=int(
-                            self.config.actor_rollout_ref.rollout.n
-                        ),
-                        require=formal_required or runtime_evidence_required,
-                        require_runtime_evidence=runtime_evidence_required,
-                        expected_suffix_credit=expected_suffix_credit,
-                    )
+                    with _timer('formal_validate_post_balance', timing_raw):
+                        validate_formal_trajectory_metadata(
+                            batch,
+                            expected_replicas=int(
+                                self.config.actor_rollout_ref.rollout.n
+                            ),
+                            require=formal_required or runtime_evidence_required,
+                            require_runtime_evidence=runtime_evidence_required,
+                            expected_suffix_credit=expected_suffix_credit,
+                        )
 
                     # compute global_valid tokens
                     batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
@@ -1858,41 +1877,49 @@ class RayPPOTrainer(object):
                         # Keep padding through distributed forward passes so DP
                         # ranks receive equal chunks, then exclude it from every
                         # reward, advantage, loss, and logical metric surface.
-                        _mask_ppo_padding_samples(batch)
+                        with _timer('adv_mask_padding', timing_raw):
+                            _mask_ppo_padding_samples(batch)
                         # we combine with rule-based rm
-                        reward_tensor = batch.batch['scores']
-                        batch.batch['token_level_scores'] = reward_tensor
+                        with _timer('adv_reward_setup', timing_raw):
+                            reward_tensor = batch.batch['scores']
+                            batch.batch['token_level_scores'] = reward_tensor
 
                         # compute rewards. apply_kl_penalty if available
-                        if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
-                            batch, kl_metrics = apply_kl_penalty(batch,
-                                                                 kl_ctrl=self.kl_ctrl,
-                                                                 kl_penalty=self.config.algorithm.kl_penalty)
-                            metrics.update(kl_metrics)
-                        else:
-                            batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
+                        with _timer('adv_apply_kl_penalty', timing_raw):
+                            if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
+                                batch, kl_metrics = apply_kl_penalty(batch,
+                                                                     kl_ctrl=self.kl_ctrl,
+                                                                     kl_penalty=self.config.algorithm.kl_penalty)
+                                metrics.update(kl_metrics)
+                            else:
+                                batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
 
                         # compute advantages, executed on the driver process
-                        batch = compute_advantage(batch,
-                                                  adv_estimator=self.config.algorithm.adv_estimator,
-                                                  gamma=self.config.algorithm.gamma,
-                                                  lam=self.config.algorithm.lam,
-                                                  num_repeat=self.config.actor_rollout_ref.rollout.n)
-                        validate_formal_trajectory_metadata(
+                        batch = compute_advantage(
                             batch,
-                            expected_replicas=int(
-                                self.config.actor_rollout_ref.rollout.n
-                            ),
-                            require=formal_required or runtime_evidence_required,
-                            require_runtime_evidence=runtime_evidence_required,
-                            expected_suffix_credit=expected_suffix_credit,
+                            adv_estimator=self.config.algorithm.adv_estimator,
+                            gamma=self.config.algorithm.gamma,
+                            lam=self.config.algorithm.lam,
+                            num_repeat=self.config.actor_rollout_ref.rollout.n,
+                            timing_raw=timing_raw,
                         )
-                        _agentmemory_dump_ppo_batch_debug(
-                            batch=batch,
-                            config=self.config,
-                            global_steps=self.global_steps,
-                            stage="post_adv",
-                        )
+                        with _timer('adv_formal_validate_post', timing_raw):
+                            validate_formal_trajectory_metadata(
+                                batch,
+                                expected_replicas=int(
+                                    self.config.actor_rollout_ref.rollout.n
+                                ),
+                                require=formal_required or runtime_evidence_required,
+                                require_runtime_evidence=runtime_evidence_required,
+                                expected_suffix_credit=expected_suffix_credit,
+                            )
+                        with _timer('adv_debug_dump', timing_raw):
+                            _agentmemory_dump_ppo_batch_debug(
+                                batch=batch,
+                                config=self.config,
+                                global_steps=self.global_steps,
+                                stage="post_adv",
+                            )
 
                     # update critic
                     post_update_critic_values = None

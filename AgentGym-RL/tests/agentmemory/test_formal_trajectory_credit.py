@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -98,6 +99,7 @@ def load_ray_trainer_functions():
         "DataProto": FakeDataProto,
         "core_algos": core_algos,
         "json": json,
+        "nullcontext": nullcontext,
         "np": np,
         "os": os,
         "requires_formal_trajectory_metadata": (
