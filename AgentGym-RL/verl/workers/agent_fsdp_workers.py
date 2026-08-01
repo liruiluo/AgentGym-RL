@@ -15,8 +15,11 @@
 The main entry point to run the PPO algorithm
 """
 
+import json
 import logging
 import os
+from pathlib import Path
+import time
 import warnings
 
 import torch
@@ -52,6 +55,103 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_PPO_LOGGING_LEVEL', 'WARN'))
 
 AGENTMEMORY_FORMAL_UPDATE_READBACK_ACTIVE = 'agentmemory_formal_update_readback_active'
+OPTIMIZER_PHASE_TELEMETRY_DIR = 'VERL_AGENTMEMORY_OPTIMIZER_PHASE_TELEMETRY_DIR'
+
+
+def _optimizer_state_summary(optimizer):
+    bytes_by_device = {}
+    tensors_by_device = {}
+    for state in optimizer.state.values():
+        for value in state.values():
+            if not isinstance(value, torch.Tensor):
+                continue
+            device = str(value.device)
+            bytes_by_device[device] = (
+                bytes_by_device.get(device, 0)
+                + value.numel() * value.element_size()
+            )
+            tensors_by_device[device] = tensors_by_device.get(device, 0) + 1
+    return {
+        'bytes_by_device': bytes_by_device,
+        'tensor_count_by_device': tensors_by_device,
+        'total_bytes': sum(bytes_by_device.values()),
+        'total_tensors': sum(tensors_by_device.values()),
+    }
+
+
+def _optimizer_phase_payload(*, optimizer, role, action, update_index,
+                             elapsed_seconds=None, before=None):
+    rank = (
+        torch.distributed.get_rank()
+        if torch.distributed.is_initialized()
+        else 0
+    )
+    payload = {
+        'action': action,
+        'elapsed_seconds': elapsed_seconds,
+        'pid': os.getpid(),
+        'rank': rank,
+        'role': role,
+        'state': _optimizer_state_summary(optimizer),
+        'timestamp_unix': time.time(),
+        'update_index': update_index,
+    }
+    if before is not None:
+        payload['state_before'] = before
+    if torch.cuda.is_available():
+        payload['cuda'] = {
+            'allocated_bytes': torch.cuda.memory_allocated(),
+            'max_allocated_bytes': torch.cuda.max_memory_allocated(),
+            'max_reserved_bytes': torch.cuda.max_memory_reserved(),
+            'reserved_bytes': torch.cuda.memory_reserved(),
+        }
+    return payload
+
+
+def _write_optimizer_phase_payload(payload):
+    output_dir = os.getenv(OPTIMIZER_PHASE_TELEMETRY_DIR)
+    if not output_dir:
+        return
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    file_path = output_path / (
+        f"{payload['role']}_rank{payload['rank']}_pid{payload['pid']}.jsonl"
+    )
+    with file_path.open('a', encoding='utf-8') as handle:
+        handle.write(json.dumps(payload, sort_keys=True) + '\n')
+
+
+def _record_optimizer_snapshot(*, optimizer, role, action, update_index):
+    if not os.getenv(OPTIMIZER_PHASE_TELEMETRY_DIR):
+        return
+    _write_optimizer_phase_payload(
+        _optimizer_phase_payload(
+            optimizer=optimizer,
+            role=role,
+            action=action,
+            update_index=update_index,
+        )
+    )
+
+
+def _run_optimizer_transfer(*, optimizer, role, action, update_index, transfer):
+    if not os.getenv(OPTIMIZER_PHASE_TELEMETRY_DIR):
+        transfer()
+        return
+    before = _optimizer_state_summary(optimizer)
+    started = time.perf_counter()
+    transfer()
+    elapsed_seconds = time.perf_counter() - started
+    _write_optimizer_phase_payload(
+        _optimizer_phase_payload(
+            optimizer=optimizer,
+            role=role,
+            action=action,
+            update_index=update_index,
+            elapsed_seconds=elapsed_seconds,
+            before=before,
+        )
+    )
 
 
 def _add_parameter_probe_metrics(metrics, *, prefix, summary):
@@ -132,6 +232,7 @@ class ActorRolloutRefWorker(Worker):
         elif self._is_ref:
             # TODO: it seems that manual offload is slowly than FSDP offload
             self._is_offload_param = self.config.ref.fsdp_config.get('param_offload', False)
+        self._optimizer_update_index = 0
 
         # normalize config
         if self._is_actor:
@@ -467,6 +568,7 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
+        update_index = self._optimizer_update_index + 1
         fsdp_group = self.device_mesh.get_group()
         data.meta_info['ppo_loss_process_group'] = fsdp_group
         data.meta_info['ppo_metric_process_group'] = fsdp_group
@@ -477,8 +579,29 @@ class ActorRolloutRefWorker(Worker):
             load_fsdp_param_and_grad(module=self.actor_module_fsdp,
                                      device_id=torch.cuda.current_device(),
                                      load_grad=self._is_offload_grad)
+        _record_optimizer_snapshot(
+            optimizer=self.actor_optimizer,
+            role='actor',
+            action='before_optional_load',
+            update_index=update_index,
+        )
         if self._is_offload_optimizer:
-            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=torch.cuda.current_device())
+            _run_optimizer_transfer(
+                optimizer=self.actor_optimizer,
+                role='actor',
+                action='load',
+                update_index=update_index,
+                transfer=lambda: load_fsdp_optimizer(
+                    optimizer=self.actor_optimizer,
+                    device_id=torch.cuda.current_device(),
+                ),
+            )
+        _record_optimizer_snapshot(
+            optimizer=self.actor_optimizer,
+            role='actor',
+            action='after_optional_load',
+            update_index=update_index,
+        )
 
         data.batch = data.batch.cuda()
 
@@ -524,8 +647,29 @@ class ActorRolloutRefWorker(Worker):
 
         if self._is_offload_param:
             offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
+        _record_optimizer_snapshot(
+            optimizer=self.actor_optimizer,
+            role='actor',
+            action='after_update_before_optional_offload',
+            update_index=update_index,
+        )
         if self._is_offload_optimizer:
-            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+            _run_optimizer_transfer(
+                optimizer=self.actor_optimizer,
+                role='actor',
+                action='offload',
+                update_index=update_index,
+                transfer=lambda: offload_fsdp_optimizer(
+                    optimizer=self.actor_optimizer
+                ),
+            )
+        _record_optimizer_snapshot(
+            optimizer=self.actor_optimizer,
+            role='actor',
+            action='after_optional_offload',
+            update_index=update_index,
+        )
+        self._optimizer_update_index = update_index
         torch.cuda.empty_cache()
         return output
 
@@ -700,6 +844,7 @@ class CriticWorker(Worker):
         self._is_offload_param = self.config.model.fsdp_config.param_offload
         self._is_offload_grad = self.config.model.fsdp_config.grad_offload
         self._is_offload_optimizer = self.config.model.fsdp_config.optimizer_offload
+        self._optimizer_update_index = 0
 
         # normalize config
         critic_dp = torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size
@@ -940,6 +1085,7 @@ class CriticWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_critic(self, data: DataProto):
+        update_index = self._optimizer_update_index + 1
         fsdp_group = self.device_mesh.get_group()
         data.meta_info['ppo_loss_process_group'] = fsdp_group
         data.meta_info['ppo_metric_process_group'] = fsdp_group
@@ -948,8 +1094,29 @@ class CriticWorker(Worker):
             load_fsdp_param_and_grad(module=self.critic_module,
                                      device_id=torch.cuda.current_device(),
                                      load_grad=self._is_offload_grad)
+        _record_optimizer_snapshot(
+            optimizer=self.critic_optimizer,
+            role='critic',
+            action='before_optional_load',
+            update_index=update_index,
+        )
         if self._is_offload_optimizer:
-            load_fsdp_optimizer(optimizer=self.critic_optimizer, device_id=torch.cuda.current_device())
+            _run_optimizer_transfer(
+                optimizer=self.critic_optimizer,
+                role='critic',
+                action='load',
+                update_index=update_index,
+                transfer=lambda: load_fsdp_optimizer(
+                    optimizer=self.critic_optimizer,
+                    device_id=torch.cuda.current_device(),
+                ),
+            )
+        _record_optimizer_snapshot(
+            optimizer=self.critic_optimizer,
+            role='critic',
+            action='after_optional_load',
+            update_index=update_index,
+        )
 
         # perform forward computation
         with self.ulysses_sharding_manager:
@@ -988,8 +1155,29 @@ class CriticWorker(Worker):
 
         if self._is_offload_param:
             offload_fsdp_param_and_grad(module=self.critic_module, offload_grad=self._is_offload_grad)
+        _record_optimizer_snapshot(
+            optimizer=self.critic_optimizer,
+            role='critic',
+            action='after_update_before_optional_offload',
+            update_index=update_index,
+        )
         if self._is_offload_optimizer:
-            offload_fsdp_optimizer(optimizer=self.critic_optimizer)
+            _run_optimizer_transfer(
+                optimizer=self.critic_optimizer,
+                role='critic',
+                action='offload',
+                update_index=update_index,
+                transfer=lambda: offload_fsdp_optimizer(
+                    optimizer=self.critic_optimizer
+                ),
+            )
+        _record_optimizer_snapshot(
+            optimizer=self.critic_optimizer,
+            role='critic',
+            action='after_optional_offload',
+            update_index=update_index,
+        )
+        self._optimizer_update_index = update_index
         torch.cuda.empty_cache()
         output = output.to('cpu')
         return output
