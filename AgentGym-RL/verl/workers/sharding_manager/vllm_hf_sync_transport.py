@@ -6,12 +6,19 @@ import os
 
 
 TRANSPORT_ENV = "AGENTMEMORY_VLLM_HF_SYNC_TRANSPORT"
-_VALID_TRANSPORTS = {"file", "direct_inproc"}
+DIRECT_INPROC_TRANSPORT = "direct_inproc"
+DIRECT_INPROC_STREAMING_TRANSPORT = "direct_inproc_streaming"
+_VALID_TRANSPORTS = {
+    "file",
+    DIRECT_INPROC_TRANSPORT,
+    DIRECT_INPROC_STREAMING_TRANSPORT,
+}
 _EXPECTED_DIRECT_TYPES = {
     "engine_client": "vllm.v1.engine.core_client.InprocClient",
     "engine_core": "vllm.v1.engine.core.EngineCore",
     "model_executor": "vllm.v1.executor.uniproc_executor.UniProcExecutor",
 }
+_EXPECTED_STREAMING_TENSOR_TYPE = "torch.distributed.tensor.DTensor"
 
 
 def resolve_hf_sync_transport(environ=None):
@@ -21,6 +28,26 @@ def resolve_hf_sync_transport(environ=None):
         allowed = ", ".join(sorted(_VALID_TRANSPORTS))
         raise ValueError(f"{TRANSPORT_ENV} must be one of {allowed}, got {value!r}")
     return value
+
+
+def uses_streaming_sharded_state_dict(transport):
+    return str(transport) == DIRECT_INPROC_STREAMING_TRANSPORT
+
+
+def require_streaming_sharded_tensor(name, tensor):
+    """Reject state-dict values that cannot reconstruct one global tensor."""
+    actual_type = _qualified_type(tensor)
+    if actual_type != _EXPECTED_STREAMING_TENSOR_TYPE:
+        raise RuntimeError(
+            "direct_inproc_streaming requires every sharded state-dict value "
+            f"to be {_EXPECTED_STREAMING_TENSOR_TYPE}; {name!r} is {actual_type}"
+        )
+    if not callable(getattr(tensor, "full_tensor", None)):
+        raise RuntimeError(
+            "direct_inproc_streaming state-dict value is missing full_tensor(): "
+            f"{name!r} ({actual_type})"
+        )
+    return actual_type
 
 
 def _qualified_type(value):
