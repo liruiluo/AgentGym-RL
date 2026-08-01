@@ -133,6 +133,15 @@ def validate_qwen3_5_training_runtime(
     versions["packed_conv_seq_idx"] = True
     versions["packed_flash_position_ids"] = True
     if sequence_parallel_size > 1:
+        from verl.models.transformers.qwen3_5 import (
+            qwen3_5_ulysses_flash_attention_patch_installed,
+        )
+
+        if not qwen3_5_ulysses_flash_attention_patch_installed():
+            raise RuntimeError(
+                "Qwen3.5 Ulysses SP requires the full-attention all-to-all "
+                "patch to be installed before model construction."
+            )
         if "cp_context" not in inspect.signature(
             chunk_gated_delta_rule
         ).parameters:
@@ -161,6 +170,7 @@ def validate_qwen3_5_training_runtime(
                 "Qwen3.5 Ulysses SP found non-callable FLA context-parallel helpers."
             )
         versions["ulysses_context_parallel"] = True
+        versions["ulysses_full_attention_all_to_all"] = True
         versions["ulysses_sequence_parallel_size"] = sequence_parallel_size
 
     capability = torch.cuda.get_device_capability()

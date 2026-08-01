@@ -28,16 +28,162 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from verl.utils.ulysses import (
+    gather_heads_scatter_seq,
+    gather_seq_scatter_heads,
     get_ulysses_sequence_parallel_group,
+    get_ulysses_sequence_parallel_rank,
     get_ulysses_sequence_parallel_world_size,
 )
 
 
 QWEN35_MODEL_TYPES = frozenset({"qwen3_5", "qwen3_5_text"})
+_ORIGINAL_FLASH_ATTENTION_FORWARD = None
+_ULYSSES_FLASH_ATTENTION_MARKER = "_verl_qwen35_ulysses_flash_attention"
 
 
 def is_qwen3_5_model_type(model_type: str) -> bool:
     return model_type in QWEN35_MODEL_TYPES
+
+
+def _repeat_kv_for_ulysses(
+    hidden_states: torch.Tensor,
+    repeats: int,
+) -> torch.Tensor:
+    if repeats == 1:
+        return hidden_states
+    batch_size, seq_len, num_heads, head_dim = hidden_states.shape
+    hidden_states = hidden_states[:, :, :, None, :].expand(
+        batch_size,
+        seq_len,
+        num_heads,
+        repeats,
+        head_dim,
+    )
+    return hidden_states.reshape(
+        batch_size,
+        seq_len,
+        num_heads * repeats,
+        head_dim,
+    )
+
+
+def qwen3_5_ulysses_flash_attention_forward(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    query_length: int,
+    *args,
+    position_ids: Optional[torch.Tensor] = None,
+    **kwargs,
+):
+    """Run full attention with sequence/head all-to-all under Ulysses SP."""
+
+    if _ORIGINAL_FLASH_ATTENTION_FORWARD is None:
+        raise RuntimeError("Qwen3.5 Ulysses FlashAttention patch is not installed.")
+
+    ulysses_sp_size = get_ulysses_sequence_parallel_world_size()
+    use_ulysses = ulysses_sp_size > 1 and position_ids is not None
+    if use_ulysses:
+        local_seq_len = query_states.size(1)
+        if position_ids.size(-1) != local_seq_len:
+            raise ValueError(
+                "Qwen3.5 Ulysses FlashAttention expects local position_ids: "
+                f"positions={position_ids.size(-1)} local_query={local_seq_len}."
+            )
+        if query_states.size(2) % ulysses_sp_size:
+            raise ValueError(
+                "Qwen3.5 query heads must divide the Ulysses world size: "
+                f"heads={query_states.size(2)} sp={ulysses_sp_size}."
+            )
+
+        repeats = max(ulysses_sp_size // key_states.size(2), 1)
+        key_states = _repeat_kv_for_ulysses(key_states, repeats)
+        value_states = _repeat_kv_for_ulysses(value_states, repeats)
+        if key_states.size(2) % ulysses_sp_size:
+            raise ValueError(
+                "Qwen3.5 key/value heads must divide the Ulysses world size "
+                "after repetition: "
+                f"heads={key_states.size(2)} sp={ulysses_sp_size}."
+            )
+
+        query_states = gather_seq_scatter_heads(
+            query_states,
+            seq_dim=1,
+            head_dim=2,
+        )
+        key_states = gather_seq_scatter_heads(
+            key_states,
+            seq_dim=1,
+            head_dim=2,
+        )
+        value_states = gather_seq_scatter_heads(
+            value_states,
+            seq_dim=1,
+            head_dim=2,
+        )
+
+        gathered_position_ids = [
+            torch.empty_like(position_ids) for _ in range(ulysses_sp_size)
+        ]
+        dist.all_gather(
+            gathered_position_ids,
+            position_ids.contiguous(),
+            group=get_ulysses_sequence_parallel_group(),
+        )
+        position_ids = torch.cat(gathered_position_ids, dim=-1)
+        query_length = query_states.size(1)
+
+    attention_output = _ORIGINAL_FLASH_ATTENTION_FORWARD(
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        query_length,
+        *args,
+        position_ids=position_ids,
+        **kwargs,
+    )
+    if use_ulysses:
+        attention_output = gather_heads_scatter_seq(
+            attention_output,
+            seq_dim=1,
+            head_dim=2,
+        )
+    return attention_output
+
+
+setattr(
+    qwen3_5_ulysses_flash_attention_forward,
+    _ULYSSES_FLASH_ATTENTION_MARKER,
+    True,
+)
+
+
+def _install_qwen3_5_ulysses_flash_attention_patch() -> bool:
+    from transformers.integrations import flash_attention
+
+    global _ORIGINAL_FLASH_ATTENTION_FORWARD
+    current = flash_attention._flash_attention_forward
+    if getattr(current, _ULYSSES_FLASH_ATTENTION_MARKER, False):
+        return False
+    _ORIGINAL_FLASH_ATTENTION_FORWARD = current
+    flash_attention._flash_attention_forward = (
+        qwen3_5_ulysses_flash_attention_forward
+    )
+    return True
+
+
+def qwen3_5_ulysses_flash_attention_patch_installed() -> bool:
+    from transformers.integrations import flash_attention
+
+    return bool(
+        getattr(
+            flash_attention._flash_attention_forward,
+            _ULYSSES_FLASH_ATTENTION_MARKER,
+            False,
+        )
+    )
 
 
 def apply_qwen3_5_packed_forward_patch() -> bool:
@@ -58,7 +204,8 @@ def apply_qwen3_5_packed_forward_patch() -> bool:
     )
     Qwen3_5DecoderLayer.forward = qwen3_5_decoder_layer_forward
     Qwen3_5GatedDeltaNet.forward = qwen3_5_gated_delta_net_forward
-    return not already_patched
+    flash_attention_patched = _install_qwen3_5_ulysses_flash_attention_patch()
+    return not already_patched or flash_attention_patched
 
 
 def _call_accepts_kwarg(fn, name: str) -> bool:
@@ -500,6 +647,40 @@ def qwen3_5_gated_delta_net_forward(
     return self.out_proj(core_attn_out)
 
 
+def _slice_ulysses_position_tensor(
+    tensor: Optional[torch.Tensor],
+    *,
+    sequence_dim: int,
+    local_sequence_length: int,
+    label: str,
+) -> Optional[torch.Tensor]:
+    if tensor is None:
+        return None
+    ulysses_sp_size = get_ulysses_sequence_parallel_world_size()
+    if ulysses_sp_size <= 1:
+        return tensor
+
+    sequence_dim = sequence_dim % tensor.ndim
+    position_length = tensor.size(sequence_dim)
+    if position_length == local_sequence_length:
+        return tensor
+    expected_full_length = local_sequence_length * ulysses_sp_size
+    if position_length != expected_full_length:
+        raise ValueError(
+            f"Qwen3.5 Ulysses {label} length {position_length} does not match "
+            f"local/full sequence lengths {local_sequence_length}/"
+            f"{expected_full_length}."
+        )
+
+    rank = get_ulysses_sequence_parallel_rank()
+    start = rank * local_sequence_length
+    return tensor.narrow(
+        sequence_dim,
+        start,
+        local_sequence_length,
+    ).contiguous()
+
+
 def qwen3_5_decoder_layer_forward(
     self,
     hidden_states: torch.Tensor,
@@ -523,6 +704,22 @@ def qwen3_5_decoder_layer_forward(
             cu_seqlens_cpu=cu_seqlens_cpu,
         )
     elif self.layer_type == "full_attention":
+        local_sequence_length = hidden_states.size(1)
+        position_embeddings = tuple(
+            _slice_ulysses_position_tensor(
+                embedding,
+                sequence_dim=-2,
+                local_sequence_length=local_sequence_length,
+                label=f"position_embeddings[{index}]",
+            )
+            for index, embedding in enumerate(position_embeddings)
+        )
+        position_ids = _slice_ulysses_position_tensor(
+            position_ids,
+            sequence_dim=-1,
+            local_sequence_length=local_sequence_length,
+            label="position_ids",
+        )
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,

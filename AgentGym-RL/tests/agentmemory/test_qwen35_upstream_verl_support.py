@@ -106,10 +106,21 @@ class Qwen35PackedWorkerContractTests(unittest.TestCase):
             def forward(self):
                 return None
 
+        fake_flash_attention = types.SimpleNamespace(
+            _flash_attention_forward=lambda *args, **kwargs: None
+        )
+        original_flash_attention_forward = (
+            fake_flash_attention._flash_attention_forward
+        )
+        fake_integrations = types.ModuleType("transformers.integrations")
+        fake_integrations.flash_attention = fake_flash_attention
         fake_qwen35.Qwen3_5DecoderLayer = Decoder
         fake_qwen35.Qwen3_5GatedDeltaNet = GatedDeltaNet
         fake_ulysses = types.ModuleType("verl.utils.ulysses")
+        fake_ulysses.gather_heads_scatter_seq = lambda value, **_kwargs: value
+        fake_ulysses.gather_seq_scatter_heads = lambda value, **_kwargs: value
         fake_ulysses.get_ulysses_sequence_parallel_group = lambda: None
+        fake_ulysses.get_ulysses_sequence_parallel_rank = lambda: 0
         fake_ulysses.get_ulysses_sequence_parallel_world_size = lambda: 1
         with patch.dict(
             sys.modules,
@@ -118,6 +129,7 @@ class Qwen35PackedWorkerContractTests(unittest.TestCase):
                 "torch.distributed": fake_torch.distributed,
                 "torch.nn": fake_nn,
                 "torch.nn.functional": fake_functional,
+                "transformers.integrations": fake_integrations,
                 "transformers.models.qwen3_5.modeling_qwen3_5": fake_qwen35,
                 "verl.utils.ulysses": fake_ulysses,
             },
@@ -129,6 +141,14 @@ class Qwen35PackedWorkerContractTests(unittest.TestCase):
             self.assertIs(
                 GatedDeltaNet.forward,
                 module.qwen3_5_gated_delta_net_forward,
+            )
+            self.assertIs(
+                fake_flash_attention._flash_attention_forward,
+                module.qwen3_5_ulysses_flash_attention_forward,
+            )
+            self.assertIs(
+                module._ORIGINAL_FLASH_ATTENTION_FORWARD,
+                original_flash_attention_forward,
             )
 
 
