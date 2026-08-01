@@ -6,6 +6,7 @@ from unittest import mock
 
 import torch
 
+from verl.agent_trainer.main_ppo import _ray_runtime_env_vars
 from verl.workers.agent_fsdp_workers import (
     OPTIMIZER_PHASE_TELEMETRY_DIR,
     _record_optimizer_snapshot,
@@ -24,6 +25,30 @@ class _OptimizerStub:
 
 
 class OptimizerPhaseTelemetryTest(unittest.TestCase):
+    def test_telemetry_dir_reaches_main_task_and_worker_allowlists(self):
+        output_dir = "/tmp/amg-optimizer-phase-telemetry-smoke"
+        with mock.patch.dict(
+            os.environ,
+            {OPTIMIZER_PHASE_TELEMETRY_DIR: output_dir},
+            clear=True,
+        ):
+            self.assertEqual(
+                _ray_runtime_env_vars()[OPTIMIZER_PHASE_TELEMETRY_DIR],
+                output_dir,
+            )
+
+        worker_source = os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "..",
+            "verl",
+            "single_controller",
+            "ray",
+            "base.py",
+        )
+        with open(worker_source, encoding="utf-8") as handle:
+            self.assertIn(OPTIMIZER_PHASE_TELEMETRY_DIR, handle.read())
+
     def test_snapshot_and_transfer_record_state_bytes(self):
         optimizer = _OptimizerStub()
         with tempfile.TemporaryDirectory() as output_dir:

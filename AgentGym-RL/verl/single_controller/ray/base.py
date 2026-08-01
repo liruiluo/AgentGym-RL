@@ -270,6 +270,7 @@ class RayWorkerGroup(WorkerGroup):
                     'VLLM_USE_MODELSCOPE',
         'VLLM_ALLOW_INSECURE_SERIALIZATION',
                     'VERL_AGENTMEMORY_HF_SYNC_DIR',
+                    'VERL_AGENTMEMORY_OPTIMIZER_PHASE_TELEMETRY_DIR',
                     'VERL_PPO_LOGGING_LEVEL',
                     'VERL_TRAINING_TRITON_CACHE_DIR',
                     'FLA_CACHE_RESULTS',
