@@ -35,6 +35,7 @@ from .vllm_sync_evidence import (
     read_last_event,
     validate_sync_event,
 )
+from .vllm_sync_timing import SyncPhaseTimer, format_sync_timing_event
 from verl.workers.qwen35_weight_sync import (
     map_actor_weight_name_for_vllm,
     validate_qwen35_mapped_source_names,
@@ -99,6 +100,8 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         self._last_sync_event = None
         self._current_sync_event = None
         self._current_sync_previous = None
+        self._sync_timing_enabled = (
+            os.getenv('VERL_AGENTMEMORY_VLLM_SYNC_TIMING', '0') == '1')
 
     def _sync_rank(self):
         return torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
@@ -197,15 +200,22 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         return vllm_ps.get_tensor_model_parallel_group().device_group
 
     def __enter__(self):
+        sync_timer = SyncPhaseTimer(
+            enabled=self.full_params and self._sync_timing_enabled)
+        sync_file_bytes = None
+        sync_dir = None
+        sync_transport = None
         log_gpu_memory_usage('Before state_dict() in sharding manager memory', logger=logger)
-        params = self.module.state_dict()
+        with sync_timer.phase('state_dict'):
+            params = self.module.state_dict()
         log_gpu_memory_usage('After state_dict() in sharding manager memory', logger=logger)
         # Copy, not share memory
         load_format = self.sync_weight_format
         if vllm_version in ('0.4.2', '0.5.4', '0.6.3'):
             self.inference_engine.sync_model_weights(params, load_format=load_format)
         else:
-            self.inference_engine.wake_up()
+            with sync_timer.phase('wake_up'):
+                self.inference_engine.wake_up()
             # TODO(ZSL): deal with 'hf' format
             llm_engine = getattr(self.inference_engine, 'llm_engine', None)
             if llm_engine is None:
@@ -273,18 +283,23 @@ class FSDPVLLMShardingManager(BaseShardingManager):
 
                 if hasattr(llm_engine, 'apply_model'):
                     sync_dir = os.getenv('VERL_AGENTMEMORY_HF_SYNC_DIR') or os.getenv('RAY_TMPDIR') or '/tmp'
+                    sync_transport = 'file_backed_apply_model'
                     os.makedirs(sync_dir, exist_ok=True)
                     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
                     sync_file = os.path.join(sync_dir, f'agentmemory_hf_sync_rank{rank}_pid{os.getpid()}.pt')
-                    hf_weights = materialize_hf_weights()
+                    with sync_timer.phase('materialize'):
+                        hf_weights = materialize_hf_weights()
                     expected_source_names = self.expected_source_names
                     evidence_enabled = bool(self._sync_evidence_dir)
-                    if evidence_enabled:
-                        global_steps, sync_id = self._next_sync_identity()
-                        source_before = bounded_tensor_fingerprint(hf_weights)
-                    else:
-                        global_steps = sync_id = source_before = None
-                    torch.save(hf_weights, sync_file)
+                    with sync_timer.phase('evidence'):
+                        if evidence_enabled:
+                            global_steps, sync_id = self._next_sync_identity()
+                            source_before = bounded_tensor_fingerprint(hf_weights)
+                        else:
+                            global_steps = sync_id = source_before = None
+                    with sync_timer.phase('save'):
+                        torch.save(hf_weights, sync_file)
+                        sync_file_bytes = os.path.getsize(sync_file)
                     del hf_weights
 
                     def agentmemory_load_hf_from_file(model):
@@ -332,28 +347,31 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                         return result
 
                     try:
-                        sync_results = llm_engine.apply_model(agentmemory_load_hf_from_file)
+                        with sync_timer.phase('apply_model'):
+                            sync_results = llm_engine.apply_model(agentmemory_load_hf_from_file)
                     finally:
-                        try:
-                            os.remove(sync_file)
-                        except FileNotFoundError:
-                            pass
-                    if evidence_enabled:
-                        previous_event = self._last_sync_event
-                        event = build_sync_event(
-                            rank=rank,
-                            pid=os.getpid(),
-                            global_steps=global_steps,
-                            sync_sequence=self._sync_sequence,
-                            sync_id=sync_id,
-                            source_before=source_before,
-                            apply_model_results=sync_results,
-                            previous_event=previous_event,
-                        )
-                        self._current_sync_previous = previous_event
-                        self._current_sync_event = append_and_readback_event(
-                            self._sync_evidence_path(), event)
-                        self._last_sync_event = self._current_sync_event
+                        with sync_timer.phase('cleanup'):
+                            try:
+                                os.remove(sync_file)
+                            except FileNotFoundError:
+                                pass
+                    with sync_timer.phase('evidence'):
+                        if evidence_enabled:
+                            previous_event = self._last_sync_event
+                            event = build_sync_event(
+                                rank=rank,
+                                pid=os.getpid(),
+                                global_steps=global_steps,
+                                sync_sequence=self._sync_sequence,
+                                sync_id=sync_id,
+                                source_before=source_before,
+                                apply_model_results=sync_results,
+                                previous_event=previous_event,
+                            )
+                            self._current_sync_previous = previous_event
+                            self._current_sync_event = append_and_readback_event(
+                                self._sync_evidence_path(), event)
+                            self._last_sync_event = self._current_sync_event
                     logger.info('Synced actor HF weights into official vLLM via file-backed apply_model: %s', sync_results)
                 elif hasattr(llm_engine, 'model_executor'):
                     model = llm_engine.model_executor.driver_worker.worker.model_runner.model
@@ -366,9 +384,21 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                 raise NotImplementedError(f'load_format {load_format} not implemented')
         log_gpu_memory_usage('After sync model weights in sharding manager', logger=logger)
 
-        del params
-        torch.cuda.empty_cache()
+        with sync_timer.phase('cleanup'):
+            del params
+            torch.cuda.empty_cache()
         log_gpu_memory_usage('After del state_dict and empty_cache in sharding manager', logger=logger)
+
+        timing_event = sync_timer.build_event(
+            rank=self._sync_rank(),
+            pid=os.getpid(),
+            sync_format=self.sync_weight_format,
+            transport=sync_transport,
+            sync_dir=sync_dir,
+            sync_file_bytes=sync_file_bytes,
+        )
+        if timing_event is not None:
+            logger.warning(format_sync_timing_event(timing_event))
 
         # TODO: offload FSDP model weights
         # self.module.cpu()
