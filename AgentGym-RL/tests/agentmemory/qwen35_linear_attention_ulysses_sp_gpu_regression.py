@@ -82,6 +82,31 @@ def _all_gather_sequence(local_tensor: torch.Tensor) -> torch.Tensor:
     return torch.cat(gathered, dim=1)
 
 
+def _cases_for_world_size(world_size: int) -> list[tuple[str, list[int]]]:
+    if world_size == 2:
+        return [
+            ("boundary_aligned", [8, 8]),
+            ("sequence_cut", [6, 10]),
+            ("single_sequence", [16]),
+            ("many_short_sequences", [3, 4, 5, 4]),
+        ]
+    if world_size == 4:
+        return [
+            ("boundary_aligned", [8, 8, 8, 8]),
+            ("sequence_cut", [20, 12]),
+            ("single_sequence", [32]),
+            ("many_short_sequences", [5, 7, 9, 11]),
+        ]
+    if world_size == 8:
+        return [
+            ("boundary_aligned", [128] * 8),
+            ("sequence_cut", [700, 324]),
+            ("single_sequence", [1024]),
+            ("many_short_sequences", [100, 150, 200, 250, 124, 100, 100]),
+        ]
+    raise RuntimeError("this regression supports world sizes 2, 4, and 8")
+
+
 def _run_case(
     *,
     case_name: str,
@@ -184,8 +209,9 @@ def _run_case(
 
 
 def main() -> None:
-    if int(os.environ.get("WORLD_SIZE", "1")) != 2:
-        raise RuntimeError("this regression must run with exactly two ranks")
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size not in (2, 4, 8):
+        raise RuntimeError("this regression requires 2, 4, or 8 ranks")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
 
@@ -196,12 +222,7 @@ def main() -> None:
     torch.cuda.set_device(device)
     apply_qwen3_5_packed_forward_patch()
 
-    cases = [
-        ("boundary_aligned", [8, 8]),
-        ("sequence_cut", [6, 10]),
-        ("single_sequence", [16]),
-        ("many_short_sequences", [3, 4, 5, 4]),
-    ]
+    cases = _cases_for_world_size(world_size)
     results = []
     failures = []
     for use_causal_conv1d in (True, False):
