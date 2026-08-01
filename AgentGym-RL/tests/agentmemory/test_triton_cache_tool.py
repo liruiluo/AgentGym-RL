@@ -65,19 +65,41 @@ class TritonCacheToolTests(unittest.TestCase):
             with self.assertRaisesRegex(tool.CacheToolError, "missing kernels"):
                 tool.assert_prewarmer_ready(inventory)
 
-    def test_inventory_rejects_duplicate_function_key(self):
+    def test_inventory_accepts_same_function_key_for_distinct_variants(self):
         tool = _load_tool()
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             _write_autotune(root, "bucket-a", "l2norm_fwd_kernel", [128, 1])
             _write_autotune(root, "bucket-b", "l2norm_fwd_kernel", [128, 1])
             inventory = tool.inventory_cache(root)
-            self.assertEqual(len(inventory["duplicate_function_keys"]), 1)
-            with self.assertRaisesRegex(tool.CacheToolError, "duplicate"):
-                tool.assert_prewarmer_ready(
-                    inventory,
-                    required_kernels=("l2norm_fwd_kernel",),
-                )
+            self.assertEqual(inventory["unique_function_keys"], 1)
+            self.assertEqual(inventory["unique_variant_keys"], 2)
+            self.assertEqual(inventory["duplicate_function_keys"], [])
+            self.assertEqual(len(inventory["cross_variant_function_keys"]), 1)
+            tool.assert_prewarmer_ready(
+                inventory,
+                required_kernels=("l2norm_fwd_kernel",),
+            )
+
+    def test_reference_coverage_requires_every_compiled_variant(self):
+        tool = _load_tool()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            reference = root / "reference"
+            cache = root / "cache"
+            _write_autotune(
+                reference, "bucket-a", "l2norm_fwd_kernel", [128, 1]
+            )
+            _write_autotune(
+                reference, "bucket-b", "l2norm_fwd_kernel", [128, 1]
+            )
+            _write_autotune(cache, "bucket-a", "l2norm_fwd_kernel", [128, 1])
+
+            coverage = tool.verify_reference_coverage(reference, cache)
+            self.assertEqual(len(coverage["missing_function_keys"]), 1)
+            self.assertEqual(
+                coverage["missing_function_keys"][0]["variant"], "bucket-b"
+            )
 
     def test_seed_is_idempotent_and_covers_reference(self):
         tool = _load_tool()

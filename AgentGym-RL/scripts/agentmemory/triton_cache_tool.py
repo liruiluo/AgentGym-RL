@@ -43,12 +43,13 @@ def _canonical_key(value: Any) -> str:
 
 def _autotune_records(
     root: Path,
-) -> tuple[dict[tuple[str, str], list[str]], list[str], Counter[str]]:
-    records: dict[tuple[str, str], list[str]] = defaultdict(list)
+) -> tuple[dict[tuple[str, str, str], list[str]], list[str], Counter[str]]:
+    records: dict[tuple[str, str, str], list[str]] = defaultdict(list)
     invalid: list[str] = []
     kernel_counts: Counter[str] = Counter()
     for path in sorted(root.rglob(f"*{AUTOTUNE_SUFFIX}")):
         relative = str(path.relative_to(root))
+        variant = str(path.parent.relative_to(root))
         kernel = path.name[: -len(AUTOTUNE_SUFFIX)]
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -59,7 +60,10 @@ def _autotune_records(
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             invalid.append(relative)
             continue
-        records[(kernel, key)].append(relative)
+        # The parent directory is Triton's compiled-source hash. Different
+        # hashes may legitimately use the same function name and autotune key;
+        # collapsing them makes a required variant JIT again on every run.
+        records[(variant, kernel, key)].append(relative)
         kernel_counts[kernel] += 1
     return records, invalid, kernel_counts
 
@@ -69,11 +73,24 @@ def inventory_cache(path: str | os.PathLike[str]) -> dict[str, Any]:
     records, invalid, kernel_counts = _autotune_records(root)
     duplicates = [
         {
+            "variant": variant,
             "kernel": kernel,
             "key": json.loads(key),
             "paths": paths,
         }
-        for (kernel, key), paths in sorted(records.items())
+        for (variant, kernel, key), paths in sorted(records.items())
+        if len(paths) > 1
+    ]
+    function_records: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for (_, kernel, key), paths in records.items():
+        function_records[(kernel, key)].extend(paths)
+    cross_variant_keys = [
+        {
+            "kernel": kernel,
+            "key": json.loads(key),
+            "paths": sorted(paths),
+        }
+        for (kernel, key), paths in sorted(function_records.items())
         if len(paths) > 1
     ]
     files = [entry for entry in root.rglob("*") if entry.is_file()]
@@ -82,9 +99,11 @@ def inventory_cache(path: str | os.PathLike[str]) -> dict[str, Any]:
         "files": len(files),
         "bytes": sum(entry.stat().st_size for entry in files),
         "autotune_files": sum(kernel_counts.values()),
-        "unique_function_keys": len(records),
+        "unique_function_keys": len(function_records),
+        "unique_variant_keys": len(records),
         "kernel_counts": dict(sorted(kernel_counts.items())),
         "invalid_autotune_files": invalid,
+        "cross_variant_function_keys": cross_variant_keys,
         "duplicate_function_keys": duplicates,
     }
 
@@ -102,7 +121,7 @@ def assert_prewarmer_ready(
         )
     if inventory["duplicate_function_keys"]:
         raise CacheToolError(
-            "duplicate (kernel, key) autotune records: "
+            "duplicate (variant, kernel, key) autotune records: "
             f"{len(inventory['duplicate_function_keys'])}"
         )
     missing = sorted(
@@ -207,9 +226,9 @@ def verify_reference_coverage(
     if cache_invalid:
         raise CacheToolError("destination cache has invalid autotune files")
     if any(len(paths) > 1 for paths in reference_records.values()):
-        raise CacheToolError("reference cache has duplicate function keys")
+        raise CacheToolError("reference cache has duplicate variant keys")
     if any(len(paths) > 1 for paths in cache_records.values()):
-        raise CacheToolError("destination cache has duplicate function keys")
+        raise CacheToolError("destination cache has duplicate variant keys")
     missing = sorted(set(reference_records) - set(cache_records))
     return {
         "reference_dir": str(reference),
@@ -217,8 +236,12 @@ def verify_reference_coverage(
         "reference_function_keys": len(reference_records),
         "cache_function_keys": len(cache_records),
         "missing_function_keys": [
-            {"kernel": kernel, "key": json.loads(key)}
-            for kernel, key in missing
+            {
+                "variant": variant,
+                "kernel": kernel,
+                "key": json.loads(key),
+            }
+            for variant, kernel, key in missing
         ],
     }
 
