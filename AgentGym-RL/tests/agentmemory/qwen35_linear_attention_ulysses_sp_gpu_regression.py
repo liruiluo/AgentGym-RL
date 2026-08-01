@@ -235,6 +235,14 @@ def main() -> None:
     apply_qwen3_5_packed_forward_patch()
 
     cases = _cases_for_world_size(world_size)
+    profile = os.environ.get("QWEN35_SP_REGRESSION_PROFILE", "upstream")
+    # The upstream two-rank fixture has only 16 BF16 tokens. On B200 its
+    # one-ULP gradient delta is a larger relative error than in the 1024-token
+    # fixture, so retain both an absolute ULP gate and a slightly wider ratio.
+    gradient_error_tolerance = (
+        3e-3 if world_size == 2 and profile == "upstream" else 2e-3
+    )
+    gradient_max_abs_tolerance = 0.015625 + 1e-8
     results = []
     failures = []
     for use_causal_conv1d in (True, False):
@@ -256,10 +264,15 @@ def main() -> None:
             )
             result["backend"] = backend
             results.append(result)
-            if result["gradient_error_ratio"] >= 2e-3:
+            if (
+                result["gradient_error_ratio"] >= gradient_error_tolerance
+                or result["gradient_max_abs_delta"] > gradient_max_abs_tolerance
+            ):
                 failures.append(
-                    f"{backend}/{case_name}: gradient error ratio "
-                    f"{result['gradient_error_ratio']} >= 0.002"
+                    f"{backend}/{case_name}: gradient error ratio/max abs "
+                    f"{result['gradient_error_ratio']}/"
+                    f"{result['gradient_max_abs_delta']} exceed "
+                    f"{gradient_error_tolerance}/{gradient_max_abs_tolerance}"
                 )
             layer.zero_grad(set_to_none=True)
 
@@ -272,6 +285,8 @@ def main() -> None:
                     "profile": os.environ.get(
                         "QWEN35_SP_REGRESSION_PROFILE", "upstream"
                     ),
+                    "gradient_error_tolerance": gradient_error_tolerance,
+                    "gradient_max_abs_tolerance": gradient_max_abs_tolerance,
                     "upstream_verl_commit": "6a6242f3",
                     "cases": results,
                     "failures": failures,
