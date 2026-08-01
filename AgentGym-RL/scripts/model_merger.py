@@ -27,6 +27,25 @@ from concurrent.futures import ThreadPoolExecutor
 from torch.distributed._tensor import DTensor, Shard, Placement
 
 
+def resolve_auto_model_class(config):
+    architectures = config.architectures or []
+    if any("ForTokenClassification" in architecture for architecture in architectures):
+        return AutoModelForTokenClassification
+    if any("ForCausalLM" in architecture for architecture in architectures):
+        return AutoModelForCausalLM
+
+    # Qwen3.5 language-model-only checkpoints intentionally persist the nested
+    # text config, which has no architectures field. Transformers still maps
+    # that config to AutoModelForCausalLM.
+    if getattr(config, "model_type", None) == "qwen3_5_text":
+        return AutoModelForCausalLM
+
+    raise NotImplementedError(
+        f"Unknown architecture {architectures!r} for model_type "
+        f"{getattr(config, 'model_type', None)!r}"
+    )
+
+
 def merge_by_placement(tensors: List[torch.Tensor], placement: Placement):
     if placement.is_replicate():
         return tensors[0]
@@ -132,7 +151,11 @@ if __name__ == '__main__':
             break  
     assert world_size, "No model file with the proper format"
         
-    state_dict = torch.load(os.path.join(local_dir, f'model_world_size_{world_size}_rank_{rank}.pt'), map_location='cpu')
+    state_dict = torch.load(
+        os.path.join(local_dir, f'model_world_size_{world_size}_rank_{rank}.pt'),
+        map_location='cpu',
+        weights_only=False,
+    )
     pivot_key = sorted(list(state_dict.keys()))[0]
     weight = state_dict[pivot_key]
     if not isinstance(weight, torch.distributed._tensor.DTensor):
@@ -145,12 +168,7 @@ if __name__ == '__main__':
         hf_path = os.path.join(local_dir, 'huggingface')
         config = AutoConfig.from_pretrained(hf_path)
 
-        if 'ForTokenClassification' in config.architectures[0]:
-            auto_model = AutoModelForTokenClassification
-        elif 'ForCausalLM' in config.architectures[0]:
-            auto_model = AutoModelForCausalLM
-        else:
-            raise NotImplementedError(f'Unknown architecture {config["architectures"]}')
+        auto_model = resolve_auto_model_class(config)
 
         with torch.device('meta'):
             model = auto_model.from_config(config, torch_dtype=torch.bfloat16)
@@ -241,12 +259,7 @@ if __name__ == '__main__':
     hf_path = os.path.join(local_dir, 'huggingface')
     config = AutoConfig.from_pretrained(hf_path)
 
-    if 'ForTokenClassification' in config.architectures[0]:
-        auto_model = AutoModelForTokenClassification
-    elif 'ForCausalLM' in config.architectures[0]:
-        auto_model = AutoModelForCausalLM
-    else:
-        raise NotImplementedError(f'Unknown architecture {config["architectures"]}')
+    auto_model = resolve_auto_model_class(config)
 
     with torch.device('meta'):
         model = auto_model.from_config(config, torch_dtype=torch.bfloat16)
@@ -268,7 +281,6 @@ if __name__ == '__main__':
         )
     
     
-
 
 
 

@@ -93,6 +93,26 @@ class ModelMergerGenerationContractTests(unittest.TestCase):
             self.assertIn(sampled[-1], contract["eos_token_id"])
             self.assertEqual(sampled[-1], contract["pad_token_id"])
 
+    def test_qwen35_text_config_without_architectures_uses_causal_lm(self) -> None:
+        config = type(
+            "Qwen35TextConfigStub",
+            (),
+            {"architectures": None, "model_type": "qwen3_5_text"},
+        )()
+        self.assertIs(
+            self.module.resolve_auto_model_class(config),
+            self.module.AutoModelForCausalLM,
+        )
+
+    def test_unknown_architecture_without_model_mapping_fails_closed(self) -> None:
+        config = type(
+            "UnknownConfigStub",
+            (),
+            {"architectures": None, "model_type": "unknown_test_model"},
+        )()
+        with self.assertRaisesRegex(NotImplementedError, "unknown_test_model"):
+            self.module.resolve_auto_model_class(config)
+
     def test_real_tiny_model_save_roundtrip_preserves_contract_and_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir)
