@@ -83,6 +83,18 @@ def _all_gather_sequence(local_tensor: torch.Tensor) -> torch.Tensor:
 
 
 def _cases_for_world_size(world_size: int) -> list[tuple[str, list[int]]]:
+    profile = os.environ.get("QWEN35_SP_REGRESSION_PROFILE", "upstream")
+    if profile == "long_sp2":
+        if world_size != 2:
+            raise RuntimeError("long_sp2 regression profile requires two ranks")
+        return [
+            ("boundary_aligned", [128] * 8),
+            ("sequence_cut", [700, 324]),
+            ("single_sequence", [1024]),
+            ("many_short_sequences", [100, 150, 200, 250, 124, 100, 100]),
+        ]
+    if profile != "upstream":
+        raise RuntimeError(f"unknown regression profile: {profile}")
     if world_size == 2:
         return [
             ("boundary_aligned", [8, 8]),
@@ -257,6 +269,9 @@ def main() -> None:
                 {
                     "status": "fail" if failures else "pass",
                     "world_size": dist.get_world_size(),
+                    "profile": os.environ.get(
+                        "QWEN35_SP_REGRESSION_PROFILE", "upstream"
+                    ),
                     "upstream_verl_commit": "6a6242f3",
                     "cases": results,
                     "failures": failures,
