@@ -30,7 +30,7 @@ class DirectInprocTransportTests(unittest.TestCase):
     def setUpClass(cls):
         cls.module = _load_module(_TRANSPORT, "vllm_hf_sync_transport_under_test")
 
-    def test_file_is_default_and_direct_inproc_is_explicit(self):
+    def test_file_is_default_and_direct_transports_are_explicit(self):
         self.assertEqual(self.module.resolve_hf_sync_transport({}), "file")
         self.assertEqual(
             self.module.resolve_hf_sync_transport(
@@ -38,9 +38,46 @@ class DirectInprocTransportTests(unittest.TestCase):
             ),
             "direct_inproc",
         )
-        with self.assertRaisesRegex(ValueError, "direct_inproc, file"):
+        self.assertEqual(
+            self.module.resolve_hf_sync_transport(
+                {self.module.TRANSPORT_ENV: "direct_inproc_streaming"}
+            ),
+            "direct_inproc_streaming",
+        )
+        self.assertTrue(
+            self.module.uses_streaming_sharded_state_dict(
+                "direct_inproc_streaming"
+            )
+        )
+        self.assertFalse(
+            self.module.uses_streaming_sharded_state_dict("direct_inproc")
+        )
+        with self.assertRaisesRegex(
+            ValueError, "direct_inproc, direct_inproc_streaming, file"
+        ):
             self.module.resolve_hf_sync_transport(
                 {self.module.TRANSPORT_ENV: "automatic"}
+            )
+
+    def test_streaming_requires_exact_dtensor_contract(self):
+        dtensor = _typed_object("torch.distributed.tensor", "DTensor")
+        dtensor.full_tensor = lambda: "full"
+        self.assertEqual(
+            self.module.require_streaming_sharded_tensor("weight", dtensor),
+            "torch.distributed.tensor.DTensor",
+        )
+
+        regular_tensor = _typed_object("torch", "Tensor")
+        regular_tensor.full_tensor = lambda: "full"
+        with self.assertRaisesRegex(RuntimeError, "every sharded state-dict"):
+            self.module.require_streaming_sharded_tensor(
+                "weight", regular_tensor
+            )
+
+        missing_method = _typed_object("torch.distributed.tensor", "DTensor")
+        with self.assertRaisesRegex(RuntimeError, "missing full_tensor"):
+            self.module.require_streaming_sharded_tensor(
+                "weight", missing_method
             )
 
     def make_runtime(self):
@@ -80,12 +117,23 @@ class DirectInprocTransportTests(unittest.TestCase):
 class FSDPTransportWiringTests(unittest.TestCase):
     def test_direct_inproc_is_opt_in_and_file_fallback_remains(self):
         source = _FSDP_VLLM.read_text(encoding="utf-8")
-        self.assertIn("effective_transport = resolve_hf_sync_transport()", source)
+        self.assertIn("self._hf_sync_transport = (", source)
+        self.assertIn("resolve_hf_sync_transport()", source)
+        self.assertIn("effective_transport = self._hf_sync_transport", source)
         self.assertIn("if effective_transport == 'direct_inproc':", source)
         self.assertIn("require_direct_inproc_runtime(", source)
         self.assertIn("agentmemory_load_hf_direct)", source)
         self.assertIn("torch.save(hf_weights, sync_file)", source)
         self.assertIn("transport=effective_transport", source)
+
+    def test_streaming_selects_sharded_state_dict_and_never_materializes_batch(self):
+        source = _FSDP_VLLM.read_text(encoding="utf-8")
+        self.assertIn("self._streaming_hf_sync", source)
+        self.assertIn("ShardedStateDictConfig(offload_to_cpu=False)", source)
+        self.assertIn("sharded_tensor.full_tensor()", source)
+        self.assertIn("agentmemory_load_hf_streaming", source)
+        self.assertIn("extract_streamed_source_fingerprint", source)
+        self.assertIn("vLLM did not consume every streamed actor tensor", source)
 
 
 if __name__ == "__main__":

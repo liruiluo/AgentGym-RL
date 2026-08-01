@@ -1,17 +1,30 @@
 #!/usr/bin/env python3
 """CPU-only smoke for bounded actor-to-vLLM sync evidence."""
 
+import importlib.util
 import os
 import tempfile
 from pathlib import Path
 
-from verl.workers.sharding_manager.vllm_sync_evidence import (
-    append_and_readback_event,
-    bounded_tensor_fingerprint,
-    build_sync_event,
-    read_last_event,
-    validate_sync_event,
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_EVIDENCE_PATH = (
+    _REPO_ROOT / "verl/workers/sharding_manager/vllm_sync_evidence.py"
 )
+_SPEC = importlib.util.spec_from_file_location(
+    "vllm_sync_evidence_under_test", _EVIDENCE_PATH
+)
+_EVIDENCE = importlib.util.module_from_spec(_SPEC)
+assert _SPEC.loader is not None
+_SPEC.loader.exec_module(_EVIDENCE)
+
+StreamingTensorFingerprint = _EVIDENCE.StreamingTensorFingerprint
+append_and_readback_event = _EVIDENCE.append_and_readback_event
+bounded_tensor_fingerprint = _EVIDENCE.bounded_tensor_fingerprint
+build_sync_event = _EVIDENCE.build_sync_event
+extract_streamed_source_fingerprint = _EVIDENCE.extract_streamed_source_fingerprint
+read_last_event = _EVIDENCE.read_last_event
+validate_sync_event = _EVIDENCE.validate_sync_event
 
 
 class FakeTensor:
@@ -69,6 +82,50 @@ def main():
     assert source1["sampled_tensor_count"] == 64
     assert source1["sampled_value_count"] == 64 * 1024
     assert source2["sha256"] != source1["sha256"]
+
+    streamed = StreamingTensorFingerprint(
+        (name for name, _ in reversed(make_weights()))
+    )
+    for name, tensor in make_weights():
+        streamed.observe(name, tensor)
+    assert streamed.finalize() == source1
+
+    try:
+        StreamingTensorFingerprint(["duplicate", "duplicate"])
+    except ValueError as error:
+        assert "unique" in str(error)
+    else:
+        raise AssertionError("duplicate expected tensor names must fail closed")
+
+    missing = StreamingTensorFingerprint(["present", "missing"])
+    missing.observe("present", FakeTensor([1.0]))
+    try:
+        missing.finalize()
+    except RuntimeError as error:
+        assert "did not observe all tensors" in str(error)
+    else:
+        raise AssertionError("missing streamed tensor must fail closed")
+
+    duplicate = StreamingTensorFingerprint(["weight"])
+    duplicate.observe("weight", FakeTensor([1.0]))
+    try:
+        duplicate.observe("weight", FakeTensor([1.0]))
+    except RuntimeError as error:
+        assert "observed twice" in str(error)
+    else:
+        raise AssertionError("duplicate streamed tensor must fail closed")
+
+    unexpected = StreamingTensorFingerprint(["weight"])
+    try:
+        unexpected.observe("other", FakeTensor([1.0]))
+    except RuntimeError as error:
+        assert "Unexpected streamed tensor name" in str(error)
+    else:
+        raise AssertionError("unexpected streamed tensor must fail closed")
+
+    streamed_result = {"_streamed_source_before": dict(source1)}
+    assert extract_streamed_source_fingerprint(streamed_result) == source1
+    assert "_streamed_source_before" not in streamed_result
 
     target1 = bounded_tensor_fingerprint(make_weights(delta=10.0))
     target2 = bounded_tensor_fingerprint(make_weights(delta=11.0))

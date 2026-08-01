@@ -26,53 +26,119 @@ def _json_sha256(value):
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _sample_tensor(name, tensor, max_values_per_tensor):
+    value = tensor.detach() if hasattr(tensor, "detach") else tensor
+    shape = [int(size) for size in value.shape]
+    numel = int(value.numel())
+    positions = _evenly_spaced_indices(numel, max_values_per_tensor)
+    if positions:
+        flat = value.reshape(-1)
+        selected = flat[positions]
+        if hasattr(selected, "detach"):
+            selected = selected.detach()
+        if hasattr(selected, "cpu"):
+            selected = selected.cpu()
+        values = selected.tolist()
+        if not isinstance(values, list):
+            values = [values]
+    else:
+        values = []
+    return {
+        "name": str(name),
+        "shape": shape,
+        "dtype": str(value.dtype),
+        "numel": numel,
+        "positions": positions,
+        "values": values,
+    }
+
+
+class StreamingTensorFingerprint:
+    """Build the bounded fingerprint while tensors are materialized one at a time."""
+
+    def __init__(self, names, max_tensors=64, max_values_per_tensor=1024):
+        self.names = sorted(str(name) for name in names)
+        if len(self.names) != len(set(self.names)):
+            raise ValueError("Streaming tensor fingerprint names must be unique")
+        selected_indices = _evenly_spaced_indices(len(self.names), max_tensors)
+        self.selected_names = [self.names[index] for index in selected_indices]
+        self._expected = set(self.names)
+        self._selected = set(self.selected_names)
+        self.max_tensors = int(max_tensors)
+        self.max_values_per_tensor = int(max_values_per_tensor)
+        self._observed = set()
+        self._samples = {}
+
+    def observe(self, name, tensor):
+        name = str(name)
+        if name not in self._expected:
+            raise RuntimeError(f"Unexpected streamed tensor name: {name}")
+        if name in self._observed:
+            raise RuntimeError(f"Streamed tensor name was observed twice: {name}")
+        self._observed.add(name)
+        if name in self._selected:
+            self._samples[name] = _sample_tensor(
+                name, tensor, self.max_values_per_tensor
+            )
+
+    def finalize(self):
+        missing = sorted(set(self.names) - self._observed)
+        if missing:
+            raise RuntimeError(
+                f"Streaming tensor fingerprint did not observe all tensors: {missing[:8]}"
+            )
+        samples = [self._samples[name] for name in self.selected_names]
+        sampled_value_count = sum(len(sample["values"]) for sample in samples)
+        digest_payload = {
+            "total_tensor_count": len(self.names),
+            "samples": samples,
+        }
+        return {
+            "algorithm": "sha256-bounded-even-samples-v1",
+            "sha256": _json_sha256(digest_payload),
+            "total_tensor_count": len(self.names),
+            "sampled_tensor_count": len(samples),
+            "sampled_value_count": sampled_value_count,
+            "max_tensors": self.max_tensors,
+            "max_values_per_tensor": self.max_values_per_tensor,
+            "sampled_tensor_names": self.selected_names,
+        }
+
+
+def extract_streamed_source_fingerprint(apply_model_results):
+    """Extract one identical streamed-source fingerprint from executor results."""
+    results = flatten_apply_model_results(apply_model_results)
+    fingerprints = []
+    for result in results:
+        fingerprint = result.pop("_streamed_source_before", None)
+        if not isinstance(fingerprint, dict) or not fingerprint.get("sha256"):
+            raise RuntimeError(
+                "direct_inproc_streaming result is missing its source fingerprint"
+            )
+        fingerprints.append(fingerprint)
+    if not fingerprints:
+        raise RuntimeError(
+            "direct_inproc_streaming returned no source fingerprints"
+        )
+    first = fingerprints[0]
+    if any(fingerprint != first for fingerprint in fingerprints[1:]):
+        raise RuntimeError(
+            "direct_inproc_streaming executor results disagree on source fingerprint"
+        )
+    return first
+
+
 def bounded_tensor_fingerprint(named_tensors, max_tensors=64, max_values_per_tensor=1024):
     """Hash deterministic samples without copying or hashing the full model."""
     items = sorted(list(named_tensors), key=lambda item: item[0])
-    selected_indices = _evenly_spaced_indices(len(items), max_tensors)
-    samples = []
-    sampled_value_count = 0
-    for item_index in selected_indices:
-        name, tensor = items[item_index]
-        value = tensor.detach() if hasattr(tensor, "detach") else tensor
-        shape = [int(size) for size in value.shape]
-        numel = int(value.numel())
-        positions = _evenly_spaced_indices(numel, max_values_per_tensor)
-        if positions:
-            flat = value.reshape(-1)
-            selected = flat[positions]
-            if hasattr(selected, "detach"):
-                selected = selected.detach()
-            if hasattr(selected, "cpu"):
-                selected = selected.cpu()
-            values = selected.tolist()
-            if not isinstance(values, list):
-                values = [values]
-        else:
-            values = []
-        sampled_value_count += len(values)
-        samples.append({
-            "name": str(name),
-            "shape": shape,
-            "dtype": str(value.dtype),
-            "numel": numel,
-            "positions": positions,
-            "values": values,
-        })
-    digest_payload = {
-        "total_tensor_count": len(items),
-        "samples": samples,
-    }
-    return {
-        "algorithm": "sha256-bounded-even-samples-v1",
-        "sha256": _json_sha256(digest_payload),
-        "total_tensor_count": len(items),
-        "sampled_tensor_count": len(samples),
-        "sampled_value_count": sampled_value_count,
-        "max_tensors": int(max_tensors),
-        "max_values_per_tensor": int(max_values_per_tensor),
-        "sampled_tensor_names": [sample["name"] for sample in samples],
-    }
+    fingerprint = StreamingTensorFingerprint(
+        (name for name, _ in items),
+        max_tensors=max_tensors,
+        max_values_per_tensor=max_values_per_tensor,
+    )
+    for name, tensor in items:
+        fingerprint.observe(name, tensor)
+    return fingerprint.finalize()
 
 
 def flatten_apply_model_results(value):
@@ -144,7 +210,11 @@ def validate_sync_event(event, previous_event=None, require_change=False):
     )
     if not valid_schema:
         raise RuntimeError("Unexpected vLLM sync evidence schema")
-    if schema == SCHEMA_VERSION and event.get("transport") not in {"file", "direct_inproc"}:
+    if schema == SCHEMA_VERSION and event.get("transport") not in {
+        "file",
+        "direct_inproc",
+        "direct_inproc_streaming",
+    }:
         raise RuntimeError("vLLM sync evidence has an invalid transport")
     if event.get("global_steps") is None:
         raise RuntimeError("vLLM sync evidence is missing prompts.meta_info global_steps")

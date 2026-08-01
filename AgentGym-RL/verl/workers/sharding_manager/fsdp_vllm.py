@@ -30,11 +30,20 @@ from verl.third_party.vllm import vllm_version
 
 from .base import BaseShardingManager
 from .vllm_sync_evidence import (
+    StreamingTensorFingerprint,
     append_and_readback_event,
     bounded_tensor_fingerprint,
     build_sync_event,
+    extract_streamed_source_fingerprint,
+    flatten_apply_model_results,
     read_last_event,
     validate_sync_event,
+)
+from .vllm_hf_sync_transport import (
+    require_direct_inproc_runtime,
+    require_streaming_sharded_tensor,
+    resolve_hf_sync_transport,
+    uses_streaming_sharded_state_dict,
 )
 from verl.workers.qwen35_weight_sync import (
     map_actor_weight_name_for_vllm,
@@ -66,7 +75,24 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             raise ValueError(f'Unsupported rollout sync format: {self.sync_weight_format}')
         self.expected_source_names = tuple(expected_source_names or ())
 
-        self.full_params = self.sync_weight_format == 'hf'
+        self._hf_sync_transport = (
+            resolve_hf_sync_transport()
+            if self.sync_weight_format == 'hf'
+            else None
+        )
+        self._streaming_hf_sync = uses_streaming_sharded_state_dict(
+            self._hf_sync_transport)
+        if self._streaming_hf_sync:
+            model_type = str(getattr(self.model_config, 'model_type', ''))
+            if not is_qwen3_5_model_type(model_type):
+                raise RuntimeError(
+                    'direct_inproc_streaming is validated only for Qwen3.5 HF sync')
+            if vllm_version in ('0.4.2', '0.5.4', '0.6.3'):
+                raise RuntimeError(
+                    'direct_inproc_streaming requires official vLLM apply_model')
+
+        self.full_params = (
+            self.sync_weight_format == 'hf' and not self._streaming_hf_sync)
         if self.full_params:
             FSDP.set_state_dict_type(self.module,
                                      state_dict_type=StateDictType.FULL_STATE_DICT,
@@ -74,7 +100,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         else:
             FSDP.set_state_dict_type(self.module,
                                      state_dict_type=StateDictType.SHARDED_STATE_DICT,
-                                     state_dict_config=ShardedStateDictConfig())
+                                     state_dict_config=ShardedStateDictConfig(offload_to_cpu=False))
 
         # Note that torch_random_states may be different on each dp rank
         self.torch_random_states = torch.cuda.get_rng_state()
@@ -284,28 +310,140 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                     return result
 
                 if hasattr(llm_engine, 'apply_model'):
-                    from .vllm_hf_sync_transport import (
-                        require_direct_inproc_runtime,
-                        resolve_hf_sync_transport,
-                    )
-
-                    effective_transport = resolve_hf_sync_transport()
+                    effective_transport = self._hf_sync_transport
                     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
                     transport_stats = {'transport': effective_transport}
-                    materialize_started = time.perf_counter()
-                    hf_weights = materialize_hf_weights()
-                    transport_stats['materialize_seconds'] = (
-                        time.perf_counter() - materialize_started)
                     expected_source_names = self.expected_source_names
                     evidence_enabled = bool(self._sync_evidence_dir)
-                    source_evidence_started = time.perf_counter()
-                    if evidence_enabled:
-                        global_steps, sync_id = self._next_sync_identity()
-                        source_before = bounded_tensor_fingerprint(hf_weights)
+                    if self._streaming_hf_sync:
+                        transport_stats['runtime_types'] = require_direct_inproc_runtime(
+                            llm_engine,
+                            infer_tp_size=self._get_infer_tp_size(),
+                        )
+                        mapping_started = time.perf_counter()
+                        mapped_entries = []
+                        for source_name, sharded_tensor in params.items():
+                            mapped_name = map_actor_weight_name_for_vllm(
+                                source_name, model_type=model_type)
+                            require_streaming_sharded_tensor(
+                                mapped_name, sharded_tensor)
+                            mapped_entries.append((mapped_name, source_name))
+                        mapped_entries.sort(key=lambda item: item[0])
+                        mapped_names = [name for name, _ in mapped_entries]
+                        validate_qwen35_mapped_source_names(
+                            mapped_names,
+                            expected_names=expected_source_names,
+                        )
+                        transport_stats['mapping_validation_seconds'] = (
+                            time.perf_counter() - mapping_started)
+                        transport_stats['streamed_tensor_count'] = len(mapped_entries)
+
+                        if evidence_enabled:
+                            global_steps, sync_id = self._next_sync_identity()
+                        else:
+                            global_steps = sync_id = None
+
+                        def agentmemory_load_hf_streaming(model):
+                            fingerprint = (
+                                StreamingTensorFingerprint(mapped_names)
+                                if evidence_enabled else None)
+                            stream_state = {
+                                'full_tensor_seconds': 0.0,
+                                'source_evidence_seconds': 0.0,
+                                'streamed_tensor_count': 0,
+                            }
+
+                            def streamed_weights():
+                                for mapped_name, source_name in mapped_entries:
+                                    sharded_tensor = params[source_name]
+                                    require_streaming_sharded_tensor(
+                                        mapped_name, sharded_tensor)
+                                    full_tensor_started = time.perf_counter()
+                                    full_tensor = sharded_tensor.full_tensor()
+                                    stream_state['full_tensor_seconds'] += (
+                                        time.perf_counter() - full_tensor_started)
+                                    if hasattr(full_tensor, 'detach'):
+                                        full_tensor = full_tensor.detach()
+                                    if fingerprint is not None:
+                                        source_evidence_started = time.perf_counter()
+                                        fingerprint.observe(mapped_name, full_tensor)
+                                        stream_state['source_evidence_seconds'] += (
+                                            time.perf_counter() - source_evidence_started)
+                                    stream_state['streamed_tensor_count'] += 1
+                                    yield mapped_name, full_tensor
+                                    del full_tensor
+                                if fingerprint is not None:
+                                    source_evidence_started = time.perf_counter()
+                                    stream_state['source_before'] = fingerprint.finalize()
+                                    stream_state['source_evidence_seconds'] += (
+                                        time.perf_counter() - source_evidence_started)
+
+                            result = load_hf_weights(model, streamed_weights())
+                            if stream_state['streamed_tensor_count'] != len(mapped_entries):
+                                raise RuntimeError(
+                                    'vLLM did not consume every streamed actor tensor: '
+                                    f"consumed={stream_state['streamed_tensor_count']} "
+                                    f'expected={len(mapped_entries)}')
+                            result.update({
+                                'full_tensor_seconds': stream_state['full_tensor_seconds'],
+                                'loaded_source_evidence_seconds': (
+                                    stream_state['source_evidence_seconds']),
+                                'streamed_tensor_count': (
+                                    stream_state['streamed_tensor_count']),
+                            })
+                            if evidence_enabled:
+                                source_before_local = stream_state.get('source_before')
+                                if source_before_local is None:
+                                    raise RuntimeError(
+                                        'Streaming source fingerprint did not finalize')
+                                target_evidence_started = time.perf_counter()
+                                result.update({
+                                    'sync_id': sync_id,
+                                    'source_fingerprint_sha256': (
+                                        source_before_local['sha256']),
+                                    'loaded_source_fingerprint_sha256': (
+                                        source_before_local['sha256']),
+                                    'target_after': bounded_tensor_fingerprint(
+                                        model.named_parameters()),
+                                    '_streamed_source_before': source_before_local,
+                                })
+                                result['target_evidence_seconds'] = (
+                                    time.perf_counter() - target_evidence_started)
+                            return result
+
+                        apply_model_started = time.perf_counter()
+                        try:
+                            sync_results = llm_engine.apply_model(
+                                agentmemory_load_hf_streaming)
+                        finally:
+                            transport_stats['apply_model_seconds'] = (
+                                time.perf_counter() - apply_model_started)
+                        if evidence_enabled:
+                            source_before = extract_streamed_source_fingerprint(
+                                sync_results)
+                        else:
+                            source_before = None
+                        transport_stats['source_evidence_seconds'] = (
+                            sum(
+                                result.get('loaded_source_evidence_seconds', 0.0)
+                                for result in flatten_apply_model_results(
+                                    sync_results)
+                            ))
+                        transport_stats['apply_model_results'] = sync_results
                     else:
-                        global_steps = sync_id = source_before = None
-                    transport_stats['source_evidence_seconds'] = (
-                        time.perf_counter() - source_evidence_started)
+                        materialize_started = time.perf_counter()
+                        hf_weights = materialize_hf_weights()
+                        transport_stats['materialize_seconds'] = (
+                            time.perf_counter() - materialize_started)
+                        source_evidence_started = time.perf_counter()
+                        if evidence_enabled:
+                            global_steps, sync_id = self._next_sync_identity()
+                            source_before = bounded_tensor_fingerprint(hf_weights)
+                        else:
+                            global_steps = sync_id = source_before = None
+                        transport_stats['source_evidence_seconds'] = (
+                            time.perf_counter() - source_evidence_started)
+
                     if effective_transport == 'direct_inproc':
                         transport_stats['runtime_types'] = require_direct_inproc_runtime(
                             llm_engine,
@@ -343,7 +481,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                                 time.perf_counter() - apply_model_started)
                         transport_stats['apply_model_results'] = sync_results
                         del hf_weights
-                    else:
+                    elif effective_transport == 'file':
                         sync_dir = (
                             os.getenv('VERL_AGENTMEMORY_HF_SYNC_DIR')
                             or os.getenv('RAY_TMPDIR')
@@ -436,6 +574,9 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                             except FileNotFoundError:
                                 pass
                         transport_stats['apply_model_results'] = sync_results
+                    elif not self._streaming_hf_sync:
+                        raise RuntimeError(
+                            f'Unhandled vLLM HF sync transport: {effective_transport}')
                     if evidence_enabled:
                         previous_event = self._last_sync_event
                         event = build_sync_event(
