@@ -14,6 +14,7 @@
 
 import os
 import logging
+import time
 import numpy as np
 import torch
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
@@ -197,11 +198,16 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         return vllm_ps.get_tensor_model_parallel_group().device_group
 
     def __enter__(self):
+        state_dict_started = time.perf_counter()
         log_gpu_memory_usage('Before state_dict() in sharding manager memory', logger=logger)
         params = self.module.state_dict()
         log_gpu_memory_usage('After state_dict() in sharding manager memory', logger=logger)
+        state_dict_seconds = time.perf_counter() - state_dict_started
         # Copy, not share memory
         load_format = self.sync_weight_format
+        effective_transport = load_format
+        transport_stats = None
+        weight_sync_started = time.perf_counter()
         if vllm_version in ('0.4.2', '0.5.4', '0.6.3'):
             self.inference_engine.sync_model_weights(params, load_format=load_format)
         else:
@@ -256,12 +262,18 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                 def load_hf_weights(model, weights):
                     if not hasattr(model, 'load_weights'):
                         raise AttributeError(f'{model.__class__.__name__} has no load_weights method')
+                    load_weights_started = time.perf_counter()
                     loaded = model.load_weights(weights)
+                    load_weights_seconds = time.perf_counter() - load_weights_started
                     try:
                         loaded_count = len(loaded)
                     except Exception:
                         loaded_count = len(list(loaded)) if loaded is not None else -1
-                    result = {'model': model.__class__.__name__, 'loaded_count': loaded_count}
+                    result = {
+                        'model': model.__class__.__name__,
+                        'loaded_count': loaded_count,
+                        'load_weights_seconds': load_weights_seconds,
+                    }
                     if is_qwen3_5_model_type(model_type):
                         result.update(validate_qwen35_vllm_load_coverage(
                             loaded_names=loaded,
@@ -272,72 +284,158 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                     return result
 
                 if hasattr(llm_engine, 'apply_model'):
-                    sync_dir = os.getenv('VERL_AGENTMEMORY_HF_SYNC_DIR') or os.getenv('RAY_TMPDIR') or '/tmp'
-                    os.makedirs(sync_dir, exist_ok=True)
+                    from .vllm_hf_sync_transport import (
+                        require_direct_inproc_runtime,
+                        resolve_hf_sync_transport,
+                    )
+
+                    effective_transport = resolve_hf_sync_transport()
                     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-                    sync_file = os.path.join(sync_dir, f'agentmemory_hf_sync_rank{rank}_pid{os.getpid()}.pt')
+                    transport_stats = {'transport': effective_transport}
+                    materialize_started = time.perf_counter()
                     hf_weights = materialize_hf_weights()
+                    transport_stats['materialize_seconds'] = (
+                        time.perf_counter() - materialize_started)
                     expected_source_names = self.expected_source_names
                     evidence_enabled = bool(self._sync_evidence_dir)
+                    source_evidence_started = time.perf_counter()
                     if evidence_enabled:
                         global_steps, sync_id = self._next_sync_identity()
                         source_before = bounded_tensor_fingerprint(hf_weights)
                     else:
                         global_steps = sync_id = source_before = None
-                    torch.save(hf_weights, sync_file)
-                    del hf_weights
+                    transport_stats['source_evidence_seconds'] = (
+                        time.perf_counter() - source_evidence_started)
+                    if effective_transport == 'direct_inproc':
+                        transport_stats['runtime_types'] = require_direct_inproc_runtime(
+                            llm_engine,
+                            infer_tp_size=self._get_infer_tp_size(),
+                        )
 
-                    def agentmemory_load_hf_from_file(model):
-                        import torch as _torch
-                        from verl.models.transformers.qwen3_5 import (
-                            is_qwen3_5_model_type as _is_qwen3_5_model_type,
+                        def agentmemory_load_hf_direct(model):
+                            loaded_source_started = time.perf_counter()
+                            loaded_source = (
+                                bounded_tensor_fingerprint(hf_weights)
+                                if evidence_enabled else None)
+                            loaded_source_seconds = (
+                                time.perf_counter() - loaded_source_started)
+                            result = load_hf_weights(model, hf_weights)
+                            result['loaded_source_evidence_seconds'] = loaded_source_seconds
+                            if evidence_enabled:
+                                target_evidence_started = time.perf_counter()
+                                result.update({
+                                    'sync_id': sync_id,
+                                    'source_fingerprint_sha256': source_before['sha256'],
+                                    'loaded_source_fingerprint_sha256': loaded_source['sha256'],
+                                    'target_after': bounded_tensor_fingerprint(
+                                        model.named_parameters()),
+                                })
+                                result['target_evidence_seconds'] = (
+                                    time.perf_counter() - target_evidence_started)
+                            return result
+
+                        apply_model_started = time.perf_counter()
+                        try:
+                            sync_results = llm_engine.apply_model(
+                                agentmemory_load_hf_direct)
+                        finally:
+                            transport_stats['apply_model_seconds'] = (
+                                time.perf_counter() - apply_model_started)
+                        transport_stats['apply_model_results'] = sync_results
+                        del hf_weights
+                    else:
+                        sync_dir = (
+                            os.getenv('VERL_AGENTMEMORY_HF_SYNC_DIR')
+                            or os.getenv('RAY_TMPDIR')
+                            or '/tmp'
                         )
-                        from verl.workers.qwen35_weight_sync import (
-                            validate_qwen35_mapped_source_names as _validate_source_names,
-                            validate_qwen35_vllm_load_coverage as _validate_load_coverage,
+                        os.makedirs(sync_dir, exist_ok=True)
+                        sync_file = os.path.join(
+                            sync_dir,
+                            f'agentmemory_hf_sync_rank{rank}_pid{os.getpid()}.pt',
                         )
-                        from verl.workers.sharding_manager.vllm_sync_evidence import (
-                            bounded_tensor_fingerprint as _bounded_tensor_fingerprint,
-                        )
-                        weights = _torch.load(sync_file, map_location='cpu', weights_only=False)
-                        if _is_qwen3_5_model_type(model_type):
-                            _validate_source_names(
-                                (name for name, _ in weights),
-                                expected_names=expected_source_names,
+                        save_started = time.perf_counter()
+                        torch.save(hf_weights, sync_file)
+                        transport_stats['save_seconds'] = time.perf_counter() - save_started
+                        transport_stats['sync_file_bytes'] = os.path.getsize(sync_file)
+                        del hf_weights
+
+                        def agentmemory_load_hf_from_file(model):
+                            import torch as _torch
+                            import time as _time
+                            from verl.models.transformers.qwen3_5 import (
+                                is_qwen3_5_model_type as _is_qwen3_5_model_type,
                             )
-                        loaded_source = (
-                            _bounded_tensor_fingerprint(weights) if evidence_enabled else None)
-                        if not hasattr(model, 'load_weights'):
-                            raise AttributeError(f'{model.__class__.__name__} has no load_weights method')
-                        loaded = model.load_weights(weights)
-                        try:
-                            loaded_count = len(loaded)
-                        except Exception:
-                            loaded_count = len(list(loaded)) if loaded is not None else -1
-                        result = {'model': model.__class__.__name__, 'loaded_count': loaded_count}
-                        if _is_qwen3_5_model_type(model_type):
-                            result.update(_validate_load_coverage(
-                                loaded_names=loaded,
-                                target_parameter_names=(
-                                    name for name, _ in model.named_parameters(remove_duplicate=False)
-                                ),
-                            ))
-                        if evidence_enabled:
-                            result.update({
-                                'sync_id': sync_id,
-                                'source_fingerprint_sha256': source_before['sha256'],
-                                'loaded_source_fingerprint_sha256': loaded_source['sha256'],
-                                'target_after': _bounded_tensor_fingerprint(model.named_parameters()),
-                            })
-                        return result
+                            from verl.workers.qwen35_weight_sync import (
+                                validate_qwen35_mapped_source_names as _validate_source_names,
+                                validate_qwen35_vllm_load_coverage as _validate_load_coverage,
+                            )
+                            from verl.workers.sharding_manager.vllm_sync_evidence import (
+                                bounded_tensor_fingerprint as _bounded_tensor_fingerprint,
+                            )
+                            file_load_started = _time.perf_counter()
+                            weights = _torch.load(sync_file, map_location='cpu', weights_only=False)
+                            file_load_seconds = _time.perf_counter() - file_load_started
+                            if _is_qwen3_5_model_type(model_type):
+                                _validate_source_names(
+                                    (name for name, _ in weights),
+                                    expected_names=expected_source_names,
+                                )
+                            loaded_source_started = _time.perf_counter()
+                            loaded_source = (
+                                _bounded_tensor_fingerprint(weights) if evidence_enabled else None)
+                            loaded_source_seconds = (
+                                _time.perf_counter() - loaded_source_started)
+                            if not hasattr(model, 'load_weights'):
+                                raise AttributeError(
+                                    f'{model.__class__.__name__} has no load_weights method')
+                            load_weights_started = _time.perf_counter()
+                            loaded = model.load_weights(weights)
+                            load_weights_seconds = (
+                                _time.perf_counter() - load_weights_started)
+                            try:
+                                loaded_count = len(loaded)
+                            except Exception:
+                                loaded_count = len(list(loaded)) if loaded is not None else -1
+                            result = {
+                                'model': model.__class__.__name__,
+                                'loaded_count': loaded_count,
+                                'file_load_seconds': file_load_seconds,
+                                'loaded_source_evidence_seconds': loaded_source_seconds,
+                                'load_weights_seconds': load_weights_seconds,
+                            }
+                            if _is_qwen3_5_model_type(model_type):
+                                result.update(_validate_load_coverage(
+                                    loaded_names=loaded,
+                                    target_parameter_names=(
+                                        name for name, _ in model.named_parameters(
+                                            remove_duplicate=False)
+                                    ),
+                                ))
+                            if evidence_enabled:
+                                target_evidence_started = _time.perf_counter()
+                                result.update({
+                                    'sync_id': sync_id,
+                                    'source_fingerprint_sha256': source_before['sha256'],
+                                    'loaded_source_fingerprint_sha256': loaded_source['sha256'],
+                                    'target_after': _bounded_tensor_fingerprint(
+                                        model.named_parameters()),
+                                })
+                                result['target_evidence_seconds'] = (
+                                    _time.perf_counter() - target_evidence_started)
+                            return result
 
-                    try:
-                        sync_results = llm_engine.apply_model(agentmemory_load_hf_from_file)
-                    finally:
+                        apply_model_started = time.perf_counter()
                         try:
-                            os.remove(sync_file)
-                        except FileNotFoundError:
-                            pass
+                            sync_results = llm_engine.apply_model(agentmemory_load_hf_from_file)
+                        finally:
+                            transport_stats['apply_model_seconds'] = (
+                                time.perf_counter() - apply_model_started)
+                            try:
+                                os.remove(sync_file)
+                            except FileNotFoundError:
+                                pass
+                        transport_stats['apply_model_results'] = sync_results
                     if evidence_enabled:
                         previous_event = self._last_sync_event
                         event = build_sync_event(
@@ -349,12 +447,17 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                             source_before=source_before,
                             apply_model_results=sync_results,
                             previous_event=previous_event,
+                            transport=effective_transport,
                         )
                         self._current_sync_previous = previous_event
                         self._current_sync_event = append_and_readback_event(
                             self._sync_evidence_path(), event)
                         self._last_sync_event = self._current_sync_event
-                    logger.info('Synced actor HF weights into official vLLM via file-backed apply_model: %s', sync_results)
+                    logger.info(
+                        'Synced actor HF weights into official vLLM via %s apply_model: %s',
+                        effective_transport,
+                        sync_results,
+                    )
                 elif hasattr(llm_engine, 'model_executor'):
                     model = llm_engine.model_executor.driver_worker.worker.model_runner.model
                     sync_results = load_hf_weights(model, materialize_hf_weights())
@@ -365,6 +468,15 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             else:
                 raise NotImplementedError(f'load_format {load_format} not implemented')
         log_gpu_memory_usage('After sync model weights in sharding manager', logger=logger)
+        logger.warning(
+            'AGENTMEMORY_VLLM_SYNC_TIMING rank=%s transport=%s '
+            'state_dict_s=%.6f weight_sync_s=%.6f transport_stats=%s',
+            self._sync_rank(),
+            effective_transport,
+            state_dict_seconds,
+            time.perf_counter() - weight_sync_started,
+            transport_stats,
+        )
 
         del params
         torch.cuda.empty_cache()
