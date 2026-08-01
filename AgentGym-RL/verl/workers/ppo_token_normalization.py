@@ -311,16 +311,29 @@ def optimizer_step_readback(
 ) -> dict:
     """Return the expected actor/critic optimizer steps for one PPO update."""
 
-    world_size = _positive_int(contract["world_size"], "contract.world_size")
     global_rows = _positive_int(
         global_rows_after_dp_padding, "global_rows_after_dp_padding"
     )
-    if global_rows % world_size != 0:
+    actor_dp = _positive_int(
+        contract["actor_data_parallel_size"],
+        "contract.actor_data_parallel_size",
+    )
+    critic_dp = _positive_int(
+        contract["critic_data_parallel_size"],
+        "contract.critic_data_parallel_size",
+    )
+    if global_rows % actor_dp != 0:
         raise ValueError(
-            "global_rows_after_dp_padding must be divisible by world_size: "
-            f"{global_rows} / {world_size}."
+            "global_rows_after_dp_padding must be divisible by actor data "
+            f"parallel size: {global_rows} / {actor_dp}."
         )
-    local_rows = global_rows // world_size
+    if global_rows % critic_dp != 0:
+        raise ValueError(
+            "global_rows_after_dp_padding must be divisible by critic data "
+            f"parallel size: {global_rows} / {critic_dp}."
+        )
+    actor_local_rows = global_rows // actor_dp
+    critic_local_rows = global_rows // critic_dp
     actor_local = _positive_int(
         contract["actor_local_mini_batch_rows"],
         "contract.actor_local_mini_batch_rows",
@@ -335,16 +348,23 @@ def optimizer_step_readback(
     critic_epochs = _positive_int(
         contract["critic_ppo_epochs"], "contract.critic_ppo_epochs"
     )
-    actor_minibatches = math.ceil(local_rows / actor_local)
-    critic_minibatches = math.ceil(local_rows / critic_local)
+    actor_minibatches = math.ceil(actor_local_rows / actor_local)
+    critic_minibatches = math.ceil(critic_local_rows / critic_local)
     if actor_minibatches != critic_minibatches:
         raise ValueError(
             "actor and critic mini-batches per epoch differ: "
             f"actor={actor_minibatches} critic={critic_minibatches}."
         )
     return {
-        "local_rows": local_rows,
+        # ``local_rows`` is retained for existing metric consumers.  When the
+        # actor and critic use different DP sizes, expose the role-specific
+        # values below instead of silently pretending they share one shard.
+        "local_rows": actor_local_rows,
+        "actor_local_rows": actor_local_rows,
+        "critic_local_rows": critic_local_rows,
         "minibatches_per_epoch": actor_minibatches,
+        "actor_minibatches_per_epoch": actor_minibatches,
+        "critic_minibatches_per_epoch": critic_minibatches,
         "actor_optimizer_steps": actor_minibatches * actor_epochs,
         "critic_optimizer_steps": critic_minibatches * critic_epochs,
     }

@@ -246,6 +246,20 @@ class BatchContractTest(unittest.TestCase):
                     expected,
                 )
 
+    def test_sp2_uses_data_parallel_rows_for_step_readback(self):
+        contract = _batch_contract(
+            actor_sequence_parallel_size=2,
+            critic_sequence_parallel_size=2,
+        )
+        readback = optimizer_step_readback(contract, 640)
+        self.assertEqual(contract["actor_data_parallel_size"], 4)
+        self.assertEqual(readback["actor_local_rows"], 160)
+        self.assertEqual(readback["critic_local_rows"], 160)
+        self.assertEqual(readback["actor_minibatches_per_epoch"], 2)
+        self.assertEqual(readback["critic_minibatches_per_epoch"], 2)
+        self.assertEqual(readback["actor_optimizer_steps"], 2)
+        self.assertEqual(readback["critic_optimizer_steps"], 4)
+
     def test_mixed_batch_unit_mode_fails_closed(self):
         with self.assertRaisesRegex(ValueError, "different flattened-row units"):
             _batch_contract(critic_mini_batch_size=64)
