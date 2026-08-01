@@ -55,8 +55,11 @@ from verl.utils.agentgym.rollout_context import (
     AGENTMEMORY_TRAJECTORY_TERMINAL,
     AGENTMEMORY_TRAJECTORY_UID,
     align_batch_to_rollout,
+    capture_formal_validation_receipt,
     requires_formal_trajectory_metadata,
+    reuse_formal_validation_receipt,
     summarize_update_readback,
+    validate_formal_ppo_update_tensors,
     validate_formal_trajectory_metadata,
     validate_state_aware_rollout_uids,
 )
@@ -200,6 +203,7 @@ def compute_advantage(
     lam=1.0,
     num_repeat=1,
     timing_raw=None,
+    formal_validation_receipt=None,
 ):
     # prepare response group
     # TODO: add other ways to estimate advantages
@@ -213,15 +217,24 @@ def compute_advantage(
             if timing_raw is not None
             else nullcontext()
         ):
-            formal_groups = validate_formal_trajectory_metadata(
-                data,
-                expected_replicas=int(num_repeat),
-                require=formal_required or runtime_evidence_required,
-                require_runtime_evidence=runtime_evidence_required,
-                expected_suffix_credit=(
-                    False if formal_required or runtime_evidence_required else None
-                ),
-            )
+            if formal_validation_receipt is None:
+                formal_groups = validate_formal_trajectory_metadata(
+                    data,
+                    expected_replicas=int(num_repeat),
+                    require=formal_required or runtime_evidence_required,
+                    require_runtime_evidence=runtime_evidence_required,
+                    expected_suffix_credit=(
+                        False if formal_required or runtime_evidence_required else None
+                    ),
+                )
+            else:
+                if not (formal_required or runtime_evidence_required):
+                    raise RuntimeError(
+                        "A formal validation receipt cannot be used for a non-formal PPO batch."
+                    )
+                formal_groups = reuse_formal_validation_receipt(
+                    data, formal_validation_receipt
+                )
         values = data.batch['values']
         response_mask = data.batch['response_mask']
         token_level_rewards = data.batch['token_level_rewards']
@@ -275,13 +288,22 @@ def compute_advantage(
         runtime_evidence_required = _agentmemory_env_flag(
             "AGENTMEMORY_REQUIRE_FORMAL_RUNTIME_EVIDENCE"
         )
-        formal_groups = validate_formal_trajectory_metadata(
-            data,
-            expected_replicas=int(num_repeat),
-            require=formal_required or runtime_evidence_required,
-            require_runtime_evidence=runtime_evidence_required,
-            expected_suffix_credit=False if runtime_evidence_required else None,
-        )
+        if formal_validation_receipt is None:
+            formal_groups = validate_formal_trajectory_metadata(
+                data,
+                expected_replicas=int(num_repeat),
+                require=formal_required or runtime_evidence_required,
+                require_runtime_evidence=runtime_evidence_required,
+                expected_suffix_credit=False if runtime_evidence_required else None,
+            )
+        else:
+            if not (formal_required or runtime_evidence_required):
+                raise RuntimeError(
+                    "A formal validation receipt cannot be used for a non-formal PPO batch."
+                )
+            formal_groups = reuse_formal_validation_receipt(
+                data, formal_validation_receipt
+            )
         if formal_groups is not None:
             advantages, returns = core_algos.compute_formal_grpo_complete_trajectory_advantage(
                 immediate_rewards=data.batch[AGENTMEMORY_IMMEDIATE_REWARD],
@@ -1777,7 +1799,7 @@ class RayPPOTrainer(object):
                     # Please take care when you implement group based adv computation such as GRPO and rloo
                     self._balance_batch(batch, metrics=metrics)
                     with _timer('formal_validate_post_balance', timing_raw):
-                        validate_formal_trajectory_metadata(
+                        formal_groups = validate_formal_trajectory_metadata(
                             batch,
                             expected_replicas=int(
                                 self.config.actor_rollout_ref.rollout.n
@@ -1785,6 +1807,10 @@ class RayPPOTrainer(object):
                             require=formal_required or runtime_evidence_required,
                             require_runtime_evidence=runtime_evidence_required,
                             expected_suffix_credit=expected_suffix_credit,
+                        )
+                        formal_validation_receipt = capture_formal_validation_receipt(
+                            batch,
+                            grouped=formal_groups,
                         )
 
                     # compute global_valid tokens
@@ -1902,17 +1928,34 @@ class RayPPOTrainer(object):
                             lam=self.config.algorithm.lam,
                             num_repeat=self.config.actor_rollout_ref.rollout.n,
                             timing_raw=timing_raw,
+                            formal_validation_receipt=formal_validation_receipt,
                         )
                         with _timer('adv_formal_validate_post', timing_raw):
-                            validate_formal_trajectory_metadata(
-                                batch,
-                                expected_replicas=int(
-                                    self.config.actor_rollout_ref.rollout.n
-                                ),
-                                require=formal_required or runtime_evidence_required,
-                                require_runtime_evidence=runtime_evidence_required,
-                                expected_suffix_credit=expected_suffix_credit,
-                            )
+                            if formal_validation_receipt is None:
+                                validate_formal_trajectory_metadata(
+                                    batch,
+                                    expected_replicas=int(
+                                        self.config.actor_rollout_ref.rollout.n
+                                    ),
+                                    require=formal_required or runtime_evidence_required,
+                                    require_runtime_evidence=runtime_evidence_required,
+                                    expected_suffix_credit=expected_suffix_credit,
+                                )
+                            else:
+                                required_update_tensors = [
+                                    "old_log_probs",
+                                    "token_level_scores",
+                                    "token_level_rewards",
+                                    "advantages",
+                                    "returns",
+                                ]
+                                if self.use_critic:
+                                    required_update_tensors.append("values")
+                                validate_formal_ppo_update_tensors(
+                                    batch,
+                                    receipt=formal_validation_receipt,
+                                    required_tensor_keys=required_update_tensors,
+                                )
                         with _timer('adv_debug_dump', timing_raw):
                             _agentmemory_dump_ppo_batch_debug(
                                 batch=batch,

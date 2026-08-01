@@ -80,6 +80,23 @@ _RESTRICTED_AGENTMEMORY_MARKERS = (
     "agentmemory_nonformal_grouping_mode",
 )
 
+_FORMAL_RECEIPT_NON_TENSOR_KEYS = (
+    *FORMAL_TRAJECTORY_NON_TENSOR_KEYS,
+    *FORMAL_RUNTIME_EVIDENCE_NON_TENSOR_KEYS,
+    "rollout_parent_indices",
+    "rollout_uid",
+    "rollout_done_flags",
+)
+_FORMAL_RECEIPT_TENSOR_KEYS = (
+    *FORMAL_TRAJECTORY_TENSOR_KEYS,
+    *FORMAL_RUNTIME_EVIDENCE_TENSOR_KEYS,
+    "prompts",
+    "attention_mask",
+    "responses",
+    "scores",
+    "task_rounds",
+)
+
 
 def build_parent_group_uid(parent_index: int) -> str:
     """Identify all online continuations sampled from one initial task."""
@@ -274,6 +291,206 @@ def validate_formal_response_aligned_tensors(
                 )
             checked += 1
     return {"tensor_count": len(tensors), "checked_rows": checked}
+
+
+def _formal_tensor_version_token(tensor: Any) -> tuple[Any, ...]:
+    """Identify a validated tensor without rescanning its contents."""
+
+    try:
+        data_ptr = int(tensor.untyped_storage().data_ptr())
+    except AttributeError:
+        data_ptr = int(tensor.data_ptr())
+    return (
+        data_ptr,
+        int(tensor.storage_offset()),
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        str(tensor.dtype),
+        str(tensor.device),
+        int(getattr(tensor, "_version", -1)),
+    )
+
+
+def capture_formal_validation_receipt(
+    rollout_output: Any,
+    *,
+    grouped: dict[str, list[dict[str, Any]]] | None,
+) -> dict[str, Any] | None:
+    """Capture cheap identity evidence after a successful full validation."""
+
+    if grouped is None:
+        return None
+    non_tensor_batch = rollout_output.non_tensor_batch or {}
+    tensor_batch = rollout_output.batch
+    row_count = len(rollout_output)
+    valid_mask = tensor_batch.get(_PPO_VALID_SAMPLE_MASK)
+    if valid_mask is None:
+        valid_mask_values = tuple(True for _ in range(row_count))
+    else:
+        valid_mask_values = tuple(valid_mask.detach().cpu().bool().tolist())
+    response_mask = tensor_batch.get("response_mask")
+    if response_mask is None:
+        raise RuntimeError(
+            "Cannot capture formal validation receipt without response_mask."
+        )
+    return {
+        "data_identity": id(rollout_output),
+        "groups": grouped,
+        "row_count": row_count,
+        "valid_mask": valid_mask_values,
+        "response_mask": response_mask.detach().cpu().clone(),
+        "non_tensor_rows": {
+            key: tuple(np.asarray(non_tensor_batch[key], dtype=object).tolist())
+            for key in _FORMAL_RECEIPT_NON_TENSOR_KEYS
+        },
+        "tensor_versions": {
+            key: _formal_tensor_version_token(tensor_batch[key])
+            for key in _FORMAL_RECEIPT_TENSOR_KEYS
+        },
+    }
+
+
+def reuse_formal_validation_receipt(
+    rollout_output: Any,
+    receipt: dict[str, Any],
+) -> dict[str, list[dict[str, Any]]]:
+    """Fail closed unless the already-validated formal evidence is unchanged."""
+
+    if not isinstance(receipt, dict) or receipt.get("groups") is None:
+        raise RuntimeError("Formal validation receipt is missing or malformed.")
+    if receipt.get("data_identity") != id(rollout_output):
+        raise RuntimeError("Formal validation receipt belongs to another PPO batch.")
+    row_count = len(rollout_output)
+    if receipt.get("row_count") != row_count:
+        raise RuntimeError("Formal PPO batch row count changed after validation.")
+
+    non_tensor_batch = rollout_output.non_tensor_batch or {}
+    non_tensor_rows = receipt.get("non_tensor_rows")
+    if not isinstance(non_tensor_rows, dict) or set(non_tensor_rows) != set(
+        _FORMAL_RECEIPT_NON_TENSOR_KEYS
+    ):
+        raise RuntimeError("Formal validation receipt has incomplete row evidence.")
+    for key, expected in non_tensor_rows.items():
+        values = non_tensor_batch.get(key)
+        if values is None:
+            raise RuntimeError(
+                f"Formal PPO evidence {key} disappeared after validation."
+            )
+        current = tuple(np.asarray(values, dtype=object).tolist())
+        if current != expected:
+            raise RuntimeError(
+                f"Formal PPO evidence {key} changed after validation."
+            )
+
+    tensor_batch = rollout_output.batch
+    tensor_versions = receipt.get("tensor_versions")
+    if not isinstance(tensor_versions, dict) or set(tensor_versions) != set(
+        _FORMAL_RECEIPT_TENSOR_KEYS
+    ):
+        raise RuntimeError("Formal validation receipt has incomplete tensor evidence.")
+    for key, expected in tensor_versions.items():
+        tensor = tensor_batch.get(key)
+        if tensor is None:
+            raise RuntimeError(
+                f"Formal PPO evidence tensor {key} disappeared after validation."
+            )
+        if _formal_tensor_version_token(tensor) != expected:
+            raise RuntimeError(
+                f"Formal PPO evidence tensor {key} changed after validation."
+            )
+
+    valid_mask = tensor_batch.get(_PPO_VALID_SAMPLE_MASK)
+    if valid_mask is None:
+        valid_mask_values = tuple(True for _ in range(row_count))
+    else:
+        if valid_mask.ndim != 1 or valid_mask.shape[0] != row_count:
+            raise RuntimeError(
+                f"{_PPO_VALID_SAMPLE_MASK} must have shape ({row_count},)."
+            )
+        valid_mask_values = tuple(valid_mask.detach().cpu().bool().tolist())
+    if valid_mask_values != receipt.get("valid_mask"):
+        raise RuntimeError("Formal PPO valid-row mask changed after validation.")
+
+    response_mask = tensor_batch.get("response_mask")
+    expected_response_mask = receipt.get("response_mask")
+    if response_mask is None or expected_response_mask is None:
+        raise RuntimeError("Formal PPO response mask is missing after validation.")
+    current_response_mask = response_mask.detach().cpu()
+    if tuple(current_response_mask.shape) != tuple(expected_response_mask.shape):
+        raise RuntimeError("Formal PPO response mask shape changed after validation.")
+    import torch
+
+    valid_rows = torch.as_tensor(valid_mask_values, dtype=torch.bool)
+    if not torch.equal(
+        current_response_mask[valid_rows], expected_response_mask[valid_rows]
+    ):
+        raise RuntimeError(
+            "Formal PPO response mask changed on a valid row after validation."
+        )
+    return receipt["groups"]
+
+
+def validate_formal_ppo_update_tensors(
+    rollout_output: Any,
+    *,
+    receipt: dict[str, Any],
+    required_tensor_keys: Sequence[str],
+) -> dict[str, int]:
+    """Validate only PPO tensors created after the full formal evidence scan."""
+
+    import torch
+
+    reuse_formal_validation_receipt(rollout_output, receipt)
+    tensor_batch = rollout_output.batch
+    response_mask = tensor_batch["response_mask"]
+    if response_mask.ndim != 2:
+        raise RuntimeError(
+            f"Formal response_mask must be two-dimensional, got {response_mask.shape}."
+        )
+    row_count, response_width = response_mask.shape
+    valid_mask = tensor_batch.get(_PPO_VALID_SAMPLE_MASK)
+    if valid_mask is None:
+        valid_mask = torch.ones(row_count, dtype=torch.bool, device=response_mask.device)
+    else:
+        valid_mask = valid_mask.to(device=response_mask.device, dtype=torch.bool)
+    sampled_mask = response_mask.to(dtype=torch.bool) & valid_mask.unsqueeze(-1)
+
+    packed_lengths = tensor_batch.get(AGENTMEMORY_PACKED_RESPONSE_LENGTH)
+    if packed_lengths is None or packed_lengths.ndim != 1 or len(packed_lengths) != row_count:
+        raise RuntimeError(
+            "Formal packed response lengths are missing or misaligned after validation."
+        )
+    sampled_lengths = response_mask.to(dtype=torch.bool).sum(dim=-1).detach().cpu()
+    expected_lengths = packed_lengths.detach().cpu().to(dtype=sampled_lengths.dtype)
+    valid_rows_cpu = valid_mask.detach().cpu()
+    if not (sampled_lengths[valid_rows_cpu] == expected_lengths[valid_rows_cpu]).all().item():
+        raise RuntimeError(
+            "Formal response mask no longer matches packed response lengths."
+        )
+
+    keys = tuple(required_tensor_keys)
+    if not keys:
+        raise RuntimeError("Formal PPO update tensor contract is empty.")
+    missing = [key for key in keys if tensor_batch.get(key) is None]
+    if missing:
+        raise RuntimeError(
+            f"Formal PPO update tensors are missing: {sorted(missing)}"
+        )
+    checked_rows = int(valid_mask.sum().item())
+    for key in keys:
+        tensor = tensor_batch[key]
+        if tensor.ndim != 2 or tuple(tensor.shape) != (row_count, response_width):
+            raise RuntimeError(
+                f"Formal {key} shape differs from response_mask: "
+                f"tensor={tuple(tensor.shape)} mask={(row_count, response_width)}."
+            )
+        tensor_sampled_mask = sampled_mask.to(device=tensor.device)
+        sampled_values = tensor.masked_select(tensor_sampled_mask)
+        if not sampled_values.isfinite().all().item():
+            raise RuntimeError(
+                f"Formal {key} contains non-finite sampled-token values."
+            )
+    return {"tensor_count": len(keys), "checked_rows": checked_rows}
 
 
 def normalize_generation_record(

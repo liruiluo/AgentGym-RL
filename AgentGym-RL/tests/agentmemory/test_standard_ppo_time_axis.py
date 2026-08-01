@@ -351,6 +351,9 @@ def load_trainer_functions(validate_calls):
         "nullcontext": nullcontext,
         "os": os,
         "requires_formal_trajectory_metadata": lambda data: True,
+        "reuse_formal_validation_receipt": (
+            lambda data, receipt: receipt["groups"]
+        ),
         "torch": torch,
         "validate_formal_trajectory_metadata": validate,
     }
@@ -369,6 +372,34 @@ class TrainerRoutingTests(unittest.TestCase):
         self.assertEqual(
             data.meta_info["agentmemory_actor_advantage_mode"],
             "standard_trajectory_gae",
+        )
+
+    def test_prevalidated_formal_gae_skips_full_scan_and_is_identical(self) -> None:
+        baseline_calls = []
+        baseline_functions = load_trainer_functions(baseline_calls)
+        baseline = FakeDataProto()
+        baseline_functions["compute_advantage"](
+            baseline, "gae", gamma=1.0, lam=1.0
+        )
+
+        candidate_calls = []
+        candidate_functions = load_trainer_functions(candidate_calls)
+        candidate = FakeDataProto()
+        candidate_functions["compute_advantage"](
+            candidate,
+            "gae",
+            gamma=1.0,
+            lam=1.0,
+            formal_validation_receipt={"groups": {"parent": []}},
+        )
+
+        self.assertEqual(len(baseline_calls), 1)
+        self.assertEqual(candidate_calls, [])
+        torch.testing.assert_close(
+            candidate.batch["advantages"], baseline.batch["advantages"], rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            candidate.batch["returns"], baseline.batch["returns"], rtol=0, atol=0
         )
 
     def test_formal_config_rejects_legacy_suffix_and_mc_modes(self) -> None:
