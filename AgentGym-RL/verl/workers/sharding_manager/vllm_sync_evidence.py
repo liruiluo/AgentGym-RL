@@ -6,8 +6,9 @@ import os
 from datetime import datetime, timezone
 
 
-SCHEMA_VERSION = 1
-EVENT_TYPE = "official_vllm_file_backed_apply_model_sync"
+SCHEMA_VERSION = 2
+EVENT_TYPE = "official_vllm_hf_apply_model_sync"
+LEGACY_EVENT_TYPE = "official_vllm_file_backed_apply_model_sync"
 
 
 def _evenly_spaced_indices(length, limit):
@@ -98,7 +99,8 @@ def _target_aggregate_sha256(targets):
 
 
 def build_sync_event(*, rank, pid, global_steps, sync_sequence, sync_id,
-                     source_before, apply_model_results, previous_event=None):
+                     source_before, apply_model_results, previous_event=None,
+                     transport="file"):
     targets = []
     for result_index, result in enumerate(flatten_apply_model_results(apply_model_results)):
         target = dict(result)
@@ -115,6 +117,7 @@ def build_sync_event(*, rank, pid, global_steps, sync_sequence, sync_id,
         "global_steps": global_steps,
         "sync_sequence": int(sync_sequence),
         "sync_id": sync_id,
+        "transport": str(transport),
         "source_before": source_before,
         "targets_after": targets,
         "target_aggregate_sha256": target_aggregate_sha256,
@@ -133,8 +136,16 @@ def build_sync_event(*, rank, pid, global_steps, sync_sequence, sync_id,
 
 
 def validate_sync_event(event, previous_event=None, require_change=False):
-    if event.get("schema_version") != SCHEMA_VERSION or event.get("event_type") != EVENT_TYPE:
+    schema = event.get("schema_version")
+    event_type = event.get("event_type")
+    valid_schema = (
+        (schema == SCHEMA_VERSION and event_type == EVENT_TYPE)
+        or (schema == 1 and event_type == LEGACY_EVENT_TYPE)
+    )
+    if not valid_schema:
         raise RuntimeError("Unexpected vLLM sync evidence schema")
+    if schema == SCHEMA_VERSION and event.get("transport") not in {"file", "direct_inproc"}:
+        raise RuntimeError("vLLM sync evidence has an invalid transport")
     if event.get("global_steps") is None:
         raise RuntimeError("vLLM sync evidence is missing prompts.meta_info global_steps")
     if not isinstance(event.get("sync_sequence"), int) or event["sync_sequence"] < 1:
