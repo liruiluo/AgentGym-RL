@@ -16,9 +16,10 @@ FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
-import os
-import uuid
 import json
+import os
+import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -416,6 +417,8 @@ def _safe_float(value):
 def _agentmemory_dump_ppo_batch_debug(batch: DataProto, config, global_steps: int, stage: str) -> None:
     if not _agentmemory_env_flag("AGENTMEMORY_BATCH_DEBUG"):
         return
+    timing_enabled = _agentmemory_env_flag("AGENTMEMORY_BATCH_DEBUG_TIMING")
+    started_at = time.perf_counter() if timing_enabled else None
     try:
         action_text_key = "agentmemory_action_text"
         generation_prompt_digest_key = "agentmemory_generation_prompt_digest"
@@ -698,8 +701,33 @@ def _agentmemory_dump_ppo_batch_debug(batch: DataProto, config, global_steps: in
             "suffix_formula_mismatch_count": 0 if suffix_returns is not None else None,
             "rows": rows,
         }
-        with open(os.path.join(out_dir, f"ppo_batch_step{global_steps}_{stage}.json"), "w") as f:
-            json.dump(summary, f, ensure_ascii=True, indent=2)
+        output_path = os.path.join(out_dir, f"ppo_batch_step{global_steps}_{stage}.json")
+        if timing_enabled:
+            payload_ready_at = time.perf_counter()
+            encoded = json.dumps(summary, ensure_ascii=True, indent=2)
+            encoded_at = time.perf_counter()
+            with open(output_path, "w") as f:
+                f.write(encoded)
+            completed_at = time.perf_counter()
+            print(
+                "AGENTMEMORY_BATCH_DEBUG_TIMING "
+                + json.dumps(
+                    {
+                        "global_step": int(global_steps),
+                        "stage": stage,
+                        "payload_chars": len(encoded),
+                        "prepare_seconds": payload_ready_at - started_at,
+                        "encode_seconds": encoded_at - payload_ready_at,
+                        "write_seconds": completed_at - encoded_at,
+                        "total_seconds": completed_at - started_at,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+        else:
+            with open(output_path, "w") as f:
+                json.dump(summary, f, ensure_ascii=True, indent=2)
     except Exception as exc:
         print(f"AgentMemory PPO batch debug dump failed: {exc}", flush=True)
 

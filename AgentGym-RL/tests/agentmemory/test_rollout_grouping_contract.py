@@ -1,7 +1,9 @@
+import io
 import json
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -76,6 +78,56 @@ class RolloutGroupingContractTest(unittest.TestCase):
         self.assertEqual(summary["padding_rows"], 1)
         self.assertEqual(summary["uid_group_sizes"], [1, 1])
         self.assertFalse(summary["rows"][2]["ppo_valid_sample"])
+
+    def test_debug_timing_preserves_exact_payload(self):
+        batch = DataProto.from_dict(
+            tensors={
+                "response_mask": torch.tensor([[1, 1], [1, 0]]),
+                "scores": torch.tensor([[1.0, 0.0], [0.5, 0.0]]),
+                core_algos.PPO_VALID_SAMPLE_MASK: torch.tensor([True, True]),
+            },
+            non_tensors={
+                "uid": np.array(["state-a", "state-b"], dtype=object),
+            },
+        )
+        payloads = []
+        timing_stdout = io.StringIO()
+        for timing_enabled in (False, True):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                config = SimpleNamespace(
+                    trainer=SimpleNamespace(
+                        default_local_dir=str(Path(tmpdir) / "checkpoints")
+                    )
+                )
+                environment = {"AGENTMEMORY_BATCH_DEBUG": "1"}
+                if timing_enabled:
+                    environment["AGENTMEMORY_BATCH_DEBUG_TIMING"] = "1"
+                output = timing_stdout if timing_enabled else io.StringIO()
+                with (
+                    mock.patch.dict(os.environ, environment, clear=True),
+                    redirect_stdout(output),
+                ):
+                    _agentmemory_dump_ppo_batch_debug(
+                        batch=batch,
+                        config=config,
+                        global_steps=1,
+                        stage="post_adv",
+                    )
+                debug_path = Path(tmpdir) / "diagnostics/ppo_batch_step1_post_adv.json"
+                payloads.append(debug_path.read_bytes())
+
+        self.assertEqual(payloads[0], payloads[1])
+        line = timing_stdout.getvalue().strip()
+        prefix = "AGENTMEMORY_BATCH_DEBUG_TIMING "
+        self.assertTrue(line.startswith(prefix))
+        timing = json.loads(line[len(prefix) :])
+        self.assertEqual(timing["global_step"], 1)
+        self.assertEqual(timing["stage"], "post_adv")
+        self.assertEqual(timing["payload_chars"], len(payloads[1]))
+        self.assertGreaterEqual(timing["prepare_seconds"], 0.0)
+        self.assertGreaterEqual(timing["encode_seconds"], 0.0)
+        self.assertGreaterEqual(timing["write_seconds"], 0.0)
+        self.assertGreaterEqual(timing["total_seconds"], 0.0)
 
     def test_formal_capture_and_infra_exclusion_are_both_wired(self):
         rollout_path = (
