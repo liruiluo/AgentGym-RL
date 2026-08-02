@@ -27,6 +27,12 @@ class EffectiveMemoryPromptAttestationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.module = load_module()
         self.lifecycle_prompt = " ".join(self.module.LIFECYCLE_SOP_FRAGMENTS)
+        self.latent_preference_prompt = " ".join(
+            (
+                *self.module.LIFECYCLE_SOP_FRAGMENTS,
+                *self.module.LATENT_PREFERENCE_SOP_FRAGMENTS,
+            )
+        )
 
     def test_lifecycle_prompt_passes_and_records_hash(self) -> None:
         result = self.module.build_attestation(
@@ -84,3 +90,54 @@ class EffectiveMemoryPromptAttestationTests(unittest.TestCase):
         )
         self.assertFalse(result["lifecycle_sop_present"])
         self.assertTrue(result["missing_lifecycle_sop_fragments"])
+
+    def test_latent_preference_prompt_passes_both_fail_closed_gates(self) -> None:
+        result = self.module.build_attestation(
+            prompt=self.latent_preference_prompt,
+            memory_prompt_mode="latent_preference_sop",
+            ltm_inventory_mode="keys",
+            thinking_enabled=False,
+            reasoning_enabled=True,
+            require_lifecycle_sop=True,
+            require_latent_preference_sop=True,
+        )
+        self.assertTrue(result["lifecycle_sop_present"])
+        self.assertTrue(result["latent_preference_sop_present"])
+        self.assertEqual(result["missing_latent_preference_sop_fragments"], [])
+        self.assertTrue(result["require_latent_preference_sop"])
+
+    def test_generic_lifecycle_prompt_fails_latent_preference_gate(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "latent-preference SOP"):
+            self.module.build_attestation(
+                prompt=self.lifecycle_prompt,
+                memory_prompt_mode="latent_preference_sop",
+                ltm_inventory_mode="keys",
+                thinking_enabled=False,
+                reasoning_enabled=True,
+                require_lifecycle_sop=True,
+                require_latent_preference_sop=True,
+            )
+
+    def test_each_latent_preference_fragment_is_fail_closed(self) -> None:
+        for missing_fragment in self.module.LATENT_PREFERENCE_SOP_FRAGMENTS:
+            with self.subTest(missing_fragment=missing_fragment):
+                prompt = " ".join(
+                    (
+                        *self.module.LIFECYCLE_SOP_FRAGMENTS,
+                        *(
+                            fragment
+                            for fragment in self.module.LATENT_PREFERENCE_SOP_FRAGMENTS
+                            if fragment != missing_fragment
+                        ),
+                    )
+                )
+                with self.assertRaisesRegex(RuntimeError, "latent-preference SOP"):
+                    self.module.build_attestation(
+                        prompt=prompt,
+                        memory_prompt_mode="latent_preference_sop",
+                        ltm_inventory_mode="keys",
+                        thinking_enabled=False,
+                        reasoning_enabled=True,
+                        require_lifecycle_sop=True,
+                        require_latent_preference_sop=True,
+                    )

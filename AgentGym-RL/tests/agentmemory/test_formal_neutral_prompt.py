@@ -135,6 +135,18 @@ class FormalPromptTests(unittest.TestCase):
         self.neutral_horizon_responsibility_inventory_prompt = values[
             "AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON_RESPONSIBILITY_LTM_KEY_INVENTORY"
         ]
+        self.latent_preference_prompts = (
+            values["AGENTMEMORY_ACTION_SYSTEM_PROMPT_LATENT_PREFERENCE_SOP"],
+            values[
+                "AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_LATENT_PREFERENCE_SOP"
+            ],
+            values[
+                "AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_LATENT_PREFERENCE_SOP"
+            ],
+        )
+        self.latent_preference_inventory_prompt = values[
+            "AGENTMEMORY_ACTION_SYSTEM_PROMPT_LATENT_PREFERENCE_SOP_LTM_KEY_INVENTORY"
+        ]
 
     def test_both_prompts_have_native_action_contract(self) -> None:
         for prompt in (self.no_thinking_prompt, self.thinking_prompt, self.reasoning_prompt):
@@ -318,6 +330,42 @@ class FormalPromptTests(unittest.TestCase):
             1,
         )
 
+    def test_latent_preference_sop_preserves_evidence_and_infers_without_fixed_shots(
+        self,
+    ) -> None:
+        required = (
+            "confirmed choice as preference evidence",
+            "customer-profile memory",
+            "preference axis",
+            "inferred value",
+            "Do not assume a fixed number",
+            "use ADD before click[Buy Now]",
+            "use UPDATE",
+            "At the start of every later shopping session",
+            "use RETRIEVE",
+            "later application sessions",
+            "memory_id:string for exact readback",
+        )
+        forbidden = (
+            "save one concise memory containing that product's identity",
+            "attributes needed for later compatibility decisions",
+            "exactly two examples",
+            "exactly three examples",
+        )
+        for prompt in self.latent_preference_prompts:
+            for fragment in required:
+                self.assertIn(fragment, prompt)
+            for fragment in forbidden:
+                self.assertNotIn(fragment, prompt)
+        self.assertIn(
+            "key-only long-term memory inventory",
+            self.latent_preference_inventory_prompt,
+        )
+        self.assertIn(
+            "values remain hidden until RETRIEVE",
+            self.latent_preference_inventory_prompt,
+        )
+
     def test_prompt_mode_is_opt_in_and_validated(self) -> None:
         module = load_schemas_module()
         with patch.dict(os.environ, {}, clear=True):
@@ -355,6 +403,15 @@ class FormalPromptTests(unittest.TestCase):
             self.assertEqual(
                 module.agentmemory_action_system_prompt(),
                 module.AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON_RESPONSIBILITY,
+            )
+        with patch.dict(
+            os.environ,
+            {"AGENTMEMORY_MEMORY_PROMPT_MODE": "latent_preference_sop"},
+            clear=True,
+        ):
+            self.assertEqual(
+                module.agentmemory_action_system_prompt(),
+                module.AGENTMEMORY_ACTION_SYSTEM_PROMPT_LATENT_PREFERENCE_SOP,
             )
         with patch.dict(
             os.environ,

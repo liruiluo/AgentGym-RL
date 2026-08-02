@@ -16,6 +16,15 @@ LIFECYCLE_SOP_FRAGMENTS = (
     "memory_id:string for exact readback",
     "does not reject an otherwise correct purchase when ADD was skipped",
 )
+LATENT_PREFERENCE_SOP_FRAGMENTS = (
+    "confirmed choice as preference evidence",
+    "customer-profile memory",
+    "preference axis",
+    "inferred value",
+    "use UPDATE",
+    "Do not assume a fixed number",
+    "later application sessions",
+)
 
 
 def build_attestation(
@@ -26,6 +35,7 @@ def build_attestation(
     thinking_enabled: bool,
     reasoning_enabled: bool,
     require_lifecycle_sop: bool,
+    require_latent_preference_sop: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("effective AgentMemory system prompt is empty")
@@ -37,6 +47,16 @@ def build_attestation(
             "effective AgentMemory system prompt is missing the required "
             f"memory lifecycle SOP: {missing}"
         )
+    missing_latent_preference = [
+        fragment
+        for fragment in LATENT_PREFERENCE_SOP_FRAGMENTS
+        if fragment not in prompt
+    ]
+    if require_latent_preference_sop and missing_latent_preference:
+        raise RuntimeError(
+            "effective AgentMemory system prompt is missing the required "
+            f"latent-preference SOP: {missing_latent_preference}"
+        )
     return {
         "memory_prompt_mode": memory_prompt_mode,
         "ltm_inventory_mode": ltm_inventory_mode,
@@ -45,6 +65,9 @@ def build_attestation(
         "require_lifecycle_sop": bool(require_lifecycle_sop),
         "lifecycle_sop_present": not missing,
         "missing_lifecycle_sop_fragments": missing,
+        "require_latent_preference_sop": bool(require_latent_preference_sop),
+        "latent_preference_sop_present": not missing_latent_preference,
+        "missing_latent_preference_sop_fragments": missing_latent_preference,
         "system_prompt_chars": len(prompt),
         "system_prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
         "system_prompt": prompt,
@@ -76,6 +99,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expect-memory-prompt-mode")
     parser.add_argument("--expect-ltm-inventory-mode")
     parser.add_argument("--require-lifecycle-sop", action="store_true")
+    parser.add_argument("--require-latent-preference-sop", action="store_true")
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
@@ -106,6 +130,7 @@ def main() -> int:
         thinking_enabled=_env_enabled("AGENTMEMORY_ENABLE_THINKING"),
         reasoning_enabled=_env_enabled("AGENTMEMORY_ALLOW_REASONING"),
         require_lifecycle_sop=args.require_lifecycle_sop,
+        require_latent_preference_sop=args.require_latent_preference_sop,
     )
     rendered = (
         json.dumps(attestation, ensure_ascii=True, indent=2, sort_keys=True) + "\n"

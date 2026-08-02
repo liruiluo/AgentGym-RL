@@ -34,6 +34,7 @@ AGENTMEMORY_MEMORY_PROMPT_MODES = (
     "neutral",
     "neutral_horizon",
     "neutral_horizon_responsibility",
+    "latent_preference_sop",
 )
 
 
@@ -143,6 +144,23 @@ _AGENTMEMORY_CROSS_SESSION_MEMORY_RESPONSIBILITY = (
     "facts needed for later decisions."
 )
 
+_AGENTMEMORY_LATENT_PREFERENCE_SOP = (
+    "Each early evidence session may show which approved listing a customer "
+    "confirmed. Treat each confirmed choice as preference evidence. Preserve the "
+    "confirmed listing and its visible distinguishing attributes. After a confirmed "
+    "choice is visible, use ADD before click[Buy Now] to store that evidence or "
+    "create a customer-profile memory containing the customer, preference axis, and "
+    "inferred value. When a customer-profile memory already exists, first retrieve "
+    "its exact memory_id and use UPDATE to incorporate additional evidence without "
+    "discarding prior support. Do not assume a fixed number of examples is always "
+    "sufficient; infer a preference only when the visible confirmed choices support "
+    "it. At the start of every later shopping session, use RETRIEVE to expose the "
+    "relevant confirmed-choice evidence or customer profile. In later application "
+    "sessions, apply the retrieved preference when choosing between approved "
+    "listings. The environment does not perform these memory actions for you, and it "
+    "does not reject an otherwise correct purchase when ADD was skipped."
+)
+
 _AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT = (
     "The observation includes a key-only long-term memory inventory when that interface "
     "variant is enabled. It lists only the memory_id and a policy-authored lookup key; memory "
@@ -210,6 +228,21 @@ AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON_RESPONSIBILITY = (
     + " "
     + _AGENTMEMORY_CROSS_SESSION_MEMORY_RESPONSIBILITY
 )
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_LATENT_PREFERENCE_SOP = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL
+    + " "
+    + _AGENTMEMORY_LATENT_PREFERENCE_SOP
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_LATENT_PREFERENCE_SOP = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL
+    + " "
+    + _AGENTMEMORY_LATENT_PREFERENCE_SOP
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_LATENT_PREFERENCE_SOP = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL
+    + " "
+    + _AGENTMEMORY_LATENT_PREFERENCE_SOP
+)
 AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_HORIZON_RESPONSIBILITY = (
     AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_HORIZON
     + " "
@@ -270,6 +303,21 @@ AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON_RESPONSIBILITY_LTM_KEY_INVENTOR
     + " "
     + _AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT
 )
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_LATENT_PREFERENCE_SOP_LTM_KEY_INVENTORY = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_LATENT_PREFERENCE_SOP
+    + " "
+    + _AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_LATENT_PREFERENCE_SOP_LTM_KEY_INVENTORY = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_LATENT_PREFERENCE_SOP
+    + " "
+    + _AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_LATENT_PREFERENCE_SOP_LTM_KEY_INVENTORY = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_LATENT_PREFERENCE_SOP
+    + " "
+    + _AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT
+)
 AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_HORIZON_RESPONSIBILITY_LTM_KEY_INVENTORY = (
     AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_HORIZON_RESPONSIBILITY
     + " "
@@ -308,7 +356,12 @@ def agentmemory_action_system_prompt(
             + "."
         )
     key_inventory = inventory_mode == "keys"
-    neutral = prompt_mode in AGENTMEMORY_MEMORY_PROMPT_MODES[1:]
+    latent_preference = prompt_mode == "latent_preference_sop"
+    neutral = prompt_mode in (
+        "neutral",
+        "neutral_horizon",
+        "neutral_horizon_responsibility",
+    )
     neutral_horizon = prompt_mode in (
         "neutral_horizon",
         "neutral_horizon_responsibility",
@@ -316,6 +369,8 @@ def agentmemory_action_system_prompt(
     responsibility = prompt_mode == "neutral_horizon_responsibility"
     if _agentmemory_thinking_enabled():
         if key_inventory:
+            if latent_preference:
+                return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_LATENT_PREFERENCE_SOP_LTM_KEY_INVENTORY
             if responsibility:
                 return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_HORIZON_RESPONSIBILITY_LTM_KEY_INVENTORY
             if neutral_horizon:
@@ -323,6 +378,8 @@ def agentmemory_action_system_prompt(
             if neutral:
                 return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_LTM_KEY_INVENTORY
             return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_LTM_KEY_INVENTORY
+        if latent_preference:
+            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_LATENT_PREFERENCE_SOP
         if responsibility:
             return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_HORIZON_RESPONSIBILITY
         if neutral_horizon:
@@ -332,6 +389,8 @@ def agentmemory_action_system_prompt(
         return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING
     if _agentmemory_reasoning_enabled():
         if key_inventory:
+            if latent_preference:
+                return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_LATENT_PREFERENCE_SOP_LTM_KEY_INVENTORY
             if responsibility:
                 return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_HORIZON_RESPONSIBILITY_LTM_KEY_INVENTORY
             if neutral_horizon:
@@ -339,6 +398,8 @@ def agentmemory_action_system_prompt(
             if neutral:
                 return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_LTM_KEY_INVENTORY
             return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_LTM_KEY_INVENTORY
+        if latent_preference:
+            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_LATENT_PREFERENCE_SOP
         if responsibility:
             return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_HORIZON_RESPONSIBILITY
         if neutral_horizon:
@@ -347,6 +408,8 @@ def agentmemory_action_system_prompt(
             return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL
         return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING
     if key_inventory:
+        if latent_preference:
+            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_LATENT_PREFERENCE_SOP_LTM_KEY_INVENTORY
         if responsibility:
             return AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON_RESPONSIBILITY_LTM_KEY_INVENTORY
         if neutral_horizon:
@@ -354,6 +417,8 @@ def agentmemory_action_system_prompt(
         if neutral:
             return AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_LTM_KEY_INVENTORY
         return AGENTMEMORY_ACTION_SYSTEM_PROMPT_LTM_KEY_INVENTORY
+    if latent_preference:
+        return AGENTMEMORY_ACTION_SYSTEM_PROMPT_LATENT_PREFERENCE_SOP
     if responsibility:
         return AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON_RESPONSIBILITY
     if neutral_horizon:

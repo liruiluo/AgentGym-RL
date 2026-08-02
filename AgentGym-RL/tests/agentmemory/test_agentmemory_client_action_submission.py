@@ -49,6 +49,24 @@ def procedural_metadata():
     }
 
 
+def latent_preference_metadata():
+    metadata = procedural_metadata()
+    metadata["surface"] = "agentmemory_webshop_latent_preference_train_v1"
+    metadata["memory_prompt_mode"] = "latent_preference_sop"
+    metadata["provider"] = {
+        **metadata["provider"],
+        "schema": "agentmemory_verified_latent_preference_provider_v1",
+        "supporting_evidence_counts": [1, 2, 3],
+        "resolution_step": 1,
+        "preference_hypothesis": "one_value_on_one_natural_attribute_axis",
+        "counterfactual_pairing": True,
+        "application_observation_identity": True,
+        "application_target_flip": True,
+        "purchase_receipt_asin_verification": True,
+    }
+    return metadata
+
+
 class AgentMemoryClientActionSubmissionTest(unittest.TestCase):
     def client(
         self,
@@ -247,6 +265,118 @@ class ProceduralAgentMemoryClientContractTest(unittest.TestCase):
             ):
                 AgentMemoryEnvClient(
                     "http://procedural.invalid",
+                    None,
+                    action_format=ActionFormat.REACT,
+                )
+            post.assert_not_called()
+
+    def test_latent_preference_surface_uses_dedicated_sop(self) -> None:
+        metadata = latent_preference_metadata()
+        create_response = Mock(status_code=200)
+        create_response.json.return_value = {
+            "id": 7,
+            "observation": "latent preference reset",
+            "reward": 0.0,
+            "done": False,
+            "info": {},
+        }
+        with (
+            patch.object(
+                AgentMemoryEnvClient,
+                "get_metadata",
+                return_value=metadata,
+            ),
+            patch(
+                "agentenv.envs.agentmemory.requests.post",
+                return_value=create_response,
+            ) as post,
+        ):
+            client = AgentMemoryEnvClient(
+                "http://latent-preference.test",
+                None,
+                action_format=ActionFormat.REACT,
+            )
+
+        self.assertTrue(client.is_procedural)
+        self.assertEqual(client.memory_prompt_mode, "latent_preference_sop")
+        prompt = client.conversation_start[0]["value"]
+        for fragment in (
+            "confirmed choice as preference evidence",
+            "customer-profile memory",
+            "preference axis",
+            "inferred value",
+            "Do not assume a fixed number",
+            "use ADD before click[Buy Now]",
+            "use UPDATE",
+            "At the start of every later shopping session",
+            "use RETRIEVE",
+            "later application sessions",
+        ):
+            self.assertIn(fragment, prompt)
+        self.assertNotIn("compatibility-relevant attributes", prompt)
+        post.assert_called_once()
+
+    def test_latent_preference_rejects_non_preference_prompt_mode_before_create(
+        self,
+    ) -> None:
+        metadata = latent_preference_metadata()
+        metadata["memory_prompt_mode"] = "legacy"
+        post = Mock()
+        with (
+            patch.object(
+                AgentMemoryEnvClient,
+                "get_metadata",
+                return_value=metadata,
+            ),
+            patch("agentenv.envs.agentmemory.requests.post", post),
+            self.assertRaisesRegex(RuntimeError, "latent_preference_sop"),
+        ):
+            AgentMemoryEnvClient(
+                "http://latent-preference.invalid",
+                None,
+                action_format=ActionFormat.REACT,
+            )
+        post.assert_not_called()
+
+    def test_bad_latent_preference_metadata_is_rejected_before_create(self) -> None:
+        mutations = {
+            "schema": lambda value: value["provider"].update(schema="unknown"),
+            "evidence_counts": lambda value: value["provider"].update(
+                supporting_evidence_counts=[2]
+            ),
+            "resolution": lambda value: value["provider"].update(resolution_step=2),
+            "hypothesis": lambda value: value["provider"].update(
+                preference_hypothesis="fixed_three_shot"
+            ),
+            "counterfactual": lambda value: value["provider"].update(
+                counterfactual_pairing=False
+            ),
+            "observation_identity": lambda value: value["provider"].update(
+                application_observation_identity=False
+            ),
+            "target_flip": lambda value: value["provider"].update(
+                application_target_flip=False
+            ),
+            "receipt": lambda value: value["provider"].update(
+                purchase_receipt_asin_verification=False
+            ),
+        }
+        for name, mutate in mutations.items():
+            metadata = deepcopy(latent_preference_metadata())
+            mutate(metadata)
+            post = Mock()
+            with (
+                self.subTest(case=name),
+                patch.object(
+                    AgentMemoryEnvClient,
+                    "get_metadata",
+                    return_value=metadata,
+                ),
+                patch("agentenv.envs.agentmemory.requests.post", post),
+                self.assertRaises(RuntimeError),
+            ):
+                AgentMemoryEnvClient(
+                    "http://latent-preference.invalid",
                     None,
                     action_format=ActionFormat.REACT,
                 )

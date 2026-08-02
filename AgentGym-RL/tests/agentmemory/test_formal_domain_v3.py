@@ -291,6 +291,7 @@ class FormalDomainV3Test(unittest.TestCase):
         for surface in (
             MODULE.FORMAL_WEBSHOP_SURFACE_V2,
             MODULE.FORMAL_WEBSHOP_PROCEDURAL_SURFACE_V2,
+            MODULE.FORMAL_WEBSHOP_LATENT_PREFERENCE_SURFACE_V2,
         ):
             with self.subTest(surface=surface):
                 schema, prompt, source = MODULE.resolve_formal_runtime_contract(
@@ -335,6 +336,10 @@ class FormalDomainV3Test(unittest.TestCase):
         MODULE.validate_webshop_memory_prompt_mode(
             {"memory_prompt_mode": "neutral_horizon_responsibility"},
             expected_mode="neutral_horizon_responsibility",
+        )
+        MODULE.validate_webshop_memory_prompt_mode(
+            {"memory_prompt_mode": "latent_preference_sop"},
+            expected_mode="latent_preference_sop",
         )
 
         with self.assertRaisesRegex(MODULE.FormalDomainV3Error, "disagree"):

@@ -14,10 +14,14 @@ FORMAL_WEBSHOP_SURFACE_V2 = "memoryarena_webshop_native_v1"
 FORMAL_WEBSHOP_PROCEDURAL_SURFACE_V2 = (
     "agentmemory_webshop_procedural_natural_chain_train_v1"
 )
+FORMAL_WEBSHOP_LATENT_PREFERENCE_SURFACE_V2 = (
+    "agentmemory_webshop_latent_preference_train_v1"
+)
 FORMAL_WEBSHOP_SURFACES_V2 = frozenset(
     {
         FORMAL_WEBSHOP_SURFACE_V2,
         FORMAL_WEBSHOP_PROCEDURAL_SURFACE_V2,
+        FORMAL_WEBSHOP_LATENT_PREFERENCE_SURFACE_V2,
     }
 )
 LTM_INVENTORY_MODES = ("hidden", "keys")
@@ -26,6 +30,7 @@ MEMORY_PROMPT_MODES = (
     "neutral",
     "neutral_horizon",
     "neutral_horizon_responsibility",
+    "latent_preference_sop",
 )
 ACTION_LISTING_MODES = ("separate", "unified")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
