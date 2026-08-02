@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import importlib.util
 import os
 import sys
@@ -11,6 +12,19 @@ from unittest.mock import patch
 
 
 SCHEMAS_PATH = Path(__file__).resolve().parents[2] / "verl" / "workers" / "rollout" / "schemas.py"
+FORMAL_DOMAIN_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "verl"
+    / "utils"
+    / "agentgym"
+    / "formal_domain_v3.py"
+)
+PROMPT_ATTESTATION_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "scripts"
+    / "agentmemory"
+    / "attest_effective_memory_prompt.py"
+)
 
 
 def extract_static_string_assignments() -> dict[str, str]:
@@ -58,6 +72,25 @@ def load_schemas_module():
     ):
         spec.loader.exec_module(module)
     return module
+
+
+def load_standalone_module(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class RecordingTokenizer:
+    def __init__(self) -> None:
+        self.conversations = None
+        self.kwargs = None
+
+    def apply_chat_template(self, conversations, **kwargs):
+        self.conversations = conversations
+        self.kwargs = kwargs
+        return [101, 102, 103]
 
 
 class FormalPromptTests(unittest.TestCase):
@@ -127,6 +160,80 @@ class FormalPromptTests(unittest.TestCase):
                 "does not reject an otherwise correct purchase when ADD was skipped",
             ):
                 self.assertIn(fragment, prompt)
+
+    def test_procedural_formal_resolver_renders_attested_lifecycle_prompt(self) -> None:
+        schemas = load_schemas_module()
+        formal_domain = load_standalone_module(
+            "agentmemory_formal_domain_for_prompt_test",
+            FORMAL_DOMAIN_PATH,
+        )
+        attestation = load_standalone_module(
+            "agentmemory_prompt_attestation_for_integration_test",
+            PROMPT_ATTESTATION_PATH,
+        )
+        with patch.dict(os.environ, {}, clear=True):
+            expected_prompt = schemas.agentmemory_action_system_prompt()
+            schema, resolved_prompt, source = (
+                formal_domain.resolve_formal_runtime_contract(
+                    {
+                        "surface": formal_domain.FORMAL_WEBSHOP_PROCEDURAL_SURFACE_V2,
+                        "memory_prompt_mode": "legacy",
+                    },
+                    webshop_v2_system_prompt=expected_prompt,
+                )
+            )
+
+            handler = schemas.RolloutHandler(
+                messages=[schemas.Message(role="user", content="RESET OBSERVATION")],
+                task_name="agentmemory",
+                item_id=0,
+                score=0.0,
+                done=False,
+                input_ids=[],
+                prompt_ids=[],
+                response_ids=[],
+                attention_mask=[],
+                prompt_attention_mask=[],
+                response_attention_mask=[],
+                position_ids=[],
+                prompt_position_ids=[],
+                response_position_ids=[],
+                loss_mask=[],
+                prompt_loss_mask=[],
+                response_loss_mask=[],
+            )
+            tokenizer = RecordingTokenizer()
+            rendered_ids = handler.get_latest_observation_prompt(
+                tokenizer,
+                system_prompt=resolved_prompt,
+            )
+            receipt = attestation.build_attestation(
+                prompt=resolved_prompt,
+                memory_prompt_mode="legacy",
+                ltm_inventory_mode="hidden",
+                thinking_enabled=False,
+                reasoning_enabled=False,
+                require_lifecycle_sop=True,
+            )
+
+        self.assertEqual(schema, formal_domain.FORMAL_WEBSHOP_SCHEMA_V2)
+        self.assertEqual(source, "rollout_webshop_v2")
+        self.assertEqual(resolved_prompt, expected_prompt)
+        self.assertEqual(rendered_ids, [101, 102, 103])
+        self.assertEqual(
+            tokenizer.conversations,
+            [
+                {"role": "system", "content": expected_prompt},
+                {"role": "user", "content": "RESET OBSERVATION"},
+            ],
+        )
+        self.assertTrue(receipt["lifecycle_sop_present"])
+        self.assertEqual(receipt["missing_lifecycle_sop_fragments"], [])
+        self.assertEqual(
+            receipt["system_prompt_sha256"],
+            hashlib.sha256(expected_prompt.encode("utf-8")).hexdigest(),
+        )
+        self.assertIn("memory_id:string for exact readback", resolved_prompt)
 
     def test_neutral_prompts_keep_generic_tool_contract_without_timing_sop(self) -> None:
         forbidden = (

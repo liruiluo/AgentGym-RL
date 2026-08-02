@@ -11,6 +11,15 @@ from typing import Any, Mapping, Sequence
 FORMAL_DOMAIN_SCHEMA_V3 = "agentmemory_formal_step_v3"
 FORMAL_WEBSHOP_SCHEMA_V2 = "agentmemory_formal_step_v2"
 FORMAL_WEBSHOP_SURFACE_V2 = "memoryarena_webshop_native_v1"
+FORMAL_WEBSHOP_PROCEDURAL_SURFACE_V2 = (
+    "agentmemory_webshop_procedural_natural_chain_train_v1"
+)
+FORMAL_WEBSHOP_SURFACES_V2 = frozenset(
+    {
+        FORMAL_WEBSHOP_SURFACE_V2,
+        FORMAL_WEBSHOP_PROCEDURAL_SURFACE_V2,
+    }
+)
 LTM_INVENTORY_MODES = ("hidden", "keys")
 MEMORY_PROMPT_MODES = (
     "legacy",
@@ -131,9 +140,10 @@ def resolve_formal_runtime_contract(
     surface = metadata.get("surface")
     schema_version = metadata.get("formal_schema_version")
     if schema_version in (None, FORMAL_WEBSHOP_SCHEMA_V2):
-        if surface != FORMAL_WEBSHOP_SURFACE_V2:
+        if surface not in FORMAL_WEBSHOP_SURFACES_V2:
             raise FormalDomainV3Error(
-                "formal runtime metadata without v3 schema must be the WebShop v2 surface"
+                "formal runtime metadata without v3 schema must be a recognized "
+                "WebShop v2 surface"
             )
         if not isinstance(webshop_v2_system_prompt, str) or not webshop_v2_system_prompt.strip():
             raise FormalDomainV3Error("WebShop v2 system prompt must not be empty")

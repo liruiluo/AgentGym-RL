@@ -287,14 +287,20 @@ class FormalDomainV3Test(unittest.TestCase):
                 webshop_v2_system_prompt="webshop prompt",
             )
 
-    def test_v2_contract_remains_webshop_only(self):
-        schema, prompt, source = MODULE.resolve_formal_runtime_contract(
-            {"surface": MODULE.FORMAL_WEBSHOP_SURFACE_V2},
-            webshop_v2_system_prompt="webshop prompt",
-        )
-        self.assertEqual(schema, MODULE.FORMAL_WEBSHOP_SCHEMA_V2)
-        self.assertEqual(prompt, "webshop prompt")
-        self.assertEqual(source, "rollout_webshop_v2")
+    def test_v2_contract_accepts_only_recognized_webshop_surfaces(self):
+        for surface in (
+            MODULE.FORMAL_WEBSHOP_SURFACE_V2,
+            MODULE.FORMAL_WEBSHOP_PROCEDURAL_SURFACE_V2,
+        ):
+            with self.subTest(surface=surface):
+                schema, prompt, source = MODULE.resolve_formal_runtime_contract(
+                    {"surface": surface},
+                    webshop_v2_system_prompt="webshop prompt",
+                )
+                self.assertEqual(schema, MODULE.FORMAL_WEBSHOP_SCHEMA_V2)
+                self.assertEqual(prompt, "webshop prompt")
+                self.assertEqual(source, "rollout_webshop_v2")
+
         with self.assertRaisesRegex(MODULE.FormalDomainV3Error, "WebShop v2"):
             MODULE.resolve_formal_runtime_contract(
                 {"surface": "travel_v3"},
