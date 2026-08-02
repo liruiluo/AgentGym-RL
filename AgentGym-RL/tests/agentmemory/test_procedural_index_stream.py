@@ -90,6 +90,24 @@ def server_metadata(*, generator_seed: int = 233) -> dict:
     }
 
 
+def latent_preference_server_metadata(*, generator_seed: int = 233) -> dict:
+    metadata = server_metadata(generator_seed=generator_seed)
+    metadata["surface"] = "agentmemory_webshop_latent_preference_train_v1"
+    metadata["memory_prompt_mode"] = "latent_preference_sop"
+    metadata["provider"] = {
+        **metadata["provider"],
+        "schema": "agentmemory_verified_latent_preference_provider_v1",
+        "supporting_evidence_counts": [1, 2, 3],
+        "resolution_step": 1,
+        "preference_hypothesis": "one_value_on_one_natural_attribute_axis",
+        "counterfactual_pairing": True,
+        "application_observation_identity": True,
+        "application_target_flip": True,
+        "purchase_receipt_asin_verification": True,
+    }
+    return metadata
+
+
 class ProceduralIndexSourceTests(unittest.TestCase):
     def test_explicit_data_index_is_promoted_for_environment_reset(self) -> None:
         indices = [200_000, 200_001]
@@ -235,6 +253,26 @@ class ProceduralIndexSourceTests(unittest.TestCase):
                 bad_native_contract["provider"][field] = value
                 with self.assertRaisesRegex(ProceduralIndexError, error):
                     source.validate_server_metadata(bad_native_contract)
+
+    def test_server_contract_accepts_only_approved_surface_schema_pairs(self) -> None:
+        source = ProceduralIndexSource(
+            task_count=64,
+            provider_mode=PROVIDER_MODE_RESEEDED_STREAM,
+        )
+        source.validate_server_metadata(server_metadata())
+        source.validate_server_metadata(latent_preference_server_metadata())
+
+        unknown_surface = latent_preference_server_metadata()
+        unknown_surface["surface"] = "agentmemory_webshop_unknown_train_v1"
+        with self.assertRaisesRegex(ProceduralIndexError, "unsupported server surface"):
+            source.validate_server_metadata(unknown_surface)
+
+        mismatched_schema = latent_preference_server_metadata()
+        mismatched_schema["provider"]["schema"] = (
+            "agentmemory_verified_natural_chain_provider_v4"
+        )
+        with self.assertRaisesRegex(ProceduralIndexError, "approved pair"):
+            source.validate_server_metadata(mismatched_schema)
 
     def test_batch_indices_preserve_complete_adjacent_orbits(self) -> None:
         validate_paired_batch_indices([200, 201, 202, 203])

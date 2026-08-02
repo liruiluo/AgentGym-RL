@@ -19,6 +19,14 @@ PROVIDER_MODES = (
     PROVIDER_MODE_FIXED_WINDOW,
     PROVIDER_MODE_RESEEDED_STREAM,
 )
+SUPPORTED_SERVER_SURFACE_SCHEMAS = {
+    "agentmemory_webshop_procedural_natural_chain_train_v1": (
+        "agentmemory_verified_natural_chain_provider_v4"
+    ),
+    "agentmemory_webshop_latent_preference_train_v1": (
+        "agentmemory_verified_latent_preference_provider_v1"
+    ),
+}
 
 
 class ProceduralIndexError(ValueError):
@@ -319,17 +327,19 @@ class ProceduralIndexSource:
             )
 
     def validate_server_metadata(self, metadata: Mapping[str, Any]) -> None:
-        if metadata.get("surface") != (
-            "agentmemory_webshop_procedural_natural_chain_train_v1"
-        ):
+        surface = metadata.get("surface")
+        expected_provider_schema = SUPPORTED_SERVER_SURFACE_SCHEMAS.get(surface)
+        if expected_provider_schema is None:
             raise ProceduralIndexError(
-                "procedural index source requires the natural-chain server surface"
+                "procedural index source received an unsupported server surface"
             )
         provider = metadata.get("provider")
         if not isinstance(provider, Mapping):
             raise ProceduralIndexError("server metadata is missing provider")
-        if provider.get("schema") != "agentmemory_verified_natural_chain_provider_v4":
-            raise ProceduralIndexError("server provider schema is unsupported")
+        if provider.get("schema") != expected_provider_schema:
+            raise ProceduralIndexError(
+                "server surface and provider schema are not an approved pair"
+            )
         if provider.get("provider_mode") != self.provider_mode:
             raise ProceduralIndexError(
                 "dataset/server provider modes disagree: "
