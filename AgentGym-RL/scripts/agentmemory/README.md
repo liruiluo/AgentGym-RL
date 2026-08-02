@@ -1,5 +1,10 @@
 # AgentMemoryGym Evidence Eval
 
+`attest_effective_memory_prompt.py` records the exact rollout system prompt,
+its SHA-256, and the effective memory/LTM modes. Formal MemoryChain launchers
+should pass `--require-lifecycle-sop` when their scientific contract requires
+explicit `ADD`-before-buy and later-session `RETRIEVE` timing.
+
 `eval_v3_openai.py` runs a small, auditable behavior evaluation against an
 already-running AgentMemory HTTP server and an OpenAI-compatible vLLM server.
 It does not import the training stack and has no `torch` dependency.
