@@ -55,6 +55,24 @@ class EffectiveMemoryPromptAttestationTests(unittest.TestCase):
                 require_lifecycle_sop=True,
             )
 
+    def test_each_required_fragment_is_fail_closed(self) -> None:
+        for missing_fragment in self.module.LIFECYCLE_SOP_FRAGMENTS:
+            with self.subTest(missing_fragment=missing_fragment):
+                prompt = " ".join(
+                    fragment
+                    for fragment in self.module.LIFECYCLE_SOP_FRAGMENTS
+                    if fragment != missing_fragment
+                )
+                with self.assertRaisesRegex(RuntimeError, "missing the required"):
+                    self.module.build_attestation(
+                        prompt=prompt,
+                        memory_prompt_mode="legacy",
+                        ltm_inventory_mode="keys",
+                        thinking_enabled=False,
+                        reasoning_enabled=True,
+                        require_lifecycle_sop=True,
+                    )
+
     def test_neutral_prompt_can_be_attested_without_sop_requirement(self) -> None:
         result = self.module.build_attestation(
             prompt="Across shopping sessions, preserve facts needed later.",

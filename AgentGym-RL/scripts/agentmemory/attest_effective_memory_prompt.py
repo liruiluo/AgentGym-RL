@@ -13,6 +13,7 @@ LIFECYCLE_SOP_FRAGMENTS = (
     "use ADD before click[Buy Now]",
     "At the start of every later shopping session",
     "use RETRIEVE",
+    "memory_id:string for exact readback",
     "does not reject an otherwise correct purchase when ADD was skipped",
 )
 
