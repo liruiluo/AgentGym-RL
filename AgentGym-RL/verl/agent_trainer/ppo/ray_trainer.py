@@ -63,6 +63,14 @@ from verl.utils.agentgym.rollout_context import (
 from verl.utils.agentgym.formal_training_metrics import (
     summarize_formal_training_rows,
 )
+from verl.utils.agentgym.rollout_logprob_reuse import (
+    ROLLOUT_LOGPROB_BATCH_KEY,
+    ROLLOUT_LOGPROB_MODE_BYPASS,
+    ROLLOUT_LOGPROB_MODE_COMPARE,
+    ROLLOUT_LOGPROB_MODE_OFF,
+    resolve_rollout_logprob_mode,
+    validate_rollout_logprob_training_scope,
+)
 from verl.workers.ppo_token_normalization import (
     PPO_BATCH_CONTRACT_META_KEY,
     build_legacy_asymmetric_batch_contract,
@@ -337,6 +345,108 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
 
 def _agentmemory_env_flag(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _validate_packed_rollout_logprobs(batch: DataProto):
+    if ROLLOUT_LOGPROB_BATCH_KEY not in batch.batch.keys():
+        raise RuntimeError(
+            "Rollout-logprob reuse is enabled but rollout_log_probs is missing."
+        )
+    rollout_log_probs = batch.batch[ROLLOUT_LOGPROB_BATCH_KEY]
+    response_mask = batch.batch["response_mask"]
+    if rollout_log_probs.shape != response_mask.shape:
+        raise RuntimeError(
+            "Rollout logprob/response-mask shape mismatch: "
+            f"logprobs={tuple(rollout_log_probs.shape)} "
+            f"mask={tuple(response_mask.shape)}."
+        )
+    if not torch.is_floating_point(rollout_log_probs):
+        raise RuntimeError("Rollout logprobs must use a floating-point dtype.")
+    if not bool(torch.isfinite(rollout_log_probs).all().item()):
+        raise RuntimeError("Rollout logprobs contain non-finite values.")
+    padding_values = rollout_log_probs.masked_select(~response_mask.bool())
+    if padding_values.numel() and bool(
+        torch.any(padding_values != 0.0).item()
+    ):
+        raise RuntimeError("Rollout logprob padding must be exactly zero.")
+
+    valid_sample_mask = _get_ppo_valid_sample_mask(batch).bool()
+    valid_token_mask = response_mask.bool() & valid_sample_mask.unsqueeze(-1)
+    if not bool(valid_token_mask.any().item()):
+        raise RuntimeError("Rollout-logprob batch contains no valid response tokens.")
+    return rollout_log_probs, valid_token_mask, valid_sample_mask
+
+
+def _compare_rollout_and_recomputed_logprobs(
+    batch: DataProto,
+    *,
+    clip_ratio: float,
+) -> dict[str, float]:
+    rollout_log_probs, valid_token_mask, valid_sample_mask = (
+        _validate_packed_rollout_logprobs(batch)
+    )
+    recomputed_log_probs = batch.batch.get("old_log_probs")
+    if recomputed_log_probs is None:
+        raise RuntimeError(
+            "Rollout-logprob compare mode requires recomputed old_log_probs."
+        )
+    if recomputed_log_probs.shape != rollout_log_probs.shape:
+        raise RuntimeError(
+            "Recomputed/rollout logprob shape mismatch: "
+            f"recomputed={tuple(recomputed_log_probs.shape)} "
+            f"rollout={tuple(rollout_log_probs.shape)}."
+        )
+    recomputed_valid = recomputed_log_probs.masked_select(valid_token_mask)
+    if not bool(torch.isfinite(recomputed_valid).all().item()):
+        raise RuntimeError("Recomputed old logprobs contain non-finite values.")
+
+    delta = (rollout_log_probs - recomputed_log_probs).float()
+    valid_delta = delta.masked_select(valid_token_mask)
+    absolute_delta = valid_delta.abs()
+    sequence_log_ratio = (
+        (recomputed_log_probs - rollout_log_probs).float()
+        * valid_token_mask.to(torch.float32)
+    ).sum(dim=-1)
+    sequence_mask = valid_sample_mask & valid_token_mask.any(dim=-1)
+    valid_sequence_log_ratio = sequence_log_ratio[sequence_mask]
+
+    initial_bypass_ratio = torch.exp(
+        (recomputed_log_probs - rollout_log_probs).float().clamp(-60.0, 60.0)
+    )
+    valid_initial_ratio = initial_bypass_ratio.masked_select(valid_token_mask)
+    clipped = (valid_initial_ratio < (1.0 - float(clip_ratio))) | (
+        valid_initial_ratio > (1.0 + float(clip_ratio))
+    )
+
+    return {
+        "agentmemory/rollout_logprob_compare/valid_tokens": float(
+            valid_delta.numel()
+        ),
+        "agentmemory/rollout_logprob_compare/delta_signed_mean": float(
+            valid_delta.mean().item()
+        ),
+        "agentmemory/rollout_logprob_compare/delta_abs_mean": float(
+            absolute_delta.mean().item()
+        ),
+        "agentmemory/rollout_logprob_compare/delta_abs_max": float(
+            absolute_delta.max().item()
+        ),
+        "agentmemory/rollout_logprob_compare/delta_rms": float(
+            torch.sqrt(torch.mean(valid_delta.square())).item()
+        ),
+        "agentmemory/rollout_logprob_compare/sequence_log_ratio_abs_mean": float(
+            valid_sequence_log_ratio.abs().mean().item()
+        ),
+        "agentmemory/rollout_logprob_compare/sequence_log_ratio_abs_max": float(
+            valid_sequence_log_ratio.abs().max().item()
+        ),
+        "agentmemory/rollout_logprob_compare/sequence_log_ratio_rms": float(
+            torch.sqrt(torch.mean(valid_sequence_log_ratio.square())).item()
+        ),
+        "agentmemory/rollout_logprob_compare/initial_clipfrac": float(
+            clipped.to(torch.float32).mean().item()
+        ),
+    }
 
 
 def _validate_formal_actor_advantage_config(config) -> str:
@@ -1151,6 +1261,7 @@ class RayPPOTrainer(object):
 
         self.tokenizer = tokenizer
         self.config = config
+        self.rollout_logprob_mode = resolve_rollout_logprob_mode()
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, 'Currently, only support hybrid engine'
@@ -1198,6 +1309,11 @@ class RayPPOTrainer(object):
         task_name = str(
             config.actor_rollout_ref.agentgym.get('task_name', '')
         ).strip().lower()
+        self.agentmemory_task = validate_rollout_logprob_training_scope(
+            task_name=task_name,
+            adv_estimator=str(config.algorithm.adv_estimator),
+            mode=self.rollout_logprob_mode,
+        )
         self.ppo_batch_contract = None
 
         # 1. Check total batch size for data correctness
@@ -1691,6 +1807,32 @@ class RayPPOTrainer(object):
                     with _timer('gen', timing_raw):
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
 
+                    if self.agentmemory_task:
+                        rollout_logprob_present = (
+                            ROLLOUT_LOGPROB_BATCH_KEY
+                            in gen_batch_output.batch.keys()
+                        )
+                        rollout_logprob_expected = (
+                            self.rollout_logprob_mode
+                            != ROLLOUT_LOGPROB_MODE_OFF
+                        )
+                        if rollout_logprob_present != rollout_logprob_expected:
+                            raise RuntimeError(
+                                "Rollout-logprob mode/data mismatch: "
+                                f"mode={self.rollout_logprob_mode} "
+                                f"tensor_present={rollout_logprob_present}."
+                            )
+                        metrics.update({
+                            "trainer/rollout_logprob_compare": float(
+                                self.rollout_logprob_mode
+                                == ROLLOUT_LOGPROB_MODE_COMPARE
+                            ),
+                            "trainer/rollout_logprob_bypass": float(
+                                self.rollout_logprob_mode
+                                == ROLLOUT_LOGPROB_MODE_BYPASS
+                            ),
+                        })
+
                     if self.config.algorithm.adv_estimator == 'remax':
                         with _timer('gen_max', timing_raw):
                             gen_baseline_batch = deepcopy(gen_batch)
@@ -1819,10 +1961,36 @@ class RayPPOTrainer(object):
                                     f'ppo_batch/{role}_max_token_len_per_gpu'
                                 ] = float(dynamic_caps[role])
 
-                    # recompute old_log_probs
-                    with _timer('old_log_prob', timing_raw):
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        batch = batch.union(old_log_prob)
+                    # Reuse is opt-in. Compare mode preserves the original FSDP
+                    # anchor; bypass mode is enabled only after a paired compare
+                    # run clears the numerical and learning gates.
+                    if self.rollout_logprob_mode == ROLLOUT_LOGPROB_MODE_BYPASS:
+                        with _timer('old_log_prob', timing_raw):
+                            rollout_log_probs, _, _ = (
+                                _validate_packed_rollout_logprobs(batch)
+                            )
+                            batch.batch['old_log_probs'] = rollout_log_probs
+                            batch.meta_info['temperature'] = float(
+                                self.config.actor_rollout_ref.rollout.temperature
+                            )
+                            batch.batch.pop(ROLLOUT_LOGPROB_BATCH_KEY)
+                    else:
+                        with _timer('old_log_prob', timing_raw):
+                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                            batch = batch.union(old_log_prob)
+                        if (
+                            self.rollout_logprob_mode
+                            == ROLLOUT_LOGPROB_MODE_COMPARE
+                        ):
+                            metrics.update(
+                                _compare_rollout_and_recomputed_logprobs(
+                                    batch,
+                                    clip_ratio=float(
+                                        self.config.actor_rollout_ref.actor.clip_ratio
+                                    ),
+                                )
+                            )
+                            batch.batch.pop(ROLLOUT_LOGPROB_BATCH_KEY)
 
                     if self.use_reference_policy:
                         # compute reference log_prob

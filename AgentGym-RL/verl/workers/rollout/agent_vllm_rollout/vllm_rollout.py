@@ -82,6 +82,17 @@ from verl.utils.agentgym.rollout_context import (
     validate_formal_response_reward_placement,
     validate_formal_sequence_limits,
 )
+from verl.utils.agentgym.rollout_logprob_reuse import (
+    ROLLOUT_LOGPROB_BATCH_KEY,
+    ROLLOUT_LOGPROB_MODE_OFF,
+    SAMPLED_LOGPROBS_RECORD_KEY,
+    build_official_vllm_sampled_logprob_evidence,
+    resolve_rollout_logprob_mode,
+    rollout_logprob_reuse_enabled,
+    validate_official_vllm_engine_logprob_contract,
+    validate_rollout_logprob_rows,
+    validate_rollout_logprob_sampling_contract,
+)
 from verl.workers.rollout.agent_vllm_rollout.agentmemory_grouping import (
     AGENTMEMORY_EXACT_STATE_UID,
     AGENTMEMORY_IMMEDIATE_REWARD,
@@ -506,6 +517,7 @@ class vLLMRollout(BaseRollout):
         self.config = rollout_config
         self.agentgym_config = agentgym_config
         self.actor_module = actor_module
+        self.rollout_logprob_mode = resolve_rollout_logprob_mode()
         if str(read_config(agentgym_config, "task_name", "")).lower() == "agentmemory":
             validate_formal_sequence_limits(
                 prompt_width=int(rollout_config.prompt_length),
@@ -543,6 +555,13 @@ class vLLMRollout(BaseRollout):
                                                   num_tp_per_train_tp=num_tp_per_train_tp)
 
         self._official_vllm = vllm_version not in ('0.3.1', '0.4.2', '0.5.4', '0.6.3')
+        if (
+            rollout_logprob_reuse_enabled(self.rollout_logprob_mode)
+            and not self._official_vllm
+        ):
+            raise RuntimeError(
+                "Rollout-logprob reuse requires the official vLLM backend."
+            )
         if not self._official_vllm:
             assert not (
                 not rollout_config.enforce_eager
@@ -624,6 +643,8 @@ class vLLMRollout(BaseRollout):
             )
             if compilation_config is not None:
                 official_vllm_kwargs['compilation_config'] = compilation_config
+            if rollout_logprob_reuse_enabled(self.rollout_logprob_mode):
+                official_vllm_kwargs['logprobs_mode'] = 'raw_logprobs'
             print(
                 'AgentMemoryGym official vLLM runtime config: '
                 f'version={vllm_version} '
@@ -634,6 +655,18 @@ class vLLMRollout(BaseRollout):
                 flush=True,
             )
             self.inference_engine = LLM(**official_vllm_kwargs)
+            rollout_logprob_engine_readback = (
+                validate_official_vllm_engine_logprob_contract(
+                    self.inference_engine,
+                    self.rollout_logprob_mode,
+                )
+            )
+            if self.rollout_logprob_mode != ROLLOUT_LOGPROB_MODE_OFF:
+                print(
+                    "AgentMemory rollout-logprob engine contract: "
+                    + json.dumps(rollout_logprob_engine_readback, sort_keys=True),
+                    flush=True,
+                )
             training_triton_cache = restore_training_triton_cache_after_vllm()
             if training_triton_cache is not None:
                 print(
@@ -696,6 +729,18 @@ class vLLMRollout(BaseRollout):
 
         print(f"kwargs: {kwargs}")
         self.sampling_params = SamplingParams(**kwargs)
+        rollout_logprob_sampling_readback = (
+            validate_rollout_logprob_sampling_contract(
+                self.sampling_params,
+                self.rollout_logprob_mode,
+            )
+        )
+        if self.rollout_logprob_mode != ROLLOUT_LOGPROB_MODE_OFF:
+            print(
+                "AgentMemory rollout-logprob sampling contract: "
+                + json.dumps(rollout_logprob_sampling_readback, sort_keys=True),
+                flush=True,
+            )
         self.generation_stop_token_ids = _ordered_unique_token_ids(
             self.generation_eos_token_ids,
             getattr(self.sampling_params, "stop_token_ids", None),
@@ -758,9 +803,16 @@ class vLLMRollout(BaseRollout):
         sampling_params=None,
         *,
         require_exact_metadata: bool = False,
+        expected_prompt_token_ids: List[List[int]] | None = None,
     ):
         """Preserve actual generated tokens and backend termination metadata."""
 
+        collect_sampled_logprobs = rollout_logprob_reuse_enabled(
+            self.rollout_logprob_mode
+        )
+        require_exact_metadata = bool(
+            require_exact_metadata or collect_sampled_logprobs
+        )
         sampling_params = sampling_params or self.sampling_params
         max_tokens = int(
             getattr(
@@ -799,6 +851,42 @@ class vLLMRollout(BaseRollout):
                 finish_reason_source=source,
                 token_ids_are_exact=token_ids_are_exact,
             )
+
+        unsupported_logprob_output = (
+            isinstance(output, tuple)
+            or hasattr(output, "tolist")
+            or (
+                isinstance(output, list)
+                and (
+                    not output
+                    or isinstance(output[0], (list, tuple, dict))
+                )
+            )
+        )
+        if collect_sampled_logprobs and unsupported_logprob_output:
+            raise RuntimeError(
+                "Rollout-logprob reuse requires official vLLM RequestOutput "
+                "objects with exact token and logprob metadata."
+            )
+        if collect_sampled_logprobs:
+            if not isinstance(output, list):
+                raise RuntimeError(
+                    "Rollout-logprob reuse requires a list of official vLLM "
+                    "RequestOutput objects."
+                )
+            if not isinstance(expected_prompt_token_ids, list) or any(
+                not isinstance(row, list)
+                or any(type(token_id) is not int for token_id in row)
+                for row in expected_prompt_token_ids
+            ):
+                raise RuntimeError(
+                    "Rollout-logprob reuse requires exact expected prompt token rows."
+                )
+            if len(expected_prompt_token_ids) != len(output):
+                raise RuntimeError(
+                    "Official vLLM prompt/output row-count mismatch: "
+                    f"prompts={len(expected_prompt_token_ids)} outputs={len(output)}."
+                )
 
         if isinstance(output, tuple):
             if require_exact_metadata:
@@ -852,7 +940,7 @@ class vLLMRollout(BaseRollout):
                 )
             return records
         records = []
-        for request_output in output:
+        for output_index, request_output in enumerate(output):
             if not getattr(request_output, 'outputs', None):
                 raise RuntimeError(
                     "Formal generation backend returned no candidate output."
@@ -896,6 +984,16 @@ class vLLMRollout(BaseRollout):
                 )
                 if require_exact_metadata:
                     validate_official_vllm_generation_record(record)
+                if collect_sampled_logprobs:
+                    record[SAMPLED_LOGPROBS_RECORD_KEY] = (
+                        build_official_vllm_sampled_logprob_evidence(
+                            request_output=request_output,
+                            expected_prompt_token_ids=(
+                                expected_prompt_token_ids[output_index]
+                            ),
+                            normalized_response_token_ids=record["token_ids"],
+                        )
+                    )
                 records.append(record)
         return records
 
@@ -1061,11 +1159,19 @@ class vLLMRollout(BaseRollout):
         suffix_credit_applied: bool | None = None,
         suffix_returns: List[float] | None = None,
         step_records: List[dict] | None = None,
+        rollout_log_probs: List[Mapping[str, object]] | None = None,
     ) -> DataProto:
         if step_records is not None and len(step_records) != len(rollout_handler_ls):
             raise RuntimeError(
                 "Formal step-record count does not match rollout handlers: "
                 f"records={len(step_records)} handlers={len(rollout_handler_ls)}."
+            )
+        normalized_rollout_log_probs = None
+        if rollout_log_probs is not None:
+            normalized_rollout_log_probs = validate_rollout_logprob_rows(
+                [handler.prompt_ids for handler in rollout_handler_ls],
+                [handler.response_ids for handler in rollout_handler_ls],
+                rollout_log_probs,
             )
         response_ids, response_attention_mask, response_position_ids, response_loss_mask = [], [], [], []
         scores = []
@@ -1104,6 +1210,15 @@ class vLLMRollout(BaseRollout):
                     "Formal sampled response changed during handler truncation: "
                     f"row={row_index}."
                 )
+            if (
+                normalized_rollout_log_probs is not None
+                and len(rollout_handler.response_ids)
+                != len(normalized_rollout_log_probs[row_index])
+            ):
+                raise RuntimeError(
+                    "Rollout response/logprob alignment changed during handler "
+                    f"truncation at row {row_index}."
+                )
             assert len(rollout_handler.input_ids) == len(rollout_handler.attention_mask) == len(rollout_handler.position_ids) == len(rollout_handler.loss_mask), f"""Rollout Handler has different length of {len(rollout_handler.input_ids)=},
             {len(rollout_handler.attention_mask)=}, {len(rollout_handler.position_ids)=}, {len(rollout_handler.loss_mask)=}"""
             assert len(rollout_handler.input_ids) <= self.config.max_model_len, f"Rollout Handler has sequence length {len(rollout_handler.input_ids)} > max_sequence_length {self.config.max_model_len}"
@@ -1124,6 +1239,40 @@ class vLLMRollout(BaseRollout):
         if response_loss_mask.shape[1] < self.config.response_length:
             response_loss_mask = pad_sequence_to_length(response_loss_mask, self.config.response_length, 0)
         response_length = response_ids.size(1)
+        packed_rollout_log_probs = None
+        if normalized_rollout_log_probs is not None:
+            rollout_logprob_tensors = [
+                torch.tensor(row, dtype=torch.float32, device=cur_device)
+                for row in normalized_rollout_log_probs
+            ]
+            packed_rollout_log_probs = pad_sequence(
+                rollout_logprob_tensors,
+                batch_first=True,
+                padding_value=0.0,
+            )
+            if packed_rollout_log_probs.shape[1] < self.config.response_length:
+                packed_rollout_log_probs = pad_sequence_to_length(
+                    packed_rollout_log_probs,
+                    self.config.response_length,
+                    0.0,
+                )
+            if packed_rollout_log_probs.shape != response_loss_mask.shape:
+                raise RuntimeError(
+                    "Packed rollout-logprob shape does not match response mask: "
+                    f"logprobs={tuple(packed_rollout_log_probs.shape)} "
+                    f"mask={tuple(response_loss_mask.shape)}."
+                )
+            if not bool(torch.isfinite(packed_rollout_log_probs).all().item()):
+                raise RuntimeError("Packed rollout logprobs contain non-finite values.")
+            padding_values = packed_rollout_log_probs.masked_select(
+                ~response_loss_mask.bool()
+            )
+            if padding_values.numel() and bool(
+                torch.any(padding_values != 0.0).item()
+            ):
+                raise RuntimeError(
+                    "Rollout logprob padding must be exactly zero."
+                )
 
         prompt_ids = [torch.tensor(handler.prompt_ids, dtype=torch.int, device=cur_device) for handler in rollout_handler_ls]
         prompt_attention_mask = [
@@ -1220,18 +1369,21 @@ class vLLMRollout(BaseRollout):
             device=input_ids.device,
         )
 
+        tensor_batch = {
+            'prompts': input_ids,
+            'responses': response_ids,
+            'input_ids': seq,
+            'attention_mask': attention_mask,
+            'position_ids': position_ids,
+            'response_mask': response_loss_mask,
+            'scores': reward_tensor,
+            'task_rounds': task_round_tensor,
+            'task_scores': reward_tensor,
+        }
+        if packed_rollout_log_probs is not None:
+            tensor_batch[ROLLOUT_LOGPROB_BATCH_KEY] = packed_rollout_log_probs
         batch = TensorDict(
-            {
-                'prompts': input_ids,
-                'responses': response_ids,
-                'input_ids': seq,
-                'attention_mask': attention_mask,
-                'position_ids': position_ids,
-                'response_mask': response_loss_mask,
-                'scores': reward_tensor,
-                'task_rounds': task_round_tensor,
-                'task_scores': reward_tensor,
-            },
+            tensor_batch,
             batch_size=len(rollout_handler_ls),
         )
         non_tensor_batch = {}
@@ -1512,10 +1664,15 @@ class vLLMRollout(BaseRollout):
         flat_handlers = []
         flat_rollout_indices = []
         excluded_rollout_indices = set()
+        collect_rollout_log_probs = rollout_logprob_reuse_enabled(
+            self.rollout_logprob_mode
+        )
+        flat_rollout_log_probs = []
         suffix_credit = _agentmemory_latest_observation_suffix_credit_enabled()
         state_aware_group_uid = _agentmemory_state_aware_group_uid_enabled()
         formal_trajectory_credit = True
         trajectory_steps = [[] for _ in rollout_handler_ls]
+        trajectory_rollout_log_probs = [[] for _ in rollout_handler_ls]
         flat_step_refs = []
         uid_overrides = []
         task_rounds = [0] * len(rollout_handler_ls)
@@ -1577,15 +1734,28 @@ class vLLMRollout(BaseRollout):
             if len(not_done_idxs) == 0:
                 break
             with self.update_sampling_params(**sampling_kwargs):
+                if collect_rollout_log_probs:
+                    validate_rollout_logprob_sampling_contract(
+                        self.sampling_params,
+                        self.rollout_logprob_mode,
+                    )
                 output = self._generate_token_ids(
                     generation_prompt_idxs=generation_prompt_idxs,
                     sampling_params=self.sampling_params,
                 )
-            generation_records = self._output_generation_records(
-                output,
-                self.sampling_params,
-                require_exact_metadata=bool(formal_trajectory_credit),
-            )
+                if collect_rollout_log_probs:
+                    generation_records = self._output_generation_records(
+                        output,
+                        self.sampling_params,
+                        require_exact_metadata=bool(formal_trajectory_credit),
+                        expected_prompt_token_ids=generation_prompt_idxs,
+                    )
+            if not collect_rollout_log_probs:
+                generation_records = self._output_generation_records(
+                    output,
+                    self.sampling_params,
+                    require_exact_metadata=bool(formal_trajectory_credit),
+                )
             if len(generation_records) != len(not_done_idxs):
                 raise RuntimeError(
                     "Formal generation result count mismatch: "
@@ -1598,6 +1768,15 @@ class vLLMRollout(BaseRollout):
                 prompt_token_ids = generation_prompt_idxs[i]
                 action_token_ids = response_ids[i]
                 generation_record = generation_records[i]
+                sampled_action_logprobs = None
+                if collect_rollout_log_probs:
+                    sampled_action_logprobs = generation_record.get(
+                        SAMPLED_LOGPROBS_RECORD_KEY
+                    )
+                    if not isinstance(sampled_action_logprobs, Mapping):
+                        raise FormalRuntimeEvidenceError(
+                            "Formal rollout is missing exact sampled-token logprobs."
+                        )
                 visible_prompt = self.tokenizer.decode(
                     prompt_token_ids, skip_special_tokens=False
                 )
@@ -1764,6 +1943,10 @@ class vLLMRollout(BaseRollout):
                             trajectory_uid, step_record["trajectory_row_order"]
                         )
                         trajectory_steps[idx].append(step_record)
+                        if collect_rollout_log_probs:
+                            trajectory_rollout_log_probs[idx].append(
+                                sampled_action_logprobs
+                            )
                     if suffix_credit:
                         pass
                     else:
@@ -1782,6 +1965,10 @@ class vLLMRollout(BaseRollout):
                         flat_rollout_indices.append(idx)
                         if formal_trajectory_credit:
                             flat_step_refs.append(step_record)
+                        if collect_rollout_log_probs:
+                            flat_rollout_log_probs.append(
+                                sampled_action_logprobs
+                            )
                         if state_aware_group_uid:
                             uid_overrides.append(exact_state_uid)
                     rollout_handler_ls[idx].add_user_message(self.tokenizer, state)
@@ -1894,6 +2081,10 @@ class vLLMRollout(BaseRollout):
                             trajectory_uid, step_record["trajectory_row_order"]
                         )
                         trajectory_steps[idx].append(step_record)
+                        if collect_rollout_log_probs:
+                            trajectory_rollout_log_probs[idx].append(
+                                sampled_action_logprobs
+                            )
                     if suffix_credit:
                         pass
                     else:
@@ -1912,6 +2103,10 @@ class vLLMRollout(BaseRollout):
                         flat_rollout_indices.append(idx)
                         if formal_trajectory_credit:
                             flat_step_refs.append(step_record)
+                        if collect_rollout_log_probs:
+                            flat_rollout_log_probs.append(
+                                sampled_action_logprobs
+                            )
                         if state_aware_group_uid:
                             uid_overrides.append(exact_state_uid)
                     print(f"AgentMemory rollout step error: {e} item id = {rollout_handler_ls[idx].item_id}")
@@ -1980,7 +2175,16 @@ class vLLMRollout(BaseRollout):
                     continue
                 if not steps:
                     continue
-                for step in steps:
+                if (
+                    collect_rollout_log_probs
+                    and len(trajectory_rollout_log_probs[trajectory_index])
+                    != len(steps)
+                ):
+                    raise RuntimeError(
+                        "Trajectory step/logprob count mismatch before suffix-credit "
+                        f"packing: trajectory={trajectory_index}."
+                    )
+                for step_index, step in enumerate(steps):
                     flat_handlers.append(
                         self.build_rollout_handler_from_prompt(
                             prompt_token_ids=step["prompt_token_ids"],
@@ -1996,6 +2200,10 @@ class vLLMRollout(BaseRollout):
                     flat_rollout_indices.append(trajectory_index)
                     if formal_trajectory_credit:
                         flat_step_refs.append(step)
+                    if collect_rollout_log_probs:
+                        flat_rollout_log_probs.append(
+                            trajectory_rollout_log_probs[trajectory_index][step_index]
+                        )
                     if state_aware_group_uid:
                         uid_overrides.append(step["exact_state_uid"])
 
@@ -2015,6 +2223,11 @@ class vLLMRollout(BaseRollout):
                 flat_step_refs = [
                     flat_step_refs[position] for position in keep_positions
                 ]
+            if collect_rollout_log_probs:
+                flat_rollout_log_probs = [
+                    flat_rollout_log_probs[position]
+                    for position in keep_positions
+                ]
             if state_aware_group_uid:
                 uid_overrides = [
                     uid_overrides[position] for position in keep_positions
@@ -2028,6 +2241,15 @@ class vLLMRollout(BaseRollout):
 
         if not flat_handlers:
             raise RuntimeError("AgentMemory latest-observation rollout produced no trainable action samples.")
+        if (
+            collect_rollout_log_probs
+            and len(flat_rollout_log_probs) != len(flat_handlers)
+        ):
+            raise RuntimeError(
+                "Formal rollout handler/logprob count mismatch before packing: "
+                f"handlers={len(flat_handlers)} "
+                f"logprobs={len(flat_rollout_log_probs)}."
+            )
 
         for idx, rollout_handler in enumerate(rollout_handler_ls):
             messages[idx] = rollout_handler.messages
@@ -2137,6 +2359,9 @@ class vLLMRollout(BaseRollout):
             cur_device=cur_device,
             parent_indices=parent_indices,
             done_flags=flat_done_flags,
+            rollout_log_probs=(
+                flat_rollout_log_probs if collect_rollout_log_probs else None
+            ),
             **formal_pack_kwargs,
         )
         output.batch['task_rounds'] = torch.tensor(
