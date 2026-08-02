@@ -50,22 +50,29 @@ def procedural_metadata():
 
 
 class AgentMemoryClientActionSubmissionTest(unittest.TestCase):
-    def client(self, submitted: list[str]) -> AgentMemoryEnvClient:
+    def client(
+        self,
+        submitted: list[str],
+        *,
+        step_response: dict | None = None,
+    ) -> AgentMemoryEnvClient:
         client = AgentMemoryEnvClient.__new__(AgentMemoryEnvClient)
         client.is_v3 = False
         client.action_format = ActionFormat.REACT
         client.adapter_cls = AgentMemoryAdapter
         client.metadata = {}
 
+        response = step_response or {
+            "observation": "next",
+            "reward": 0.0,
+            "done": False,
+            "info": {},
+        }
+
         def post(path, payload):
             self.assertEqual(path, "step")
             submitted.append(payload["action"])
-            return {
-                "observation": "next",
-                "reward": 0.0,
-                "done": False,
-                "info": {},
-            }
+            return deepcopy(response)
 
         client.post = post
         return client
@@ -134,6 +141,40 @@ class AgentMemoryClientActionSubmissionTest(unittest.TestCase):
                 "submitted_action": "</s>",
                 "parser_status": "raw_fallback",
             },
+        )
+
+    def test_formal_buy_evidence_is_internal_and_not_part_of_model_state(self):
+        submitted: list[str] = []
+        client = self.client(
+            submitted,
+            step_response={
+                "observation": "Purchase recorded. The next shopping session is ready.",
+                "reward": 1.0,
+                "done": False,
+                "info": {
+                    "tool_ops": [
+                        {
+                            "op": "BUY",
+                            "step": 3,
+                            "committed": True,
+                            "purchase_correct": True,
+                            "session_advanced": True,
+                            "terminal": False,
+                        }
+                    ]
+                },
+            },
+        )
+
+        output = client.step("Thought: done\nAction: click[Buy Now]")
+
+        self.assertEqual(
+            output.state,
+            "Purchase recorded. The next shopping session is ready.",
+        )
+        self.assertNotIn("purchase_correct", output.state)
+        self.assertTrue(
+            client.info["env_info"]["tool_ops"][0]["purchase_correct"]
         )
 
 
