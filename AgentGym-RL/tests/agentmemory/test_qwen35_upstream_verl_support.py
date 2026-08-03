@@ -130,12 +130,19 @@ class OfficialVllmRuntimeConfigTests(unittest.TestCase):
             "verl.agent_trainer.ppo.ray_trainer"
         )
         fake_trainer.RayPPOTrainer = object
+        fake_reference_policy = types.ModuleType(
+            "verl.agent_trainer.reference_policy"
+        )
+        fake_reference_policy.should_create_reference_policy = (
+            lambda *_args, **_kwargs: False
+        )
         with patch.dict(
             sys.modules,
             {
                 "ray": fake_ray,
                 "hydra": fake_hydra,
                 "verl.agent_trainer.ppo.ray_trainer": fake_trainer,
+                "verl.agent_trainer.reference_policy": fake_reference_policy,
             },
         ):
             return _load_module(_MAIN_PPO, "main_ppo_cache_env_under_test")
@@ -282,6 +289,21 @@ class OfficialVllmRuntimeConfigTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "absolute"):
                 module._ray_runtime_env_vars()
+
+    def test_deep_gemm_disable_reaches_main_task_and_rollout_workers(self):
+        module = self._load_main_ppo()
+        with patch.dict(
+            os.environ,
+            {"VLLM_USE_DEEP_GEMM": "0"},
+            clear=True,
+        ):
+            env = module._ray_runtime_env_vars()
+        self.assertEqual(env["VLLM_USE_DEEP_GEMM"], "0")
+
+        for path in (_MAIN_PPO, _RAY_BASE):
+            source = path.read_text(encoding="utf-8")
+            with self.subTest(path=path):
+                self.assertIn("'VLLM_USE_DEEP_GEMM'", source)
 
     def test_training_triton_cache_restore_order_and_env_propagation(self):
         rollout_source = _VLLM_ROLLOUT.read_text(encoding="utf-8")

@@ -265,6 +265,7 @@ class RayWorkerGroup(WorkerGroup):
                 # because vLLM reads them at import/engine-construction time.
                 for key in (
                     'VLLM_USE_V1',
+                    'VLLM_USE_DEEP_GEMM',
                     'VLLM_ATTENTION_BACKEND',
                     'VLLM_WORKER_MULTIPROC_METHOD',
                     'VLLM_USE_MODELSCOPE',

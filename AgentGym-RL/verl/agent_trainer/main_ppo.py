@@ -45,6 +45,7 @@ def _ray_runtime_env_vars():
     # hide shell exports such as VLLM_USE_V1=0.
     for key in (
         'VLLM_USE_V1',
+        'VLLM_USE_DEEP_GEMM',
         'VLLM_ATTENTION_BACKEND',
         'VLLM_WORKER_MULTIPROC_METHOD',
         'VLLM_USE_MODELSCOPE',
