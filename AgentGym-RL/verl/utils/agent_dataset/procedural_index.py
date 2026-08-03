@@ -26,6 +26,9 @@ SUPPORTED_SERVER_SURFACE_SCHEMAS = {
     "agentmemory_webshop_latent_preference_train_v1": (
         "agentmemory_verified_latent_preference_provider_v1"
     ),
+    "agentmemory_webshop_recency_override_train_v1": (
+        "agentmemory_verified_recency_override_provider_v1"
+    ),
 }
 
 

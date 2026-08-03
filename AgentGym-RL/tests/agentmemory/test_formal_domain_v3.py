@@ -292,6 +292,7 @@ class FormalDomainV3Test(unittest.TestCase):
             MODULE.FORMAL_WEBSHOP_SURFACE_V2,
             MODULE.FORMAL_WEBSHOP_PROCEDURAL_SURFACE_V2,
             MODULE.FORMAL_WEBSHOP_LATENT_PREFERENCE_SURFACE_V2,
+            MODULE.FORMAL_WEBSHOP_RECENCY_OVERRIDE_SURFACE_V2,
         ):
             with self.subTest(surface=surface):
                 schema, prompt, source = MODULE.resolve_formal_runtime_contract(

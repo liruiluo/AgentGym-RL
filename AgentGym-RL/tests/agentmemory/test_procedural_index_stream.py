@@ -108,6 +108,34 @@ def latent_preference_server_metadata(*, generator_seed: int = 233) -> dict:
     return metadata
 
 
+def recency_override_server_metadata(*, generator_seed: int = 233) -> dict:
+    metadata = server_metadata(generator_seed=generator_seed)
+    metadata["surface"] = "agentmemory_webshop_recency_override_train_v1"
+    metadata["memory_prompt_mode"] = "latent_preference_sop"
+    metadata["provider"] = {
+        **metadata["provider"],
+        "schema": "agentmemory_verified_recency_override_provider_v1",
+        "phase_schedule": [
+            "evidence",
+            "application",
+            "override",
+            "application",
+            "application",
+            "application",
+        ],
+        "override_phase_index": 2,
+        "canonical_memory_key": "user_preference",
+        "counterfactual_pairing": True,
+        "stay_branch": "old preference remains active",
+        "flip_branch": "new preference replaces old canonical state",
+        "update_contract": "UPDATE same memory_id or DELETE old then ADD new",
+        "application_observation_identity": True,
+        "application_target_flip": True,
+        "purchase_receipt_asin_verification": True,
+    }
+    return metadata
+
+
 class ProceduralIndexSourceTests(unittest.TestCase):
     def test_explicit_data_index_is_promoted_for_environment_reset(self) -> None:
         indices = [200_000, 200_001]
@@ -261,6 +289,7 @@ class ProceduralIndexSourceTests(unittest.TestCase):
         )
         source.validate_server_metadata(server_metadata())
         source.validate_server_metadata(latent_preference_server_metadata())
+        source.validate_server_metadata(recency_override_server_metadata())
 
         unknown_surface = latent_preference_server_metadata()
         unknown_surface["surface"] = "agentmemory_webshop_unknown_train_v1"
@@ -273,6 +302,13 @@ class ProceduralIndexSourceTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ProceduralIndexError, "approved pair"):
             source.validate_server_metadata(mismatched_schema)
+
+        recency_mismatched_schema = recency_override_server_metadata()
+        recency_mismatched_schema["provider"]["schema"] = (
+            "agentmemory_verified_latent_preference_provider_v1"
+        )
+        with self.assertRaisesRegex(ProceduralIndexError, "approved pair"):
+            source.validate_server_metadata(recency_mismatched_schema)
 
     def test_batch_indices_preserve_complete_adjacent_orbits(self) -> None:
         validate_paired_batch_indices([200, 201, 202, 203])
