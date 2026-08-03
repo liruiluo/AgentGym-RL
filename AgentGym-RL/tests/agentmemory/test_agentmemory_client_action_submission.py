@@ -23,6 +23,7 @@ def procedural_metadata():
         "memory_prompt_mode": "neutral",
         "provider": {
             "schema": "agentmemory_verified_natural_chain_provider_v4",
+            "tasks_per_orbit": 2,
             "provider_mode": "reseeded_stream",
             "task_count": 64,
             "accepted_index_domain": "all_nonnegative_integers",
@@ -100,6 +101,118 @@ def recency_override_metadata():
         "application_target_flip": True,
         "purchase_receipt_asin_verification": True,
     }
+    return metadata
+
+
+def distractor_robustness_metadata():
+    metadata = latent_preference_metadata()
+    metadata["surface"] = (
+        "agentmemory_webshop_distractor_robustness_top1_train_v1"
+    )
+    metadata["provider"] = {
+        **metadata["provider"],
+        "schema": "agentmemory_verified_distractor_robustness_provider_v1",
+        "counterfactual_pairing": True,
+        "branch_order": ["clean", "distracted"],
+        "correct_memory_preloaded": False,
+        "correct_memory_policy_authored_after_evidence": True,
+        "retrieve_policy": "query_top1",
+        "memory_id_lookup_allowed": False,
+        "initial_memory_inventory_visible": False,
+        "strict_top1_certified": True,
+        "purchase_receipt_asin_verification": True,
+    }
+    return metadata
+
+
+def compositional_recall_metadata():
+    metadata = latent_preference_metadata()
+    metadata["surface"] = (
+        "agentmemory_webshop_compositional_recall_top1_train_v1"
+    )
+    metadata["provider"].update(
+        {
+            "schema": "agentmemory_verified_compositional_recall_provider_v1",
+            "tasks_per_orbit": 4,
+            "semantic_period_tasks": 400,
+            "factorial_coordinates": [[0, 0], [0, 1], [1, 0], [1, 1]],
+            "canonical_memory_count": 2,
+            "retrieve_policy": "query_top1",
+            "required_sequential_retrievals": 2,
+            "memory_id_lookup_allowed": False,
+            "ltm_inventory_visible": False,
+            "leave_one_memory_out_certified": True,
+            "purchase_receipt_asin_verification": True,
+        }
+    )
+    metadata["provider"]["reseeded_stream"] = {
+        **metadata["provider"]["reseeded_stream"],
+        "tasks_per_seed_epoch": 400,
+        "factorial_orbit_never_crosses_seed_epoch": True,
+        "semantic_uniqueness_guaranteed_through_task_index": 399,
+    }
+    metadata["provider"]["reseeded_stream"].pop(
+        "counterfactual_pair_never_crosses_seed_epoch"
+    )
+    return metadata
+
+
+def intent_clarification_metadata():
+    metadata = latent_preference_metadata()
+    metadata["surface"] = "agentmemory_webshop_intent_clarification_train_v1"
+    metadata["provider"] = {
+        **metadata["provider"],
+        "schema": "agentmemory_verified_intent_clarification_provider_v1",
+        "counterfactual_pairing": True,
+        "pre_ask_observation_identity": True,
+        "all_targets_flip_after_clarification": True,
+        "required_action": "ASK",
+        "clarification_event": "CLARIFY",
+        "ask_allowed_session": 0,
+        "max_successful_asks": 1,
+        "purchase_before_clarification_allowed": False,
+        "canonical_memory_count": 1,
+        "retrieve_policy": "query_top1",
+        "memory_id_lookup_allowed": False,
+        "ltm_inventory_visible": False,
+        "training_ready": True,
+    }
+    return metadata
+
+
+def selective_memory_use_metadata():
+    metadata = procedural_metadata()
+    metadata["surface"] = (
+        "agentmemory_webshop_selective_memory_use_top1_train_v1"
+    )
+    metadata["memory_prompt_mode"] = "selective_memory_sop"
+    metadata["provider"] = {
+        **metadata["provider"],
+        "schema": "agentmemory_verified_selective_memory_use_provider_v1",
+        "tasks_per_orbit": 4,
+        "semantic_period_tasks": 400,
+        "memory_required_fraction": 0.5,
+        "memory_not_required_fraction": 0.5,
+        "required_branch_seeded_memory_state": "current",
+        "not_required_branch_seeded_memory_state": "stale_opposite",
+        "retrieve_policy": "query_top1",
+        "memory_id_lookup_allowed": False,
+        "ltm_inventory_visible": False,
+        "memory_action_positive_shaping_allowed": False,
+        "unnecessary_memory_action_penalty": -0.01,
+        "memory_required_without_memory_counterfactually_ambiguous": True,
+        "memory_not_required_current_request_explicit": True,
+        "purchase_receipt_asin_verification": True,
+    }
+    metadata["provider"]["reseeded_stream"] = {
+        **metadata["provider"]["reseeded_stream"],
+        "tasks_per_seed_epoch": 400,
+        "factorial_orbit_never_crosses_seed_epoch": True,
+        "semantic_uniqueness_guaranteed_through_task_index": 399,
+    }
+    metadata["provider"]["reseeded_stream"].pop(
+        "counterfactual_pair_never_crosses_seed_epoch"
+    )
     return metadata
 
 
@@ -233,6 +346,37 @@ class AgentMemoryClientActionSubmissionTest(unittest.TestCase):
 
 
 class ProceduralAgentMemoryClientContractTest(unittest.TestCase):
+    def create_client(
+        self,
+        metadata: dict,
+        *,
+        action_format: ActionFormat = ActionFormat.REACT,
+    ) -> AgentMemoryEnvClient:
+        create_response = Mock(status_code=200)
+        create_response.json.return_value = {
+            "id": 17,
+            "observation": "programmatic reset",
+            "reward": 0.0,
+            "done": False,
+            "info": {},
+        }
+        with (
+            patch.object(
+                AgentMemoryEnvClient,
+                "get_metadata",
+                return_value=metadata,
+            ),
+            patch(
+                "agentenv.envs.agentmemory.requests.post",
+                return_value=create_response,
+            ),
+        ):
+            return AgentMemoryEnvClient(
+                "http://programmatic.test",
+                None,
+                action_format=action_format,
+            )
+
     def test_prompt_names_the_generated_surface_without_claiming_memoryarena_parity(
         self,
     ) -> None:
@@ -408,6 +552,107 @@ class ProceduralAgentMemoryClientContractTest(unittest.TestCase):
         self.assertIn("use UPDATE", prompt)
         self.assertIn("use RETRIEVE", prompt)
         post.assert_called_once()
+
+    def test_distractor_surface_uses_query_only_top1_without_ask(self) -> None:
+        client = self.create_client(distractor_robustness_metadata())
+        self.assertTrue(client.is_distractor_robustness)
+        prompt = client.conversation_start[0]["value"]
+        self.assertIn("RETRIEVE requires exactly query:string", prompt)
+        self.assertIn("one highest-ranked matching memory", prompt)
+        self.assertIn("memory_id and top_k are forbidden", prompt)
+        self.assertNotIn("ASK", prompt)
+        self.assertNotIn("CLARIFY", prompt)
+
+    def test_compositional_surface_accepts_four_task_orbit_contract(self) -> None:
+        client = self.create_client(compositional_recall_metadata())
+        self.assertTrue(client.is_compositional_recall)
+        self.assertEqual(client.metadata["provider"]["tasks_per_orbit"], 4)
+        prompt = client.conversation_start[0]["value"]
+        self.assertIn("RETRIEVE requires exactly query:string", prompt)
+        self.assertNotIn("ASK", prompt)
+
+    def test_intent_surface_exposes_ask_only_on_that_surface(self) -> None:
+        client = self.create_client(intent_clarification_metadata())
+        self.assertTrue(client.is_intent_clarification)
+        prompt = client.conversation_start[0]["value"]
+        self.assertIn('ASK {"field":"..."}', prompt)
+        self.assertIn("CLARIFY observation", prompt)
+
+    def test_selective_surface_uses_decide_then_use_or_abstain_sop(self) -> None:
+        client = self.create_client(selective_memory_use_metadata())
+        self.assertTrue(client.is_selective_memory_use)
+        self.assertEqual(client.memory_prompt_mode, "selective_memory_sop")
+        self.assertEqual(client.metadata["provider"]["tasks_per_orbit"], 4)
+        prompt = client.conversation_start[0]["value"]
+        for fragment in (
+            "First decide whether the current request already states every attribute",
+            "explicit current requirements override profile history",
+            "should not ADD or RETRIEVE merely by habit",
+            "current request omits the customer's profile preference",
+            "use RETRIEVE to expose the saved current profile",
+            "Store new memory only when",
+            "RETRIEVE requires exactly query:string",
+            "memory_id and top_k are forbidden",
+        ):
+            self.assertIn(fragment, prompt)
+        self.assertNotIn("confirmed choice as preference evidence", prompt)
+        self.assertNotIn("ASK", prompt)
+
+    def test_selective_surface_rejects_wrong_prompt_and_reward_contract(self) -> None:
+        mutations = {
+            "prompt": lambda value: value.update(
+                memory_prompt_mode="latent_preference_sop"
+            ),
+            "positive_shaping": lambda value: value["provider"].update(
+                memory_action_positive_shaping_allowed=True
+            ),
+            "fraction": lambda value: value["provider"].update(
+                memory_not_required_fraction=0.25
+            ),
+            "penalty": lambda value: value["provider"].update(
+                unnecessary_memory_action_penalty=0.0
+            ),
+        }
+        for name, mutate in mutations.items():
+            metadata = selective_memory_use_metadata()
+            mutate(metadata)
+            post = Mock()
+            with (
+                self.subTest(case=name),
+                patch.object(
+                    AgentMemoryEnvClient,
+                    "get_metadata",
+                    return_value=metadata,
+                ),
+                patch("agentenv.envs.agentmemory.requests.post", post),
+                self.assertRaises(RuntimeError),
+            ):
+                AgentMemoryEnvClient(
+                    "http://selective-memory.invalid",
+                    None,
+                    action_format=ActionFormat.REACT,
+                )
+            post.assert_not_called()
+
+    def test_query_top1_function_schema_has_no_top_k_or_memory_id(self) -> None:
+        query_top1 = self.create_client(
+            distractor_robustness_metadata(),
+            action_format=ActionFormat.FUNCTION_CALLING,
+        )
+        query_prompt = query_top1.conversation_start[0]["value"]
+        self.assertIn("exactly the highest-ranked memory", query_prompt)
+        self.assertNotIn('"top_k"', query_prompt)
+        retrieve_schema = query_prompt.split('"name": "retrieve"', 1)[1].split(
+            '"name": "summary"', 1
+        )[0]
+        self.assertIn('"query"', retrieve_schema)
+        self.assertNotIn('"memory_id"', retrieve_schema)
+
+        ordinary_prompt = build_procedural_conversation_start(
+            ActionFormat.FUNCTION_CALLING,
+            "neutral",
+        )[0]["value"]
+        self.assertIn('"top_k"', ordinary_prompt)
 
     def test_bad_recency_override_metadata_is_rejected_before_create(self) -> None:
         mutations = {

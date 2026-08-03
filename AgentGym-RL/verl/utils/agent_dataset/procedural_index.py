@@ -19,15 +19,34 @@ PROVIDER_MODES = (
     PROVIDER_MODE_FIXED_WINDOW,
     PROVIDER_MODE_RESEEDED_STREAM,
 )
-SUPPORTED_SERVER_SURFACE_SCHEMAS = {
+SUPPORTED_SERVER_SURFACE_CONTRACTS = {
     "agentmemory_webshop_procedural_natural_chain_train_v1": (
-        "agentmemory_verified_natural_chain_provider_v4"
+        "agentmemory_verified_natural_chain_provider_v4",
+        2,
     ),
     "agentmemory_webshop_latent_preference_train_v1": (
-        "agentmemory_verified_latent_preference_provider_v1"
+        "agentmemory_verified_latent_preference_provider_v1",
+        2,
     ),
     "agentmemory_webshop_recency_override_train_v1": (
-        "agentmemory_verified_recency_override_provider_v1"
+        "agentmemory_verified_recency_override_provider_v1",
+        2,
+    ),
+    "agentmemory_webshop_distractor_robustness_top1_train_v1": (
+        "agentmemory_verified_distractor_robustness_provider_v1",
+        2,
+    ),
+    "agentmemory_webshop_compositional_recall_top1_train_v1": (
+        "agentmemory_verified_compositional_recall_provider_v1",
+        4,
+    ),
+    "agentmemory_webshop_intent_clarification_train_v1": (
+        "agentmemory_verified_intent_clarification_provider_v1",
+        2,
+    ),
+    "agentmemory_webshop_selective_memory_use_top1_train_v1": (
+        "agentmemory_verified_selective_memory_use_provider_v1",
+        4,
     ),
 }
 
@@ -62,8 +81,19 @@ def promote_data_idx_for_rollout(
     return True
 
 
-def validate_paired_batch_indices(indices: Sequence[Any]) -> None:
-    """Require a contiguous batch made of complete even/odd task orbits."""
+def validate_orbit_batch_indices(
+    indices: Sequence[Any],
+    *,
+    tasks_per_orbit: int,
+) -> None:
+    """Require a contiguous batch made of complete procedural task orbits."""
+
+    if (
+        isinstance(tasks_per_orbit, bool)
+        or not isinstance(tasks_per_orbit, int)
+        or tasks_per_orbit <= 0
+    ):
+        raise ProceduralIndexError("tasks_per_orbit must be a positive integer")
 
     normalized = []
     for position, value in enumerate(indices):
@@ -77,20 +107,26 @@ def validate_paired_batch_indices(indices: Sequence[Any]) -> None:
             raise ProceduralIndexError(
                 f"procedural batch index {position} is not an integer: {value!r}"
             ) from exc
-    if not normalized or len(normalized) % 2:
+    if not normalized or len(normalized) % tasks_per_orbit:
         raise ProceduralIndexError(
-            "procedural batch must contain a positive even number of indices"
+            "procedural batch must contain a positive number of complete orbits"
         )
-    if normalized[0] < 0 or normalized[0] % 2:
+    if normalized[0] < 0 or normalized[0] % tasks_per_orbit:
         raise ProceduralIndexError(
-            "procedural batch must start at a non-negative even index"
+            "procedural batch must start at a non-negative orbit boundary"
         )
     expected = list(range(normalized[0], normalized[0] + len(normalized)))
     if normalized != expected:
         raise ProceduralIndexError(
             "procedural batch indices must be contiguous and preserve adjacent "
-            "counterfactual pairs"
+            "task orbits"
         )
+
+
+def validate_paired_batch_indices(indices: Sequence[Any]) -> None:
+    """Compatibility wrapper for the original two-task orbit contract."""
+
+    validate_orbit_batch_indices(indices, tasks_per_orbit=2)
 
 
 def validate_rollout_parent_coverage(
@@ -240,17 +276,28 @@ class ProceduralIndexSource:
 
     task_count: int
     provider_mode: str
+    tasks_per_orbit: int = 2
     start_index: int = 0
     item_id_prefix: str = "agentmemory"
 
     def __post_init__(self) -> None:
         if (
+            isinstance(self.tasks_per_orbit, bool)
+            or not isinstance(self.tasks_per_orbit, int)
+            or self.tasks_per_orbit <= 0
+        ):
+            raise ProceduralIndexError(
+                "tasks_per_orbit must be a positive integer"
+            )
+        if (
             isinstance(self.task_count, bool)
             or not isinstance(self.task_count, int)
             or self.task_count <= 0
-            or self.task_count % 2
+            or self.task_count % self.tasks_per_orbit
         ):
-            raise ProceduralIndexError("task_count must be a positive even integer")
+            raise ProceduralIndexError(
+                "task_count must be a positive multiple of tasks_per_orbit"
+            )
         if self.provider_mode not in PROVIDER_MODES:
             raise ProceduralIndexError(
                 f"provider_mode must be one of {PROVIDER_MODES}, got "
@@ -260,10 +307,10 @@ class ProceduralIndexSource:
             isinstance(self.start_index, bool)
             or not isinstance(self.start_index, int)
             or self.start_index < 0
-            or self.start_index % 2
+            or self.start_index % self.tasks_per_orbit
         ):
             raise ProceduralIndexError(
-                "start_index must be a non-negative even integer"
+                "start_index must be a non-negative orbit boundary"
             )
         if self.provider_mode == PROVIDER_MODE_FIXED_WINDOW and self.start_index != 0:
             raise ProceduralIndexError("fixed_window requires start_index=0")
@@ -305,7 +352,10 @@ class ProceduralIndexSource:
             "start_index": self.start_index,
             "item_id_prefix": self.item_id_prefix,
             "materialized_rows": 0,
-            "counterfactual_pair_size": 2,
+            "tasks_per_orbit": self.tasks_per_orbit,
+            "counterfactual_pair_size": (
+                2 if self.tasks_per_orbit == 2 else None
+            ),
         }
 
     def validate_training_batch_size(self, batch_size: int) -> None:
@@ -317,11 +367,11 @@ class ProceduralIndexSource:
             isinstance(batch_size, bool)
             or not isinstance(batch_size, int)
             or batch_size <= 0
-            or batch_size % 2
+            or batch_size % self.tasks_per_orbit
         ):
             raise ProceduralIndexError(
-                "procedural natural-chain train_batch_size must be a positive "
-                "even integer"
+                "procedural train_batch_size must contain a positive number of "
+                "complete orbits"
             )
         if self.task_count % batch_size:
             raise ProceduralIndexError(
@@ -331,10 +381,15 @@ class ProceduralIndexSource:
 
     def validate_server_metadata(self, metadata: Mapping[str, Any]) -> None:
         surface = metadata.get("surface")
-        expected_provider_schema = SUPPORTED_SERVER_SURFACE_SCHEMAS.get(surface)
-        if expected_provider_schema is None:
+        expected_contract = SUPPORTED_SERVER_SURFACE_CONTRACTS.get(surface)
+        if expected_contract is None:
             raise ProceduralIndexError(
                 "procedural index source received an unsupported server surface"
+            )
+        expected_provider_schema, expected_tasks_per_orbit = expected_contract
+        if self.tasks_per_orbit != expected_tasks_per_orbit:
+            raise ProceduralIndexError(
+                "dataset tasks_per_orbit does not match the server surface"
             )
         provider = metadata.get("provider")
         if not isinstance(provider, Mapping):
@@ -342,6 +397,10 @@ class ProceduralIndexSource:
         if provider.get("schema") != expected_provider_schema:
             raise ProceduralIndexError(
                 "server surface and provider schema are not an approved pair"
+            )
+        if provider.get("tasks_per_orbit") != self.tasks_per_orbit:
+            raise ProceduralIndexError(
+                "dataset/server tasks_per_orbit metadata disagrees"
             )
         if provider.get("provider_mode") != self.provider_mode:
             raise ProceduralIndexError(
@@ -379,7 +438,8 @@ class ProceduralIndexSource:
             or semantic_period_orbits <= 0
             or isinstance(semantic_period_tasks, bool)
             or not isinstance(semantic_period_tasks, int)
-            or semantic_period_tasks != semantic_period_orbits * 2
+            or semantic_period_tasks
+            != semantic_period_orbits * self.tasks_per_orbit
         ):
             raise ProceduralIndexError("server semantic period metadata is invalid")
         if self.provider_mode == PROVIDER_MODE_RESEEDED_STREAM:
@@ -390,10 +450,15 @@ class ProceduralIndexSource:
             stream = provider.get("reseeded_stream")
             if not isinstance(stream, Mapping):
                 raise ProceduralIndexError("server stream metadata is missing")
+            orbit_boundary_field = (
+                "factorial_orbit_never_crosses_seed_epoch"
+                if self.tasks_per_orbit == 4
+                else "counterfactual_pair_never_crosses_seed_epoch"
+            )
             expected_stream_values = {
                 "tasks_per_seed_epoch": semantic_period_tasks,
                 "orbits_per_seed_epoch": semantic_period_orbits,
-                "counterfactual_pair_never_crosses_seed_epoch": True,
+                orbit_boundary_field: True,
                 "seed_epoch_zero_uses_base_seed": True,
                 "collision_free_within_complete_seed_epoch": True,
                 "semantic_uniqueness_guaranteed_through_task_index": (
@@ -424,7 +489,7 @@ class ProceduralIndexSource:
                 "train_batch_size": train_batch_size,
                 "shuffle": False,
                 "drop_last": True,
-                "counterfactual_pair_size": 2,
+                "tasks_per_orbit": self.tasks_per_orbit,
             },
             "server_metadata": _canonical_json_mapping(
                 server_metadata,
@@ -450,10 +515,10 @@ class StatefulProceduralStreamSampler:
             isinstance(next_position, bool)
             or not isinstance(next_position, int)
             or next_position < 0
-            or next_position % 2
+            or next_position % data_source.tasks_per_orbit
         ):
             raise ProceduralIndexError(
-                "next_position must be a non-negative even integer"
+                "next_position must be a non-negative orbit boundary"
             )
         self.data_source = data_source
         self.next_position = next_position
@@ -484,7 +549,7 @@ class StatefulProceduralStreamSampler:
             isinstance(next_position, bool)
             or not isinstance(next_position, int)
             or next_position < 0
-            or next_position % 2
+            or next_position % self.data_source.tasks_per_orbit
         ):
             raise ProceduralIndexError("invalid sampler next_position")
         if state.get("samples_per_epoch") != self.samples_per_epoch:
@@ -506,6 +571,7 @@ def procedural_index_source_from_config(
     return ProceduralIndexSource(
         task_count=raw.get("task_count"),
         provider_mode=raw.get("provider_mode"),
+        tasks_per_orbit=raw.get("tasks_per_orbit", 2),
         start_index=raw.get("start_index", 0),
         item_id_prefix=raw.get("item_id_prefix", "agentmemory"),
     )

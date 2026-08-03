@@ -45,7 +45,7 @@ from verl.utils.agent_dataset.procedural_index import (
     generation_non_tensor_keys,
     promote_data_idx_for_rollout,
     restore_stream_checkpoint,
-    validate_paired_batch_indices,
+    validate_orbit_batch_indices,
     validate_rollout_parent_coverage,
 )
 from verl.utils.agentgym.rollout_context import (
@@ -1405,6 +1405,7 @@ class RayPPOTrainer(object):
         )
         procedural_source = self.train_dataset.procedural_index_source
         self.procedural_stream_identity = None
+        self.procedural_tasks_per_orbit = None
         if procedural_source is not None:
             if procedural_source.provider_mode != PROVIDER_MODE_RESEEDED_STREAM:
                 raise ValueError(
@@ -1421,6 +1422,7 @@ class RayPPOTrainer(object):
                 self.config.data.train_batch_size
             )
             sampler = StatefulProceduralStreamSampler(procedural_source)
+            self.procedural_tasks_per_orbit = procedural_source.tasks_per_orbit
             self.procedural_stream_identity = procedural_source.training_identity(
                 server_metadata=self.train_dataset.env_client.metadata,
                 train_batch_size=self.config.data.train_batch_size,
@@ -1753,8 +1755,9 @@ class RayPPOTrainer(object):
                 # not rely on parsing a numeric suffix from item_id.
                 promote_data_idx_for_rollout(gen_batch.non_tensor_batch)
                 if self.procedural_stream_identity is not None:
-                    validate_paired_batch_indices(
-                        gen_batch.non_tensor_batch["rollout_data_indices"]
+                    validate_orbit_batch_indices(
+                        gen_batch.non_tensor_batch["rollout_data_indices"],
+                        tasks_per_orbit=self.procedural_tasks_per_orbit,
                     )
                 # Preserve driver-global source identities across DP dispatch.
                 # Rollout workers must return these values as parent indices;

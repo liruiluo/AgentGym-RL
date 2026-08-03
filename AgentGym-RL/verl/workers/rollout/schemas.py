@@ -35,6 +35,7 @@ AGENTMEMORY_MEMORY_PROMPT_MODES = (
     "neutral_horizon",
     "neutral_horizon_responsibility",
     "latent_preference_sop",
+    "selective_memory_sop",
 )
 
 
@@ -159,6 +160,43 @@ _AGENTMEMORY_LATENT_PREFERENCE_SOP = (
     "sessions, apply the retrieved preference when choosing between approved "
     "listings. The environment does not perform these memory actions for you, and it "
     "does not reject an otherwise correct purchase when ADD was skipped."
+)
+
+_AGENTMEMORY_SELECTIVE_MEMORY_SOP = (
+    "First decide whether the current request already states every attribute needed "
+    "to choose between its approved listings. When the current request is complete, "
+    "follow it directly: explicit current requirements override profile history, and "
+    "you should not ADD or RETRIEVE merely by habit. When the current request omits "
+    "the customer's profile preference, use RETRIEVE to expose the saved current "
+    "profile before choosing. Store new memory only when the episode provides new "
+    "information that a later session will actually need."
+)
+
+AGENTMEMORY_QUERY_TOP1_SURFACES = frozenset(
+    {
+        "agentmemory_webshop_distractor_robustness_top1_train_v1",
+        "agentmemory_webshop_compositional_recall_top1_train_v1",
+        "agentmemory_webshop_intent_clarification_train_v1",
+        "agentmemory_webshop_selective_memory_use_top1_train_v1",
+    }
+)
+AGENTMEMORY_INTENT_CLARIFICATION_SURFACE = (
+    "agentmemory_webshop_intent_clarification_train_v1"
+)
+_AGENTMEMORY_QUERY_TOP1_RETRIEVAL_CONTRACT = (
+    "RETRIEVE requires exactly query:string and returns exactly "
+    "one highest-ranked matching memory. memory_id and top_k are forbidden."
+)
+_AGENTMEMORY_DEFAULT_RETRIEVAL_CONTRACT = (
+    "RETRIEVE accepts exactly one lookup field: query:string for BM25 text matching "
+    "with optional top_k:int (default 3), or memory_id:string for exact readback of "
+    "that entry."
+)
+_AGENTMEMORY_INTENT_CLARIFICATION_CONTRACT = (
+    "In the first shopping session, the request is intentionally ambiguous. ASK "
+    "requires field:string and may be used exactly once with the ambiguity-resolving "
+    "field named by the task. The environment returns a CLARIFY observation; store "
+    "that clarification before the first purchase and retrieve it in later sessions."
 )
 
 _AGENTMEMORY_LTM_KEY_INVENTORY_CONTRACT = (
@@ -334,6 +372,7 @@ def agentmemory_action_system_prompt(
     *,
     ltm_inventory_mode: str | None = None,
     memory_prompt_mode: str | None = None,
+    surface: str | None = None,
 ) -> str:
     # Pick the reply rule that matches the active thinking mode so the prompt
     # never contradicts what the chat template does with <think>.
@@ -357,75 +396,95 @@ def agentmemory_action_system_prompt(
         )
     key_inventory = inventory_mode == "keys"
     latent_preference = prompt_mode == "latent_preference_sop"
+    selective_memory = prompt_mode == "selective_memory_sop"
     neutral = prompt_mode in (
         "neutral",
         "neutral_horizon",
         "neutral_horizon_responsibility",
-    )
+    ) or selective_memory
     neutral_horizon = prompt_mode in (
         "neutral_horizon",
         "neutral_horizon_responsibility",
     )
     responsibility = prompt_mode == "neutral_horizon_responsibility"
+
+    def finish(prompt: str) -> str:
+        if surface in AGENTMEMORY_QUERY_TOP1_SURFACES:
+            if prompt.count(_AGENTMEMORY_DEFAULT_RETRIEVAL_CONTRACT) != 1:
+                raise RuntimeError(
+                    "AgentMemory query-top1 prompt could not replace the default "
+                    "RETRIEVE contract exactly once."
+                )
+            prompt = prompt.replace(
+                _AGENTMEMORY_DEFAULT_RETRIEVAL_CONTRACT,
+                _AGENTMEMORY_QUERY_TOP1_RETRIEVAL_CONTRACT,
+                1,
+            )
+        if surface == AGENTMEMORY_INTENT_CLARIFICATION_SURFACE:
+            prompt += " " + _AGENTMEMORY_INTENT_CLARIFICATION_CONTRACT
+        if selective_memory:
+            prompt += " " + _AGENTMEMORY_SELECTIVE_MEMORY_SOP
+        return prompt
+
     if _agentmemory_thinking_enabled():
         if key_inventory:
             if latent_preference:
-                return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_LATENT_PREFERENCE_SOP_LTM_KEY_INVENTORY
+                return finish(AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_LATENT_PREFERENCE_SOP_LTM_KEY_INVENTORY)
             if responsibility:
-                return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_HORIZON_RESPONSIBILITY_LTM_KEY_INVENTORY
+                return finish(AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_HORIZON_RESPONSIBILITY_LTM_KEY_INVENTORY)
             if neutral_horizon:
-                return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_HORIZON_LTM_KEY_INVENTORY
+                return finish(AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_HORIZON_LTM_KEY_INVENTORY)
             if neutral:
-                return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_LTM_KEY_INVENTORY
-            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_LTM_KEY_INVENTORY
+                return finish(AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_LTM_KEY_INVENTORY)
+            return finish(AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_LTM_KEY_INVENTORY)
         if latent_preference:
-            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_LATENT_PREFERENCE_SOP
+            return finish(AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_LATENT_PREFERENCE_SOP)
         if responsibility:
-            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_HORIZON_RESPONSIBILITY
+            return finish(AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_HORIZON_RESPONSIBILITY)
         if neutral_horizon:
-            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_HORIZON
+            return finish(AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL_HORIZON)
         if neutral:
-            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL
-        return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING
+            return finish(AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEUTRAL)
+        return finish(AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING)
     if _agentmemory_reasoning_enabled():
         if key_inventory:
             if latent_preference:
-                return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_LATENT_PREFERENCE_SOP_LTM_KEY_INVENTORY
+                return finish(AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_LATENT_PREFERENCE_SOP_LTM_KEY_INVENTORY)
             if responsibility:
-                return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_HORIZON_RESPONSIBILITY_LTM_KEY_INVENTORY
+                return finish(AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_HORIZON_RESPONSIBILITY_LTM_KEY_INVENTORY)
             if neutral_horizon:
-                return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_HORIZON_LTM_KEY_INVENTORY
+                return finish(AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_HORIZON_LTM_KEY_INVENTORY)
             if neutral:
-                return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_LTM_KEY_INVENTORY
-            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_LTM_KEY_INVENTORY
+                return finish(AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_LTM_KEY_INVENTORY)
+            return finish(AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_LTM_KEY_INVENTORY)
         if latent_preference:
-            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_LATENT_PREFERENCE_SOP
+            return finish(AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_LATENT_PREFERENCE_SOP)
         if responsibility:
-            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_HORIZON_RESPONSIBILITY
+            return finish(AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_HORIZON_RESPONSIBILITY)
         if neutral_horizon:
-            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_HORIZON
+            return finish(AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL_HORIZON)
         if neutral:
-            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL
-        return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING
+            return finish(AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEUTRAL)
+        return finish(AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING)
     if key_inventory:
         if latent_preference:
-            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_LATENT_PREFERENCE_SOP_LTM_KEY_INVENTORY
+            return finish(AGENTMEMORY_ACTION_SYSTEM_PROMPT_LATENT_PREFERENCE_SOP_LTM_KEY_INVENTORY)
         if responsibility:
-            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON_RESPONSIBILITY_LTM_KEY_INVENTORY
+            return finish(AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON_RESPONSIBILITY_LTM_KEY_INVENTORY)
         if neutral_horizon:
-            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON_LTM_KEY_INVENTORY
+            return finish(AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON_LTM_KEY_INVENTORY)
         if neutral:
-            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_LTM_KEY_INVENTORY
-        return AGENTMEMORY_ACTION_SYSTEM_PROMPT_LTM_KEY_INVENTORY
+            return finish(AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_LTM_KEY_INVENTORY)
+        return finish(AGENTMEMORY_ACTION_SYSTEM_PROMPT_LTM_KEY_INVENTORY)
     if latent_preference:
-        return AGENTMEMORY_ACTION_SYSTEM_PROMPT_LATENT_PREFERENCE_SOP
+        return finish(AGENTMEMORY_ACTION_SYSTEM_PROMPT_LATENT_PREFERENCE_SOP)
     if responsibility:
-        return AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON_RESPONSIBILITY
+        return finish(AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON_RESPONSIBILITY)
     if neutral_horizon:
-        return AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON
+        return finish(AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL_HORIZON)
     if neutral:
-        return AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL
-    return AGENTMEMORY_ACTION_SYSTEM_PROMPT
+        return finish(AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEUTRAL)
+    return finish(AGENTMEMORY_ACTION_SYSTEM_PROMPT)
 
 def _normalize_chat_template_token_ids(encoded) -> List[int]:
     """Normalize tokenizer.apply_chat_template(..., tokenize=True) output.

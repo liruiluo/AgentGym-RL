@@ -16,6 +16,7 @@ data:
     enabled: False
     provider_mode: reseeded_stream
     task_count: null
+    tasks_per_orbit: 2
     start_index: 0
     item_id_prefix: agentmemory
 

@@ -415,11 +415,60 @@ class FormalPromptTests(unittest.TestCase):
             )
         with patch.dict(
             os.environ,
+            {
+                "AGENTMEMORY_MEMORY_PROMPT_MODE": "selective_memory_sop",
+                "AGENTMEMORY_SURFACE": (
+                    "agentmemory_webshop_selective_memory_use_top1_train_v1"
+                ),
+            },
+            clear=True,
+        ):
+            prompt = module.agentmemory_action_system_prompt(
+                surface=os.environ["AGENTMEMORY_SURFACE"]
+            )
+            for fragment in (
+                "First decide whether the current request already states every attribute",
+                "explicit current requirements override profile history",
+                "should not ADD or RETRIEVE merely by habit",
+                "use RETRIEVE to expose the saved current profile",
+                "RETRIEVE requires exactly query:string",
+                "memory_id and top_k are forbidden",
+            ):
+                self.assertIn(fragment, prompt)
+            self.assertNotIn("use ADD before click[Buy Now]", prompt)
+            self.assertNotIn("confirmed choice as preference evidence", prompt)
+        with patch.dict(
+            os.environ,
             {"AGENTMEMORY_MEMORY_PROMPT_MODE": "instruction"},
             clear=True,
         ):
             with self.assertRaisesRegex(ValueError, "MEMORY_PROMPT_MODE"):
                 module.agentmemory_action_system_prompt()
+
+    def test_surface_specific_top1_and_clarification_contracts(self) -> None:
+        module = load_schemas_module()
+        distractor_surface = (
+            "agentmemory_webshop_distractor_robustness_top1_train_v1"
+        )
+        intent_surface = "agentmemory_webshop_intent_clarification_train_v1"
+        distractor_prompt = module.agentmemory_action_system_prompt(
+            memory_prompt_mode="latent_preference_sop",
+            surface=distractor_surface,
+        )
+        intent_prompt = module.agentmemory_action_system_prompt(
+            memory_prompt_mode="latent_preference_sop",
+            surface=intent_surface,
+        )
+        for prompt in (distractor_prompt, intent_prompt):
+            self.assertIn("RETRIEVE requires exactly query:string", prompt)
+            self.assertIn("one highest-ranked matching memory", prompt)
+            self.assertIn("memory_id and top_k are forbidden", prompt)
+            self.assertNotIn("optional top_k:int", prompt)
+            self.assertNotIn("memory_id:string for exact readback", prompt)
+        self.assertNotIn("ASK requires field:string", distractor_prompt)
+        self.assertNotIn("CLARIFY observation", distractor_prompt)
+        self.assertIn("ASK requires field:string", intent_prompt)
+        self.assertIn("CLARIFY observation", intent_prompt)
 
     def test_action_listing_mode_is_opt_in_and_validated(self) -> None:
         module = load_schemas_module()

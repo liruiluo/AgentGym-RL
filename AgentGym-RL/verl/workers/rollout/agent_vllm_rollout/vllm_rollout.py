@@ -182,7 +182,9 @@ def _formal_runtime_contract_for_client(env_client) -> tuple[str, str, str]:
         )
         return resolve_formal_runtime_contract(
             info_metadata,
-            webshop_v2_system_prompt=agentmemory_action_system_prompt(),
+            webshop_v2_system_prompt=agentmemory_action_system_prompt(
+                surface=info_metadata["surface"]
+            ),
         )
     except FormalDomainV3Error as exc:
         raise FormalRuntimeEvidenceError(

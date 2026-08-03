@@ -20,12 +20,28 @@ FORMAL_WEBSHOP_LATENT_PREFERENCE_SURFACE_V2 = (
 FORMAL_WEBSHOP_RECENCY_OVERRIDE_SURFACE_V2 = (
     "agentmemory_webshop_recency_override_train_v1"
 )
+FORMAL_WEBSHOP_DISTRACTOR_ROBUSTNESS_SURFACE_V2 = (
+    "agentmemory_webshop_distractor_robustness_top1_train_v1"
+)
+FORMAL_WEBSHOP_COMPOSITIONAL_RECALL_SURFACE_V2 = (
+    "agentmemory_webshop_compositional_recall_top1_train_v1"
+)
+FORMAL_WEBSHOP_INTENT_CLARIFICATION_SURFACE_V2 = (
+    "agentmemory_webshop_intent_clarification_train_v1"
+)
+FORMAL_WEBSHOP_SELECTIVE_MEMORY_USE_SURFACE_V2 = (
+    "agentmemory_webshop_selective_memory_use_top1_train_v1"
+)
 FORMAL_WEBSHOP_SURFACES_V2 = frozenset(
     {
         FORMAL_WEBSHOP_SURFACE_V2,
         FORMAL_WEBSHOP_PROCEDURAL_SURFACE_V2,
         FORMAL_WEBSHOP_LATENT_PREFERENCE_SURFACE_V2,
         FORMAL_WEBSHOP_RECENCY_OVERRIDE_SURFACE_V2,
+        FORMAL_WEBSHOP_DISTRACTOR_ROBUSTNESS_SURFACE_V2,
+        FORMAL_WEBSHOP_COMPOSITIONAL_RECALL_SURFACE_V2,
+        FORMAL_WEBSHOP_INTENT_CLARIFICATION_SURFACE_V2,
+        FORMAL_WEBSHOP_SELECTIVE_MEMORY_USE_SURFACE_V2,
     }
 )
 LTM_INVENTORY_MODES = ("hidden", "keys")
@@ -35,6 +51,7 @@ MEMORY_PROMPT_MODES = (
     "neutral_horizon",
     "neutral_horizon_responsibility",
     "latent_preference_sop",
+    "selective_memory_sop",
 )
 ACTION_LISTING_MODES = ("separate", "unified")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")

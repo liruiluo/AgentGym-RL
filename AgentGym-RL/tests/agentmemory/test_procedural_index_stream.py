@@ -34,6 +34,7 @@ procedural_index_source_from_config = MODULE.procedural_index_source_from_config
 promote_data_idx_for_rollout = MODULE.promote_data_idx_for_rollout
 restore_stream_checkpoint = MODULE.restore_stream_checkpoint
 validate_paired_batch_indices = MODULE.validate_paired_batch_indices
+validate_orbit_batch_indices = MODULE.validate_orbit_batch_indices
 validate_rollout_parent_coverage = MODULE.validate_rollout_parent_coverage
 
 
@@ -57,6 +58,7 @@ def server_metadata(*, generator_seed: int = 233) -> dict:
         "reward_contract": {"correct_purchase": 1.0},
         "provider": {
             "schema": "agentmemory_verified_natural_chain_provider_v4",
+            "tasks_per_orbit": 2,
             "provider_mode": PROVIDER_MODE_RESEEDED_STREAM,
             "task_count": 64,
             "accepted_index_domain": "all_nonnegative_integers",
@@ -136,6 +138,111 @@ def recency_override_server_metadata(*, generator_seed: int = 233) -> dict:
     return metadata
 
 
+def distractor_robustness_server_metadata(*, generator_seed: int = 233) -> dict:
+    metadata = latent_preference_server_metadata(generator_seed=generator_seed)
+    metadata["surface"] = (
+        "agentmemory_webshop_distractor_robustness_top1_train_v1"
+    )
+    metadata["provider"] = {
+        **metadata["provider"],
+        "schema": "agentmemory_verified_distractor_robustness_provider_v1",
+        "counterfactual_pairing": True,
+        "branch_order": ["clean", "distracted"],
+        "correct_memory_preloaded": False,
+        "correct_memory_policy_authored_after_evidence": True,
+        "retrieve_policy": "query_top1",
+        "memory_id_lookup_allowed": False,
+        "initial_memory_inventory_visible": False,
+        "strict_top1_certified": True,
+        "purchase_receipt_asin_verification": True,
+    }
+    return metadata
+
+
+def compositional_recall_server_metadata(*, generator_seed: int = 233) -> dict:
+    metadata = latent_preference_server_metadata(generator_seed=generator_seed)
+    metadata["surface"] = (
+        "agentmemory_webshop_compositional_recall_top1_train_v1"
+    )
+    provider = metadata["provider"]
+    provider.update(
+        {
+            "schema": "agentmemory_verified_compositional_recall_provider_v1",
+            "tasks_per_orbit": 4,
+            "semantic_period_tasks": 400,
+            "factorial_coordinates": [[0, 0], [0, 1], [1, 0], [1, 1]],
+            "canonical_memory_count": 2,
+            "retrieve_policy": "query_top1",
+            "required_sequential_retrievals": 2,
+            "memory_id_lookup_allowed": False,
+            "ltm_inventory_visible": False,
+            "leave_one_memory_out_certified": True,
+            "purchase_receipt_asin_verification": True,
+        }
+    )
+    provider["reseeded_stream"] = {
+        **provider["reseeded_stream"],
+        "tasks_per_seed_epoch": 400,
+        "factorial_orbit_never_crosses_seed_epoch": True,
+    }
+    provider["reseeded_stream"].pop(
+        "counterfactual_pair_never_crosses_seed_epoch"
+    )
+    provider["reseeded_stream"][
+        "semantic_uniqueness_guaranteed_through_task_index"
+    ] = 399
+    return metadata
+
+
+def intent_clarification_server_metadata(*, generator_seed: int = 233) -> dict:
+    metadata = latent_preference_server_metadata(generator_seed=generator_seed)
+    metadata["surface"] = "agentmemory_webshop_intent_clarification_train_v1"
+    metadata["provider"] = {
+        **metadata["provider"],
+        "schema": "agentmemory_verified_intent_clarification_provider_v1",
+        "counterfactual_pairing": True,
+        "pre_ask_observation_identity": True,
+        "all_targets_flip_after_clarification": True,
+        "required_action": "ASK",
+        "clarification_event": "CLARIFY",
+        "ask_allowed_session": 0,
+        "max_successful_asks": 1,
+        "purchase_before_clarification_allowed": False,
+        "canonical_memory_count": 1,
+        "retrieve_policy": "query_top1",
+        "memory_id_lookup_allowed": False,
+        "ltm_inventory_visible": False,
+        "training_ready": True,
+    }
+    return metadata
+
+
+def selective_memory_use_server_metadata(*, generator_seed: int = 233) -> dict:
+    metadata = server_metadata(generator_seed=generator_seed)
+    metadata["surface"] = (
+        "agentmemory_webshop_selective_memory_use_top1_train_v1"
+    )
+    metadata["memory_prompt_mode"] = "selective_memory_sop"
+    provider = metadata["provider"]
+    provider.update(
+        {
+            "schema": "agentmemory_verified_selective_memory_use_provider_v1",
+            "tasks_per_orbit": 4,
+            "semantic_period_tasks": 400,
+        }
+    )
+    provider["reseeded_stream"] = {
+        **provider["reseeded_stream"],
+        "tasks_per_seed_epoch": 400,
+        "factorial_orbit_never_crosses_seed_epoch": True,
+        "semantic_uniqueness_guaranteed_through_task_index": 399,
+    }
+    provider["reseeded_stream"].pop(
+        "counterfactual_pair_never_crosses_seed_epoch"
+    )
+    return metadata
+
+
 class ProceduralIndexSourceTests(unittest.TestCase):
     def test_explicit_data_index_is_promoted_for_environment_reset(self) -> None:
         indices = [200_000, 200_001]
@@ -197,7 +304,7 @@ class ProceduralIndexSourceTests(unittest.TestCase):
             source.row_for_position(10)
 
     def test_pair_alignment_and_config_are_fail_closed(self) -> None:
-        with self.assertRaisesRegex(ProceduralIndexError, "even"):
+        with self.assertRaisesRegex(ProceduralIndexError, "multiple"):
             ProceduralIndexSource(
                 task_count=9,
                 provider_mode=PROVIDER_MODE_RESEEDED_STREAM,
@@ -229,7 +336,7 @@ class ProceduralIndexSourceTests(unittest.TestCase):
         source.validate_training_batch_size(4)
         for invalid in (True, 0, 3):
             with self.subTest(invalid=invalid), self.assertRaisesRegex(
-                ProceduralIndexError, "positive even"
+                ProceduralIndexError, "complete orbits"
             ):
                 source.validate_training_batch_size(invalid)
         with self.assertRaisesRegex(ProceduralIndexError, "divisible"):
@@ -290,6 +397,19 @@ class ProceduralIndexSourceTests(unittest.TestCase):
         source.validate_server_metadata(server_metadata())
         source.validate_server_metadata(latent_preference_server_metadata())
         source.validate_server_metadata(recency_override_server_metadata())
+        source.validate_server_metadata(distractor_robustness_server_metadata())
+        source.validate_server_metadata(intent_clarification_server_metadata())
+        compositional_source = ProceduralIndexSource(
+            task_count=64,
+            provider_mode=PROVIDER_MODE_RESEEDED_STREAM,
+            tasks_per_orbit=4,
+        )
+        compositional_source.validate_server_metadata(
+            compositional_recall_server_metadata()
+        )
+        compositional_source.validate_server_metadata(
+            selective_memory_use_server_metadata()
+        )
 
         unknown_surface = latent_preference_server_metadata()
         unknown_surface["surface"] = "agentmemory_webshop_unknown_train_v1"
@@ -325,6 +445,16 @@ class ProceduralIndexSourceTests(unittest.TestCase):
                 ProceduralIndexError
             ):
                 validate_paired_batch_indices(invalid)
+
+        validate_orbit_batch_indices(
+            [200, 201, 202, 203, 204, 205, 206, 207],
+            tasks_per_orbit=4,
+        )
+        for invalid in ([200, 201], [202, 203, 204, 205], [200, 201, 203, 204]):
+            with self.subTest(factorial_invalid=invalid), self.assertRaises(
+                ProceduralIndexError
+            ):
+                validate_orbit_batch_indices(invalid, tasks_per_orbit=4)
 
     def test_rollout_requires_every_parent_and_replica(self) -> None:
         complete = {
