@@ -1,6 +1,6 @@
-# SciWorld memory environment design for AgentMemoryGym
+# SciWorld memory environments for AgentMemoryGym
 
-Status: first integration skeleton, not a completed capability result.
+Status: multi-surface integration skeleton. These surfaces are registered and fixture-tested; native Java/Python SciWorld smoke and PPO training are still separate gates.
 
 ## Plain objective
 
@@ -12,7 +12,7 @@ Use SciWorld as a controlled scientific-experiment environment where the agent m
 4. use it to solve a later task;
 5. run another experiment instead of guessing when memory is insufficient.
 
-This is not meant to prove that the model knows elementary science facts. It is meant to train and test memory formation, retrieval, and reuse in an interactive lab.
+This is not meant to prove that the model already knows elementary science facts. It is meant to train and test memory formation, retrieval, and reuse in an interactive lab.
 
 ## Non-negotiable memory boundary
 
@@ -27,96 +27,106 @@ Allowed:
 
 Not allowed for the main memory surface:
 
-- “keep only the latest N steps” as a semantic design;
+- keeping a fixed small suffix of prior steps as the semantic memory design;
 - environment-written summaries;
 - ground-truth lab notes;
 - curated recent-window transcripts;
 - automatic compression by the harness.
 
-The model itself must choose what to compress, what to store, and what to retrieve. Any environment-provided summary or handcrafted rolling window is only a scaffold/control variant, not evidence of learned long-term memory use.
+The model itself must choose what to compress, what to store, and what to retrieve. Any environment-provided summary or handcrafted rolling transcript is only a scaffold/control variant, not evidence of learned long-term memory use.
 
-## First surfaces
+## Registered SciWorld memory surfaces
 
 ### 1. `sciworld_conductivity_memory_v1`
 
-First implementation target.
-
-Why this one:
-
-- simple action procedure;
-- clear source-session fact: object/substance X is conductive or non-conductive;
-- clear dependent-session use: pick the correct material/component later;
-- easy to audit whether success used memory or only current observation.
-
-Memory ability trained:
+What it tests:
 
 - experimental fact memory;
-- object-property binding;
-- “if unsure, test again rather than inventing.”
+- binding an unknown material to `conductive` / `nonconductive`;
+- using the prior lab result in a later circuit-building phase.
+
+Native SciWorld anchor:
+
+- `test-conductivity-of-unknown-substances`.
 
 ### 2. `sciworld_meltingpoint_memory_v1`
 
-Second target.
-
-Memory ability trained:
+What it tests:
 
 - numeric experimental memory;
-- threshold comparison;
-- avoiding stale or approximate values when exact measurement is needed.
+- remembering an exact measured value;
+- comparing that value against a later threshold.
+
+Native SciWorld anchor:
+
+- `measure-melting-point-unknown-substance`.
 
 ### 3. `sciworld_friction_memory_v1`
 
-Third target.
-
-Memory ability trained:
+What it tests:
 
 - comparative / ranking memory;
-- remembering which unnamed surface had higher or lower friction;
-- using prior measurements to avoid rerunning the same experiment.
+- remembering which unnamed surface has higher friction;
+- using prior measurements to choose a later surface.
 
-### 4. `sciworld_lab_notebook_longhorizon_v1`
+Native SciWorld anchor:
 
-Later target.
+- `inclined-plane-friction-unnamed-surfaces`.
 
-This is the long-context surface. It should chain many SciWorld experiments so the raw transcript becomes too long to keep in prompt. The success condition should require a policy-authored external notebook/LTM, not a harness-made recent-N prompt.
+### 4. `sciworld_rule_memory_v1`
 
-Memory ability trained:
+What it tests:
 
-- self-managed compression;
-- self-managed external lab notebook updates;
-- retrieving the right prior experiment from many notes;
-- deleting/updating wrong or obsolete notes when the agent discovers a correction.
+- multi-experiment fact/rule induction;
+- storing a reusable scientific rule from several observations;
+- applying the rule later when the original experiments are not repeated;
+- chaining retrieved facts, e.g. first retrieve `red + yellow -> orange`, then
+  retrieve `orange + yellow -> amber`, then state the two-step plan.
 
-### 5. `sciworld_rule_memory_v1`
+Boundary:
 
-Later target.
+- color mixing / friction rules are fact/rule memory, not SOP memory by default.
 
-This covers multi-experiment rule/fact induction. Color mixing and friction rules belong here. They are not SOP memory by default.
+Native SciWorld anchor:
 
-Memory ability trained:
+- `chemistry-mix-paint-secondary-color` and `chemistry-mix-paint-tertiary-color`.
 
-- deriving a reusable scientific fact/rule from multiple experiments;
-- storing the rule in a way that can transfer to a later task.
+### 5. `sciworld_sop_memory_v1`
 
-## SOP memory boundary
+What it tests:
 
-SOP memory means remembering a reusable procedure, not just remembering a scientific fact.
+- procedural memory;
+- remembering a reusable lab procedure;
+- transferring the procedure to a later task with different objects.
 
-Examples:
+Example:
 
-- fact/rule memory: “red + yellow makes orange”; “surface A has more friction than surface B.”
-- SOP memory: “to test conductivity, assemble a circuit, insert the material, observe whether the bulb lights, then record the result.”
+- remember how to test conductivity: assemble battery, wire, bulb, and sample; observe whether the bulb lights.
 
-SciWorld can train both, but they need separate surface IDs and metrics.
+Boundary:
 
-## Acceptance bar for the first skeleton
+- this is different from remembering that a specific material was conductive.
 
-The first code drop should only claim environment-support progress when it has:
+### 6. `sciworld_lab_notebook_longhorizon_v1`
 
-1. registered SciWorld surface IDs in the AgentMemoryGym v3 domain registry;
+What it tests:
+
+- self-managed external lab notebook;
+- many experiment records across phases;
+- retrieving the right old note from many policy-written notes;
+- succeeding without a harness-generated history summary.
+
+This is the long-context surface. The raw interaction can become too large to rely on ordinary prompt context; success should come from policy-authored `ADD/UPDATE/RETRIEVE`, not environment curation.
+
+## Acceptance bar for this skeleton
+
+This code drop may claim only environment-support progress when it has:
+
+1. registered all six SciWorld surface IDs in the AgentMemoryGym v3 domain registry;
 2. exposed a model-facing contract that says memory is policy-managed;
-3. included tests that reject manual recent-N / environment-summary wording;
+3. included tests that reject manual history-window / environment-summary wording;
 4. kept `scienceworld` as an optional runtime dependency with a clear fail-closed error if missing;
-5. provided a deterministic fixture backend so Mac-side tests do not require Java, torch, or the real SciWorld package.
+5. provided deterministic fixture backends so Mac-side tests do not require Java, torch, or the real SciWorld package;
+6. fixture-tested at least one minimal memory chain for every registered surface.
 
 It must not claim full native SciWorld training readiness until the real Java/Python SciWorld runtime smoke passes.
