@@ -67,6 +67,42 @@ def latent_preference_metadata():
     return metadata
 
 
+def recency_override_metadata():
+    metadata = latent_preference_metadata()
+    metadata["surface"] = "agentmemory_webshop_recency_override_train_v1"
+    metadata["task_count"] = 10_000
+    metadata["provider_mode"] = "fixed_window"
+    metadata["accepted_index_domain"] = "0_to_9999_inclusive"
+    metadata["provider"] = {
+        **metadata["provider"],
+        "schema": "agentmemory_verified_recency_override_provider_v1",
+        "provider_mode": "fixed_window",
+        "task_count": 10_000,
+        "accepted_index_domain": "0_to_9999_inclusive",
+        "semantic_period_orbits": 131_072,
+        "semantic_period_tasks": 262_144,
+        "reseeded_stream": None,
+        "phase_schedule": [
+            "evidence",
+            "application",
+            "override",
+            "application",
+            "application",
+            "application",
+        ],
+        "override_phase_index": 2,
+        "canonical_memory_key": "user_preference",
+        "counterfactual_pairing": True,
+        "stay_branch": "old preference remains active",
+        "flip_branch": "new preference replaces old canonical state",
+        "update_contract": "UPDATE same memory_id or DELETE old then ADD new",
+        "application_observation_identity": True,
+        "application_target_flip": True,
+        "purchase_receipt_asin_verification": True,
+    }
+    return metadata
+
+
 class AgentMemoryClientActionSubmissionTest(unittest.TestCase):
     def client(
         self,
@@ -337,6 +373,81 @@ class ProceduralAgentMemoryClientContractTest(unittest.TestCase):
                 action_format=ActionFormat.REACT,
             )
         post.assert_not_called()
+
+    def test_recency_override_surface_uses_preference_sop(self) -> None:
+        metadata = recency_override_metadata()
+        create_response = Mock(status_code=200)
+        create_response.json.return_value = {
+            "id": 8,
+            "observation": "recency override reset",
+            "reward": 0.0,
+            "done": False,
+            "info": {},
+        }
+        with (
+            patch.object(
+                AgentMemoryEnvClient,
+                "get_metadata",
+                return_value=metadata,
+            ),
+            patch(
+                "agentenv.envs.agentmemory.requests.post",
+                return_value=create_response,
+            ) as post,
+        ):
+            client = AgentMemoryEnvClient(
+                "http://recency-override.test",
+                None,
+                action_format=ActionFormat.REACT,
+            )
+
+        self.assertTrue(client.is_procedural)
+        self.assertTrue(client.is_recency_override)
+        self.assertEqual(client.memory_prompt_mode, "latent_preference_sop")
+        prompt = client.conversation_start[0]["value"]
+        self.assertIn("use UPDATE", prompt)
+        self.assertIn("use RETRIEVE", prompt)
+        post.assert_called_once()
+
+    def test_bad_recency_override_metadata_is_rejected_before_create(self) -> None:
+        mutations = {
+            "schema": lambda value: value["provider"].update(schema="unknown"),
+            "schedule": lambda value: value["provider"].update(
+                phase_schedule=["evidence"] * 6
+            ),
+            "override_index": lambda value: value["provider"].update(
+                override_phase_index=3
+            ),
+            "update_contract": lambda value: value["provider"].update(
+                update_contract="ADD another memory"
+            ),
+            "observation_identity": lambda value: value["provider"].update(
+                application_observation_identity=False
+            ),
+            "target_flip": lambda value: value["provider"].update(
+                application_target_flip=False
+            ),
+        }
+        for name, mutate in mutations.items():
+            metadata = deepcopy(recency_override_metadata())
+            mutate(metadata)
+            post = Mock()
+            with (
+                self.subTest(case=name),
+                patch.object(
+                    AgentMemoryEnvClient,
+                    "get_metadata",
+                    return_value=metadata,
+                ),
+                patch("agentenv.envs.agentmemory.requests.post", post),
+                self.assertRaises(RuntimeError),
+            ):
+                AgentMemoryEnvClient(
+                    "http://recency-override.invalid",
+                    None,
+                    action_format=ActionFormat.REACT,
+                )
+            post.assert_not_called()
 
     def test_bad_latent_preference_metadata_is_rejected_before_create(self) -> None:
         mutations = {
