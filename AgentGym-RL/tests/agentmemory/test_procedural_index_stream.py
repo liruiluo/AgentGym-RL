@@ -243,6 +243,45 @@ def selective_memory_use_server_metadata(*, generator_seed: int = 233) -> dict:
     return metadata
 
 
+def negative_constraint_server_metadata(*, generator_seed: int = 233) -> dict:
+    metadata = server_metadata(generator_seed=generator_seed)
+    metadata["surface"] = "agentmemory_webshop_negative_constraint_top1_train_v1"
+    metadata["task_count"] = 72
+    metadata["provider"] = {
+        **metadata["provider"],
+        "schema": "agentmemory_verified_negative_constraint_provider_v1",
+        "task_count": 72,
+        "virtual_task_count": 72,
+        "tasks_per_orbit": 3,
+        "candidate_count_per_phase": 3,
+        "distinct_values_per_phase": 3,
+        "counterfactual_branches": 3,
+        "retrieve_policy": "query_top1",
+        "memory_id_lookup_allowed": False,
+        "initial_memory_inventory_visible": False,
+        "native_certified": True,
+        "training_ready": True,
+        "semantic_period_orbits": 100,
+        "semantic_period_tasks": 300,
+        "human_review_required": False,
+        "llm_judge_required": False,
+        "task_prompt_product_identity": "complete_native_title",
+        "target_asin_in_task_prompt": False,
+        "native_search_result_asin_handles_visible": True,
+        "native_click_action_uses_asin_handle": True,
+        "reseeded_stream": {
+            "tasks_per_seed_epoch": 300,
+            "orbits_per_seed_epoch": 100,
+            "counterfactual_orbit_never_crosses_seed_epoch": True,
+            "seed_epoch_zero_uses_base_seed": True,
+            "collision_free_within_complete_seed_epoch": True,
+            "semantic_uniqueness_guaranteed_through_task_index": 299,
+            "cross_seed_epoch_semantic_uniqueness_guaranteed": False,
+        },
+    }
+    return metadata
+
+
 class ProceduralIndexSourceTests(unittest.TestCase):
     def test_explicit_data_index_is_promoted_for_environment_reset(self) -> None:
         indices = [200_000, 200_001]
@@ -410,6 +449,15 @@ class ProceduralIndexSourceTests(unittest.TestCase):
         compositional_source.validate_server_metadata(
             selective_memory_use_server_metadata()
         )
+        negative_source = ProceduralIndexSource(
+            task_count=72,
+            provider_mode=PROVIDER_MODE_RESEEDED_STREAM,
+            tasks_per_orbit=3,
+        )
+        negative_source.validate_training_batch_size(72)
+        negative_source.validate_server_metadata(
+            negative_constraint_server_metadata()
+        )
 
         unknown_surface = latent_preference_server_metadata()
         unknown_surface["surface"] = "agentmemory_webshop_unknown_train_v1"
@@ -429,6 +477,13 @@ class ProceduralIndexSourceTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ProceduralIndexError, "approved pair"):
             source.validate_server_metadata(recency_mismatched_schema)
+
+        negative_mismatched_schema = negative_constraint_server_metadata()
+        negative_mismatched_schema["provider"]["schema"] = (
+            "agentmemory_verified_selective_memory_use_provider_v1"
+        )
+        with self.assertRaisesRegex(ProceduralIndexError, "approved pair"):
+            negative_source.validate_server_metadata(negative_mismatched_schema)
 
     def test_batch_indices_preserve_complete_adjacent_orbits(self) -> None:
         validate_paired_batch_indices([200, 201, 202, 203])

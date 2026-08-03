@@ -19,6 +19,9 @@ PROVIDER_MODES = (
     PROVIDER_MODE_FIXED_WINDOW,
     PROVIDER_MODE_RESEEDED_STREAM,
 )
+NEGATIVE_CONSTRAINT_SURFACE = (
+    "agentmemory_webshop_negative_constraint_top1_train_v1"
+)
 SUPPORTED_SERVER_SURFACE_CONTRACTS = {
     "agentmemory_webshop_procedural_natural_chain_train_v1": (
         "agentmemory_verified_natural_chain_provider_v4",
@@ -47,6 +50,10 @@ SUPPORTED_SERVER_SURFACE_CONTRACTS = {
     "agentmemory_webshop_selective_memory_use_top1_train_v1": (
         "agentmemory_verified_selective_memory_use_provider_v1",
         4,
+    ),
+    NEGATIVE_CONSTRAINT_SURFACE: (
+        "agentmemory_verified_negative_constraint_provider_v1",
+        3,
     ),
 }
 
@@ -412,8 +419,14 @@ class ProceduralIndexSource:
                 "dataset/server task counts disagree: "
                 f"{self.task_count!r} != {provider.get('task_count')!r}"
             )
-        if provider.get("candidate_count_per_phase") != 2:
-            raise ProceduralIndexError("server no longer provides binary phases")
+        expected_candidate_count = (
+            3 if surface == NEGATIVE_CONSTRAINT_SURFACE else 2
+        )
+        if provider.get("candidate_count_per_phase") != expected_candidate_count:
+            raise ProceduralIndexError(
+                "server candidate count per phase disagrees with the approved "
+                f"surface contract: expected {expected_candidate_count}"
+            )
         if provider.get("phase_count_per_task") != 6:
             raise ProceduralIndexError("server no longer provides six-phase tasks")
         if provider.get("human_review_required") is not False:
@@ -450,11 +463,11 @@ class ProceduralIndexSource:
             stream = provider.get("reseeded_stream")
             if not isinstance(stream, Mapping):
                 raise ProceduralIndexError("server stream metadata is missing")
-            orbit_boundary_field = (
-                "factorial_orbit_never_crosses_seed_epoch"
-                if self.tasks_per_orbit == 4
-                else "counterfactual_pair_never_crosses_seed_epoch"
-            )
+            orbit_boundary_field = {
+                4: "factorial_orbit_never_crosses_seed_epoch",
+                3: "counterfactual_orbit_never_crosses_seed_epoch",
+                2: "counterfactual_pair_never_crosses_seed_epoch",
+            }[self.tasks_per_orbit]
             expected_stream_values = {
                 "tasks_per_seed_epoch": semantic_period_tasks,
                 "orbits_per_seed_epoch": semantic_period_orbits,
