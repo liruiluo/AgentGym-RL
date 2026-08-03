@@ -37,6 +37,11 @@ The model itself must choose what to compress, what to store, and what to retrie
 
 ## Registered SciWorld memory surfaces
 
+These are memory-training surfaces inside SciWorld. They are not meant to be a
+one-to-one copy of the official 30 ScienceWorld task names. A later native smoke
+should map each surface to one or more real ScienceWorld task families, while
+keeping the memory contract below unchanged.
+
 ### 1. `sciworld_conductivity_memory_v1`
 
 What it tests:
@@ -107,7 +112,79 @@ Boundary:
 
 - this is different from remembering that a specific material was conductive.
 
-### 6. `sciworld_lab_notebook_longhorizon_v1`
+### 6. `sciworld_negative_evidence_memory_v1`
+
+What it tests:
+
+- remembering failed or null experimental results;
+- using negative evidence to exclude a candidate later;
+- not repeating the same dead-end experiment as if it were unknown.
+
+Example:
+
+- record that powder zeta did not fizz with vinegar, then later choose the other candidate when the task needs a fizzing material.
+
+### 7. `sciworld_hypothesis_tracking_memory_v1`
+
+What it tests:
+
+- keeping competing hypotheses separate;
+- remembering which experiment supported or ruled out each hypothesis;
+- selecting the supported explanation later.
+
+Example:
+
+- lamp direction is supported; soil color is ruled out.
+
+### 8. `sciworld_calibration_memory_v1`
+
+What it tests:
+
+- remembering instrument calibration;
+- applying a stored measurement offset later;
+- avoiding treating raw readings as corrected facts.
+
+Example:
+
+- thermometer T reads 5 degrees high; later raw 75 means corrected 70.
+
+### 9. `sciworld_contextual_rule_memory_v1`
+
+What it tests:
+
+- remembering that a rule depends on context;
+- applying the rule only under the right condition;
+- not flattening conditional science facts into universal facts.
+
+Example:
+
+- sugar dissolves quickly in hot water and slowly in cold water; the useful rule depends on temperature.
+
+### 10. `sciworld_state_change_memory_v1`
+
+What it tests:
+
+- revising an earlier lab note after newer reliable evidence;
+- using the latest reliable state rather than the stale preliminary result;
+- exercising `UPDATE`-style memory behavior in later runtime tests.
+
+Example:
+
+- a quick strip first suggests riva is acidic; a calibrated pH meter later supersedes it and says neutral.
+
+### 11. `sciworld_goal_progress_memory_v1`
+
+What it tests:
+
+- remembering unfinished experiment progress;
+- carrying completed subgoals and the next subgoal across phase boundaries;
+- resuming a multi-step lab plan without the harness repeating the checklist.
+
+Example:
+
+- collect sample -> heat sample -> record final color; later remember that only final color remains.
+
+### 12. `sciworld_lab_notebook_longhorizon_v1`
 
 What it tests:
 
@@ -122,7 +199,7 @@ This is the long-context surface. The raw interaction can become too large to re
 
 This code drop may claim only environment-support progress when it has:
 
-1. registered all six SciWorld surface IDs in the AgentMemoryGym v3 domain registry;
+1. registered all twelve SciWorld surface IDs in the AgentMemoryGym v3 domain registry;
 2. exposed a model-facing contract that says memory is policy-managed;
 3. included tests that reject manual history-window / environment-summary wording;
 4. kept `scienceworld` as an optional runtime dependency with a clear fail-closed error if missing;
