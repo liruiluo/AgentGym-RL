@@ -1,5 +1,55 @@
 # AgentMemoryGym Evidence Eval
 
+## Codex filesystem SFT bootstrap
+
+`generate_filesystem_sft_v1.py` creates executed demonstrations for the
+`agentmemory_webshop_procedural_natural_chain_filesystem_v2` surface.  It uses
+the real WebShop backend and the real namespace-isolated Codex workspace, so a
+record is admitted only when the submitted `shell_command` or `apply_patch`
+has an authoritative event with matching request bytes, before/after tree
+hashes, and a verified native purchase trajectory.  The generator keeps the
+1.18M-item catalog and Lucene searcher alive for the entire process; do not
+launch it once per task.
+
+The output is a JSON array plus a manifest.  Each task contributes exactly 28
+supervised actions (six searches, twelve native clicks, five shell reads, and
+five patches), and the manifest records the source commits, provider/catalog
+fingerprints, action counts, and record-hash sequence.  Dataset and manifest
+publication is rolled back if either side cannot be authenticated.
+
+The SFT adapter uses `data_mode: agent_action_v1`.  The policy-visible input is
+the canonical system prompt plus the current environment observation; the
+loss mask covers only the assistant action and `<|im_end|>`, never execution
+receipts, private ASINs, or verifier fields.  Run the tokenizer-equivalence
+and tiny-overfit gates before using the resulting checkpoint for PPO.
+
+Example configuration override:
+
+```bash
+python3 scripts/agentmemory/generate_filesystem_sft_v1.py \
+  --memoryarena-root /path/to/MemoryArena \
+  --memoryarena-base-commit <sha> \
+  --items-file /path/to/items_shuffle.json \
+  --attributes-file /path/to/attributes.json \
+  --search-root /path/to/lucene \
+  --java-home /path/to/java \
+  --lucene-index-manifest /path/to/lucene-manifest.json \
+  --product-pool /path/to/certified-product-pool.json \
+  --product-pool-file-sha256 <sha256> \
+  --orbit-count 64 \
+  --workspace-rg-binary /path/to/rg \
+  --workspace-rg-sha256 <sha256> \
+  --expected-outer-source-commit <sha> \
+  --expected-agentgym-source-commit <sha> \
+  --output-json /path/to/filesystem-sft.json \
+  --manifest-json /path/to/filesystem-sft.manifest.json
+```
+
+For training, set `data.data_mode=agent_action_v1`, point
+`data.train_files` at the generated JSON array, and keep `data.truncation`
+large enough that the complete action remains supervised.  A source worktree
+must be clean and pinned to the commits recorded in the manifest.
+
 `attest_effective_memory_prompt.py` records the exact rollout system prompt,
 its SHA-256, and the effective memory/LTM modes. Formal MemoryChain launchers
 should pass `--require-lifecycle-sop` when their scientific contract requires

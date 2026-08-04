@@ -1,4 +1,5 @@
 data:
+  data_mode: conversations  # conversations | agent_action_v1
   train_batch_size: 16
   micro_batch_size: null # will be deprecated, use micro_batch_size_per_gpu
   micro_batch_size_per_gpu: 2  # this is also val batch size
@@ -40,4 +41,3 @@ trainer:
   logger: ['console']
   seed: 1
   storage_mode: local
-

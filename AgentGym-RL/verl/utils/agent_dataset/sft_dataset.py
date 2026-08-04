@@ -26,6 +26,12 @@ from transformers import PreTrainedTokenizer
 
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils import hf_tokenizer
+from verl.utils.agent_dataset.agent_action_schema import (
+    validate_agent_action_record,
+)
+
+
+SFT_DATA_MODES = ("conversations", "agent_action_v1")
 
 
 class SFTDataset(Dataset):
@@ -38,9 +44,15 @@ class SFTDataset(Dataset):
                  tokenizer,
                  prompt_key='conversations',
                  max_length=4096,
-                 truncation='right'):
+                 truncation='right',
+                 data_mode='conversations'):
         assert truncation in ['error', 'left', 'right']
+        if data_mode not in SFT_DATA_MODES:
+            raise ValueError(
+                f"data_mode must be one of {SFT_DATA_MODES!r}, got {data_mode!r}"
+            )
         self.truncation = truncation
+        self.data_mode = data_mode
 
         self.json_file = json_file
         if isinstance(tokenizer, str):
@@ -55,7 +67,10 @@ class SFTDataset(Dataset):
 
     def _read_files_and_tokenize(self):
         self.dataframe = pd.read_json(self.json_file)
-        self.prompts = self.dataframe[self.prompt_key].tolist()
+        if self.data_mode == 'conversations':
+            self.prompts = self.dataframe[self.prompt_key].tolist()
+        else:
+            self.prompts = self.dataframe.to_dict(orient='records')
 
     def __len__(self):
         return len(self.prompts)
@@ -64,6 +79,70 @@ class SFTDataset(Dataset):
         tokenizer = self.tokenizer
 
         prompt = self.prompts[item]
+
+        if self.data_mode == 'agent_action_v1':
+            input_ids, attention_mask, loss_mask = self._tokenize_agent_action(
+                prompt
+            )
+        else:
+            input_ids, attention_mask, loss_mask = self._tokenize_conversations(
+                prompt
+            )
+
+        input_ids, attention_mask, loss_mask = self._pad_or_truncate(
+            input_ids, attention_mask, loss_mask
+        )
+
+        position_ids = compute_position_id_with_mask(attention_mask)
+
+        return {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'position_ids': position_ids,
+            'loss_mask': loss_mask
+        }
+
+    def _tokenize_agent_action(self, record):
+        fields = validate_agent_action_record(record)
+        messages = [
+            {'role': 'system', 'content': fields['system_prompt']},
+            {'role': 'user', 'content': fields['observation']},
+        ]
+        encoded = self.tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            enable_thinking=False,
+        )
+        prompt_ids = _normalize_token_ids(encoded, field='generation prompt')
+        action_ids = _normalize_token_ids(
+            self.tokenizer.encode(
+                fields['assistant_action'], add_special_tokens=False
+            ),
+            field='assistant action',
+        )
+        terminator_ids = _normalize_token_ids(
+            self.tokenizer.encode('<|im_end|>', add_special_tokens=False),
+            field='assistant terminator',
+        )
+        if not prompt_ids or not action_ids or not terminator_ids:
+            raise ValueError(
+                'agent_action_v1 prompt, action, and terminator must tokenize '
+                'to non-empty sequences'
+            )
+        input_ids = torch.tensor(
+            prompt_ids + action_ids + terminator_ids, dtype=torch.long
+        )
+        attention_mask = torch.ones_like(input_ids)
+        loss_mask = torch.tensor(
+            [0] * len(prompt_ids)
+            + [1] * (len(action_ids) + len(terminator_ids)),
+            dtype=torch.long,
+        )
+        return input_ids, attention_mask, loss_mask
+
+    def _tokenize_conversations(self, prompt):
+        tokenizer = self.tokenizer
 
         # string
         system_chat_dict = {'role': 'system', 'content': ''}
@@ -91,11 +170,17 @@ class SFTDataset(Dataset):
             else:
                 raise NotImplementedError
 
+        return input_ids, attention_mask, loss_mask
+
+    def _pad_or_truncate(self, input_ids, attention_mask, loss_mask):
+        tokenizer = self.tokenizer
+        supervised_tokens = int(torch.sum(loss_mask).item())
+
         # padding to max length
         sequence_length = input_ids.shape[0]
         if sequence_length < self.max_length:
             padded_input_ids = torch.ones(size=(self.max_length - sequence_length,),
-                                          dtype=input_ids.dtype) * self.tokenizer.pad_token_id
+                                          dtype=input_ids.dtype) * tokenizer.pad_token_id
             padded_attention_mask = torch.zeros(size=(self.max_length - sequence_length,), dtype=attention_mask.dtype)
             padded_loss_mask = torch.zeros(size=(self.max_length - sequence_length,), dtype=loss_mask.dtype)
 
@@ -116,12 +201,36 @@ class SFTDataset(Dataset):
                 raise NotImplementedError(f'{sequence_length=} is larger than {self.max_length=}')
             else:
                 raise NotImplementedError(f'Unknown truncation method {self.truncation}')
+        if (
+            self.data_mode == 'agent_action_v1'
+            and int(torch.sum(loss_mask).item()) != supervised_tokens
+        ):
+            raise ValueError(
+                'agent_action_v1 truncation removed supervised action tokens; '
+                'increase max_length or use left truncation with enough target space'
+            )
+        if not torch.any(loss_mask):
+            raise ValueError(
+                'SFT sample has no supervised target tokens after truncation; '
+                'increase max_length or use left truncation'
+            )
+        return input_ids, attention_mask, loss_mask
 
-        position_ids = compute_position_id_with_mask(attention_mask)
 
-        return {
-            'input_ids': input_ids,
-            'attention_mask': attention_mask,
-            'position_ids': position_ids,
-            'loss_mask': loss_mask
-        }
+def _normalize_token_ids(encoded, *, field):
+    if isinstance(encoded, dict) or (
+        hasattr(encoded, '__contains__')
+        and hasattr(encoded, '__getitem__')
+        and 'input_ids' in encoded
+    ):
+        encoded = encoded['input_ids']
+    if hasattr(encoded, 'tolist'):
+        encoded = encoded.tolist()
+    if encoded and isinstance(encoded[0], (list, tuple)):
+        if len(encoded) != 1:
+            raise ValueError(f'{field} produced a batch instead of one sequence')
+        encoded = encoded[0]
+    token_ids = list(encoded)
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in token_ids):
+        raise TypeError(f'{field} produced non-integer token ids')
+    return token_ids
