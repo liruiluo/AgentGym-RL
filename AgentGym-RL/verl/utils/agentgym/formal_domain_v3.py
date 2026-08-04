@@ -62,9 +62,22 @@ class FormalDomainV3Error(ValueError):
 
 
 def canonical_unicode_contains(text: str, fragment: str) -> bool:
-    """Compare decoded prompt text across canonically equivalent Unicode forms."""
+    """Compare prompt text across Unicode and chat-template formatting boundaries.
 
-    return unicodedata.normalize("NFC", fragment) in unicodedata.normalize("NFC", text)
+    Chat templates may trim formatting whitespace at the end of a user message
+    while preserving every substantive character.  Treat only that trailing
+    whitespace difference as equivalent; a missing non-whitespace suffix still
+    fails the containment check.
+    """
+
+    normalized_text = unicodedata.normalize("NFC", text)
+    normalized_fragment = unicodedata.normalize("NFC", fragment)
+    if normalized_fragment in normalized_text:
+        return True
+    trimmed_fragment = normalized_fragment.rstrip()
+    return bool(trimmed_fragment and trimmed_fragment != normalized_fragment) and (
+        trimmed_fragment in normalized_text
+    )
 
 
 def validate_webshop_ltm_inventory_mode(

@@ -463,6 +463,18 @@ class FormalDomainRolloutV3Test(unittest.TestCase):
                 summary = validate_one_record(record)
                 self.assertEqual(summary["valid_rows"], 1)
 
+    def test_runtime_validator_accepts_chat_template_trimmed_observation_whitespace(self):
+        for record_factory in (packed_webshop_v2_record, packed_v3_record):
+            with self.subTest(schema=record_factory.__name__):
+                record = record_factory()
+                record["latest_observation"] = "latest observation\n"
+                record["visible_prompt"] = (
+                    f"<system>{record.get('system_prompt', 'tools')}</system>\n"
+                    "latest observation"
+                )
+                summary = validate_one_record(record)
+                self.assertEqual(summary["valid_rows"], 1)
+
     def test_runtime_validator_accepts_canonical_unicode_system_prompt(self):
         record = packed_v3_record()
         decomposed = "Use the CAFE\u0301 tool contract."
