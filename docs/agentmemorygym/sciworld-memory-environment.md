@@ -16,11 +16,17 @@ This is not meant to prove that the model already knows elementary science facts
 
 ## Non-negotiable memory boundary
 
-For long-horizon SciWorld tasks, the harness must not hand the model a helpful rolling history window.
-The formal task is one continuous native ScienceWorld episode. It must not be
-split into artificial sessions or reset at handcrafted semantic phase
-boundaries merely to create a memory problem. The interaction trace grows
-naturally until the policy decides to compress it.
+The episode/session structure is part of each SciWorld memory surface's
+capability contract. It must not be imposed globally:
+
+- `sciworld_lab_notebook_longhorizon_v1` is one continuous native ScienceWorld
+  episode. Its trace grows naturally until the policy decides to compress it.
+- `sciworld_sop_memory_v1` intentionally spans distinct native episodes/tasks.
+  The local trace resets at a real task boundary while policy-authored external
+  memory persists, so the later task measures procedure transfer.
+
+In either case, the harness must not hand the model a helpful rolling history
+window or add an extra boundary merely to manufacture a memory problem.
 
 Allowed:
 
@@ -29,6 +35,8 @@ Allowed:
 - policy-facing memory tools such as `ADD`, `UPDATE`, `RETRIEVE`, `SUMMARY`, and `FILTER`;
 - policy-authored compaction of the visible trace before it exceeds the model
   context budget;
+- genuine native episode/task boundaries required by a cross-episode surface,
+  with the surface's declared short-term reset and long-term-memory persistence;
 - context failure if the policy refuses to manage its own notes.
 
 Not allowed for the main memory surface:
@@ -123,6 +131,12 @@ Example:
 Boundary:
 
 - this is different from remembering that a specific material was conductive.
+- the formal unit is a multi-episode orbit: learn or refine the SOP in one
+  native task, then reuse it in a semantically distinct later native task;
+- the boundary resets the per-episode trace but preserves policy-authored LTM;
+  a handcrafted split inside one task does not certify SOP transfer.
+- until the native multi-episode orbit driver implements that boundary exactly,
+  the SOP native backend fails closed instead of falling back to one episode.
 
 ### 6. `sciworld_negative_evidence_memory_v1`
 
@@ -223,6 +237,9 @@ This code drop may claim only environment-support progress when it has:
 
 It must not claim full native SciWorld training readiness until the real Java/Python SciWorld runtime smoke passes.
 Fixture phases are static plumbing only. They must not be cited as evidence for
-the continuous long-horizon contract, which additionally requires a native
-single-episode trace that crosses a frozen context-pressure threshold and a
-verifier linking policy-authored compaction/memory to later dependent actions.
+either formal structure. The continuous long-horizon contract additionally
+requires a native single-episode trace that crosses a frozen context-pressure
+threshold and a verifier linking policy-authored compaction/memory to later
+dependent actions. The SOP contract requires at least two distinct native
+episodes/tasks with persistent policy-authored LTM and a verifier linking the
+earlier procedure memory to successful execution in the later task.
