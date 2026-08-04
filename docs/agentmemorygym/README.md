@@ -15,7 +15,7 @@ must not be restored as an experiment path.
 
 ## Procedural shopping stream
 
-The training-only
+The legacy training/control surface
 `agentmemory_webshop_procedural_natural_chain_train_v1` surface generates and
 rule-verifies a task when the environment receives its integer reset index. It
 does not require a materialized JSON task file, per-item human review, or an
@@ -43,6 +43,22 @@ the two branches of every counterfactual pair stay adjacent, and make
 untrained tail. The trainer fails closed on shuffle, invalid batch geometry, or
 mismatched server metadata. PPO accepts only `reseeded_stream`; `fixed_window`
 is reserved for bounded generation and evaluation rather than training.
+
+The v2 mainline keeps the same proof-carrying task provider and native WebShop
+semantics but replaces dedicated memory APIs with an episode-scoped persistent
+workspace:
+
+```text
+agentmemory_webshop_procedural_natural_chain_filesystem_v2
+```
+
+The policy operates ordinary workspace files through Codex-style
+`shell_command` and `apply_patch`. Workspace actions receive zero task reward;
+the shell runs in a networkless, resource-bounded Linux namespace and exposes
+no host path, LTM inventory, or hidden memory-management API. The v1 and v2
+surface IDs remain separate so historical results are reproducible. The
+complete runtime, safety, evidence, and migration contract is in
+[`natural-filesystem-memory-v2.md`](natural-filesystem-memory-v2.md).
 
 For this stream, `data.pt` contains only a versioned sampler cursor plus a
 canonical identity for the index source, complete server metadata, and training

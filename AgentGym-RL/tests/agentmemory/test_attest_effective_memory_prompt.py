@@ -50,6 +50,9 @@ class EffectiveMemoryPromptAttestationTests(unittest.TestCase):
                 *self.module.SELECTIVE_MEMORY_SOP_FRAGMENTS,
             )
         )
+        self.filesystem_prompt = " ".join(
+            self.module.FILESYSTEM_REQUIRED_FRAGMENTS
+        )
 
     def test_lifecycle_prompt_passes_and_records_hash(self) -> None:
         result = self.module.build_attestation(
@@ -294,3 +297,70 @@ class EffectiveMemoryPromptAttestationTests(unittest.TestCase):
                 require_latent_preference_sop=True,
                 surface="agentmemory_webshop_distractor_robustness_top1_train_v1",
             )
+
+    def test_filesystem_surface_passes_and_records_isolated_contract(self) -> None:
+        result = self.module.build_attestation(
+            prompt=self.filesystem_prompt,
+            memory_prompt_mode="natural_filesystem",
+            ltm_inventory_mode="hidden",
+            thinking_enabled=False,
+            reasoning_enabled=True,
+            require_lifecycle_sop=False,
+            surface=self.module.FILESYSTEM_SURFACE,
+        )
+        self.assertTrue(result["filesystem_required"])
+        self.assertTrue(result["filesystem_present"])
+        self.assertEqual(result["missing_filesystem_fragments"], [])
+        self.assertEqual(result["forbidden_filesystem_fragments_present"], [])
+        self.assertFalse(result["lifecycle_sop_present"])
+
+    def test_each_filesystem_fragment_is_fail_closed(self) -> None:
+        for missing_fragment in self.module.FILESYSTEM_REQUIRED_FRAGMENTS:
+            with self.subTest(missing_fragment=missing_fragment):
+                prompt = " ".join(
+                    fragment
+                    for fragment in self.module.FILESYSTEM_REQUIRED_FRAGMENTS
+                    if fragment != missing_fragment
+                )
+                with self.assertRaisesRegex(RuntimeError, "filesystem prompt contract"):
+                    self.module.build_attestation(
+                        prompt=prompt,
+                        memory_prompt_mode="natural_filesystem",
+                        ltm_inventory_mode="hidden",
+                        thinking_enabled=False,
+                        reasoning_enabled=True,
+                        require_lifecycle_sop=False,
+                        surface=self.module.FILESYSTEM_SURFACE,
+                    )
+
+    def test_filesystem_surface_rejects_every_legacy_memory_fragment(self) -> None:
+        for forbidden_fragment in self.module.FILESYSTEM_FORBIDDEN_FRAGMENTS:
+            with self.subTest(forbidden_fragment=forbidden_fragment):
+                with self.assertRaisesRegex(RuntimeError, "filesystem prompt contract"):
+                    self.module.build_attestation(
+                        prompt=f"{self.filesystem_prompt} {forbidden_fragment}",
+                        memory_prompt_mode="natural_filesystem",
+                        ltm_inventory_mode="hidden",
+                        thinking_enabled=False,
+                        reasoning_enabled=True,
+                        require_lifecycle_sop=False,
+                        surface=self.module.FILESYSTEM_SURFACE,
+                    )
+
+    def test_filesystem_prompt_mode_and_surface_must_be_paired(self) -> None:
+        cases = (
+            ("natural_filesystem", None),
+            ("legacy", self.module.FILESYSTEM_SURFACE),
+        )
+        for memory_prompt_mode, surface in cases:
+            with self.subTest(memory_prompt_mode=memory_prompt_mode, surface=surface):
+                with self.assertRaisesRegex(RuntimeError, "must be paired"):
+                    self.module.build_attestation(
+                        prompt=self.filesystem_prompt,
+                        memory_prompt_mode=memory_prompt_mode,
+                        ltm_inventory_mode="hidden",
+                        thinking_enabled=False,
+                        reasoning_enabled=True,
+                        require_lifecycle_sop=False,
+                        surface=surface,
+                    )

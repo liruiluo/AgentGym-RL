@@ -60,6 +60,7 @@ from verl.utils.agentgym.formal_domain_v3 import (
     resolve_formal_runtime_contract,
     validate_formal_env_schema,
     validate_webshop_action_listing_mode,
+    validate_webshop_filesystem_surface,
     validate_webshop_ltm_inventory_mode,
     validate_webshop_memory_prompt_mode,
 )
@@ -175,6 +176,10 @@ def _formal_runtime_contract_for_client(env_client) -> tuple[str, str, str]:
         validate_webshop_memory_prompt_mode(
             info_metadata,
             expected_mode=agentmemory_memory_prompt_mode(),
+        )
+        validate_webshop_filesystem_surface(
+            info_metadata,
+            expected_prompt_mode=agentmemory_memory_prompt_mode(),
         )
         validate_webshop_action_listing_mode(
             info_metadata,

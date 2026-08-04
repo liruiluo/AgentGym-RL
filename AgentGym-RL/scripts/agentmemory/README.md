@@ -10,10 +10,13 @@ already-running AgentMemory HTTP server and an OpenAI-compatible vLLM server.
 It does not import the training stack and has no `torch` dependency.
 
 The driver supports all AgentMemory v3 domain surfaces (Travel, formal
-reasoning, and BrowseComp+) plus the native WebShop v2 surface.  For every
-policy turn it:
+reasoning, and BrowseComp+), the native WebShop v2 surface, and the non-paper
+`agentmemory_webshop_procedural_natural_chain_filesystem_v2` evidence surface.
+For every policy turn it:
 
-1. Reads the canonical v3 `system_prompt` from `/metadata`.
+1. Reads the canonical v3 `system_prompt` from `/metadata`; WebShop v2 surfaces
+   resolve the exact rollout prompt from `verl/workers/rollout/schemas.py` and
+   reject any conflicting server-provided prompt.
 2. Builds exactly two messages: `system` plus the latest `user` observation.
    Prior assistant/environment messages are not sent to the model.
 3. Calls the model at `/v1/chat/completions`.
@@ -68,6 +71,40 @@ per-phase quotas plus explicit memory-action headroom. Use
 
 The evaluator is a behavior/evidence smoke harness.  It does not invoke the
 outer formal PPO validator and does not claim sampled response-token exactness.
+
+For the natural-filesystem surface, `/metadata` must attest the exact
+Codex `shell_command/apply_patch` contract, episode-scoped cross-session
+persistence, namespace-isolated networkless shell, no host-path access,
+positive workspace quotas, and zero workspace-action or memory-specific
+shaping. The evaluator recomputes each workspace manifest's tree SHA-256,
+before/after diff, and contiguous audit ledger. Its diagnostic candidate chain
+is:
+
+```text
+source-session workspace write(path, content_sha256)
+-> correct source-session BUY
+-> written version remains present at a later-session shell_command
+-> correct later-session BUY
+```
+
+Shell audit does not establish that a specific file was read or influenced the
+decision, so this chain is not counted as `functional_memory_chain_count`.
+Workspace-operation counts and this temporal chain are diagnostic behavior
+evidence, not a causal memory-capability result. A capability claim additionally
+requires the frozen `correct`, `blank`, `swapped`, and `no_workspace`
+intervention arms. This surface lives in `EVIDENCE_SURFACE_REGISTRY`, not
+`PAPER_SURFACE_REGISTRY`, and always reports `paper_macro_eligible=false`.
+
+Run those four arms with `eval_filesystem_causal_v2.py` against a dedicated
+`intervention_eval` environment service. The driver first samples policy-owned
+target and paired source workspaces, exports their exact files through the
+authenticated evaluator control plane, replays the exact target source actions
+into four fresh environments, and only then installs the interventions. It
+resamples dependent sessions at `temperature=0`. The private intervention token
+is supplied by `--intervention-token-file`; only its SHA-256 appears in runtime
+metadata or saved evidence. The `no_workspace` arm uses a separate canonical
+system prompt that permits only native WebShop actions, while the other three
+arms use the byte-identical enabled Codex prompt.
 
 ## Metric Contract
 

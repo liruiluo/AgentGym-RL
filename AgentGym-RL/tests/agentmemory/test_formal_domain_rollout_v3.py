@@ -522,6 +522,64 @@ class FormalDomainRolloutV3Test(unittest.TestCase):
         summary = validate_one_record(record)
         self.assertEqual(summary["valid_rows"], 1)
 
+    def test_webshop_v2_binds_apply_patch_to_tool_event(self):
+        record = packed_webshop_v2_record()
+        action = (
+            "apply_patch\n"
+            "*** Begin Patch\n"
+            "*** Add File: .agent_memory/MEMORY.md\n"
+            "+color=gray\n"
+            "*** End Patch"
+        )
+        record["action"] = action
+        record["action_submission"] = {
+            "raw_policy_output": action,
+            "submitted_action": action,
+            "parser_status": "adapter_parsed",
+        }
+        record["env_result"] = "Done!"
+        record["env_info_after"]["session_trace"] = [action]
+        record["env_info_after"]["tool_ops"] = [
+            {
+                "op": "APPLY_PATCH",
+                "step": 1,
+                "raw_action": action,
+                "path": ".agent_memory/MEMORY.md",
+                "workspace_tree_sha256_before": "0" * 64,
+                "workspace_tree_sha256_after": "1" * 64,
+            }
+        ]
+        record["env_info_after"]["reward_components"] = [
+            {
+                "name": "apply_patch_transition",
+                "op": "APPLY_PATCH",
+                "step": 1,
+                "value": 0.0,
+            }
+        ]
+        record["search_result_count"] = None
+        summary = validate_one_record(record)
+        self.assertEqual(summary["valid_rows"], 1)
+
+    def test_webshop_v2_rejects_shell_command_tool_misbinding(self):
+        record = packed_webshop_v2_record()
+        action = (
+            'shell_command {"command":"cat notes.md","workdir":".",'
+            '"timeout_ms":10000}'
+        )
+        record["action"] = action
+        record["action_submission"] = {
+            "raw_policy_output": action,
+            "submitted_action": action,
+            "parser_status": "adapter_parsed",
+        }
+        record["env_info_after"]["tool_ops"][0]["raw_action"] = action
+        with self.assertRaisesRegex(
+            ValueError,
+            "Formal SHELL_COMMAND action is bound to SEARCH",
+        ):
+            validate_one_record(record)
+
     def test_webshop_v2_accepts_server_authoritative_invalid_wrapper(self):
         raw_output = '{"action": "click[Buy Now]"}'
         summary = validate_one_record(

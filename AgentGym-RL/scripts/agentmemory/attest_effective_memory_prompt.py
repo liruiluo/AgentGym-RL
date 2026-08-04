@@ -39,6 +39,9 @@ INTENT_CLARIFICATION_SURFACE = (
 SELECTIVE_MEMORY_USE_SURFACE = (
     "agentmemory_webshop_selective_memory_use_top1_train_v1"
 )
+FILESYSTEM_SURFACE = (
+    "agentmemory_webshop_procedural_natural_chain_filesystem_v2"
+)
 QUERY_TOP1_REQUIRED_FRAGMENTS = (
     "RETRIEVE requires exactly query:string",
     "returns exactly one highest-ranked matching memory",
@@ -60,6 +63,30 @@ SELECTIVE_MEMORY_SOP_FRAGMENTS = (
     "use RETRIEVE to expose the saved current profile",
     "Store new memory only when",
 )
+FILESYSTEM_REQUIRED_FRAGMENTS = (
+    'shell_command {"command":"rg -n pattern ."',
+    "apply_patch is followed on the next line",
+    "*** Begin Patch",
+    "*** End Patch",
+    "workspace persists across shopping sessions within this episode",
+    "Workspace actions have zero task reward",
+    "has no network",
+    "no host-path access",
+    "no dedicated memory API",
+)
+FILESYSTEM_FORBIDDEN_FRAGMENTS = (
+    'Read {"path"',
+    'Write {"path"',
+    'Edit {"path"',
+    'Grep {"pattern"',
+    'Glob {"pattern"',
+    "ADD requires",
+    "RETRIEVE accepts",
+    "memory_id:string",
+    "use ADD before",
+    "use RETRIEVE",
+    "Long-term memory persists",
+)
 
 
 def build_attestation(
@@ -75,6 +102,22 @@ def build_attestation(
 ) -> dict[str, Any]:
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("effective AgentMemory system prompt is empty")
+    filesystem_required = surface == FILESYSTEM_SURFACE
+    if (memory_prompt_mode == "natural_filesystem") != filesystem_required:
+        raise RuntimeError(
+            "natural_filesystem prompt mode and filesystem surface must be paired"
+        )
+    missing_filesystem = [
+        fragment for fragment in FILESYSTEM_REQUIRED_FRAGMENTS if fragment not in prompt
+    ]
+    forbidden_filesystem = [
+        fragment for fragment in FILESYSTEM_FORBIDDEN_FRAGMENTS if fragment in prompt
+    ]
+    if filesystem_required and (missing_filesystem or forbidden_filesystem):
+        raise RuntimeError(
+            "effective AgentMemory filesystem prompt contract is invalid: "
+            f"missing={missing_filesystem} forbidden={forbidden_filesystem}"
+        )
     query_top1_required = surface in QUERY_TOP1_SURFACES
     required_lifecycle_fragments = tuple(
         fragment
@@ -186,6 +229,10 @@ def build_attestation(
         "selective_memory_required": selective_memory_required,
         "selective_memory_present": not missing_selective_memory,
         "missing_selective_memory_fragments": missing_selective_memory,
+        "filesystem_required": filesystem_required,
+        "filesystem_present": not missing_filesystem and not forbidden_filesystem,
+        "missing_filesystem_fragments": missing_filesystem,
+        "forbidden_filesystem_fragments_present": forbidden_filesystem,
         "system_prompt_chars": len(prompt),
         "system_prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
         "system_prompt": prompt,

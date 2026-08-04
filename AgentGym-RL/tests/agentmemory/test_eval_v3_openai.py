@@ -57,12 +57,296 @@ class _Response:
         return json.dumps(self.payload).encode("utf-8")
 
 
+def _filesystem_snapshot(files=(), directories=()):
+    manifest = [
+        {"path": path, "sha256": sha256, "bytes": size}
+        for path, sha256, size in sorted(files)
+    ]
+    directory_set = set(directories)
+    for item in manifest:
+        parts = item["path"].split("/")[:-1]
+        directory_set.update("/".join(parts[:index]) for index in range(1, len(parts) + 1))
+    directory_manifest = sorted(directory_set)
+    encoded = json.dumps(
+        {"directories": directory_manifest, "files": manifest},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        "schema": "agentmemory_workspace_snapshot_v2",
+        "file_count": len(manifest),
+        "directory_count": len(directory_manifest),
+        "total_bytes": sum(item["bytes"] for item in manifest),
+        "directories": directory_manifest,
+        "files": manifest,
+        "tree_sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def _filesystem_metadata():
+    workspace_limits = {
+        "max_path_chars": 240,
+        "max_files": 64,
+        "max_directories": 64,
+        "max_file_bytes": 65_536,
+        "max_total_bytes": 524_288,
+        "max_command_chars": 32_768,
+        "max_patch_bytes": 262_144,
+        "default_timeout_ms": 10_000,
+        "max_timeout_ms": 30_000,
+        "cpu_seconds": 10,
+        "address_space_bytes": 1_073_741_824,
+        "max_processes": 32,
+        "max_open_files": 64,
+        "stdout_bytes": 16_384,
+        "stderr_bytes": 16_384,
+        "tmp_bytes": 67_108_864,
+        "tmp_inodes": 512,
+    }
+    sandbox_resources = {
+        name: workspace_limits[name]
+        for name in MODULE.FILESYSTEM_SANDBOX_SHARED_LIMIT_FIELDS
+    }
+    sandbox_resources.update(
+        {
+            "workspace_bytes": workspace_limits["max_total_bytes"],
+            "workspace_inodes": (
+                workspace_limits["max_files"]
+                + workspace_limits["max_directories"]
+                + 1
+            ),
+        }
+    )
+    return {
+        "surface": MODULE.FILESYSTEM_WEBSHOP_V2_SURFACE,
+        "paper_eligible": False,
+        "memory_prompt_mode": "natural_filesystem",
+        "memory_management": "policy_managed_persistent_workspace",
+        "workspace_surface": "codex_workspace_v2",
+        "workspace_tool_contract": "codex_shell_command_apply_patch_v1",
+        "workspace_tool_ops": list(MODULE.FILESYSTEM_TOOL_OPS),
+        "workspace_persistence": "episode_across_sessions",
+        "workspace_episode_isolation": True,
+        "workspace_shell_enabled": True,
+        "workspace_apply_patch_enabled": True,
+        "workspace_host_path_exposed": False,
+        "workspace_limits": workspace_limits,
+        "workspace_sandbox": {
+            **MODULE.FILESYSTEM_SANDBOX_FIELDS,
+            "ripgrep_sha256": "c" * 64,
+            "ripgrep_expected_sha256": "c" * 64,
+            "ripgrep_version": "ripgrep 15.1.0",
+            "ripgrep_startup_fingerprint": {
+                "device": 1,
+                "inode": 2,
+                "mode": 33_237,
+                "size": 5_000_000,
+                "mtime_ns": 1,
+                "ctime_ns": 1,
+            },
+            "resource_limits": sandbox_resources,
+        },
+        "reward_contract": {
+            "workspace_action_reward": 0.0,
+            "shell_command_reward": 0.0,
+            "apply_patch_reward": 0.0,
+            "memory_specific_shaping": "none",
+        },
+    }
+
+
+def _resolved_filesystem_metadata():
+    metadata = _filesystem_metadata()
+    prompt = MODULE.FILESYSTEM_WEBSHOP_SYSTEM_PROMPT
+    metadata.update(
+        {
+            "system_prompt": prompt,
+            "system_prompt_sha256": hashlib.sha256(
+                prompt.encode("utf-8")
+            ).hexdigest(),
+            "system_prompt_source": "webshop_v2_rollout_fallback",
+        }
+    )
+    return metadata
+
+
+def _filesystem_info(
+    session_index,
+    *,
+    snapshot,
+    audit_count,
+    tool_ops=(),
+    workspace_ops=(),
+    latest_event=None,
+    episode_success=False,
+):
+    return {
+        "current_subtask_index": session_index,
+        "phase_count": 2,
+        "episode_success": episode_success,
+        "reward_components": [],
+        "tool_ops": list(tool_ops),
+        "workspace_ops": list(workspace_ops),
+        "memory_ops": [],
+        "workspace_surface": "codex_workspace_v2",
+        "workspace_tool_contract": "codex_shell_command_apply_patch_v1",
+        "workspace_tool_ops": ["SHELL_COMMAND", "APPLY_PATCH"],
+        "workspace_intervention": "enabled",
+        "workspace_shell_enabled": True,
+        "workspace_apply_patch_enabled": True,
+        "workspace_snapshot": copy.deepcopy(snapshot),
+        "workspace_audit_event_count": audit_count,
+        "workspace_latest_event": copy.deepcopy(latest_event),
+    }
+
+
+def _workspace_diff(before, after):
+    before_files = {item["path"]: item for item in before["files"]}
+    after_files = {item["path"]: item for item in after["files"]}
+    before_paths = set(before_files)
+    after_paths = set(after_files)
+    return {
+        "added": [after_files[path] for path in sorted(after_paths - before_paths)],
+        "modified": [
+            {"before": before_files[path], "after": after_files[path]}
+            for path in sorted(before_paths & after_paths)
+            if before_files[path]["sha256"] != after_files[path]["sha256"]
+        ],
+        "deleted": [before_files[path] for path in sorted(before_paths - after_paths)],
+        "directories_added": sorted(
+            set(after["directories"]) - set(before["directories"])
+        ),
+        "directories_deleted": sorted(
+            set(before["directories"]) - set(after["directories"])
+        ),
+    }
+
+
+def _filesystem_eval_episode():
+    path = ".agent_memory/MEMORY.md"
+    content = b"selected finish: black"
+    content_sha = hashlib.sha256(content).hexdigest()
+    empty = _filesystem_snapshot()
+    written = _filesystem_snapshot(((path, content_sha, len(content)),))
+    write = {
+        "event_id": 0,
+        "op": "APPLY_PATCH",
+        "status": "executed",
+        "phase_index": 0,
+        "transactional": True,
+        "workspace_tree_sha256_before": empty["tree_sha256"],
+        "workspace_tree_sha256_after": written["tree_sha256"],
+        "workspace_diff": _workspace_diff(empty, written),
+    }
+    shell = {
+        "event_id": 1,
+        "op": "SHELL_COMMAND",
+        "status": "executed",
+        "phase_index": 1,
+        "exit_code": 0,
+        "timed_out": False,
+        "workspace_tree_sha256_before": written["tree_sha256"],
+        "workspace_tree_sha256_after": written["tree_sha256"],
+        "workspace_diff": _workspace_diff(written, written),
+    }
+    initial = _filesystem_info(
+        0, snapshot=empty, audit_count=0
+    )
+    after_write = _filesystem_info(
+        0,
+        snapshot=written,
+        audit_count=1,
+        tool_ops=(write,),
+        workspace_ops=(write,),
+        latest_event=write,
+    )
+    buy0 = {
+        "op": "BUY",
+        "committed": True,
+        "purchase_correct": True,
+        "session_advanced": True,
+    }
+    after_buy0 = _filesystem_info(
+        1,
+        snapshot=written,
+        audit_count=1,
+        tool_ops=(buy0,),
+    )
+    after_shell = _filesystem_info(
+        1,
+        snapshot=written,
+        audit_count=2,
+        tool_ops=(shell,),
+        workspace_ops=(shell,),
+        latest_event=shell,
+    )
+    buy1 = {
+        "op": "BUY",
+        "committed": True,
+        "purchase_correct": True,
+        "session_advanced": True,
+    }
+    after_buy1 = _filesystem_info(
+        2,
+        snapshot=written,
+        audit_count=2,
+        tool_ops=(buy1,),
+        episode_success=True,
+    )
+    steps = [
+        {
+            "action_submitted": "apply_patch\n*** Begin Patch\n*** Add File: .agent_memory/MEMORY.md\n+selected finish: black\n*** End Patch",
+            "env_info_before": initial,
+            "env_info_after": after_write,
+            "reward": 0.0,
+            "done": False,
+            "episode_success": False,
+        },
+        {
+            "action_submitted": 'BUY {"product_id":"B01"}',
+            "env_info_before": after_write,
+            "env_info_after": after_buy0,
+            "reward": 1.0,
+            "done": False,
+            "episode_success": False,
+        },
+        {
+            "action_submitted": 'shell_command {"command":"rg -n \'selected finish\' .agent_memory/MEMORY.md","workdir":".","timeout_ms":10000}',
+            "env_info_before": after_buy0,
+            "env_info_after": after_shell,
+            "reward": 0.0,
+            "done": False,
+            "episode_success": False,
+        },
+        {
+            "action_submitted": 'BUY {"product_id":"B02"}',
+            "env_info_before": after_shell,
+            "env_info_after": after_buy1,
+            "reward": 1.0,
+            "done": True,
+            "episode_success": True,
+        },
+    ]
+    return {
+        "data_idx": 0,
+        "initial_env_info": initial,
+        "steps": steps,
+        "episode_return": 2.0,
+        "done": True,
+        "episode_success": True,
+        "timed_out": False,
+        "final_phase_progress": {"phase_index_after": 2, "phase_count": 2},
+    }
+
+
 class _FakeOpen:
     def __init__(self, metadata, *, model_text="Action: ADVANCE {}"):
         self.metadata = metadata
         self.model_text = model_text
         self.requests = []
         self.authorization_headers = []
+        self.request_headers = []
         self.env_info_before = {
             "formal_schema_version": MODULE.FORMAL_SCHEMA_V3,
             "phase_index": 0,
@@ -88,6 +372,12 @@ class _FakeOpen:
         self.requests.append((request.get_method(), request.full_url, body))
         self.authorization_headers.append(
             (request.full_url, request.get_header("Authorization"))
+        )
+        self.request_headers.append(
+            {
+                name.lower(): value
+                for name, value in request.header_items()
+            }
         )
         url = request.full_url
         if request.get_method() == "GET" and url.endswith("/metadata"):
@@ -127,6 +417,52 @@ class _FakeOpen:
                             "finish_reason": "stop",
                         }
                     ],
+                }
+            )
+        if url.endswith("/workspace-intervention"):
+            return _Response(
+                {
+                    "id": 7,
+                    "observation": "dependent session",
+                    "reward": 0.0,
+                    "done": False,
+                    "info": {
+                        **self.env_info_before,
+                        "workspace_causal_arm": body["arm"],
+                    },
+                }
+            )
+        if url.endswith("/workspace-export"):
+            content = b"black"
+            digest = hashlib.sha256(content).hexdigest()
+            files = [{"path": "MEMORY.md", "sha256": digest, "bytes": 5}]
+            manifest = json.dumps(
+                {"directories": [], "files": files},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            return _Response(
+                {
+                    "schema": "agentmemory_workspace_authenticated_export_v1",
+                    "id": 7,
+                    "data_idx": 0,
+                    "workspace_state": {
+                        "schema": "agentmemory_workspace_transfer_state_v1",
+                        "file_count": 1,
+                        "directory_count": 0,
+                        "total_bytes": 5,
+                        "directories": [],
+                        "files": [
+                            {
+                                **files[0],
+                                "content_base64": "YmxhY2s=",
+                            }
+                        ],
+                        "tree_sha256": hashlib.sha256(manifest).hexdigest(),
+                    },
+                    "policy_authored": True,
+                    "hidden_answer_injection": False,
                 }
             )
         if url.endswith("/step"):
@@ -1455,6 +1791,23 @@ class EvalV3OpenAITest(unittest.TestCase):
             MODULE.LEGACY_WEBSHOP_SYSTEM_PROMPT,
             schemas.agentmemory_action_system_prompt(),
         )
+        self.assertEqual(
+            MODULE.FILESYSTEM_WEBSHOP_SYSTEM_PROMPT,
+            schemas.agentmemory_action_system_prompt(
+                ltm_inventory_mode="hidden",
+                memory_prompt_mode="natural_filesystem",
+                surface=MODULE.FILESYSTEM_WEBSHOP_V2_SURFACE,
+            ),
+        )
+        self.assertEqual(
+            MODULE.FILESYSTEM_WEBSHOP_NO_WORKSPACE_SYSTEM_PROMPT,
+            schemas.agentmemory_action_system_prompt(
+                ltm_inventory_mode="hidden",
+                memory_prompt_mode="natural_filesystem",
+                surface=MODULE.FILESYSTEM_WEBSHOP_V2_SURFACE,
+                workspace_enabled=False,
+            ),
+        )
 
     def test_readme_pins_five_surface_paper_macro(self):
         readme = (ROOT / "scripts/agentmemory/README.md").read_text(
@@ -1471,6 +1824,235 @@ class EvalV3OpenAITest(unittest.TestCase):
         self.assertIn("paper_macro_eligible=false", readme)
         self.assertIn(MODULE.TRAVEL_FAILFAST_SURFACE, readme)
         self.assertIn(MODULE.TRAVEL_PAPER_EVAL_SURFACE, readme)
+
+    def test_filesystem_surface_is_registered_as_nonpaper_and_validated(self):
+        metadata = _filesystem_metadata()
+        self.assertNotIn("formal_schema_version", metadata)
+        self.assertNotIn("system_prompt", metadata)
+        self.assertNotIn(
+            MODULE.FILESYSTEM_WEBSHOP_V2_SURFACE,
+            MODULE.PAPER_SURFACE_REGISTRY,
+        )
+        self.assertFalse(
+            MODULE.EVIDENCE_SURFACE_REGISTRY[
+                MODULE.FILESYSTEM_WEBSHOP_V2_SURFACE
+            ]["paper_macro_eligible"]
+        )
+        fake = _FakeOpen(metadata)
+        env = MODULE.AgentMemoryEnvClient(
+            "http://env.test", MODULE.JsonHttp(opener=fake)
+        )
+        try:
+            self.assertEqual(env.surface, MODULE.FILESYSTEM_WEBSHOP_V2_SURFACE)
+            self.assertEqual(env.metadata["memory_prompt_mode"], "natural_filesystem")
+            self.assertEqual(
+                env.system_prompt_source,
+                "webshop_v2_rollout_fallback",
+            )
+            self.assertEqual(
+                env.system_prompt,
+                MODULE.FILESYSTEM_WEBSHOP_SYSTEM_PROMPT,
+            )
+            MODULE.validate_filesystem_surface_metadata(env.metadata)
+        finally:
+            env.close()
+
+        tampered_cases = {
+            "shell disabled": lambda item: item.__setitem__("workspace_shell_enabled", False),
+            "patch disabled": lambda item: item.__setitem__("workspace_apply_patch_enabled", False),
+            "legacy inventory": lambda item: item.__setitem__("ltm_inventory_mode", "keys"),
+            "wrong tool contract": lambda item: item.__setitem__(
+                "workspace_tool_contract", "general_file_tools_v2"
+            ),
+            "missing limit": lambda item: item["workspace_limits"].pop(
+                "stderr_bytes"
+            ),
+            "missing sandbox": lambda item: item.pop("workspace_sandbox"),
+            "host network": lambda item: item["workspace_sandbox"].__setitem__(
+                "network", "host"
+            ),
+            "privileges enabled": lambda item: item["workspace_sandbox"].__setitem__(
+                "no_new_privileges", False
+            ),
+            "shared uid": lambda item: item["workspace_sandbox"].__setitem__(
+                "model_identity", "random_shared_uid"
+            ),
+            "ripgrep digest drift": lambda item: item["workspace_sandbox"].__setitem__(
+                "ripgrep_sha256", "d" * 64
+            ),
+            "missing ripgrep fingerprint": lambda item: item[
+                "workspace_sandbox"
+            ].pop("ripgrep_startup_fingerprint"),
+            "sandbox limit drift": lambda item: item["workspace_sandbox"][
+                "resource_limits"
+            ].__setitem__("max_processes", 31),
+            "reward shaping": lambda item: item["reward_contract"].__setitem__(
+                "workspace_action_reward", 0.1
+            ),
+            "legacy prompt": lambda item: item.__setitem__(
+                "system_prompt",
+                MODULE.FILESYSTEM_WEBSHOP_SYSTEM_PROMPT
+                + " ADD requires key:string",
+            ),
+        }
+        for label, mutate in tampered_cases.items():
+            drift = copy.deepcopy(metadata)
+            mutate(drift)
+            if label == "legacy prompt":
+                drift["system_prompt_sha256"] = hashlib.sha256(
+                    drift["system_prompt"].encode("utf-8")
+                ).hexdigest()
+            with self.subTest(label=label), self.assertRaises(MODULE.EvalError):
+                MODULE.AgentMemoryEnvClient(
+                    "http://env.test",
+                    MODULE.JsonHttp(opener=_FakeOpen(drift)),
+                )
+
+    def test_filesystem_intervention_control_is_token_and_source_bound(self):
+        token = "intervention-secret-" + "x" * 32
+        metadata = _filesystem_metadata()
+        prompt = MODULE.FILESYSTEM_WEBSHOP_SYSTEM_PROMPT
+        metadata.update(
+            {
+                "system_prompt": prompt,
+                "system_prompt_sha256": hashlib.sha256(
+                    prompt.encode("utf-8")
+                ).hexdigest(),
+                "service": {
+                    "role": "intervention_eval",
+                    "runtime_source_id": "a" * 40,
+                },
+                "workspace_intervention_control": {
+                    "enabled": True,
+                    "contract": (
+                        "authenticated_first_boundary_counterfactual_copy_v1"
+                    ),
+                    "allowed_arms": list(MODULE.FILESYSTEM_CAUSAL_ARMS),
+                    "boundary_session_index": 1,
+                    "source_state": "policy_authored_workspace_only",
+                    "authenticated_export": True,
+                    "hidden_answer_injection": False,
+                    "token_sha256": hashlib.sha256(
+                        token.encode("utf-8")
+                    ).hexdigest(),
+                },
+            }
+        )
+        MODULE.validate_filesystem_intervention_control(metadata, token=token)
+        for label, mutate in (
+            ("wrong role", lambda item: item["service"].__setitem__("role", "smoke")),
+            (
+                "answer injection",
+                lambda item: item["workspace_intervention_control"].__setitem__(
+                    "hidden_answer_injection", True
+                ),
+            ),
+            (
+                "wrong arm order",
+                lambda item: item["workspace_intervention_control"].__setitem__(
+                    "allowed_arms", list(reversed(MODULE.FILESYSTEM_CAUSAL_ARMS))
+                ),
+            ),
+        ):
+            drift = copy.deepcopy(metadata)
+            mutate(drift)
+            with self.subTest(label=label), self.assertRaises(MODULE.EvalError):
+                MODULE.validate_filesystem_intervention_control(drift, token=token)
+        with self.assertRaisesRegex(MODULE.EvalError, "token"):
+            MODULE.validate_filesystem_intervention_control(
+                metadata,
+                token="wrong-token-" + "y" * 32,
+            )
+
+    def test_client_submits_authenticated_workspace_intervention_header(self):
+        metadata = _filesystem_metadata()
+        fake = _FakeOpen(metadata)
+        env = MODULE.AgentMemoryEnvClient(
+            "http://env.test", MODULE.JsonHttp(opener=fake)
+        )
+        token = "t" * 48
+        try:
+            result = env.workspace_intervention(
+                "swapped",
+                token=token,
+                source_env_id=11,
+            )
+            self.assertEqual(result["info"]["workspace_causal_arm"], "swapped")
+            request = next(
+                item
+                for item in fake.requests
+                if item[1].endswith("/workspace-intervention")
+            )
+            self.assertEqual(
+                request[2],
+                {"id": 7, "arm": "swapped", "source_env_id": 11},
+            )
+            header_index = fake.requests.index(request)
+            self.assertEqual(
+                fake.request_headers[header_index][
+                    "x-agentmemory-intervention-token"
+                ],
+                token,
+            )
+        finally:
+            env.close()
+
+    def test_client_exports_exact_policy_workspace_out_of_band(self):
+        fake = _FakeOpen(_filesystem_metadata())
+        env = MODULE.AgentMemoryEnvClient(
+            "http://env.test", MODULE.JsonHttp(opener=fake)
+        )
+        token = "e" * 48
+        try:
+            exported = env.workspace_export(token=token)
+            self.assertTrue(exported["policy_authored"])
+            self.assertFalse(exported["hidden_answer_injection"])
+            self.assertEqual(exported["workspace_state"]["file_count"], 1)
+            request = next(
+                item for item in fake.requests if item[1].endswith("/workspace-export")
+            )
+            self.assertEqual(request[2], {"id": 7})
+            header_index = fake.requests.index(request)
+            self.assertEqual(
+                fake.request_headers[header_index][
+                    "x-agentmemory-intervention-token"
+                ],
+                token,
+            )
+        finally:
+            env.close()
+
+    def test_filesystem_summary_reports_candidate_chain_not_exact_read(self):
+        episode = _filesystem_eval_episode()
+        summary = MODULE.summarize_paper_surface(
+            [episode], _resolved_filesystem_metadata()
+        )
+        metrics = summary["filesystem_metrics"]
+        self.assertEqual(summary["evidence_metric_mode"], "filesystem_behavior_v2")
+        self.assertFalse(summary["paper_macro_eligible"])
+        self.assertFalse(summary["operation_counts_prove_memory_capability"])
+        self.assertTrue(summary["causal_intervention_required"])
+        self.assertEqual(
+            summary["filesystem_evidence_contract"],
+            "auditable_workspace_mutation_later_shell_candidate_chain_v2",
+        )
+        self.assertEqual(metrics["workspace_apply_patch_count"], 1.0)
+        self.assertEqual(metrics["workspace_shell_command_count"], 1.0)
+        self.assertEqual(metrics["later_session_shell_after_source_write_count"], 1.0)
+        self.assertEqual(
+            metrics["workspace_cross_session_success_candidate_count"], 1.0
+        )
+        self.assertEqual(metrics["functional_memory_chain_count"], 0.0)
+
+        wrong_tree = copy.deepcopy(episode)
+        after = wrong_tree["steps"][2]["env_info_after"]
+        for field in ("workspace_ops", "tool_ops"):
+            after[field][0]["workspace_tree_sha256_before"] = "f" * 64
+        after["workspace_latest_event"]["workspace_tree_sha256_before"] = "f" * 64
+        with self.assertRaisesRegex(MODULE.EvalError, "before-tree hash breaks continuity"):
+            MODULE.summarize_filesystem_surface(
+                [wrong_tree], _resolved_filesystem_metadata()
+            )
 
     def test_one_episode_records_latest_prompt_and_reward_ledger(self):
         system_prompt = "Canonical test prompt: use ADVANCE {}."
@@ -1721,6 +2303,27 @@ class EvalV3OpenAITest(unittest.TestCase):
             if method == "POST" and url.endswith("/step")
         ]
         self.assertEqual(step_requests[-1]["action"], "search[item]")
+
+    def test_filesystem_v2_react_parser_preserves_codex_tool_actions(self):
+        shell = 'shell_command {"command":"rg -n black .","workdir":"."}'
+        patch_action = (
+            "apply_patch\n*** Begin Patch\n"
+            "*** Add File: MEMORY.md\n+finish=black\n*** End Patch"
+        )
+        for action in (shell, patch_action):
+            with self.subTest(action=action.splitlines()[0]):
+                response = f"Thought: use the workspace\nAction:\n{action}"
+                self.assertEqual(
+                    MODULE.extract_webshop_v2_action(
+                        response,
+                        allow_workspace=True,
+                    ),
+                    action,
+                )
+                self.assertEqual(
+                    MODULE.extract_webshop_v2_action(response),
+                    response,
+                )
 
     def test_native_webshop_v2_derives_key_inventory_prompt_from_server(self):
         metadata = {

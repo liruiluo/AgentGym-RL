@@ -562,6 +562,11 @@ _MEMORY_ACTION_RE = re.compile(
     r"\A(ADD|UPDATE|DELETE|RETRIEVE|SUMMARY|FILTER)\s+(\{.*\})\Z",
     re.DOTALL,
 )
+_SHELL_COMMAND_ACTION_RE = re.compile(
+    r"\Ashell_command\s+(\{.*\})\Z",
+    re.DOTALL,
+)
+_APPLY_PATCH_ACTION_PREFIX = "apply_patch\n"
 
 
 def _parse_formal_native_action(action: Any, *, row_index: int) -> tuple[str, str]:
@@ -578,15 +583,37 @@ def _parse_formal_native_action(action: Any, *, row_index: int) -> tuple[str, st
         return native_match.group(1).upper(), argument
 
     memory_match = _MEMORY_ACTION_RE.fullmatch(text)
-    if memory_match is None:
-        raise ValueError(f"Formal action has unsupported native syntax at row {row_index}.")
-    try:
-        payload = json.loads(memory_match.group(2))
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Formal memory action has invalid JSON at row {row_index}.") from exc
-    if not isinstance(payload, dict):
-        raise ValueError(f"Formal memory action payload is not an object at row {row_index}.")
-    return memory_match.group(1), memory_match.group(2)
+    if memory_match is not None:
+        try:
+            payload = json.loads(memory_match.group(2))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Formal memory action has invalid JSON at row {row_index}.") from exc
+        if not isinstance(payload, dict):
+            raise ValueError(f"Formal memory action payload is not an object at row {row_index}.")
+        return memory_match.group(1), memory_match.group(2)
+
+    shell_match = _SHELL_COMMAND_ACTION_RE.fullmatch(text)
+    if shell_match is not None:
+        try:
+            payload = json.loads(shell_match.group(1))
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Formal shell_command action has invalid JSON at row {row_index}."
+            ) from exc
+        if not isinstance(payload, dict):
+            raise ValueError(
+                f"Formal shell_command payload is not an object at row {row_index}."
+            )
+        return "SHELL_COMMAND", shell_match.group(1)
+
+    if text.startswith(_APPLY_PATCH_ACTION_PREFIX):
+        patch = text[len(_APPLY_PATCH_ACTION_PREFIX) :]
+        if not patch.strip():
+            raise ValueError(
+                f"Formal apply_patch action is empty at row {row_index}."
+            )
+        return "APPLY_PATCH", patch
+    raise ValueError(f"Formal action has unsupported native syntax at row {row_index}.")
 
 
 def _resolve_formal_native_action_op(
@@ -1477,6 +1504,8 @@ def _validate_formal_step_record(
         "RETRIEVE",
         "SUMMARY",
         "FILTER",
+        "SHELL_COMMAND",
+        "APPLY_PATCH",
         "SEARCH",
         "CLICK",
         "PAGE",

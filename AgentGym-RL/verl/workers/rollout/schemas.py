@@ -36,6 +36,12 @@ AGENTMEMORY_MEMORY_PROMPT_MODES = (
     "neutral_horizon_responsibility",
     "latent_preference_sop",
     "selective_memory_sop",
+    "natural_filesystem",
+)
+
+NATURAL_FILESYSTEM_PROMPT_MODE = "natural_filesystem"
+NATURAL_FILESYSTEM_SURFACE = (
+    "agentmemory_webshop_procedural_natural_chain_filesystem_v2"
 )
 
 
@@ -170,6 +176,113 @@ _AGENTMEMORY_SELECTIVE_MEMORY_SOP = (
     "the customer's profile preference, use RETRIEVE to expose the saved current "
     "profile before choosing. Store new memory only when the episode provides new "
     "information that a later session will actually need."
+)
+
+# The filesystem surface deliberately has its own prompt family.  Reusing the
+# legacy action contract here would silently teach the policy that a dedicated
+# memory API exists, which is exactly the scaffold this surface is meant to
+# remove.
+_AGENTMEMORY_FILESYSTEM_REPLY_RULE_NO_THINKING = (
+    "Reply with exactly one executable action and nothing else: either one native browser "
+    "action, one shell_command JSON action, or one multiline apply_patch action. Output "
+    "excludes markdown, explanations, Thought/Action labels, and <think> blocks. "
+)
+_AGENTMEMORY_FILESYSTEM_REPLY_RULE_THINKING = (
+    "You may first reason inside a single <think>...</think> block. After the closing "
+    "</think>, reply with exactly one executable action and nothing else: either one native "
+    "browser action, one shell_command JSON action, or one multiline apply_patch action. "
+    "Apart from that optional <think> block, output excludes markdown, explanations, and "
+    "Thought/Action labels. "
+)
+_AGENTMEMORY_FILESYSTEM_REPLY_RULE_REASONING = (
+    "Reply with exactly two labeled fields. Write `Thought:` followed by brief free-form "
+    "reasoning, then write `Action:` followed by exactly one executable action: either one "
+    "native browser action, one shell_command JSON action, or one multiline apply_patch "
+    "action. The environment executes only the complete action after the final `Action:` "
+    "label, while PPO trains the complete sampled Thought-and-Action response. Output "
+    "excludes markdown and <think> blocks. "
+)
+_AGENTMEMORY_NO_WORKSPACE_REPLY_RULE_NO_THINKING = (
+    "Reply with exactly one executable native browser action and nothing else. Output "
+    "excludes markdown, explanations, Thought/Action labels, and <think> blocks. "
+)
+_AGENTMEMORY_NO_WORKSPACE_REPLY_RULE_THINKING = (
+    "You may first reason inside a single <think>...</think> block. After the closing "
+    "</think>, reply with exactly one executable native browser action and nothing else. "
+    "Apart from that optional <think> block, output excludes markdown, explanations, and "
+    "Thought/Action labels. "
+)
+_AGENTMEMORY_NO_WORKSPACE_REPLY_RULE_REASONING = (
+    "Reply with exactly two labeled fields. Write `Thought:` followed by brief free-form "
+    "reasoning, then write `Action:` followed by exactly one executable native browser "
+    "action. The environment executes only the complete action after the final `Action:` "
+    "label, while PPO trains the complete sampled Thought-and-Action response. Output "
+    "excludes markdown and <think> blocks. "
+)
+_AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT = (
+    "Native browser actions use square-bracket syntax. search[keywords] searches the visible "
+    "catalog. click[value] clicks one value in the current available-actions list; an ASIN "
+    "opens that product page, and click[Buy Now] commits the current shopping session. A "
+    "correct purchase advances to the next session; an incorrect purchase terminates the "
+    "episode. A product page exposes its title, price, rating, sub-pages, options, and the "
+    "Buy Now action. Two Codex-style workspace tools operate on a private episode workspace. "
+    'shell_command {"command":"rg -n pattern .","workdir":".","timeout_ms":10000} '
+    "runs one shell command; command is required and workdir and timeout_ms are optional. "
+    "The shell includes ordinary file utilities and pinned rg, has no network, and runs with "
+    "bounded time, output, processes, storage, and privileges. apply_patch is followed on the "
+    "next line by one Codex patch beginning with *** Begin Patch and ending with *** End Patch; "
+    "it supports Add File, Update File, Delete File, and Move to. "
+    "The workspace persists across shopping sessions within this episode, permits ordinary "
+    "nested files, and is reset between episodes. Workspace actions have zero task reward "
+    "and are optional; use them when a later decision needs a fact that is no longer in the "
+    "current observation. There is no host-path access and no dedicated memory API. Use one "
+    "browser or workspace action per turn."
+)
+_AGENTMEMORY_NO_WORKSPACE_ACTION_CONTRACT = (
+    "Native browser actions use square-bracket syntax. search[keywords] searches the visible "
+    "catalog. click[value] clicks one value in the current available-actions list; an ASIN "
+    "opens that product page, and click[Buy Now] commits the current shopping session. A "
+    "correct purchase advances to the next session; an incorrect purchase terminates the "
+    "episode. A product page exposes its title, price, rating, sub-pages, options, and the "
+    "Buy Now action. This causal intervention provides no persistent workspace: "
+    "shell_command and apply_patch are unavailable and invalid. Use one native browser "
+    "action per turn."
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_NATURAL_FILESYSTEM = (
+    "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
+    "with a persistent workspace. "
+    + _AGENTMEMORY_FILESYSTEM_REPLY_RULE_NO_THINKING
+    + _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NATURAL_FILESYSTEM = (
+    "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
+    "with a persistent workspace. "
+    + _AGENTMEMORY_FILESYSTEM_REPLY_RULE_THINKING
+    + _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NATURAL_FILESYSTEM = (
+    "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
+    "with a persistent workspace. "
+    + _AGENTMEMORY_FILESYSTEM_REPLY_RULE_REASONING
+    + _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_NO_WORKSPACE = (
+    "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
+    "without a persistent workspace. "
+    + _AGENTMEMORY_NO_WORKSPACE_REPLY_RULE_NO_THINKING
+    + _AGENTMEMORY_NO_WORKSPACE_ACTION_CONTRACT
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NO_WORKSPACE = (
+    "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
+    "without a persistent workspace. "
+    + _AGENTMEMORY_NO_WORKSPACE_REPLY_RULE_THINKING
+    + _AGENTMEMORY_NO_WORKSPACE_ACTION_CONTRACT
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NO_WORKSPACE = (
+    "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
+    "without a persistent workspace. "
+    + _AGENTMEMORY_NO_WORKSPACE_REPLY_RULE_REASONING
+    + _AGENTMEMORY_NO_WORKSPACE_ACTION_CONTRACT
 )
 
 AGENTMEMORY_QUERY_TOP1_SURFACES = frozenset(
@@ -373,6 +486,7 @@ def agentmemory_action_system_prompt(
     ltm_inventory_mode: str | None = None,
     memory_prompt_mode: str | None = None,
     surface: str | None = None,
+    workspace_enabled: bool = True,
 ) -> str:
     # Pick the reply rule that matches the active thinking mode so the prompt
     # never contradicts what the chat template does with <think>.
@@ -394,6 +508,33 @@ def agentmemory_action_system_prompt(
             + ", ".join(AGENTMEMORY_MEMORY_PROMPT_MODES)
             + "."
         )
+    if type(workspace_enabled) is not bool:
+        raise ValueError("workspace_enabled must be boolean.")
+    if not workspace_enabled and prompt_mode != NATURAL_FILESYSTEM_PROMPT_MODE:
+        raise ValueError(
+            "workspace_enabled=False is valid only for natural_filesystem."
+        )
+    if prompt_mode == NATURAL_FILESYSTEM_PROMPT_MODE:
+        if inventory_mode != "hidden":
+            raise ValueError(
+                "natural_filesystem requires ltm_inventory_mode='hidden'."
+            )
+        if surface not in (None, NATURAL_FILESYSTEM_SURFACE):
+            raise ValueError(
+                "natural_filesystem is only valid for the persistent-workspace "
+                f"surface {NATURAL_FILESYSTEM_SURFACE!r}."
+            )
+        if not workspace_enabled:
+            if _agentmemory_thinking_enabled():
+                return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NO_WORKSPACE
+            if _agentmemory_reasoning_enabled():
+                return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NO_WORKSPACE
+            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_NO_WORKSPACE
+        if _agentmemory_thinking_enabled():
+            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NATURAL_FILESYSTEM
+        if _agentmemory_reasoning_enabled():
+            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NATURAL_FILESYSTEM
+        return AGENTMEMORY_ACTION_SYSTEM_PROMPT_NATURAL_FILESYSTEM
     key_inventory = inventory_mode == "keys"
     latent_preference = prompt_mode == "latent_preference_sop"
     selective_memory = prompt_mode == "selective_memory_sop"

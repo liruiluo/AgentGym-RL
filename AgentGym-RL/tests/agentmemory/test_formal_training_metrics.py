@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import json
 from pathlib import Path
 import unittest
 
@@ -70,6 +72,126 @@ def row(uid, order, reward, suffix, total, advantage, step, *, terminal=False):
         "advantage_token_mean": advantage,
         "record": step,
     }
+
+
+def workspace_snapshot(files=(), directories=()):
+    manifest = [
+        {"path": path, "sha256": sha256, "bytes": size}
+        for path, sha256, size in sorted(files)
+    ]
+    directory_set = set(directories)
+    for item in manifest:
+        parts = item["path"].split("/")[:-1]
+        directory_set.update("/".join(parts[:index]) for index in range(1, len(parts) + 1))
+    directory_manifest = sorted(directory_set)
+    encoded = json.dumps(
+        {"directories": directory_manifest, "files": manifest},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        "schema": "agentmemory_workspace_snapshot_v2",
+        "file_count": len(manifest),
+        "directory_count": len(directory_manifest),
+        "total_bytes": sum(item["bytes"] for item in manifest),
+        "directories": directory_manifest,
+        "files": manifest,
+        "tree_sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def workspace_diff(before, after):
+    before_files = {item["path"]: item for item in before["files"]}
+    after_files = {item["path"]: item for item in after["files"]}
+    before_paths = set(before_files)
+    after_paths = set(after_files)
+    return {
+        "added": [after_files[path] for path in sorted(after_paths - before_paths)],
+        "modified": [
+            {"before": before_files[path], "after": after_files[path]}
+            for path in sorted(before_paths & after_paths)
+            if before_files[path]["sha256"] != after_files[path]["sha256"]
+        ],
+        "deleted": [before_files[path] for path in sorted(before_paths - after_paths)],
+        "directories_added": sorted(
+            set(after["directories"]) - set(before["directories"])
+        ),
+        "directories_deleted": sorted(
+            set(before["directories"]) - set(after["directories"])
+        ),
+    }
+
+
+def workspace_event(op, *, event_id, phase_index, before, after):
+    event = {
+        "event_id": event_id,
+        "op": op,
+        "status": "executed",
+        "phase_index": phase_index,
+        "workspace_tree_sha256_before": before["tree_sha256"],
+        "workspace_tree_sha256_after": after["tree_sha256"],
+        "workspace_diff": workspace_diff(before, after),
+    }
+    if op == "SHELL_COMMAND":
+        event.update({"exit_code": 0, "timed_out": False})
+    elif op == "APPLY_PATCH":
+        event["transactional"] = True
+    else:
+        raise ValueError(f"unsupported workspace event op: {op}")
+    return event
+
+
+def workspace_info(
+    *,
+    snapshot,
+    audit_count,
+    tool_ops=(),
+    workspace_event=None,
+    intervention="enabled",
+):
+    enabled = intervention == "enabled"
+    workspace_ops = [] if workspace_event is None else [workspace_event]
+    return {
+        "reward_components": [],
+        "tool_ops": [*workspace_ops, *tool_ops],
+        "workspace_ops": workspace_ops,
+        "memory_ops": [],
+        "workspace_surface": "codex_workspace_v2",
+        "workspace_tool_contract": "codex_shell_command_apply_patch_v1",
+        "workspace_tool_ops": ["SHELL_COMMAND", "APPLY_PATCH"],
+        "workspace_intervention": intervention,
+        "workspace_shell_enabled": enabled,
+        "workspace_apply_patch_enabled": enabled,
+        "workspace_snapshot": snapshot,
+        "workspace_audit_event_count": audit_count,
+        "workspace_latest_event": workspace_event,
+    }
+
+
+def attach_workspace(
+    step,
+    *,
+    before_snapshot,
+    after_snapshot,
+    before_audit_count,
+    after_audit_count,
+    workspace_event=None,
+    other_tool_ops=(),
+):
+    step["env_info_before"] = workspace_info(
+        snapshot=before_snapshot,
+        audit_count=before_audit_count,
+    )
+    after_info = workspace_info(
+        snapshot=after_snapshot,
+        audit_count=after_audit_count,
+        tool_ops=other_tool_ops,
+        workspace_event=workspace_event,
+    )
+    after_info["reward_components"] = step["env_info_after"]["reward_components"]
+    step["env_info_after"] = after_info
+    return step
 
 
 class FormalTrainingMetricsTests(unittest.TestCase):
@@ -628,6 +750,336 @@ class FormalTrainingMetricsTests(unittest.TestCase):
         )
         self.assertEqual(summary["nonempty_retrieve_count"], 1.0)
         self.assertEqual(summary["relevant_retrieve_count"], 1.0)
+
+    def test_workspace_candidate_chain_requires_persisted_write_and_later_shell(self) -> None:
+        path = ".agent_memory/MEMORY.md"
+        content = b"selected finish: black"
+        content_sha256 = hashlib.sha256(content).hexdigest()
+        empty = workspace_snapshot()
+        written = workspace_snapshot(((path, content_sha256, len(content)),))
+        write = workspace_event(
+            "APPLY_PATCH",
+            event_id=0,
+            phase_index=0,
+            before=empty,
+            after=written,
+        )
+        shell = workspace_event(
+            "SHELL_COMMAND",
+            event_id=1,
+            phase_index=1,
+            before=written,
+            after=written,
+        )
+        rows = [
+            row(
+                "filesystem",
+                0,
+                0.0,
+                2.0,
+                2.0,
+                0.1,
+                attach_workspace(
+                    record(
+                        "apply_patch\n*** Begin Patch\n*** Add File: .agent_memory/MEMORY.md\n+selected finish: black\n*** End Patch",
+                        before=0,
+                        after=0,
+                    ),
+                    before_snapshot=empty,
+                    after_snapshot=written,
+                    before_audit_count=0,
+                    after_audit_count=1,
+                    workspace_event=write,
+                ),
+            ),
+            row(
+                "filesystem",
+                1,
+                1.0,
+                2.0,
+                2.0,
+                1.0,
+                attach_workspace(
+                    record(
+                        'BUY {"product_id":"B01"}',
+                        before=0,
+                        after=1,
+                        accepted=True,
+                        committed=True,
+                        advanced=True,
+                    ),
+                    before_snapshot=written,
+                    after_snapshot=written,
+                    before_audit_count=1,
+                    after_audit_count=1,
+                    other_tool_ops=({"op": "BUY"},),
+                ),
+            ),
+            row(
+                "filesystem",
+                2,
+                0.0,
+                1.0,
+                2.0,
+                0.2,
+                attach_workspace(
+                    record(
+                        'shell_command {"command":"rg -n \'selected finish\' .agent_memory/MEMORY.md","workdir":".","timeout_ms":10000}',
+                        before=1,
+                        after=1,
+                    ),
+                    before_snapshot=written,
+                    after_snapshot=written,
+                    before_audit_count=1,
+                    after_audit_count=2,
+                    workspace_event=shell,
+                ),
+            ),
+            row(
+                "filesystem",
+                3,
+                1.0,
+                1.0,
+                2.0,
+                1.2,
+                attach_workspace(
+                    record(
+                        'BUY {"product_id":"B02"}',
+                        before=1,
+                        after=2,
+                        accepted=True,
+                        committed=True,
+                        advanced=True,
+                        done=True,
+                    ),
+                    before_snapshot=written,
+                    after_snapshot=written,
+                    before_audit_count=2,
+                    after_audit_count=2,
+                    other_tool_ops=({"op": "BUY"},),
+                ),
+                terminal=True,
+            ),
+        ]
+        summary = summarize_formal_training_rows(rows)
+        self.assertEqual(summary["filesystem_trajectory_count"], 1.0)
+        self.assertEqual(summary["workspace_action_count"], 2.0)
+        self.assertEqual(summary["workspace_apply_patch_count"], 1.0)
+        self.assertEqual(summary["workspace_shell_command_count"], 1.0)
+        self.assertEqual(
+            summary["source_workspace_write_before_correct_buy_count"], 1.0
+        )
+        self.assertEqual(
+            summary["later_session_shell_after_source_write_count"], 1.0
+        )
+        self.assertEqual(
+            summary["workspace_cross_session_success_candidate_count"], 1.0
+        )
+        self.assertEqual(summary["functional_memory_chain_count"], 0.0)
+        self.assertEqual(summary["workspace_snapshot_record_count"], 4.0)
+        self.assertEqual(summary["workspace_tree_change_count"], 1.0)
+        self.assertEqual(summary["workspace_final_file_count_mean"], 1.0)
+        self.assertEqual(summary["workspace_final_total_bytes_mean"], len(content))
+        self.assertEqual(summary["workspace_final_audit_event_count_mean"], 2.0)
+
+    def test_workspace_overwritten_source_version_is_not_a_candidate_chain(self) -> None:
+        path = "notes.md"
+        original = b"black"
+        revised = b"gray"
+        original_sha = hashlib.sha256(original).hexdigest()
+        revised_sha = hashlib.sha256(revised).hexdigest()
+        empty = workspace_snapshot()
+        original_snapshot = workspace_snapshot(
+            ((path, original_sha, len(original)),)
+        )
+        revised_snapshot = workspace_snapshot(((path, revised_sha, len(revised)),))
+        write = workspace_event(
+            "APPLY_PATCH",
+            event_id=0,
+            phase_index=0,
+            before=empty,
+            after=original_snapshot,
+        )
+        edit = workspace_event(
+            "APPLY_PATCH",
+            event_id=1,
+            phase_index=1,
+            before=original_snapshot,
+            after=revised_snapshot,
+        )
+        shell = workspace_event(
+            "SHELL_COMMAND",
+            event_id=2,
+            phase_index=1,
+            before=revised_snapshot,
+            after=revised_snapshot,
+        )
+        steps = [
+            attach_workspace(
+                record(
+                    "apply_patch\n*** Begin Patch\n*** Add File: notes.md\n+black\n*** End Patch",
+                    before=0,
+                    after=0,
+                ),
+                before_snapshot=empty,
+                after_snapshot=original_snapshot,
+                before_audit_count=0,
+                after_audit_count=1,
+                workspace_event=write,
+            ),
+            attach_workspace(
+                record(
+                    'BUY {"product_id":"B01"}', before=0, after=1,
+                    accepted=True, committed=True, advanced=True,
+                ),
+                before_snapshot=original_snapshot,
+                after_snapshot=original_snapshot,
+                before_audit_count=1,
+                after_audit_count=1,
+                other_tool_ops=({"op": "BUY"},),
+            ),
+            attach_workspace(
+                record(
+                    "apply_patch\n*** Begin Patch\n*** Update File: notes.md\n@@\n-black\n+gray\n*** End Patch",
+                    before=1,
+                    after=1,
+                ),
+                before_snapshot=original_snapshot,
+                after_snapshot=revised_snapshot,
+                before_audit_count=1,
+                after_audit_count=2,
+                workspace_event=edit,
+            ),
+            attach_workspace(
+                record(
+                    'shell_command {"command":"cat notes.md","workdir":".","timeout_ms":10000}',
+                    before=1,
+                    after=1,
+                ),
+                before_snapshot=revised_snapshot,
+                after_snapshot=revised_snapshot,
+                before_audit_count=2,
+                after_audit_count=3,
+                workspace_event=shell,
+            ),
+            attach_workspace(
+                record(
+                    'BUY {"product_id":"B02"}', before=1, after=2,
+                    accepted=True, committed=True, advanced=True, done=True,
+                ),
+                before_snapshot=revised_snapshot,
+                after_snapshot=revised_snapshot,
+                before_audit_count=3,
+                after_audit_count=3,
+                other_tool_ops=({"op": "BUY"},),
+            ),
+        ]
+        rewards = (0.0, 1.0, 0.0, 0.0, 1.0)
+        suffixes = (2.0, 2.0, 1.0, 1.0, 1.0)
+        rows = [
+            row(
+                "same-session",
+                index,
+                rewards[index],
+                suffixes[index],
+                2.0,
+                0.1,
+                step,
+                terminal=index == len(steps) - 1,
+            )
+            for index, step in enumerate(steps)
+        ]
+        summary = summarize_formal_training_rows(rows)
+        self.assertEqual(summary["source_workspace_write_before_correct_buy_count"], 2.0)
+        self.assertEqual(summary["later_session_shell_after_source_write_count"], 0.0)
+        self.assertEqual(summary["workspace_cross_session_success_candidate_count"], 0.0)
+        self.assertEqual(summary["functional_memory_chain_count"], 0.0)
+
+    def test_workspace_action_text_alone_is_not_workspace_evidence(self) -> None:
+        empty = workspace_snapshot()
+        step = attach_workspace(
+            record(
+                "apply_patch\n*** Begin Patch\n*** Add File: notes.md\n+black\n*** End Patch",
+                before=0,
+                after=0,
+            ),
+            before_snapshot=empty,
+            after_snapshot=empty,
+            before_audit_count=0,
+            after_audit_count=0,
+        )
+        summary = summarize_formal_training_rows(
+            [row("text-only", 0, 0.0, 0.0, 0.0, 0.0, step, terminal=True)]
+        )
+        self.assertEqual(summary["workspace_action_count"], 0.0)
+        self.assertEqual(summary["source_workspace_write_before_correct_buy_count"], 0.0)
+        self.assertEqual(summary["workspace_cross_session_success_candidate_count"], 0.0)
+
+    def test_workspace_evidence_fails_closed_on_reward_or_audit_tampering(self) -> None:
+        path = "notes.md"
+        content = b"black"
+        content_sha = hashlib.sha256(content).hexdigest()
+        empty = workspace_snapshot()
+        written = workspace_snapshot(((path, content_sha, len(content)),))
+        write = workspace_event(
+            "APPLY_PATCH",
+            event_id=0,
+            phase_index=0,
+            before=empty,
+            after=written,
+        )
+        with self.assertRaisesRegex(ValueError, "non-zero task reward"):
+            summarize_formal_training_rows(
+                [
+                    row(
+                        "reward",
+                        0,
+                        0.1,
+                        0.1,
+                        0.1,
+                        0.0,
+                        attach_workspace(
+                            record(
+                                "apply_patch\n*** Begin Patch\n*** Add File: notes.md\n+black\n*** End Patch",
+                                before=0,
+                                after=0,
+                            ),
+                            before_snapshot=empty,
+                            after_snapshot=written,
+                            before_audit_count=0,
+                            after_audit_count=1,
+                            workspace_event=write,
+                        ),
+                        terminal=True,
+                    )
+                ]
+            )
+        with self.assertRaisesRegex(ValueError, "audit count"):
+            summarize_formal_training_rows(
+                [
+                    row(
+                        "audit",
+                        0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        attach_workspace(
+                            record(
+                                "apply_patch\n*** Begin Patch\n*** Add File: notes.md\n+black\n*** End Patch",
+                                before=0,
+                                after=0,
+                            ),
+                            before_snapshot=empty,
+                            after_snapshot=written,
+                            before_audit_count=0,
+                            after_audit_count=2,
+                            workspace_event=write,
+                        ),
+                        terminal=True,
+                    )
+                ]
+            )
 
     def test_fails_closed_on_reward_or_terminal_mismatch(self) -> None:
         terminal = record('ANSWER {"text":"x"}', before=0, after=0)

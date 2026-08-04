@@ -92,6 +92,30 @@ def server_metadata(*, generator_seed: int = 233) -> dict:
     }
 
 
+def filesystem_server_metadata(*, generator_seed: int = 233) -> dict:
+    metadata = server_metadata(generator_seed=generator_seed)
+    metadata.update(
+        {
+            "surface": (
+                "agentmemory_webshop_procedural_natural_chain_filesystem_v2"
+            ),
+            "memory_prompt_mode": "natural_filesystem",
+            "workspace_surface": "codex_workspace_v2",
+            "workspace_tool_contract": "codex_shell_command_apply_patch_v1",
+            "workspace_tool_ops": ["SHELL_COMMAND", "APPLY_PATCH"],
+            "workspace_shell_enabled": True,
+            "workspace_apply_patch_enabled": True,
+            "workspace_host_path_exposed": False,
+            "reward_contract": {
+                "workspace_action_reward": 0.0,
+                "shell_command_reward": 0.0,
+                "apply_patch_reward": 0.0,
+            },
+        }
+    )
+    return metadata
+
+
 def latent_preference_server_metadata(*, generator_seed: int = 233) -> dict:
     metadata = server_metadata(generator_seed=generator_seed)
     metadata["surface"] = "agentmemory_webshop_latent_preference_train_v1"
@@ -434,6 +458,7 @@ class ProceduralIndexSourceTests(unittest.TestCase):
             provider_mode=PROVIDER_MODE_RESEEDED_STREAM,
         )
         source.validate_server_metadata(server_metadata())
+        source.validate_server_metadata(filesystem_server_metadata())
         source.validate_server_metadata(latent_preference_server_metadata())
         source.validate_server_metadata(recency_override_server_metadata())
         source.validate_server_metadata(distractor_robustness_server_metadata())
@@ -484,6 +509,35 @@ class ProceduralIndexSourceTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ProceduralIndexError, "approved pair"):
             negative_source.validate_server_metadata(negative_mismatched_schema)
+
+    def test_filesystem_server_contract_rejects_prompt_tool_and_reward_drift(self) -> None:
+        source = ProceduralIndexSource(
+            task_count=64,
+            provider_mode=PROVIDER_MODE_RESEEDED_STREAM,
+        )
+        metadata = filesystem_server_metadata()
+        source.validate_server_metadata(metadata)
+        mutations = {
+            "prompt": lambda value: value.update(memory_prompt_mode="neutral"),
+            "tools": lambda value: value.update(workspace_tool_ops=["READ"]),
+            "shell": lambda value: value.update(workspace_shell_enabled=False),
+            "patch": lambda value: value.update(workspace_apply_patch_enabled=False),
+            "contract": lambda value: value.update(workspace_tool_contract="legacy"),
+            "shaping": lambda value: value["reward_contract"].update(
+                workspace_action_reward=0.1
+            ),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(case=name):
+                tampered = deepcopy(metadata)
+                mutate(tampered)
+                with self.assertRaises(ProceduralIndexError):
+                    source.validate_server_metadata(tampered)
+
+        legacy = server_metadata()
+        legacy["memory_prompt_mode"] = "natural_filesystem"
+        with self.assertRaisesRegex(ProceduralIndexError, "bound"):
+            source.validate_server_metadata(legacy)
 
     def test_batch_indices_preserve_complete_adjacent_orbits(self) -> None:
         validate_paired_batch_indices([200, 201, 202, 203])

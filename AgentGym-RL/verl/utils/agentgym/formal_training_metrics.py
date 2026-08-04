@@ -1,8 +1,27 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import hashlib
+import json
 import math
+import re
 from typing import Any
+
+
+WORKSPACE_TOOL_OPS = frozenset({"SHELL_COMMAND", "APPLY_PATCH"})
+LEGACY_FILE_TOOL_OPS = frozenset({"READ", "WRITE", "EDIT", "GREP", "GLOB"})
+WORKSPACE_SURFACE = "codex_workspace_v2"
+WORKSPACE_TOOL_CONTRACT = "codex_shell_command_apply_patch_v1"
+WORKSPACE_SNAPSHOT_SCHEMA = "agentmemory_workspace_snapshot_v2"
+_SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+_EMPTY_WORKSPACE_MANIFEST = {"directories": [], "files": []}
+_EMPTY_WORKSPACE_TREE_SHA256 = hashlib.sha256(
+    json.dumps(
+        _EMPTY_WORKSPACE_MANIFEST,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+).hexdigest()
 
 
 def _component_names(record: dict[str, Any]) -> set[str]:
@@ -27,6 +46,194 @@ def _current_memory_ops(record: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(memory_ops, list):
         return []
     return [item for item in memory_ops if isinstance(item, dict)]
+
+
+def _require_sha256(value: Any, *, name: str) -> str:
+    if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
+        raise ValueError(f"Filesystem evidence has invalid {name}={value!r}.")
+    return value
+
+
+def _workspace_snapshot(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("Filesystem evidence lacks a workspace snapshot object.")
+    if value.get("schema") != WORKSPACE_SNAPSHOT_SCHEMA:
+        raise ValueError("Filesystem evidence has an unknown workspace snapshot schema.")
+    directories = value.get("directories")
+    files = value.get("files")
+    if not isinstance(directories, list) or any(
+        not isinstance(item, str) or not item for item in directories
+    ):
+        raise ValueError("Filesystem workspace snapshot directories must be paths.")
+    if directories != sorted(directories) or len(set(directories)) != len(directories):
+        raise ValueError(
+            "Filesystem snapshot directories are not unique deterministic paths."
+        )
+    if not isinstance(files, list):
+        raise ValueError("Filesystem workspace snapshot files must be a list.")
+    normalized_files: list[dict[str, Any]] = []
+    for index, item in enumerate(files):
+        if not isinstance(item, dict):
+            raise ValueError(f"Filesystem snapshot file {index} is not an object.")
+        path = item.get("path")
+        size = item.get("bytes")
+        if not isinstance(path, str) or not path:
+            raise ValueError(f"Filesystem snapshot file {index} has no path.")
+        if type(size) is not int or size < 0:
+            raise ValueError(f"Filesystem snapshot file {index} has invalid bytes.")
+        normalized_files.append(
+            {
+                "path": path,
+                "sha256": _require_sha256(
+                    item.get("sha256"), name=f"snapshot file {index} sha256"
+                ),
+                "bytes": size,
+            }
+        )
+    if normalized_files != sorted(normalized_files, key=lambda item: item["path"]):
+        raise ValueError("Filesystem snapshot files are not in deterministic path order.")
+    if len({item["path"] for item in normalized_files}) != len(normalized_files):
+        raise ValueError("Filesystem snapshot contains duplicate paths.")
+    file_count = value.get("file_count")
+    directory_count = value.get("directory_count")
+    total_bytes = value.get("total_bytes")
+    if type(file_count) is not int or file_count != len(normalized_files):
+        raise ValueError("Filesystem snapshot file_count disagrees with its manifest.")
+    if type(total_bytes) is not int or total_bytes != sum(
+        item["bytes"] for item in normalized_files
+    ):
+        raise ValueError("Filesystem snapshot total_bytes disagrees with its manifest.")
+    if type(directory_count) is not int or directory_count != len(directories):
+        raise ValueError(
+            "Filesystem snapshot directory_count disagrees with its manifest."
+        )
+    manifest = json.dumps(
+        {"directories": directories, "files": normalized_files},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    expected_tree_sha256 = hashlib.sha256(manifest).hexdigest()
+    tree_sha256 = _require_sha256(
+        value.get("tree_sha256"), name="workspace tree_sha256"
+    )
+    if tree_sha256 != expected_tree_sha256:
+        raise ValueError("Filesystem workspace tree hash disagrees with its manifest.")
+    return {
+        "file_count": file_count,
+        "directory_count": directory_count,
+        "total_bytes": total_bytes,
+        "directories": list(directories),
+        "files": normalized_files,
+        "tree_sha256": tree_sha256,
+    }
+
+
+def _current_workspace_ops(record: dict[str, Any]) -> list[dict[str, Any]]:
+    info = record.get("env_info_after")
+    if not isinstance(info, dict):
+        return []
+    workspace_ops = info.get("workspace_ops")
+    if not isinstance(workspace_ops, list) or any(
+        not isinstance(item, dict) for item in workspace_ops
+    ):
+        raise ValueError("Filesystem workspace_ops ledger must be a list of objects.")
+    if len(workspace_ops) > 1:
+        raise ValueError("Filesystem step contains more than one workspace operation.")
+    tool_ops = info.get("tool_ops")
+    if not isinstance(tool_ops, list):
+        raise ValueError("Filesystem evidence lacks the authoritative tool_ops ledger.")
+    stale_ops = [
+        item
+        for item in tool_ops
+        if isinstance(item, dict)
+        and str(item.get("op", "")).upper() in LEGACY_FILE_TOOL_OPS
+    ]
+    if stale_ops:
+        raise ValueError("Filesystem-v2 evidence contains a legacy five-tool operation.")
+    expected = [
+        item
+        for item in tool_ops
+        if isinstance(item, dict)
+        and str(item.get("op", "")).upper() in WORKSPACE_TOOL_OPS
+    ]
+    if workspace_ops != expected:
+        raise ValueError("Filesystem workspace_ops disagrees with authoritative tool_ops.")
+    for event in workspace_ops:
+        op = str(event.get("op", "")).upper()
+        if op not in WORKSPACE_TOOL_OPS or event.get("status") != "executed":
+            raise ValueError("Filesystem workspace operation is malformed or not executed.")
+    return workspace_ops
+
+
+def _workspace_diff(
+    before: dict[str, Any], after: dict[str, Any]
+) -> dict[str, Any]:
+    before_files = {item["path"]: item for item in before["files"]}
+    after_files = {item["path"]: item for item in after["files"]}
+    before_paths = set(before_files)
+    after_paths = set(after_files)
+    return {
+        "added": [after_files[path] for path in sorted(after_paths - before_paths)],
+        "modified": [
+            {"before": before_files[path], "after": after_files[path]}
+            for path in sorted(before_paths & after_paths)
+            if before_files[path]["sha256"] != after_files[path]["sha256"]
+        ],
+        "deleted": [before_files[path] for path in sorted(before_paths - after_paths)],
+        "directories_added": sorted(
+            set(after["directories"]) - set(before["directories"])
+        ),
+        "directories_deleted": sorted(
+            set(before["directories"]) - set(after["directories"])
+        ),
+    }
+
+
+def _workspace_diff_has_changes(diff: dict[str, Any]) -> bool:
+    return any(diff[field] for field in diff)
+
+
+def _workspace_written_versions(diff: dict[str, Any]) -> set[tuple[str, str]]:
+    versions = {
+        (item["path"], item["sha256"])
+        for item in diff["added"]
+    }
+    versions.update(
+        (item["after"]["path"], item["after"]["sha256"])
+        for item in diff["modified"]
+    )
+    return versions
+
+
+def _validate_workspace_info(info: Any) -> tuple[dict[str, Any], int, str]:
+    if not isinstance(info, dict):
+        raise ValueError("Filesystem evidence lacks a workspace info object.")
+    if info.get("workspace_surface") != WORKSPACE_SURFACE:
+        raise ValueError("Filesystem trajectory mixes workspace surface contracts.")
+    if info.get("workspace_tool_contract") != WORKSPACE_TOOL_CONTRACT:
+        raise ValueError("Filesystem evidence has the wrong workspace tool contract.")
+    if info.get("workspace_tool_ops") != ["SHELL_COMMAND", "APPLY_PATCH"]:
+        raise ValueError("Filesystem evidence has the wrong workspace tool operation set.")
+    if info.get("memory_ops") != []:
+        raise ValueError("Filesystem-v2 evidence contains a legacy memory operation.")
+    if "file_ops" in info:
+        raise ValueError("Filesystem-v2 evidence contains the retired file_ops ledger.")
+    intervention = info.get("workspace_intervention")
+    if intervention not in {"enabled", "no_workspace"}:
+        raise ValueError("Filesystem evidence has an invalid workspace intervention.")
+    expected_enabled = intervention == "enabled"
+    if info.get("workspace_shell_enabled") is not expected_enabled:
+        raise ValueError("Filesystem shell availability disagrees with its intervention.")
+    if info.get("workspace_apply_patch_enabled") is not expected_enabled:
+        raise ValueError("Filesystem patch availability disagrees with its intervention.")
+    snapshot = _workspace_snapshot(info.get("workspace_snapshot"))
+    if not expected_enabled and snapshot["tree_sha256"] != _EMPTY_WORKSPACE_TREE_SHA256:
+        raise ValueError("no_workspace intervention exposes a non-empty workspace.")
+    audit_count = info.get("workspace_audit_event_count")
+    if type(audit_count) is not int or audit_count < 0:
+        raise ValueError("Filesystem evidence has an invalid workspace audit count.")
+    return snapshot, audit_count, intervention
 
 
 def _memory_ids(memory_op: dict[str, Any]) -> set[str]:
@@ -100,6 +307,9 @@ def summarize_formal_training_rows(rows: list[dict[str, Any]]) -> dict[str, floa
     trajectory_returns: list[float] = []
     counts = defaultdict(int)
     terminal_advantages: dict[str, list[float]] = defaultdict(list)
+    workspace_final_file_counts: list[float] = []
+    workspace_final_total_bytes: list[float] = []
+    workspace_final_audit_counts: list[float] = []
 
     for trajectory_uid, trajectory_rows in trajectories.items():
         ordered = sorted(trajectory_rows, key=lambda row: int(row["row_order"]))
@@ -137,15 +347,33 @@ def summarize_formal_training_rows(rows: list[dict[str, Any]]) -> dict[str, floa
             raise ValueError(f"Trajectory {trajectory_uid!r} terminal placement is invalid.")
         trajectory_returns.append(trajectory_return)
 
+        workspace_enabled = any(
+            isinstance(row["record"].get(key), dict)
+            and row["record"][key].get("workspace_surface") == WORKSPACE_SURFACE
+            for row in ordered
+            for key in ("env_info_before", "env_info_after")
+        )
+        if workspace_enabled:
+            counts["filesystem_trajectory_count"] += 1
+            counts["workspace_trajectory_count"] += 1
+
         write_positions: list[int] = []
         relevant_retrieve_positions: list[int] = []
         dependent_buy_positions: list[int] = []
         memory_write_events: list[tuple[set[str], int, int]] = []
         memory_retrieve_events: list[tuple[set[str], int, int]] = []
+        workspace_write_events: list[tuple[set[tuple[str, str]], int, int]] = []
+        shell_events: list[
+            tuple[int, int, set[tuple[str, str]]]
+        ] = []
         correct_buy_events: list[tuple[int, int]] = []
         has_memory_id = False
         max_progress = 0
         terminal_success = False
+        previous_workspace_snapshot: dict[str, Any] | None = None
+        previous_workspace_audit_count: int | None = None
+        workspace_intervention: str | None = None
+        final_workspace_snapshot: dict[str, Any] | None = None
         for position, row in enumerate(ordered):
             record = row["record"]
             component_names = _component_names(record)
@@ -155,6 +383,143 @@ def summarize_formal_training_rows(rows: list[dict[str, Any]]) -> dict[str, floa
                 max_progress,
                 int(record.get("subtask_index_after", record.get("next_session_index", 0))),
             )
+            workspace_ops = (
+                _current_workspace_ops(record) if workspace_enabled else []
+            )
+            if workspace_enabled:
+                before_info = record.get("env_info_before")
+                after_info = record.get("env_info_after")
+                before_snapshot, before_audit_count, before_intervention = (
+                    _validate_workspace_info(before_info)
+                )
+                after_snapshot, after_audit_count, after_intervention = (
+                    _validate_workspace_info(after_info)
+                )
+                if before_intervention != after_intervention:
+                    raise ValueError(
+                        "Filesystem intervention changed within one environment step."
+                    )
+                if workspace_intervention is None:
+                    workspace_intervention = before_intervention
+                    counts[f"workspace_{before_intervention}_trajectory_count"] += 1
+                elif workspace_intervention != before_intervention:
+                    raise ValueError(
+                        "Filesystem intervention changed within one trajectory."
+                    )
+                if previous_workspace_snapshot is not None:
+                    if before_snapshot != previous_workspace_snapshot:
+                        raise ValueError(
+                            "Filesystem pre-step snapshot breaks trajectory continuity."
+                        )
+                    if before_audit_count != previous_workspace_audit_count:
+                        raise ValueError(
+                            "Filesystem pre-step audit count breaks trajectory continuity."
+                        )
+                final_workspace_snapshot = after_snapshot
+                counts["workspace_snapshot_record_count"] += 1
+                if after_snapshot["file_count"] > 0:
+                    counts["workspace_nonempty_snapshot_record_count"] += 1
+                latest_event = after_info.get("workspace_latest_event")
+                expected_diff = _workspace_diff(before_snapshot, after_snapshot)
+                if workspace_ops:
+                    event = workspace_ops[0]
+                    op = str(event.get("op", "")).upper()
+                    event_id = event.get("event_id")
+                    phase_index = event.get("phase_index")
+                    if type(event_id) is not int or event_id != before_audit_count:
+                        raise ValueError(
+                            "Filesystem audit event id is not contiguous within the episode."
+                        )
+                    if type(phase_index) is not int or phase_index != session_index:
+                        raise ValueError(
+                            "Filesystem audit event is bound to a different session."
+                        )
+                    before_tree = _require_sha256(
+                        event.get("workspace_tree_sha256_before"),
+                        name="workspace event before-tree sha256",
+                    )
+                    after_tree = _require_sha256(
+                        event.get("workspace_tree_sha256_after"),
+                        name="workspace event after-tree sha256",
+                    )
+                    if before_tree != before_snapshot["tree_sha256"]:
+                        raise ValueError(
+                            "Filesystem workspace event before-tree hash breaks continuity."
+                        )
+                    if after_tree != after_snapshot["tree_sha256"]:
+                        raise ValueError(
+                            "Filesystem workspace event after-tree hash disagrees with snapshot."
+                        )
+                    if after_audit_count != before_audit_count + 1:
+                        raise ValueError(
+                            "Filesystem audit count did not advance exactly once."
+                        )
+                    if latest_event != event:
+                        raise ValueError(
+                            "Filesystem latest-event evidence disagrees with workspace_ops."
+                        )
+                    if event.get("workspace_diff") != expected_diff:
+                        raise ValueError(
+                            "Filesystem workspace_diff disagrees with before/after snapshots."
+                        )
+                    if not math.isclose(
+                        float(row["immediate_reward"]),
+                        0.0,
+                        rel_tol=0.0,
+                        abs_tol=1e-12,
+                    ):
+                        raise ValueError(
+                            "Filesystem workspace action received non-zero task reward."
+                        )
+                    counts["workspace_action_count"] += 1
+                    counts[f"workspace_{op.lower()}_count"] += 1
+                    if _workspace_diff_has_changes(expected_diff):
+                        counts["workspace_mutating_action_count"] += 1
+                        counts["workspace_tree_change_count"] += 1
+                    written_versions = _workspace_written_versions(expected_diff)
+                    if written_versions:
+                        counts["workspace_content_write_action_count"] += 1
+                        workspace_write_events.append(
+                            (written_versions, position, session_index)
+                        )
+                    if expected_diff["deleted"]:
+                        counts["workspace_delete_action_count"] += 1
+                    snapshot_versions = {
+                        (item["path"], item["sha256"])
+                        for item in after_snapshot["files"]
+                    }
+                    if op == "SHELL_COMMAND":
+                        shell_events.append(
+                            (position, session_index, snapshot_versions)
+                        )
+                        exit_code = event.get("exit_code")
+                        if type(exit_code) is not int:
+                            raise ValueError(
+                                "Filesystem shell event has no integer exit code."
+                            )
+                        if exit_code != 0:
+                            counts["workspace_shell_nonzero_exit_count"] += 1
+                        if event.get("timed_out") is True:
+                            counts["workspace_shell_timeout_count"] += 1
+                    elif event.get("transactional") is not True:
+                        raise ValueError(
+                            "Filesystem apply_patch event is not transactional."
+                        )
+                else:
+                    if after_audit_count != before_audit_count:
+                        raise ValueError(
+                            "Filesystem audit count changed without a file operation."
+                        )
+                    if after_snapshot != before_snapshot:
+                        raise ValueError(
+                            "Filesystem tree changed without a file operation."
+                        )
+                    if latest_event is not None:
+                        raise ValueError(
+                            "Filesystem non-file step exposes a current latest event."
+                        )
+                previous_workspace_snapshot = after_snapshot
+                previous_workspace_audit_count = after_audit_count
             # Native records may omit action_execution. The environment ledger is
             # the authoritative parser outcome for the current action.
             if "invalid_action" in component_names:
@@ -251,6 +616,26 @@ def summarize_formal_training_rows(rows: list[dict[str, Any]]) -> dict[str, floa
             source_memory_writes
         )
 
+        source_workspace_writes: list[
+            tuple[set[tuple[str, str]], int, int, int]
+        ] = []
+        for versions, write_position, write_session in workspace_write_events:
+            source_buy_position = next(
+                (
+                    buy_position
+                    for buy_position, buy_session in correct_buy_events
+                    if buy_session == write_session and buy_position > write_position
+                ),
+                None,
+            )
+            if source_buy_position is not None:
+                source_workspace_writes.append(
+                    (versions, write_position, write_session, source_buy_position)
+                )
+        counts["source_workspace_write_before_correct_buy_count"] += len(
+            source_workspace_writes
+        )
+
         strict_functional_chain = False
         for retrieved_ids, retrieve_position, retrieve_session in memory_retrieve_events:
             source_linked = any(
@@ -282,8 +667,43 @@ def summarize_formal_training_rows(rows: list[dict[str, Any]]) -> dict[str, floa
                 for buy in dependent_buy_positions
             )
         )
+        workspace_success_candidate = False
+        for shell_position, shell_session, visible_versions in shell_events:
+            follows_persisted_source_write = any(
+                source_versions.intersection(visible_versions)
+                and source_session < shell_session
+                and source_buy_position < shell_position
+                for (
+                    source_versions,
+                    _write_position,
+                    source_session,
+                    source_buy_position,
+                ) in source_workspace_writes
+            )
+            if not follows_persisted_source_write:
+                continue
+            counts["later_session_shell_after_source_write_count"] += 1
+            if any(
+                buy_session == shell_session and buy_position > shell_position
+                for buy_position, buy_session in correct_buy_events
+            ):
+                workspace_success_candidate = True
+        if workspace_success_candidate:
+            counts["workspace_cross_session_success_candidate_count"] += 1
         if strict_functional_chain or legacy_functional_chain:
             counts["functional_memory_chain_count"] += 1
+        if workspace_enabled:
+            if final_workspace_snapshot is None:
+                raise ValueError("Filesystem trajectory has no final workspace snapshot.")
+            workspace_final_file_counts.append(
+                float(final_workspace_snapshot["file_count"])
+            )
+            workspace_final_total_bytes.append(
+                float(final_workspace_snapshot["total_bytes"])
+            )
+            workspace_final_audit_counts.append(
+                float(previous_workspace_audit_count or 0)
+            )
 
     result = {
         "trajectory_count": float(len(trajectories)),
@@ -305,6 +725,24 @@ def summarize_formal_training_rows(rows: list[dict[str, Any]]) -> dict[str, floa
         "relevant_retrieve_count",
         "source_memory_write_before_correct_buy_count",
         "source_linked_retrieve_count",
+        "workspace_action_count",
+        "workspace_shell_command_count",
+        "workspace_apply_patch_count",
+        "workspace_mutating_action_count",
+        "workspace_content_write_action_count",
+        "workspace_delete_action_count",
+        "workspace_shell_nonzero_exit_count",
+        "workspace_shell_timeout_count",
+        "source_workspace_write_before_correct_buy_count",
+        "later_session_shell_after_source_write_count",
+        "workspace_cross_session_success_candidate_count",
+        "filesystem_trajectory_count",
+        "workspace_trajectory_count",
+        "workspace_enabled_trajectory_count",
+        "workspace_no_workspace_trajectory_count",
+        "workspace_snapshot_record_count",
+        "workspace_nonempty_snapshot_record_count",
+        "workspace_tree_change_count",
         "functional_memory_chain_count",
         "progress_ge_1_count",
         "progress_ge_2_count",
@@ -312,6 +750,15 @@ def summarize_formal_training_rows(rows: list[dict[str, Any]]) -> dict[str, floa
         "invalid_action_count",
     ):
         result[name] = float(counts[name])
+    result["workspace_final_file_count_mean"] = _mean(
+        workspace_final_file_counts
+    )
+    result["workspace_final_total_bytes_mean"] = _mean(
+        workspace_final_total_bytes
+    )
+    result["workspace_final_audit_event_count_mean"] = _mean(
+        workspace_final_audit_counts
+    )
     for kind in ("correct_buy", "wrong_buy", "timeout"):
         values = terminal_advantages[kind]
         positive = sum(value > 0.0 for value in values)

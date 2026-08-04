@@ -14,6 +14,9 @@ FORMAL_WEBSHOP_SURFACE_V2 = "memoryarena_webshop_native_v1"
 FORMAL_WEBSHOP_PROCEDURAL_SURFACE_V2 = (
     "agentmemory_webshop_procedural_natural_chain_train_v1"
 )
+FORMAL_WEBSHOP_FILESYSTEM_SURFACE_V2 = (
+    "agentmemory_webshop_procedural_natural_chain_filesystem_v2"
+)
 FORMAL_WEBSHOP_LATENT_PREFERENCE_SURFACE_V2 = (
     "agentmemory_webshop_latent_preference_train_v1"
 )
@@ -36,6 +39,7 @@ FORMAL_WEBSHOP_SURFACES_V2 = frozenset(
     {
         FORMAL_WEBSHOP_SURFACE_V2,
         FORMAL_WEBSHOP_PROCEDURAL_SURFACE_V2,
+        FORMAL_WEBSHOP_FILESYSTEM_SURFACE_V2,
         FORMAL_WEBSHOP_LATENT_PREFERENCE_SURFACE_V2,
         FORMAL_WEBSHOP_RECENCY_OVERRIDE_SURFACE_V2,
         FORMAL_WEBSHOP_DISTRACTOR_ROBUSTNESS_SURFACE_V2,
@@ -52,13 +56,191 @@ MEMORY_PROMPT_MODES = (
     "neutral_horizon_responsibility",
     "latent_preference_sop",
     "selective_memory_sop",
+    "natural_filesystem",
 )
 ACTION_LISTING_MODES = ("separate", "unified")
+WORKSPACE_TOOL_OPS = frozenset({"SHELL_COMMAND", "APPLY_PATCH"})
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_WORKSPACE_LIMIT_FIELDS = frozenset(
+    {
+        "max_path_chars",
+        "max_files",
+        "max_directories",
+        "max_file_bytes",
+        "max_total_bytes",
+        "max_command_chars",
+        "max_patch_bytes",
+        "default_timeout_ms",
+        "max_timeout_ms",
+        "cpu_seconds",
+        "address_space_bytes",
+        "max_processes",
+        "max_open_files",
+        "stdout_bytes",
+        "stderr_bytes",
+        "tmp_bytes",
+        "tmp_inodes",
+    }
+)
+_WORKSPACE_SANDBOX_FIELDS = {
+    "contract": "linux_namespace_chroot_tmpfs_v1",
+    "formal_eligible": True,
+    "network": "new_namespace_no_routes",
+    "rootfs": "minimal_read_only_system_roots",
+    "workspace_mount": "bounded_tmpfs_copy_in_copy_out",
+    "shell": "bash_no_profile_no_rc",
+    "ripgrep_path": "/tools/rg",
+    "ripgrep_revalidation": "stat_fingerprint_before_each_command",
+    "model_identity": "exclusive_leased_high_uid_per_command",
+    "rlimit_nproc_scope": "host_uid_lease_per_concurrent_command",
+    "uid_lease_slots": 4096,
+    "no_new_privileges": True,
+    "capability_bounding_set": "empty",
+    "process_namespace": True,
+    "mount_namespace": True,
+    "ipc_namespace": True,
+    "uts_namespace": True,
+}
+_WORKSPACE_SANDBOX_BOOLEAN_FIELDS = frozenset(
+    {
+        "formal_eligible",
+        "no_new_privileges",
+        "process_namespace",
+        "mount_namespace",
+        "ipc_namespace",
+        "uts_namespace",
+    }
+)
+_WORKSPACE_SANDBOX_RESOURCE_FIELDS = frozenset(
+    {
+        "workspace_bytes",
+        "workspace_inodes",
+        "max_files",
+        "max_directories",
+        "max_file_bytes",
+        "max_path_chars",
+        "default_timeout_ms",
+        "max_timeout_ms",
+        "cpu_seconds",
+        "address_space_bytes",
+        "max_processes",
+        "max_open_files",
+        "stdout_bytes",
+        "stderr_bytes",
+        "tmp_bytes",
+        "tmp_inodes",
+    }
+)
+_WORKSPACE_SANDBOX_SHARED_LIMIT_FIELDS = frozenset(
+    _WORKSPACE_SANDBOX_RESOURCE_FIELDS - {"workspace_bytes", "workspace_inodes"}
+)
+_WORKSPACE_SANDBOX_FINGERPRINT_FIELDS = frozenset(
+    {"device", "inode", "mode", "size", "mtime_ns", "ctime_ns"}
+)
 
 
 class FormalDomainV3Error(ValueError):
     pass
+
+
+def _validate_workspace_sandbox_metadata(metadata: Mapping[str, Any]) -> None:
+    limits = metadata.get("workspace_limits")
+    if not isinstance(limits, Mapping) or not _WORKSPACE_LIMIT_FIELDS.issubset(limits):
+        raise FormalDomainV3Error(
+            "filesystem surface is missing the complete workspace_limits contract"
+        )
+    if any(type(limits[name]) is not int or limits[name] <= 0 for name in _WORKSPACE_LIMIT_FIELDS):
+        raise FormalDomainV3Error(
+            "filesystem surface workspace_limits must be positive integers"
+        )
+    if limits["default_timeout_ms"] > limits["max_timeout_ms"]:
+        raise FormalDomainV3Error(
+            "filesystem surface default timeout exceeds its maximum"
+        )
+    if limits["max_file_bytes"] > limits["max_total_bytes"]:
+        raise FormalDomainV3Error(
+            "filesystem surface file limit exceeds workspace capacity"
+        )
+
+    sandbox = metadata.get("workspace_sandbox")
+    if not isinstance(sandbox, Mapping):
+        raise FormalDomainV3Error(
+            "filesystem surface is missing workspace_sandbox metadata"
+        )
+    mismatches = []
+    for field, expected in _WORKSPACE_SANDBOX_FIELDS.items():
+        observed = sandbox.get(field)
+        if field in _WORKSPACE_SANDBOX_BOOLEAN_FIELDS:
+            matches = type(observed) is bool and observed is expected
+        elif field == "uid_lease_slots":
+            matches = type(observed) is int and observed == expected
+        else:
+            matches = observed == expected
+        if not matches:
+            mismatches.append(field)
+    if mismatches:
+        raise FormalDomainV3Error(
+            "filesystem surface workspace_sandbox contract mismatch: "
+            + ", ".join(sorted(mismatches))
+        )
+
+    observed_sha256 = sandbox.get("ripgrep_sha256")
+    expected_sha256 = sandbox.get("ripgrep_expected_sha256")
+    if (
+        not isinstance(observed_sha256, str)
+        or _SHA256_RE.fullmatch(observed_sha256) is None
+        or expected_sha256 != observed_sha256
+    ):
+        raise FormalDomainV3Error(
+            "filesystem surface workspace_sandbox has an invalid ripgrep pin"
+        )
+    version = sandbox.get("ripgrep_version")
+    if not isinstance(version, str) or not version.strip():
+        raise FormalDomainV3Error(
+            "filesystem surface workspace_sandbox lacks a ripgrep version"
+        )
+    fingerprint = sandbox.get("ripgrep_startup_fingerprint")
+    if (
+        not isinstance(fingerprint, Mapping)
+        or not _WORKSPACE_SANDBOX_FINGERPRINT_FIELDS.issubset(fingerprint)
+        or any(
+            type(fingerprint[name]) is not int or fingerprint[name] < 0
+            for name in _WORKSPACE_SANDBOX_FINGERPRINT_FIELDS
+        )
+        or any(
+            fingerprint[name] <= 0
+            for name in _WORKSPACE_SANDBOX_FINGERPRINT_FIELDS - {"device"}
+        )
+    ):
+        raise FormalDomainV3Error(
+            "filesystem surface workspace_sandbox has an invalid ripgrep fingerprint"
+        )
+
+    resources = sandbox.get("resource_limits")
+    if (
+        not isinstance(resources, Mapping)
+        or not _WORKSPACE_SANDBOX_RESOURCE_FIELDS.issubset(resources)
+        or any(
+            type(resources[name]) is not int or resources[name] <= 0
+            for name in _WORKSPACE_SANDBOX_RESOURCE_FIELDS
+        )
+    ):
+        raise FormalDomainV3Error(
+            "filesystem surface workspace_sandbox resource_limits are invalid"
+        )
+    for name in _WORKSPACE_SANDBOX_SHARED_LIMIT_FIELDS:
+        if resources[name] != limits[name]:
+            raise FormalDomainV3Error(
+                f"filesystem surface sandbox/workspace limit mismatch: {name}"
+            )
+    if resources["workspace_bytes"] != limits["max_total_bytes"]:
+        raise FormalDomainV3Error(
+            "filesystem surface sandbox workspace_bytes mismatch"
+        )
+    if resources["workspace_inodes"] != limits["max_files"] + limits["max_directories"] + 1:
+        raise FormalDomainV3Error(
+            "filesystem surface sandbox workspace_inodes mismatch"
+        )
 
 
 def canonical_unicode_contains(text: str, fragment: str) -> bool:
@@ -136,6 +318,90 @@ def validate_webshop_memory_prompt_mode(
             "WebShop server and rollout memory prompt modes disagree: "
             f"server={server_mode!r} rollout={expected_mode!r}"
         )
+
+
+def validate_webshop_filesystem_surface(
+    metadata: Mapping[str, Any],
+    *,
+    expected_prompt_mode: str,
+) -> None:
+    """Fail closed if the natural filesystem surface is wired to legacy state."""
+
+    surface = metadata.get("surface")
+    is_filesystem = surface == FORMAL_WEBSHOP_FILESYSTEM_SURFACE_V2
+    if expected_prompt_mode == "natural_filesystem" and not is_filesystem:
+        raise FormalDomainV3Error(
+            "natural_filesystem prompt mode is only valid for the persistent-workspace "
+            f"surface {FORMAL_WEBSHOP_FILESYSTEM_SURFACE_V2!r}"
+        )
+    if not is_filesystem:
+        return
+    if expected_prompt_mode != "natural_filesystem":
+        raise FormalDomainV3Error(
+            "filesystem surface requires memory_prompt_mode='natural_filesystem'"
+        )
+    expected = {
+        "memory_management": "policy_managed_persistent_workspace",
+        "workspace_surface": "codex_workspace_v2",
+        "workspace_tool_contract": "codex_shell_command_apply_patch_v1",
+        "workspace_persistence": "episode_across_sessions",
+        "workspace_episode_isolation": True,
+        "workspace_shell_enabled": True,
+        "workspace_apply_patch_enabled": True,
+        "workspace_host_path_exposed": False,
+        "paper_eligible": False,
+    }
+    mismatches = []
+    for name, expected_value in expected.items():
+        observed = metadata.get(name)
+        if type(expected_value) is bool:
+            matches = type(observed) is bool and observed is expected_value
+        else:
+            matches = observed == expected_value
+        if not matches:
+            mismatches.append(name)
+    if mismatches:
+        raise FormalDomainV3Error(
+            "filesystem surface workspace contract mismatch: "
+            + ", ".join(sorted(mismatches))
+        )
+    if "ltm_inventory_mode" in metadata:
+        raise FormalDomainV3Error(
+            "filesystem surface must not expose an LTM inventory"
+        )
+    observed_ops = metadata.get("workspace_tool_ops")
+    if not isinstance(observed_ops, (list, tuple)) or {
+        str(value).upper() for value in observed_ops
+    } != WORKSPACE_TOOL_OPS:
+        raise FormalDomainV3Error(
+            "filesystem surface workspace_tool_ops must be exactly "
+            "shell_command/apply_patch"
+        )
+    reward_contract = metadata.get("reward_contract")
+    if not isinstance(reward_contract, Mapping):
+        raise FormalDomainV3Error(
+            "filesystem surface is missing reward_contract"
+        )
+    for field in (
+        "workspace_action_reward",
+        "shell_command_reward",
+        "apply_patch_reward",
+    ):
+        value = reward_contract.get(field)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) != 0.0
+        ):
+            raise FormalDomainV3Error(
+                f"filesystem surface has nonzero {field}"
+            )
+    if reward_contract.get("memory_specific_shaping") != "none":
+        raise FormalDomainV3Error(
+            "filesystem surface must disable memory-specific shaping"
+        )
+    _validate_workspace_sandbox_metadata(metadata)
 
 
 def validate_webshop_action_listing_mode(

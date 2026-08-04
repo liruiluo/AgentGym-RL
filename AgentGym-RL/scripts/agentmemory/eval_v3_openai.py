@@ -16,6 +16,8 @@ an explicit integer id sequence (the usual OpenAI response does not).
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import copy
 import hashlib
 import importlib.util
@@ -31,7 +33,113 @@ from urllib.request import Request, urlopen
 
 
 FORMAL_SCHEMA_V3 = "agentmemory_formal_step_v3"
+FORMAL_WEBSHOP_SCHEMA_V2 = "agentmemory_formal_step_v2"
 WEBSHOP_V2_SURFACE = "memoryarena_webshop_native_v1"
+FILESYSTEM_WEBSHOP_V2_SURFACE = (
+    "agentmemory_webshop_procedural_natural_chain_filesystem_v2"
+)
+FILESYSTEM_TOOL_OPS = ("SHELL_COMMAND", "APPLY_PATCH")
+FILESYSTEM_CAUSAL_ARMS = ("correct", "blank", "swapped", "no_workspace")
+FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS = (
+    'shell_command {"command":"rg -n pattern ."',
+    "apply_patch is followed on the next line",
+    "*** Begin Patch",
+    "*** End Patch",
+    "workspace persists across shopping sessions within this episode",
+    "Workspace actions have zero task reward",
+    "has no network",
+    "no host-path access",
+    "no dedicated memory API",
+)
+FILESYSTEM_PROMPT_FORBIDDEN_FRAGMENTS = (
+    'Read {"path"',
+    'Write {"path"',
+    'Edit {"path"',
+    'Grep {"pattern"',
+    'Glob {"pattern"',
+    "ADD requires",
+    "RETRIEVE accepts",
+    "memory_id:string",
+    "use ADD before",
+    "use RETRIEVE",
+    "Long-term memory persists",
+)
+FILESYSTEM_WORKSPACE_LIMIT_FIELDS = frozenset(
+    {
+        "max_path_chars",
+        "max_files",
+        "max_directories",
+        "max_file_bytes",
+        "max_total_bytes",
+        "max_command_chars",
+        "max_patch_bytes",
+        "default_timeout_ms",
+        "max_timeout_ms",
+        "cpu_seconds",
+        "address_space_bytes",
+        "max_processes",
+        "max_open_files",
+        "stdout_bytes",
+        "stderr_bytes",
+        "tmp_bytes",
+        "tmp_inodes",
+    }
+)
+FILESYSTEM_SANDBOX_FIELDS = {
+    "contract": "linux_namespace_chroot_tmpfs_v1",
+    "formal_eligible": True,
+    "network": "new_namespace_no_routes",
+    "rootfs": "minimal_read_only_system_roots",
+    "workspace_mount": "bounded_tmpfs_copy_in_copy_out",
+    "shell": "bash_no_profile_no_rc",
+    "ripgrep_path": "/tools/rg",
+    "ripgrep_revalidation": "stat_fingerprint_before_each_command",
+    "model_identity": "exclusive_leased_high_uid_per_command",
+    "rlimit_nproc_scope": "host_uid_lease_per_concurrent_command",
+    "uid_lease_slots": 4096,
+    "no_new_privileges": True,
+    "capability_bounding_set": "empty",
+    "process_namespace": True,
+    "mount_namespace": True,
+    "ipc_namespace": True,
+    "uts_namespace": True,
+}
+FILESYSTEM_SANDBOX_BOOLEAN_FIELDS = frozenset(
+    {
+        "formal_eligible",
+        "no_new_privileges",
+        "process_namespace",
+        "mount_namespace",
+        "ipc_namespace",
+        "uts_namespace",
+    }
+)
+FILESYSTEM_SANDBOX_RESOURCE_FIELDS = frozenset(
+    {
+        "workspace_bytes",
+        "workspace_inodes",
+        "max_files",
+        "max_directories",
+        "max_file_bytes",
+        "max_path_chars",
+        "default_timeout_ms",
+        "max_timeout_ms",
+        "cpu_seconds",
+        "address_space_bytes",
+        "max_processes",
+        "max_open_files",
+        "stdout_bytes",
+        "stderr_bytes",
+        "tmp_bytes",
+        "tmp_inodes",
+    }
+)
+FILESYSTEM_SANDBOX_SHARED_LIMIT_FIELDS = frozenset(
+    FILESYSTEM_SANDBOX_RESOURCE_FIELDS - {"workspace_bytes", "workspace_inodes"}
+)
+FILESYSTEM_SANDBOX_FINGERPRINT_FIELDS = frozenset(
+    {"device", "inode", "mode", "size", "mtime_ns", "ctime_ns"}
+)
 TRAVEL_FAILFAST_SURFACE = "memoryarena_travel_planner_failfast_one_action_v3"
 TRAVEL_PAPER_EVAL_SURFACE = (
     "memoryarena_travel_planner_paper_eval_one_action_v3"
@@ -602,6 +710,17 @@ PAPER_SURFACE_REGISTRY = {
     },
 }
 
+# These surfaces are valid behavior/capability evaluations but never paper
+# columns. Keeping a separate registry prevents an experimental memory surface
+# from entering MemoryArena's canonical five-column aggregate by accident.
+EVIDENCE_SURFACE_REGISTRY = {
+    FILESYSTEM_WEBSHOP_V2_SURFACE: {
+        "variant": "natural_filesystem_v2",
+        "metric_mode": "filesystem_behavior_v2",
+        "paper_macro_eligible": False,
+    },
+}
+
 # Native WebShop v2 predates the v3 metadata contract and therefore does not
 # expose ``system_prompt`` from its server. Load the canonical no-thinking
 # prompt from the rollout schema so evaluation cannot drift from training when
@@ -612,6 +731,9 @@ def _load_legacy_webshop_system_prompt(
     *,
     ltm_inventory_mode: str = "hidden",
     memory_prompt_mode: str = "legacy",
+    surface: str | None = None,
+    workspace_enabled: bool = True,
+    reply_style: str | None = None,
 ) -> str:
     schemas_path = Path(__file__).resolve().parents[2] / "verl/workers/rollout/schemas.py"
     if not schemas_path.is_file():
@@ -642,10 +764,44 @@ def _load_legacy_webshop_system_prompt(
             raise RuntimeError(f"cannot load canonical prompt schema: {schemas_path}")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        prompt = module.agentmemory_action_system_prompt(
-            ltm_inventory_mode=ltm_inventory_mode,
-            memory_prompt_mode=memory_prompt_mode,
-        )
+        if reply_style is None:
+            prompt = module.agentmemory_action_system_prompt(
+                ltm_inventory_mode=ltm_inventory_mode,
+                memory_prompt_mode=memory_prompt_mode,
+                surface=surface,
+                workspace_enabled=workspace_enabled,
+            )
+        else:
+            if memory_prompt_mode != "natural_filesystem":
+                raise RuntimeError(
+                    "reply_style is valid only for the natural filesystem prompt"
+                )
+            prompt_names = {
+                (True, "no_thinking"): (
+                    "AGENTMEMORY_ACTION_SYSTEM_PROMPT_NATURAL_FILESYSTEM"
+                ),
+                (True, "thinking"): (
+                    "AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NATURAL_FILESYSTEM"
+                ),
+                (True, "reasoning"): (
+                    "AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NATURAL_FILESYSTEM"
+                ),
+                (False, "no_thinking"): (
+                    "AGENTMEMORY_ACTION_SYSTEM_PROMPT_NO_WORKSPACE"
+                ),
+                (False, "thinking"): (
+                    "AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NO_WORKSPACE"
+                ),
+                (False, "reasoning"): (
+                    "AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NO_WORKSPACE"
+                ),
+            }
+            try:
+                prompt = getattr(module, prompt_names[(workspace_enabled, reply_style)])
+            except KeyError as exc:
+                raise RuntimeError(
+                    "reply_style must be no_thinking, thinking, or reasoning"
+                ) from exc
     finally:
         for name, original in original_modules.items():
             if original is sentinel:
@@ -661,6 +817,39 @@ def _load_legacy_webshop_system_prompt(
 LEGACY_WEBSHOP_SYSTEM_PROMPT = _load_legacy_webshop_system_prompt(
     ltm_inventory_mode="hidden"
 )
+FILESYSTEM_WEBSHOP_SYSTEM_PROMPT = _load_legacy_webshop_system_prompt(
+    ltm_inventory_mode="hidden",
+    memory_prompt_mode="natural_filesystem",
+    surface=FILESYSTEM_WEBSHOP_V2_SURFACE,
+)
+FILESYSTEM_WEBSHOP_PROMPT_PAIRS = {
+    _load_legacy_webshop_system_prompt(
+        ltm_inventory_mode="hidden",
+        memory_prompt_mode="natural_filesystem",
+        surface=FILESYSTEM_WEBSHOP_V2_SURFACE,
+        workspace_enabled=True,
+        reply_style=style,
+    ): _load_legacy_webshop_system_prompt(
+        ltm_inventory_mode="hidden",
+        memory_prompt_mode="natural_filesystem",
+        surface=FILESYSTEM_WEBSHOP_V2_SURFACE,
+        workspace_enabled=False,
+        reply_style=style,
+    )
+    for style in ("no_thinking", "thinking", "reasoning")
+}
+FILESYSTEM_WEBSHOP_NO_WORKSPACE_SYSTEM_PROMPT = (
+    FILESYSTEM_WEBSHOP_PROMPT_PAIRS[FILESYSTEM_WEBSHOP_SYSTEM_PROMPT]
+)
+
+
+def filesystem_no_workspace_system_prompt(enabled_prompt: str) -> str:
+    try:
+        return FILESYSTEM_WEBSHOP_PROMPT_PAIRS[enabled_prompt]
+    except KeyError as exc:
+        raise EvalError(
+            "filesystem enabled prompt is not one of the canonical reply styles"
+        ) from exc
 LEGACY_WEBSHOP_MAX_POLICY_TURNS = 56
 
 
@@ -679,6 +868,310 @@ class HttpError(EvalError):
 
 class TokenizationError(EvalError):
     """The model server did not provide authoritative prompt token ids."""
+
+
+def _validate_filesystem_sandbox_metadata(metadata: Mapping[str, Any]) -> None:
+    limits = metadata.get("workspace_limits")
+    if (
+        not isinstance(limits, Mapping)
+        or not FILESYSTEM_WORKSPACE_LIMIT_FIELDS.issubset(limits)
+        or any(
+            type(limits[name]) is not int or limits[name] <= 0
+            for name in FILESYSTEM_WORKSPACE_LIMIT_FIELDS
+        )
+    ):
+        raise EvalError(
+            "filesystem-v2 metadata lacks complete positive-integer workspace_limits"
+        )
+    if limits["default_timeout_ms"] > limits["max_timeout_ms"]:
+        raise EvalError("filesystem-v2 default timeout exceeds its maximum")
+    if limits["max_file_bytes"] > limits["max_total_bytes"]:
+        raise EvalError("filesystem-v2 file limit exceeds workspace capacity")
+
+    sandbox = metadata.get("workspace_sandbox")
+    if not isinstance(sandbox, Mapping):
+        raise EvalError("filesystem-v2 metadata lacks workspace_sandbox")
+    mismatches = []
+    for field, expected in FILESYSTEM_SANDBOX_FIELDS.items():
+        observed = sandbox.get(field)
+        if field in FILESYSTEM_SANDBOX_BOOLEAN_FIELDS:
+            matches = type(observed) is bool and observed is expected
+        elif field == "uid_lease_slots":
+            matches = type(observed) is int and observed == expected
+        else:
+            matches = observed == expected
+        if not matches:
+            mismatches.append(field)
+    if mismatches:
+        raise EvalError(
+            "filesystem-v2 workspace_sandbox contract mismatch: "
+            + ", ".join(sorted(mismatches))
+        )
+
+    observed_sha256 = sandbox.get("ripgrep_sha256")
+    expected_sha256 = sandbox.get("ripgrep_expected_sha256")
+    if (
+        not isinstance(observed_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", observed_sha256) is None
+        or expected_sha256 != observed_sha256
+    ):
+        raise EvalError("filesystem-v2 workspace_sandbox has an invalid ripgrep pin")
+    version = sandbox.get("ripgrep_version")
+    if not isinstance(version, str) or not version.strip():
+        raise EvalError("filesystem-v2 workspace_sandbox lacks a ripgrep version")
+    fingerprint = sandbox.get("ripgrep_startup_fingerprint")
+    if (
+        not isinstance(fingerprint, Mapping)
+        or not FILESYSTEM_SANDBOX_FINGERPRINT_FIELDS.issubset(fingerprint)
+        or any(
+            type(fingerprint[name]) is not int or fingerprint[name] < 0
+            for name in FILESYSTEM_SANDBOX_FINGERPRINT_FIELDS
+        )
+        or any(
+            fingerprint[name] <= 0
+            for name in FILESYSTEM_SANDBOX_FINGERPRINT_FIELDS - {"device"}
+        )
+    ):
+        raise EvalError(
+            "filesystem-v2 workspace_sandbox has an invalid ripgrep fingerprint"
+        )
+
+    resources = sandbox.get("resource_limits")
+    if (
+        not isinstance(resources, Mapping)
+        or not FILESYSTEM_SANDBOX_RESOURCE_FIELDS.issubset(resources)
+        or any(
+            type(resources[name]) is not int or resources[name] <= 0
+            for name in FILESYSTEM_SANDBOX_RESOURCE_FIELDS
+        )
+    ):
+        raise EvalError(
+            "filesystem-v2 workspace_sandbox resource_limits are invalid"
+        )
+    for name in FILESYSTEM_SANDBOX_SHARED_LIMIT_FIELDS:
+        if resources[name] != limits[name]:
+            raise EvalError(
+                f"filesystem-v2 sandbox/workspace limit mismatch: {name}"
+            )
+    if resources["workspace_bytes"] != limits["max_total_bytes"]:
+        raise EvalError("filesystem-v2 sandbox workspace_bytes mismatch")
+    if (
+        resources["workspace_inodes"]
+        != limits["max_files"] + limits["max_directories"] + 1
+    ):
+        raise EvalError("filesystem-v2 sandbox workspace_inodes mismatch")
+
+
+def validate_filesystem_surface_metadata(metadata: Mapping[str, Any]) -> None:
+    """Validate the non-paper natural-filesystem evaluation contract."""
+
+    if metadata.get("surface") != FILESYSTEM_WEBSHOP_V2_SURFACE:
+        return
+    expected = {
+        "memory_prompt_mode": "natural_filesystem",
+        "memory_management": "policy_managed_persistent_workspace",
+        "workspace_surface": "codex_workspace_v2",
+        "workspace_tool_contract": "codex_shell_command_apply_patch_v1",
+        "workspace_persistence": "episode_across_sessions",
+        "workspace_episode_isolation": True,
+        "workspace_shell_enabled": True,
+        "workspace_apply_patch_enabled": True,
+        "workspace_host_path_exposed": False,
+        "paper_eligible": False,
+    }
+    mismatches = {}
+    for name, expected_value in expected.items():
+        observed = metadata.get(name)
+        if type(expected_value) is bool:
+            matches = type(observed) is bool and observed is expected_value
+        else:
+            matches = observed == expected_value
+        if not matches:
+            mismatches[name] = {
+                "expected": expected_value,
+                "observed": observed,
+            }
+    if mismatches:
+        raise EvalError(
+            "filesystem-v2 metadata contract mismatch: "
+            + json.dumps(mismatches, ensure_ascii=True, sort_keys=True)
+        )
+    if "ltm_inventory_mode" in metadata:
+        raise EvalError("filesystem-v2 metadata must not expose an LTM inventory")
+    if metadata.get("workspace_tool_ops") != list(FILESYSTEM_TOOL_OPS):
+        raise EvalError(
+            "filesystem-v2 workspace_tool_ops must be exactly "
+            "shell_command/apply_patch"
+        )
+    _validate_filesystem_sandbox_metadata(metadata)
+    reward_contract = metadata.get("reward_contract")
+    if not isinstance(reward_contract, Mapping):
+        raise EvalError("filesystem-v2 metadata lacks reward_contract")
+    for field in (
+        "workspace_action_reward",
+        "shell_command_reward",
+        "apply_patch_reward",
+    ):
+        value = reward_contract.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise EvalError(f"filesystem-v2 reward field {field} is not numeric")
+        if not math.isclose(float(value), 0.0, rel_tol=0.0, abs_tol=0.0):
+            raise EvalError(f"filesystem-v2 reward field {field} must be zero")
+    if reward_contract.get("memory_specific_shaping") != "none":
+        raise EvalError("filesystem-v2 must disable memory-specific shaping")
+    prompt = metadata.get("system_prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise EvalError("filesystem-v2 metadata lacks its effective system prompt")
+    missing = [
+        fragment
+        for fragment in FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS
+        if fragment not in prompt
+    ]
+    forbidden = [
+        fragment
+        for fragment in FILESYSTEM_PROMPT_FORBIDDEN_FRAGMENTS
+        if fragment in prompt
+    ]
+    if missing or forbidden:
+        raise EvalError(
+            "filesystem-v2 effective prompt contract mismatch: "
+            f"missing={missing} forbidden={forbidden}"
+        )
+
+
+def validate_filesystem_intervention_control(
+    metadata: Mapping[str, Any],
+    *,
+    token: str,
+) -> None:
+    """Bind a causal evaluator to the authenticated, answer-free control plane."""
+
+    validate_filesystem_surface_metadata(metadata)
+    if metadata.get("surface") != FILESYSTEM_WEBSHOP_V2_SURFACE:
+        raise EvalError("causal intervention requires filesystem WebShop v2")
+    if not isinstance(token, str) or len(token) < 32:
+        raise EvalError("workspace intervention token is missing or too short")
+    service = metadata.get("service")
+    if (
+        not isinstance(service, Mapping)
+        or service.get("role") != "intervention_eval"
+        or not isinstance(service.get("runtime_source_id"), str)
+        or not service["runtime_source_id"]
+    ):
+        raise EvalError(
+            "causal intervention requires an intervention_eval service with source identity"
+        )
+    control = metadata.get("workspace_intervention_control")
+    expected = {
+        "enabled": True,
+        "contract": "authenticated_first_boundary_counterfactual_copy_v1",
+        "allowed_arms": list(FILESYSTEM_CAUSAL_ARMS),
+        "boundary_session_index": 1,
+        "source_state": "policy_authored_workspace_only",
+        "authenticated_export": True,
+        "hidden_answer_injection": False,
+        "token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+    }
+    if not isinstance(control, Mapping):
+        raise EvalError("filesystem-v2 metadata lacks intervention control")
+    mismatches = {
+        name: {"expected": expected_value, "observed": control.get(name)}
+        for name, expected_value in expected.items()
+        if control.get(name) != expected_value
+    }
+    if mismatches:
+        raise EvalError(
+            "filesystem-v2 intervention control mismatch: "
+            + json.dumps(mismatches, ensure_ascii=True, sort_keys=True)
+        )
+
+
+def validate_workspace_transfer_state(
+    state: Mapping[str, Any],
+    *,
+    limits: Mapping[str, Any] | None = None,
+) -> None:
+    if (
+        not isinstance(state, Mapping)
+        or state.get("schema") != "agentmemory_workspace_transfer_state_v1"
+    ):
+        raise EvalError("workspace export has an invalid transfer-state schema")
+    directories = state.get("directories")
+    files = state.get("files")
+    if not isinstance(directories, list) or not isinstance(files, list):
+        raise EvalError("workspace export lacks directory and file lists")
+
+    def valid_path(value: Any) -> bool:
+        return (
+            isinstance(value, str)
+            and bool(value)
+            and not value.startswith(("/", "~"))
+            and "\\" not in value
+            and all(part not in ("", ".", "..") for part in value.split("/"))
+        )
+
+    if (
+        any(not valid_path(path) for path in directories)
+        or directories != sorted(set(directories))
+    ):
+        raise EvalError("workspace export directory paths are not canonical")
+    if limits is not None and any(
+        len(path) > limits["max_path_chars"] for path in directories
+    ):
+        raise EvalError("workspace export directory path exceeds its runtime limit")
+    manifest_files = []
+    file_paths = []
+    total_bytes = 0
+    for item in files:
+        if not isinstance(item, Mapping) or not valid_path(item.get("path")):
+            raise EvalError("workspace export has an invalid file record")
+        path = item["path"]
+        encoded = item.get("content_base64")
+        if not isinstance(encoded, str):
+            raise EvalError("workspace export file content is not base64 text")
+        try:
+            data = base64.b64decode(encoded.encode("ascii"), validate=True)
+        except (UnicodeEncodeError, ValueError, binascii.Error) as exc:
+            raise EvalError("workspace export file content is invalid base64") from exc
+        size = item.get("bytes")
+        digest = item.get("sha256")
+        if (
+            type(size) is not int
+            or size != len(data)
+            or (limits is not None and size > limits["max_file_bytes"])
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or hashlib.sha256(data).hexdigest() != digest
+        ):
+            raise EvalError("workspace export file size or digest is inconsistent")
+        file_paths.append(path)
+        if limits is not None and len(path) > limits["max_path_chars"]:
+            raise EvalError("workspace export file path exceeds its runtime limit")
+        total_bytes += size
+        manifest_files.append({"path": path, "sha256": digest, "bytes": size})
+    if file_paths != sorted(set(file_paths)):
+        raise EvalError("workspace export file paths are not sorted and unique")
+    if set(file_paths).intersection(directories):
+        raise EvalError("workspace export path is both a file and directory")
+    manifest = json.dumps(
+        {"directories": directories, "files": manifest_files},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if (
+        state.get("file_count") != len(files)
+        or state.get("directory_count") != len(directories)
+        or state.get("total_bytes") != total_bytes
+        or state.get("tree_sha256") != hashlib.sha256(manifest).hexdigest()
+    ):
+        raise EvalError("workspace export manifest or tree digest is inconsistent")
+    if limits is not None and (
+        len(files) > limits["max_files"]
+        or len(directories) > limits["max_directories"]
+        or total_bytes > limits["max_total_bytes"]
+    ):
+        raise EvalError("workspace export exceeds its attested runtime limits")
 
 
 def resolve_paper_surface(metadata: Mapping[str, Any]) -> dict[str, Any]:
@@ -2681,6 +3174,187 @@ def aggregate_search_paper_metrics(
     }
 
 
+def _load_formal_training_metrics_module():
+    module_path = (
+        Path(__file__).resolve().parents[2]
+        / "verl/utils/agentgym/formal_training_metrics.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "agentmemory_eval_formal_training_metrics", module_path
+    )
+    if spec is None or spec.loader is None:
+        raise EvalError(f"cannot load filesystem evidence metrics: {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _filesystem_metric_rows(
+    episodes: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for episode_index, episode in enumerate(episodes):
+        steps = episode.get("steps")
+        if not isinstance(steps, list) or not steps:
+            raise EvalError(
+                f"filesystem-v2 episode {episode_index} contains no step evidence"
+            )
+        rewards = []
+        for step_index, step in enumerate(steps):
+            if not isinstance(step, Mapping):
+                raise EvalError(
+                    f"filesystem-v2 episode {episode_index} step {step_index} is not an object"
+                )
+            reward = step.get("reward")
+            if (
+                isinstance(reward, bool)
+                or not isinstance(reward, (int, float))
+                or not math.isfinite(float(reward))
+            ):
+                raise EvalError("filesystem-v2 step reward is not finite and numeric")
+            rewards.append(float(reward))
+        trajectory_return = sum(rewards)
+        declared_return = episode.get("episode_return")
+        if (
+            isinstance(declared_return, bool)
+            or not isinstance(declared_return, (int, float))
+            or not math.isclose(
+                float(declared_return),
+                trajectory_return,
+                rel_tol=1e-8,
+                abs_tol=1e-8,
+            )
+        ):
+            raise EvalError("filesystem-v2 episode return disagrees with step rewards")
+        suffixes = [0.0] * len(rewards)
+        suffix = 0.0
+        for index in range(len(rewards) - 1, -1, -1):
+            suffix += rewards[index]
+            suffixes[index] = suffix
+        uid = f"eval:{episode_index}:{episode.get('data_idx')}"
+        for step_index, step in enumerate(steps):
+            before = step.get("env_info_before")
+            after = step.get("env_info_after")
+            if not isinstance(before, Mapping) or not isinstance(after, Mapping):
+                raise EvalError("filesystem-v2 step lacks before/after environment info")
+            before_index = before.get(
+                "current_subtask_index", before.get("phase_index")
+            )
+            after_index = after.get(
+                "current_subtask_index", after.get("phase_index")
+            )
+            if (
+                type(before_index) is not int
+                or type(after_index) is not int
+                or before_index < 0
+                or after_index < before_index
+            ):
+                raise EvalError("filesystem-v2 step has invalid session indices")
+            tool_ops = after.get("tool_ops")
+            if not isinstance(tool_ops, list):
+                raise EvalError("filesystem-v2 step lacks authoritative tool_ops")
+            buy_ops = [
+                event
+                for event in tool_ops
+                if isinstance(event, Mapping)
+                and str(event.get("op", "")).upper() == "BUY"
+            ]
+            buy_committed = bool(buy_ops)
+            buy_accepted = any(
+                event.get("purchase_correct") is True
+                and event.get("session_advanced") is True
+                for event in buy_ops
+            )
+            done = step.get("done")
+            if type(done) is not bool:
+                raise EvalError("filesystem-v2 step done flag is not boolean")
+            success = step.get("episode_success") is True and done
+            record = {
+                "action": step.get("action_submitted"),
+                "subtask_index_before": before_index,
+                "subtask_index_after": after_index,
+                "buy_accepted": buy_accepted,
+                "buy_committed": buy_committed,
+                "session_advanced": after_index > before_index,
+                "done": done,
+                "outcome": "success" if success else "running",
+                "env_info_before": copy.deepcopy(dict(before)),
+                "env_info_after": copy.deepcopy(dict(after)),
+            }
+            rows.append(
+                {
+                    "trajectory_uid": uid,
+                    "row_order": step_index,
+                    "terminal": step_index == len(steps) - 1,
+                    "immediate_reward": rewards[step_index],
+                    "suffix_return": suffixes[step_index],
+                    "trajectory_return": trajectory_return,
+                    "advantage_token_mean": 0.0,
+                    "record": record,
+                }
+            )
+    return rows
+
+
+def summarize_filesystem_surface(
+    episodes: Sequence[Mapping[str, Any]],
+    metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    validate_filesystem_surface_metadata(metadata)
+    metrics_module = _load_formal_training_metrics_module()
+    try:
+        metrics = metrics_module.summarize_formal_training_rows(
+            _filesystem_metric_rows(episodes)
+        )
+    except (TypeError, ValueError) as exc:
+        raise EvalError(f"invalid filesystem-v2 episode evidence: {exc}") from exc
+    selected_names = (
+        "trajectory_count",
+        "action_row_count",
+        "correct_buy_count",
+        "wrong_buy_count",
+        "workspace_action_count",
+        "workspace_shell_command_count",
+        "workspace_apply_patch_count",
+        "workspace_mutating_action_count",
+        "workspace_content_write_action_count",
+        "source_workspace_write_before_correct_buy_count",
+        "later_session_shell_after_source_write_count",
+        "workspace_cross_session_success_candidate_count",
+        "functional_memory_chain_count",
+        "workspace_snapshot_record_count",
+        "workspace_nonempty_snapshot_record_count",
+        "workspace_tree_change_count",
+        "workspace_final_file_count_mean",
+        "workspace_final_total_bytes_mean",
+        "workspace_final_audit_event_count_mean",
+    )
+    summary = summarize_episodes(episodes)
+    summary.update(
+        {
+            "evidence_surface": FILESYSTEM_WEBSHOP_V2_SURFACE,
+            "evidence_variant": EVIDENCE_SURFACE_REGISTRY[
+                FILESYSTEM_WEBSHOP_V2_SURFACE
+            ]["variant"],
+            "evidence_metric_mode": "filesystem_behavior_v2",
+            "filesystem_evidence_contract": (
+                "auditable_workspace_mutation_later_shell_candidate_chain_v2"
+            ),
+            "filesystem_metrics": {name: metrics[name] for name in selected_names},
+            "operation_counts_prove_memory_capability": False,
+            "causal_intervention_required": True,
+            "required_intervention_arms": [
+                "correct",
+                "blank",
+                "swapped",
+                "no_workspace",
+            ],
+            "paper_macro_eligible": False,
+        }
+    )
+    return summary
+
+
 def summarize_paper_surface(
     episodes: Sequence[Mapping[str, Any]],
     metadata: Mapping[str, Any],
@@ -2689,6 +3363,8 @@ def summarize_paper_surface(
 
     summary = summarize_episodes(episodes)
     surface = metadata.get("surface") if isinstance(metadata, Mapping) else None
+    if surface == FILESYSTEM_WEBSHOP_V2_SURFACE:
+        return summarize_filesystem_surface(episodes, metadata)
     if surface not in PAPER_SURFACE_REGISTRY:
         return summary
 
@@ -2809,15 +3485,29 @@ class JsonHttp:
         self.opener = opener or urlopen
         self.api_key = api_key
 
-    def request(self, method: str, url: str, payload: Mapping[str, Any] | None = None) -> Any:
+    def request(
+        self,
+        method: str,
+        url: str,
+        payload: Mapping[str, Any] | None = None,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> Any:
         body = None
-        headers = {"Accept": "application/json"}
+        request_headers = {"Accept": "application/json"}
         if payload is not None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            headers["Content-Type"] = "application/json"
+            request_headers["Content-Type"] = "application/json"
         if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        request = Request(url, data=body, headers=headers, method=method)
+            request_headers["Authorization"] = f"Bearer {self.api_key}"
+        if headers is not None:
+            for name, value in headers.items():
+                if not isinstance(name, str) or not name.strip():
+                    raise EvalError("HTTP header names must be non-empty strings")
+                if not isinstance(value, str) or "\r" in value or "\n" in value:
+                    raise EvalError("HTTP header values must be single-line strings")
+                request_headers[name] = value
+        request = Request(url, data=body, headers=request_headers, method=method)
         try:
             response = self.opener(request, timeout=self.timeout)
             status = int(getattr(response, "status", 200))
@@ -2845,8 +3535,14 @@ class JsonHttp:
     def get(self, url: str) -> Any:
         return self.request("GET", url)
 
-    def post(self, url: str, payload: Mapping[str, Any]) -> Any:
-        return self.request("POST", url, payload)
+    def post(
+        self,
+        url: str,
+        payload: Mapping[str, Any],
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> Any:
+        return self.request("POST", url, payload, headers=headers)
 
 
 def _trim_base(url: str) -> str:
@@ -2924,19 +3620,29 @@ class AgentMemoryEnvClient:
     def _get(self, path: str) -> Any:
         return self.transport.get(f"{self.base_url}/{path.lstrip('/')}")
 
-    def _post(self, path: str, payload: Mapping[str, Any]) -> Any:
-        return self.transport.post(
-            f"{self.base_url}/{path.lstrip('/')}", payload
-        )
+    def _post(
+        self,
+        path: str,
+        payload: Mapping[str, Any],
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> Any:
+        url = f"{self.base_url}/{path.lstrip('/')}"
+        if headers is None:
+            return self.transport.post(url, payload)
+        return self.transport.post(url, payload, headers=headers)
 
     def _validate_metadata(self) -> None:
         schema = self.metadata.get("formal_schema_version")
-        if schema not in (FORMAL_SCHEMA_V3, None):
+        if schema not in (FORMAL_SCHEMA_V3, FORMAL_WEBSHOP_SCHEMA_V2, None):
             raise EvalError(f"Unsupported AgentMemory formal schema: {schema!r}")
         surface = self.metadata.get("surface")
-        if schema is None and surface != WEBSHOP_V2_SURFACE:
+        if schema in (None, FORMAL_WEBSHOP_SCHEMA_V2) and surface not in (
+            WEBSHOP_V2_SURFACE,
+            FILESYSTEM_WEBSHOP_V2_SURFACE,
+        ):
             raise EvalError(
-                "Legacy AgentMemory metadata is accepted only for native WebShop v2"
+                "WebShop v2 metadata is accepted only for recognized WebShop v2 surfaces"
             )
         system_prompt = self.metadata.get("system_prompt")
         if schema == FORMAL_SCHEMA_V3:
@@ -2949,6 +3655,37 @@ class AgentMemoryEnvClient:
                     "AgentMemory metadata system_prompt_sha256 does not match prompt"
                 )
             self.metadata["system_prompt_source"] = "server_metadata"
+            validate_filesystem_surface_metadata(self.metadata)
+            return
+
+        if surface == FILESYSTEM_WEBSHOP_V2_SURFACE:
+            canonical_prompt = FILESYSTEM_WEBSHOP_SYSTEM_PROMPT
+            if system_prompt is None:
+                self.metadata["system_prompt"] = canonical_prompt
+                self.metadata["system_prompt_sha256"] = hashlib.sha256(
+                    canonical_prompt.encode("utf-8")
+                ).hexdigest()
+                self.metadata["system_prompt_source"] = "webshop_v2_rollout_fallback"
+            else:
+                if not isinstance(system_prompt, str) or not system_prompt.strip():
+                    raise EvalError(
+                        "Filesystem WebShop v2 system_prompt must be non-empty text"
+                    )
+                if system_prompt != canonical_prompt:
+                    raise EvalError(
+                        "Filesystem WebShop v2 metadata system_prompt disagrees with "
+                        "the canonical rollout fallback"
+                    )
+                expected = self.metadata.get("system_prompt_sha256")
+                observed = hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()
+                if expected is not None and expected != observed:
+                    raise EvalError(
+                        "Filesystem WebShop v2 metadata system_prompt_sha256 does not "
+                        "match prompt"
+                    )
+                self.metadata["system_prompt_sha256"] = observed
+                self.metadata["system_prompt_source"] = "server_metadata"
+            validate_filesystem_surface_metadata(self.metadata)
             return
 
         inventory_mode = self.metadata.get("ltm_inventory_mode", "hidden")
@@ -3028,10 +3765,82 @@ class AgentMemoryEnvClient:
         # This is the only normalization done by the canonical client for v3.
         submitted = action[:-4] if action.endswith("</s>") else action
         if not self.is_v3:
-            submitted = extract_webshop_v2_action(submitted)
+            submitted = extract_webshop_v2_action(
+                submitted,
+                allow_workspace=(self.surface == FILESYSTEM_WEBSHOP_V2_SURFACE),
+            )
         self.last_submitted_action = submitted
         result = self._post("step", {"id": self.env_id, "action": submitted})
         self._set_info(result)
+        return _json_copy(result)
+
+    def workspace_intervention(
+        self,
+        arm: str,
+        *,
+        token: str,
+        source_env_id: int | None = None,
+    ) -> dict[str, Any]:
+        if self.surface != FILESYSTEM_WEBSHOP_V2_SURFACE:
+            raise EvalError(
+                "workspace intervention is valid only for filesystem WebShop v2"
+            )
+        if self.env_id is None:
+            raise EvalError("Environment was not created")
+        if arm not in ("correct", "blank", "swapped", "no_workspace"):
+            raise EvalError(f"unsupported workspace intervention arm: {arm!r}")
+        if not isinstance(token, str) or len(token) < 32:
+            raise EvalError("workspace intervention token is missing or too short")
+        payload: dict[str, Any] = {"id": self.env_id, "arm": arm}
+        if source_env_id is not None:
+            if isinstance(source_env_id, bool) or not isinstance(source_env_id, int):
+                raise EvalError("source_env_id must be an integer")
+            payload["source_env_id"] = source_env_id
+        result = self._post(
+            "workspace-intervention",
+            payload,
+            headers={"X-AgentMemory-Intervention-Token": token},
+        )
+        if not isinstance(result, Mapping):
+            raise EvalError("workspace intervention returned a non-object response")
+        if result.get("id") != self.env_id:
+            raise EvalError("workspace intervention response id mismatch")
+        if result.get("reward") != 0.0 or result.get("done") is not False:
+            raise EvalError(
+                "workspace intervention must be out-of-band with reward=0 and done=false"
+            )
+        info = result.get("info")
+        if not isinstance(info, Mapping) or info.get("workspace_causal_arm") != arm:
+            raise EvalError("workspace intervention response lacks its causal arm")
+        self._set_info(result)
+        return _json_copy(result)
+
+    def workspace_export(self, *, token: str) -> dict[str, Any]:
+        if self.surface != FILESYSTEM_WEBSHOP_V2_SURFACE:
+            raise EvalError("workspace export is valid only for filesystem WebShop v2")
+        if self.env_id is None:
+            raise EvalError("Environment was not created")
+        if not isinstance(token, str) or len(token) < 32:
+            raise EvalError("workspace intervention token is missing or too short")
+        result = self._post(
+            "workspace-export",
+            {"id": self.env_id},
+            headers={"X-AgentMemory-Intervention-Token": token},
+        )
+        if (
+            not isinstance(result, Mapping)
+            or result.get("schema")
+            != "agentmemory_workspace_authenticated_export_v1"
+            or result.get("id") != self.env_id
+            or result.get("policy_authored") is not True
+            or result.get("hidden_answer_injection") is not False
+            or not isinstance(result.get("workspace_state"), Mapping)
+        ):
+            raise EvalError("workspace export response violates its evidence contract")
+        validate_workspace_transfer_state(
+            result["workspace_state"],
+            limits=self.metadata.get("workspace_limits"),
+        )
         return _json_copy(result)
 
     def close(self) -> Any:
@@ -3049,13 +3858,34 @@ _MEMORY_ACTION_RE = re.compile(
     r"\A(" + "|".join(_MEMORY_ACTION_NAMES) + r")\s+(\{.*\})\Z",
     flags=re.DOTALL,
 )
+_WORKSPACE_SHELL_ACTION_RE = re.compile(r"\Ashell_command\s+(\{.*\})\Z", re.DOTALL)
+_WORKSPACE_PATCH_ACTION_RE = re.compile(
+    r"\Aapply_patch\n\*\*\* Begin Patch\n.+\n\*\*\* End Patch\Z",
+    re.DOTALL,
+)
 
 
-def _normalize_webshop_v2_action(candidate: str) -> str | None:
+def _normalize_webshop_v2_action(
+    candidate: str,
+    *,
+    allow_workspace: bool = False,
+) -> str | None:
     cleaned = candidate.strip()
     native_match = _NATIVE_ACTION_RE.fullmatch(cleaned)
     if native_match is not None:
         return f"{native_match.group(1)}[{native_match.group(2).strip()}]"
+    if allow_workspace:
+        shell_match = _WORKSPACE_SHELL_ACTION_RE.fullmatch(cleaned)
+        if shell_match is not None:
+            try:
+                payload = json.loads(shell_match.group(1))
+            except json.JSONDecodeError:
+                return None
+            if isinstance(payload, dict):
+                return cleaned
+            return None
+        if _WORKSPACE_PATCH_ACTION_RE.fullmatch(cleaned) is not None:
+            return cleaned
     memory_match = _MEMORY_ACTION_RE.fullmatch(cleaned)
     if memory_match is None:
         return None
@@ -3068,7 +3898,11 @@ def _normalize_webshop_v2_action(candidate: str) -> str | None:
     return f"{memory_match.group(1)} {json.dumps(payload, ensure_ascii=False)}"
 
 
-def extract_webshop_v2_action(text: str) -> str:
+def extract_webshop_v2_action(
+    text: str,
+    *,
+    allow_workspace: bool = False,
+) -> str:
     """Match the legacy ReAct parser's action extraction without dependencies."""
 
     original = text
@@ -3077,12 +3911,16 @@ def extract_webshop_v2_action(text: str) -> str:
     if matches:
         cleaned = cleaned[matches[-1].end() :].strip()
     if "Action:" not in cleaned:
-        bare = _normalize_webshop_v2_action(cleaned)
+        bare = _normalize_webshop_v2_action(
+            cleaned,
+            allow_workspace=allow_workspace,
+        )
         if bare is not None:
             return bare
     else:
         parsed = _normalize_webshop_v2_action(
-            cleaned.rsplit("Action:", 1)[-1]
+            cleaned.rsplit("Action:", 1)[-1],
+            allow_workspace=allow_workspace,
         )
         if parsed is not None:
             return parsed
@@ -3314,6 +4152,98 @@ def _reward_ledger(info: Mapping[str, Any], reward: Any) -> dict[str, Any]:
     }
 
 
+def execute_policy_turn(
+    env: AgentMemoryEnvClient,
+    model: OpenAIChatClient,
+    *,
+    system_prompt: str,
+    observation: str,
+    turn: int,
+) -> tuple[dict[str, Any], str, float, bool, bool]:
+    """Sample and execute one fully evidenced policy turn."""
+
+    if isinstance(turn, bool) or not isinstance(turn, int) or turn < 1:
+        raise EvalError("policy turn index must be a positive integer")
+    before_info = _json_copy(env.info.get("env_info", {}))
+    messages = build_latest_observation_messages(system_prompt, observation)
+    prompt_ids, tokenize_json, tokenize_url = model.tokenize(messages)
+    model_json = model.complete(messages)
+    model_text = _completion_text(model_json)
+    response_ids = _response_token_ids(model_json)
+    step_result = env.step(model_text)
+    after_info = _json_copy(env.info.get("env_info", {}))
+    if not isinstance(after_info, Mapping):
+        raise EvalError("environment step info must be a JSON object")
+    raw_reward = step_result.get("reward")
+    if (
+        isinstance(raw_reward, bool)
+        or not isinstance(raw_reward, (int, float))
+        or not math.isfinite(float(raw_reward))
+    ):
+        raise EvalError("environment reward must be finite and numeric")
+    if type(step_result.get("done")) is not bool:
+        raise EvalError("environment done must be a boolean")
+    reward = float(raw_reward)
+    done = step_result["done"]
+    if "episode_success" not in after_info:
+        raise EvalError("environment step is missing authoritative episode_success")
+    if type(after_info["episode_success"]) is not bool:
+        raise EvalError("environment episode_success must be a boolean")
+    success = after_info["episode_success"]
+    if success and not done:
+        raise EvalError("environment episode_success=True requires done=True")
+    ledger = _reward_ledger(after_info, reward)
+    step = {
+        "turn": turn,
+        "request_messages": _json_copy(messages),
+        "model_request": {
+            "model": model.model,
+            "messages": _json_copy(messages),
+            "temperature": model.temperature,
+            "max_tokens": model.max_tokens,
+            "n": 1,
+            "stream": False,
+            "chat_template_kwargs": model._chat_template_kwargs(),
+        },
+        "prompt_history_policy": "latest_observation_only",
+        "raw_prior_messages_visible": False,
+        "prompt_tokenize_url": tokenize_url,
+        "prompt_tokenize_request": {
+            "model": model.model,
+            "messages": _json_copy(messages),
+            "add_generation_prompt": True,
+            "chat_template_kwargs": model._chat_template_kwargs(),
+        },
+        "prompt_tokenize_response": _json_copy(tokenize_json),
+        "prompt_token_ids": list(prompt_ids),
+        "prompt_token_ids_hash": token_ids_hash(prompt_ids),
+        "prompt_token_ids_exact": True,
+        "raw_model_response": _json_copy(model_json),
+        "model_text": model_text,
+        "response_token_ids": (
+            list(response_ids) if response_ids is not None else None
+        ),
+        "response_token_ids_hash": (
+            token_ids_hash(response_ids) if response_ids is not None else None
+        ),
+        "response_token_ids_exact": response_ids is not None,
+        "action_submitted": env.last_submitted_action,
+        "environment_step_request": {
+            "id": env.env_id,
+            "action": env.last_submitted_action,
+        },
+        "env_info_before": before_info,
+        "env_response": _json_copy(step_result),
+        "env_info_after": after_info,
+        "reward": reward,
+        **ledger,
+        "phase_progress": _phase_progress(before_info, after_info),
+        "done": done,
+        "episode_success": success,
+    }
+    return step, str(step_result.get("observation", "")), reward, done, success
+
+
 def parse_indices(spec: str) -> list[int]:
     if not isinstance(spec, str) or not spec.strip():
         raise ValueError("indices must be a comma-separated list or ranges")
@@ -3416,98 +4346,16 @@ class EvalRunner:
         final_done = False
         final_success = False
         for turn in range(1, self.max_policy_turns + 1):
-            before_info = _json_copy(self.env.info.get("env_info", {}))
-            messages = build_latest_observation_messages(
-                self.env.system_prompt, observation
+            step, observation, reward, done, final_success = execute_policy_turn(
+                self.env,
+                self.model,
+                system_prompt=self.env.system_prompt,
+                observation=observation,
+                turn=turn,
             )
-            prompt_ids, tokenize_json, tokenize_url = self.model.tokenize(messages)
-            model_json = self.model.complete(messages)
-            model_text = _completion_text(model_json)
-            response_ids = _response_token_ids(model_json)
-            step_result = self.env.step(model_text)
-            after_info = _json_copy(self.env.info.get("env_info", {}))
-            if not isinstance(after_info, Mapping):
-                raise EvalError("environment step info must be a JSON object")
-            raw_reward = step_result.get("reward")
-            if (
-                isinstance(raw_reward, bool)
-                or not isinstance(raw_reward, (int, float))
-                or not math.isfinite(float(raw_reward))
-            ):
-                raise EvalError("environment reward must be finite and numeric")
-            if type(step_result.get("done")) is not bool:
-                raise EvalError("environment done must be a boolean")
-            reward = float(raw_reward)
-            done = step_result["done"]
             episode_return += reward
             final_done = done
-            # The environment owns success semantics.  A missing or
-            # non-boolean field is an evidence failure, never an implicit
-            # unsuccessful episode.
-            if "episode_success" not in after_info:
-                raise EvalError(
-                    "environment step is missing authoritative episode_success"
-                )
-            if type(after_info["episode_success"]) is not bool:
-                raise EvalError(
-                    "environment episode_success must be a boolean"
-                )
-            final_success = after_info["episode_success"]
-            if final_success and not done:
-                raise EvalError(
-                    "environment episode_success=True requires done=True"
-                )
-            ledger = _reward_ledger(after_info, reward)
-            step = {
-                "turn": turn,
-                "request_messages": _json_copy(messages),
-                "model_request": {
-                    "model": self.model.model,
-                    "messages": _json_copy(messages),
-                    "temperature": self.model.temperature,
-                    "max_tokens": self.model.max_tokens,
-                    "n": 1,
-                    "stream": False,
-                    "chat_template_kwargs": self.model._chat_template_kwargs(),
-                },
-                "prompt_history_policy": "latest_observation_only",
-                "raw_prior_messages_visible": False,
-                "prompt_tokenize_url": tokenize_url,
-                "prompt_tokenize_request": {
-                    "model": self.model.model,
-                    "messages": _json_copy(messages),
-                    "add_generation_prompt": True,
-                    "chat_template_kwargs": self.model._chat_template_kwargs(),
-                },
-                "prompt_tokenize_response": _json_copy(tokenize_json),
-                "prompt_token_ids": list(prompt_ids),
-                "prompt_token_ids_hash": token_ids_hash(prompt_ids),
-                "prompt_token_ids_exact": True,
-                "raw_model_response": _json_copy(model_json),
-                "model_text": model_text,
-                "response_token_ids": (
-                    list(response_ids) if response_ids is not None else None
-                ),
-                "response_token_ids_hash": (
-                    token_ids_hash(response_ids) if response_ids is not None else None
-                ),
-                "response_token_ids_exact": response_ids is not None,
-                "action_submitted": self.env.last_submitted_action,
-                "environment_step_request": {
-                    "id": self.env.env_id,
-                    "action": self.env.last_submitted_action,
-                },
-                "env_info_before": before_info,
-                "env_response": _json_copy(step_result),
-                "env_info_after": after_info,
-                "reward": reward,
-                **ledger,
-                "phase_progress": _phase_progress(before_info, after_info),
-                "done": done,
-                "episode_success": final_success,
-            }
             steps.append(step)
-            observation = str(step_result.get("observation", ""))
             if done:
                 break
         timed_out = not final_done

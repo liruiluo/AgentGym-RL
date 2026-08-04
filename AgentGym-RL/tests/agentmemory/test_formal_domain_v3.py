@@ -18,6 +18,78 @@ LATEST_OBSERVATION = "latest"
 VISIBLE_PROMPT = f"{SYSTEM_PROMPT}\n{LATEST_OBSERVATION}"
 
 
+def filesystem_contract_metadata():
+    workspace_limits = {
+        "max_path_chars": 240,
+        "max_files": 64,
+        "max_directories": 64,
+        "max_file_bytes": 65_536,
+        "max_total_bytes": 524_288,
+        "max_command_chars": 32_768,
+        "max_patch_bytes": 262_144,
+        "default_timeout_ms": 10_000,
+        "max_timeout_ms": 30_000,
+        "cpu_seconds": 10,
+        "address_space_bytes": 1_073_741_824,
+        "max_processes": 32,
+        "max_open_files": 64,
+        "stdout_bytes": 16_384,
+        "stderr_bytes": 16_384,
+        "tmp_bytes": 67_108_864,
+        "tmp_inodes": 512,
+    }
+    resource_limits = {
+        name: workspace_limits[name]
+        for name in MODULE._WORKSPACE_SANDBOX_SHARED_LIMIT_FIELDS
+    }
+    resource_limits.update(
+        {
+            "workspace_bytes": workspace_limits["max_total_bytes"],
+            "workspace_inodes": (
+                workspace_limits["max_files"]
+                + workspace_limits["max_directories"]
+                + 1
+            ),
+        }
+    )
+    return {
+        "surface": MODULE.FORMAL_WEBSHOP_FILESYSTEM_SURFACE_V2,
+        "paper_eligible": False,
+        "memory_prompt_mode": "natural_filesystem",
+        "memory_management": "policy_managed_persistent_workspace",
+        "workspace_surface": "codex_workspace_v2",
+        "workspace_tool_contract": "codex_shell_command_apply_patch_v1",
+        "workspace_persistence": "episode_across_sessions",
+        "workspace_episode_isolation": True,
+        "workspace_shell_enabled": True,
+        "workspace_apply_patch_enabled": True,
+        "workspace_host_path_exposed": False,
+        "workspace_tool_ops": ["SHELL_COMMAND", "APPLY_PATCH"],
+        "workspace_limits": workspace_limits,
+        "workspace_sandbox": {
+            **MODULE._WORKSPACE_SANDBOX_FIELDS,
+            "ripgrep_sha256": "c" * 64,
+            "ripgrep_expected_sha256": "c" * 64,
+            "ripgrep_version": "ripgrep 15.1.0",
+            "ripgrep_startup_fingerprint": {
+                "device": 1,
+                "inode": 2,
+                "mode": 33_237,
+                "size": 5_000_000,
+                "mtime_ns": 1,
+                "ctime_ns": 1,
+            },
+            "resource_limits": resource_limits,
+        },
+        "reward_contract": {
+            "workspace_action_reward": 0.0,
+            "shell_command_reward": 0.0,
+            "apply_patch_reward": 0.0,
+            "memory_specific_shaping": "none",
+        },
+    }
+
+
 def env_info(*, phase=0, reward=0.0, done=False):
     return {
         "formal_schema_version": "agentmemory_formal_step_v3",
@@ -356,6 +428,79 @@ class FormalDomainV3Test(unittest.TestCase):
             MODULE.validate_webshop_memory_prompt_mode(
                 {},
                 expected_mode="neutral",
+            )
+
+    def test_filesystem_surface_requires_exact_workspace_contract(self):
+        metadata = filesystem_contract_metadata()
+        MODULE.validate_webshop_filesystem_surface(
+            metadata,
+            expected_prompt_mode="natural_filesystem",
+        )
+
+        tampered = deepcopy(metadata)
+        tampered["workspace_shell_enabled"] = False
+        with self.assertRaisesRegex(MODULE.FormalDomainV3Error, "contract mismatch"):
+            MODULE.validate_webshop_filesystem_surface(
+                tampered,
+                expected_prompt_mode="natural_filesystem",
+            )
+
+        tampered = deepcopy(metadata)
+        tampered["workspace_apply_patch_enabled"] = False
+        with self.assertRaisesRegex(MODULE.FormalDomainV3Error, "contract mismatch"):
+            MODULE.validate_webshop_filesystem_surface(
+                tampered,
+                expected_prompt_mode="natural_filesystem",
+            )
+
+        tampered = deepcopy(metadata)
+        tampered["workspace_tool_contract"] = "legacy"
+        with self.assertRaisesRegex(MODULE.FormalDomainV3Error, "contract mismatch"):
+            MODULE.validate_webshop_filesystem_surface(
+                tampered,
+                expected_prompt_mode="natural_filesystem",
+            )
+
+        tampered = deepcopy(metadata)
+        tampered["reward_contract"]["workspace_action_reward"] = 0.1
+        with self.assertRaisesRegex(MODULE.FormalDomainV3Error, "nonzero"):
+            MODULE.validate_webshop_filesystem_surface(
+                tampered,
+                expected_prompt_mode="natural_filesystem",
+            )
+
+        sandbox_tampering = {
+            "missing sandbox": lambda item: item.pop("workspace_sandbox"),
+            "host network": lambda item: item["workspace_sandbox"].__setitem__(
+                "network", "host"
+            ),
+            "shared uid": lambda item: item["workspace_sandbox"].__setitem__(
+                "model_identity", "shared"
+            ),
+            "ripgrep mismatch": lambda item: item["workspace_sandbox"].__setitem__(
+                "ripgrep_expected_sha256", "d" * 64
+            ),
+            "resource mismatch": lambda item: item["workspace_sandbox"][
+                "resource_limits"
+            ].__setitem__("max_processes", 31),
+        }
+        for label, mutate in sandbox_tampering.items():
+            with self.subTest(label=label):
+                tampered = deepcopy(metadata)
+                mutate(tampered)
+                with self.assertRaises(MODULE.FormalDomainV3Error):
+                    MODULE.validate_webshop_filesystem_surface(
+                        tampered,
+                        expected_prompt_mode="natural_filesystem",
+                    )
+
+        with self.assertRaisesRegex(MODULE.FormalDomainV3Error, "only valid"):
+            MODULE.validate_webshop_filesystem_surface(
+                {
+                    "surface": MODULE.FORMAL_WEBSHOP_PROCEDURAL_SURFACE_V2,
+                    "memory_prompt_mode": "natural_filesystem",
+                },
+                expected_prompt_mode="natural_filesystem",
             )
 
     def test_webshop_action_listing_mode_requires_server_rollout_parity(self):

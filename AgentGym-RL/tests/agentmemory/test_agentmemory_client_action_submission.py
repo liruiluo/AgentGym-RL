@@ -8,6 +8,9 @@ from agentenv.controller.types import ActionFormat
 from agentenv.envs.agentmemory import (
     AgentMemoryAdapter,
     AgentMemoryEnvClient,
+    FILESYSTEM_SANDBOX_FIELDS,
+    FILESYSTEM_SANDBOX_SHARED_LIMIT_FIELDS,
+    FilesystemAgentMemoryAdapter,
     build_procedural_conversation_start,
 )
 
@@ -48,6 +51,83 @@ def procedural_metadata():
             "native_click_action_uses_asin_handle": True,
         },
     }
+
+
+def filesystem_metadata():
+    metadata = procedural_metadata()
+    workspace_limits = {
+        "max_path_chars": 240,
+        "max_files": 64,
+        "max_directories": 64,
+        "max_file_bytes": 65_536,
+        "max_total_bytes": 524_288,
+        "max_command_chars": 32_768,
+        "max_patch_bytes": 262_144,
+        "default_timeout_ms": 10_000,
+        "max_timeout_ms": 30_000,
+        "cpu_seconds": 10,
+        "address_space_bytes": 1_073_741_824,
+        "max_processes": 32,
+        "max_open_files": 64,
+        "stdout_bytes": 16_384,
+        "stderr_bytes": 16_384,
+        "tmp_bytes": 67_108_864,
+        "tmp_inodes": 512,
+    }
+    resource_limits = {
+        name: workspace_limits[name]
+        for name in FILESYSTEM_SANDBOX_SHARED_LIMIT_FIELDS
+    }
+    resource_limits.update(
+        {
+            "workspace_bytes": workspace_limits["max_total_bytes"],
+            "workspace_inodes": (
+                workspace_limits["max_files"]
+                + workspace_limits["max_directories"]
+                + 1
+            ),
+        }
+    )
+    metadata.update(
+        {
+            "surface": (
+                "agentmemory_webshop_procedural_natural_chain_filesystem_v2"
+            ),
+            "memory_prompt_mode": "natural_filesystem",
+            "memory_management": "policy_managed_persistent_workspace",
+            "workspace_surface": "codex_workspace_v2",
+            "workspace_tool_contract": "codex_shell_command_apply_patch_v1",
+            "workspace_tool_ops": ["SHELL_COMMAND", "APPLY_PATCH"],
+            "workspace_persistence": "episode_across_sessions",
+            "workspace_episode_isolation": True,
+            "workspace_shell_enabled": True,
+            "workspace_apply_patch_enabled": True,
+            "workspace_host_path_exposed": False,
+            "workspace_limits": workspace_limits,
+            "workspace_sandbox": {
+                **FILESYSTEM_SANDBOX_FIELDS,
+                "ripgrep_sha256": "c" * 64,
+                "ripgrep_expected_sha256": "c" * 64,
+                "ripgrep_version": "ripgrep 15.1.0",
+                "ripgrep_startup_fingerprint": {
+                    "device": 1,
+                    "inode": 2,
+                    "mode": 33_237,
+                    "size": 5_000_000,
+                    "mtime_ns": 1,
+                    "ctime_ns": 1,
+                },
+                "resource_limits": resource_limits,
+            },
+            "reward_contract": {
+                "workspace_action_reward": 0.0,
+                "shell_command_reward": 0.0,
+                "apply_patch_reward": 0.0,
+                "memory_specific_shaping": "none",
+            },
+        }
+    )
+    return metadata
 
 
 def latent_preference_metadata():
@@ -388,6 +468,135 @@ class ProceduralAgentMemoryClientContractTest(unittest.TestCase):
         self.assertIn("six separate shopping sessions", prompt)
         self.assertNotIn("original MemoryArena WebShop", prompt)
         self.assertNotIn("paper", prompt.casefold())
+
+    def test_filesystem_surface_uses_surface_local_codex_adapter(self) -> None:
+        client = self.create_client(filesystem_metadata())
+        self.assertTrue(client.is_procedural)
+        self.assertTrue(client.is_filesystem)
+        self.assertIs(client.adapter_cls, FilesystemAgentMemoryAdapter)
+        prompt = client.conversation_start[0]["value"]
+        for fragment in (
+            "private persistent workspace",
+            "Use shell_command",
+            "Use apply_patch",
+            "networkless and resource-bounded",
+            "zero task reward",
+            "no host-path access or dedicated memory API",
+        ):
+            self.assertIn(fragment, prompt)
+        for forbidden in ('Read {"path"', "ADD stores", "RETRIEVE", "memory_id"):
+            self.assertNotIn(forbidden, prompt)
+
+        parsed = client.adapter_cls.action_parser(
+            'Thought: inspect the notes\nAction: shell_command {"command":"cat notes.md","workdir":"."}',
+            ActionFormat.REACT,
+        )
+        self.assertEqual(
+            parsed,
+            'shell_command {"command": "cat notes.md", "workdir": "."}',
+        )
+        self.assertEqual(
+            AgentMemoryAdapter.action_parser(
+                'Thought: x\nAction: shell_command {"command":"cat notes.md"}',
+                ActionFormat.REACT,
+            ),
+            "",
+        )
+
+    def test_filesystem_function_schema_has_no_legacy_memory_api(self) -> None:
+        client = self.create_client(
+            filesystem_metadata(),
+            action_format=ActionFormat.FUNCTION_CALLING,
+        )
+        prompt = client.conversation_start[0]["value"]
+        for function_name in ("search", "click", "shell_command", "apply_patch"):
+            self.assertIn(f'"name": "{function_name}"', prompt)
+        for function_name in (
+            "read",
+            "write",
+            "edit",
+            "grep",
+            "glob",
+            "add",
+            "retrieve",
+            "summary",
+            "filter",
+        ):
+            self.assertNotIn(f'"name": "{function_name}"', prompt)
+
+    def test_filesystem_code_action_uses_literal_call_parser(self) -> None:
+        client = self.create_client(
+            filesystem_metadata(),
+            action_format=ActionFormat.CODE_AS_ACTION,
+        )
+        parsed = client.adapter_cls.action_parser(
+            '```python\n# inspect exact value\nshell_command(command="cat notes.md", workdir=".")\n```',
+            ActionFormat.CODE_AS_ACTION,
+        )
+        self.assertEqual(
+            parsed,
+            'shell_command {"command": "cat notes.md", "workdir": "."}',
+        )
+
+        forbidden = (
+            '```python\n__import__("os").system("echo escaped")\n```',
+            '```python\nshell_command(**{"command": "cat notes.md"})\n```',
+            '```python\nshell_command(command="cat a")\napply_patch(patch="x")\n```',
+            '```python\nshell_command(command=str(1))\n```',
+        )
+        for output in forbidden:
+            with self.subTest(output=output), self.assertRaises(ValueError):
+                client.adapter_cls.action_parser(
+                    output,
+                    ActionFormat.CODE_AS_ACTION,
+                )
+
+    def test_bad_filesystem_metadata_is_rejected_before_create(self) -> None:
+        mutations = {
+            "prompt": lambda value: value.update(memory_prompt_mode="neutral"),
+            "shell": lambda value: value.update(workspace_shell_enabled=False),
+            "patch": lambda value: value.update(workspace_apply_patch_enabled=False),
+            "contract": lambda value: value.update(workspace_tool_contract="legacy"),
+            "host_path": lambda value: value.update(workspace_host_path_exposed=True),
+            "tools": lambda value: value.update(workspace_tool_ops=["READ"]),
+            "shaping": lambda value: value["reward_contract"].update(
+                workspace_action_reward=0.1
+            ),
+            "missing_sandbox": lambda value: value.pop("workspace_sandbox"),
+            "host_network": lambda value: value["workspace_sandbox"].update(
+                network="host"
+            ),
+            "shared_uid": lambda value: value["workspace_sandbox"].update(
+                model_identity="shared"
+            ),
+            "ripgrep_drift": lambda value: value["workspace_sandbox"].update(
+                ripgrep_sha256="d" * 64
+            ),
+            "sandbox_limit_drift": lambda value: value["workspace_sandbox"][
+                "resource_limits"
+            ].update(max_processes=31),
+            "legacy_ltm": lambda value: value.update(ltm_inventory_mode="hidden"),
+        }
+        for name, mutate in mutations.items():
+            metadata = deepcopy(filesystem_metadata())
+            mutate(metadata)
+            post = Mock()
+            with (
+                self.subTest(case=name),
+                patch.object(
+                    AgentMemoryEnvClient,
+                    "get_metadata",
+                    return_value=metadata,
+                ),
+                patch("agentenv.envs.agentmemory.requests.post", post),
+                self.assertRaises(RuntimeError),
+            ):
+                AgentMemoryEnvClient(
+                    "http://filesystem.invalid",
+                    None,
+                    action_format=ActionFormat.REACT,
+                )
+            post.assert_not_called()
 
     def test_bad_procedural_metadata_is_rejected_before_environment_creation(
         self,

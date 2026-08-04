@@ -22,8 +22,15 @@ PROVIDER_MODES = (
 NEGATIVE_CONSTRAINT_SURFACE = (
     "agentmemory_webshop_negative_constraint_top1_train_v1"
 )
+FILESYSTEM_SURFACE = (
+    "agentmemory_webshop_procedural_natural_chain_filesystem_v2"
+)
 SUPPORTED_SERVER_SURFACE_CONTRACTS = {
     "agentmemory_webshop_procedural_natural_chain_train_v1": (
+        "agentmemory_verified_natural_chain_provider_v4",
+        2,
+    ),
+    FILESYSTEM_SURFACE: (
         "agentmemory_verified_natural_chain_provider_v4",
         2,
     ),
@@ -443,6 +450,57 @@ class ProceduralIndexSource:
             )
         if provider.get("native_click_action_uses_asin_handle") is not True:
             raise ProceduralIndexError("server no longer uses native click[ASIN]")
+        if surface == FILESYSTEM_SURFACE:
+            if metadata.get("memory_prompt_mode") != "natural_filesystem":
+                raise ProceduralIndexError(
+                    "filesystem surface requires natural_filesystem prompt mode"
+                )
+            if metadata.get("workspace_surface") != "codex_workspace_v2":
+                raise ProceduralIndexError(
+                    "filesystem surface workspace contract is missing"
+                )
+            if (
+                metadata.get("workspace_tool_contract")
+                != "codex_shell_command_apply_patch_v1"
+            ):
+                raise ProceduralIndexError(
+                    "filesystem surface Codex tool contract is missing"
+                )
+            if metadata.get("workspace_shell_enabled") is not True:
+                raise ProceduralIndexError(
+                    "filesystem surface must expose shell_command"
+                )
+            if metadata.get("workspace_apply_patch_enabled") is not True:
+                raise ProceduralIndexError(
+                    "filesystem surface must expose apply_patch"
+                )
+            if metadata.get("workspace_host_path_exposed") is not False:
+                raise ProceduralIndexError(
+                    "filesystem surface must not expose a host path"
+                )
+            observed_ops = metadata.get("workspace_tool_ops")
+            if not isinstance(observed_ops, (list, tuple)) or {
+                str(value).upper() for value in observed_ops
+            } != {"SHELL_COMMAND", "APPLY_PATCH"}:
+                raise ProceduralIndexError(
+                    "filesystem surface Codex workspace tool contract is invalid"
+                )
+            reward_contract = metadata.get("reward_contract")
+            if not isinstance(reward_contract, Mapping) or any(
+                float(reward_contract.get(field, float("nan"))) != 0.0
+                for field in (
+                    "workspace_action_reward",
+                    "shell_command_reward",
+                    "apply_patch_reward",
+                )
+            ):
+                raise ProceduralIndexError(
+                    "filesystem surface must use zero workspace-action shaping"
+                )
+        elif metadata.get("memory_prompt_mode") == "natural_filesystem":
+            raise ProceduralIndexError(
+                "natural_filesystem prompt mode is bound to the filesystem surface"
+            )
         semantic_period_orbits = provider.get("semantic_period_orbits")
         semantic_period_tasks = provider.get("semantic_period_tasks")
         if (

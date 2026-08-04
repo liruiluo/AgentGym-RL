@@ -445,6 +445,88 @@ class FormalPromptTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "MEMORY_PROMPT_MODE"):
                 module.agentmemory_action_system_prompt()
 
+    def test_natural_filesystem_prompt_exposes_only_codex_workspace_tools(self) -> None:
+        module = load_schemas_module()
+        prompt = module.agentmemory_action_system_prompt(
+            memory_prompt_mode="natural_filesystem",
+            surface=module.NATURAL_FILESYSTEM_SURFACE,
+        )
+        for fragment in (
+            "native WebShop bundled-shopping environment",
+            "search[keywords]",
+            "click[Buy Now]",
+            'shell_command {"command":"rg -n pattern .","workdir":".","timeout_ms":10000}',
+            "apply_patch is followed on the next line",
+            "ordinary file utilities and pinned rg",
+            "has no network",
+            "workspace persists across shopping sessions within this episode",
+            "Workspace actions have zero task reward",
+            "no host-path access and no dedicated memory API",
+        ):
+            self.assertIn(fragment, prompt)
+        for forbidden in (
+            'Read {"path"',
+            'Write {"path"',
+            'Edit {"path"',
+            'Grep {"pattern"',
+            'Glob {"pattern"',
+            "ADD requires",
+            "RETRIEVE accepts",
+            "use ADD",
+            "use RETRIEVE",
+            "memory_id",
+            "Long-term memory",
+        ):
+            self.assertNotIn(forbidden, prompt)
+
+        with self.assertRaisesRegex(ValueError, "ltm_inventory_mode"):
+            module.agentmemory_action_system_prompt(
+                ltm_inventory_mode="keys",
+                memory_prompt_mode="natural_filesystem",
+                surface=module.NATURAL_FILESYSTEM_SURFACE,
+            )
+        with self.assertRaisesRegex(ValueError, "only valid"):
+            module.agentmemory_action_system_prompt(
+                memory_prompt_mode="natural_filesystem",
+                surface="agentmemory_webshop_procedural_natural_chain_train_v1",
+            )
+
+    def test_no_workspace_intervention_prompt_exposes_only_native_actions(self) -> None:
+        module = load_schemas_module()
+        prompt = module.agentmemory_action_system_prompt(
+            memory_prompt_mode="natural_filesystem",
+            surface=module.NATURAL_FILESYSTEM_SURFACE,
+            workspace_enabled=False,
+        )
+        for fragment in (
+            "without a persistent workspace",
+            "exactly one executable native browser action",
+            "search[keywords]",
+            "click[Buy Now]",
+            "shell_command and apply_patch are unavailable and invalid",
+        ):
+            self.assertIn(fragment, prompt)
+        for forbidden in (
+            "shell_command JSON action",
+            "multiline apply_patch action",
+            "workspace persists across shopping sessions",
+            "Workspace actions have zero task reward",
+            "ADD requires",
+            "RETRIEVE accepts",
+        ):
+            self.assertNotIn(forbidden, prompt)
+        with self.assertRaisesRegex(ValueError, "only for natural_filesystem"):
+            module.agentmemory_action_system_prompt(
+                memory_prompt_mode="legacy",
+                workspace_enabled=False,
+            )
+        with self.assertRaisesRegex(ValueError, "must be boolean"):
+            module.agentmemory_action_system_prompt(
+                memory_prompt_mode="natural_filesystem",
+                surface=module.NATURAL_FILESYSTEM_SURFACE,
+                workspace_enabled=0,
+            )
+
     def test_surface_specific_top1_and_clarification_contracts(self) -> None:
         module = load_schemas_module()
         distractor_surface = (
