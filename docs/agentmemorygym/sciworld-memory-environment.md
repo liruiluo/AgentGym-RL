@@ -1,6 +1,9 @@
 # SciWorld memory environments for AgentMemoryGym
 
-Status: multi-surface integration skeleton. These surfaces are registered and fixture-tested; native Java/Python SciWorld smoke and PPO training are still separate gates.
+Status: all twelve surfaces are registered and fixture-tested. The conductivity
+single-episode driver and conductivity SOP two-episode orbit have passed a real
+ScienceWorld 1.2.3 Java smoke. The other native mappings, policy PPO gates, and
+capability evaluations remain separate work.
 
 ## Plain objective
 
@@ -45,7 +48,7 @@ Not allowed for the main memory surface:
 - environment-written summaries;
 - ground-truth lab notes;
 - curated recent-window transcripts;
-- automatic compression by the harness.
+- automatic compression by the harness;
 - artificial session/reset boundaries whose only purpose is to clear history.
 
 The model itself must choose when to summarize or filter the visible trace,
@@ -58,9 +61,9 @@ scaffold/control variant, not evidence of learned long-term memory use.
 ## Registered SciWorld memory surfaces
 
 These are memory-training surfaces inside SciWorld. They are not meant to be a
-one-to-one copy of the official 30 ScienceWorld task names. A later native smoke
-should map each surface to one or more real ScienceWorld task families, while
-keeping the memory contract below unchanged.
+one-to-one copy of the official 30 ScienceWorld task names. Each formal native
+surface must have a frozen mapping to one or more official task families. A
+surface without that mapping fails closed instead of choosing an arbitrary task.
 
 ### 1. `sciworld_conductivity_memory_v1`
 
@@ -135,8 +138,9 @@ Boundary:
   native task, then reuse it in a semantically distinct later native task;
 - the boundary resets the per-episode trace but preserves policy-authored LTM;
   a handcrafted split inside one task does not certify SOP transfer.
-- until the native multi-episode orbit driver implements that boundary exactly,
-  the SOP native backend fails closed instead of falling back to one episode.
+- the implemented native orbit is `test-conductivity` followed by
+  `test-conductivity-of-unknown-substances`; official train/dev/test splits are
+  hash-attested before selecting the paired variations.
 
 ### 6. `sciworld_negative_evidence_memory_v1`
 
@@ -235,7 +239,13 @@ This code drop may claim only environment-support progress when it has:
 5. provided deterministic fixture backends so Mac-side tests do not require Java, torch, or the real SciWorld package;
 6. fixture-tested at least one minimal memory chain for every registered surface.
 
-It must not claim full native SciWorld training readiness until the real Java/Python SciWorld runtime smoke passes.
+The conductivity and SOP drivers have passed the Java/Python runtime gate with
+official variation-0 gold paths. The SOP smoke executed 34 external actions,
+reset local trace at the native boundary, retained one policy-authored LTM
+entry, retrieved it with top1, and ended both tasks at strict score 100. Native
+rewards were the `env.step()` deltas and summed to 200 across the orbit. This is
+scripted environment evidence, not model capability evidence.
+
 Fixture phases are static plumbing only. They must not be cited as evidence for
 either formal structure. The continuous long-horizon contract additionally
 requires a native single-episode trace that crosses a frozen context-pressure
