@@ -226,6 +226,7 @@ class FakeEnv:
         self.audit_count = 0
         self.control_event = None
         self.done = False
+        self.closed = False
 
     def _observation(self):
         if self.session == 0:
@@ -368,10 +369,85 @@ class FakeEnv:
         return self._response()
 
     def close(self):
+        self.closed = True
         return True
 
 
 class FilesystemCausalEvalTest(unittest.TestCase):
+    def test_contract_hash_ignores_only_dynamic_environment_counts(self):
+        token = "t" * 48
+        metadata = filesystem_metadata(token)
+        metadata.update(
+            {
+                "source": "agentmemory_programmatic_generator",
+                "active_environment_count": 0,
+                "backend": {
+                    "active_session_count": 0,
+                    "price_seed": 233,
+                },
+            }
+        )
+        reference = CAUSAL._causal_metadata_sha256(metadata)
+
+        dynamic = json.loads(json.dumps(metadata))
+        dynamic["active_environment_count"] = 17
+        dynamic["backend"]["active_session_count"] = 19
+        self.assertEqual(reference, CAUSAL._causal_metadata_sha256(dynamic))
+
+        static_mutations = {
+            "source": lambda value: value.__setitem__("source", "other_source"),
+            "backend": lambda value: value["backend"].__setitem__(
+                "price_seed", 234
+            ),
+            "sandbox": lambda value: value["workspace_sandbox"].__setitem__(
+                "network", "host"
+            ),
+        }
+        for label, mutate in static_mutations.items():
+            with self.subTest(label=label):
+                changed = json.loads(json.dumps(metadata))
+                mutate(changed)
+                self.assertNotEqual(
+                    reference,
+                    CAUSAL._causal_metadata_sha256(changed),
+                )
+
+    def test_contract_mismatch_closes_every_created_environment(self):
+        token = "t" * 48
+        registry = {}
+        next_id = 0
+
+        def factory():
+            nonlocal next_id
+            metadata = filesystem_metadata(token)
+            metadata["backend"] = {
+                "active_session_count": next_id,
+                "price_seed": 233 if next_id == 0 else 234,
+            }
+            metadata["active_environment_count"] = next_id
+            env = FakeEnv(registry, next_id, metadata)
+            registry[next_id] = env
+            next_id += 1
+            return env
+
+        with tempfile.TemporaryDirectory() as temporary:
+            runner = CAUSAL.FilesystemCausalEvalRunner(
+                factory,
+                FakeModel(),
+                indices=[0],
+                max_policy_turns=8,
+                output_dir=Path(temporary),
+                intervention_token=token,
+            )
+            with self.assertRaisesRegex(
+                CORE.EvalError,
+                "causal arms resolved to different environment contracts",
+            ):
+                runner.run_orbit(0)
+
+        self.assertEqual(set(registry), {0, 1})
+        self.assertTrue(all(env.closed for env in registry.values()))
+
     def test_real_policy_source_then_four_exact_replays_and_interventions(self):
         token = "t" * 48
         metadata = filesystem_metadata(token)

@@ -81,6 +81,9 @@ def _empty_workspace_tree_sha256() -> str:
 def _causal_metadata_sha256(metadata: Mapping[str, Any]) -> str:
     payload = _json_copy(metadata)
     payload.pop("active_environment_count", None)
+    backend = payload.get("backend")
+    if isinstance(backend, dict):
+        backend.pop("active_session_count", None)
     service = payload.get("service")
     if isinstance(service, dict):
         service.pop("instance_run_id", None)
@@ -137,37 +140,60 @@ class FilesystemCausalEvalRunner:
 
     def _new_env(self) -> core.AgentMemoryEnvClient:
         env = self.env_factory()
-        core.validate_filesystem_intervention_control(
-            env.metadata,
-            token=self.token,
-        )
-        service = env.metadata.get("service")
-        fingerprint = service.get("fingerprint_sha256") if isinstance(service, Mapping) else None
-        if (
-            not isinstance(fingerprint, str)
-            or len(fingerprint) != 64
-            or any(character not in "0123456789abcdef" for character in fingerprint)
-        ):
-            env.close()
-            raise core.EvalError("intervention service lacks a valid runtime fingerprint")
-        if self._reference_fingerprint is None:
-            self._reference_fingerprint = fingerprint
-            self._reference_contract_sha256 = _causal_metadata_sha256(env.metadata)
-            self._reference_metadata = _json_copy(env.metadata)
-        elif fingerprint != self._reference_fingerprint:
-            env.close()
-            raise core.EvalError("causal arms resolved to different environment fingerprints")
-        elif _causal_metadata_sha256(env.metadata) != self._reference_contract_sha256:
-            env.close()
-            raise core.EvalError("causal arms resolved to different environment contracts")
-        prompt_has_native_thinking = "You may first reason inside" in env.system_prompt
-        if prompt_has_native_thinking is not self.model.enable_thinking:
-            env.close()
-            raise core.EvalError(
-                "model enable_thinking does not match the attested environment prompt"
+        try:
+            core.validate_filesystem_intervention_control(
+                env.metadata,
+                token=self.token,
             )
-        core.filesystem_no_workspace_system_prompt(env.system_prompt)
-        return env
+            service = env.metadata.get("service")
+            fingerprint = (
+                service.get("fingerprint_sha256")
+                if isinstance(service, Mapping)
+                else None
+            )
+            if (
+                not isinstance(fingerprint, str)
+                or len(fingerprint) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in fingerprint
+                )
+            ):
+                raise core.EvalError(
+                    "intervention service lacks a valid runtime fingerprint"
+                )
+            if self._reference_fingerprint is None:
+                self._reference_fingerprint = fingerprint
+                self._reference_contract_sha256 = _causal_metadata_sha256(
+                    env.metadata
+                )
+                self._reference_metadata = _json_copy(env.metadata)
+            elif fingerprint != self._reference_fingerprint:
+                raise core.EvalError(
+                    "causal arms resolved to different environment fingerprints"
+                )
+            elif (
+                _causal_metadata_sha256(env.metadata)
+                != self._reference_contract_sha256
+            ):
+                raise core.EvalError(
+                    "causal arms resolved to different environment contracts"
+                )
+            prompt_has_native_thinking = (
+                "You may first reason inside" in env.system_prompt
+            )
+            if prompt_has_native_thinking is not self.model.enable_thinking:
+                raise core.EvalError(
+                    "model enable_thinking does not match the attested environment prompt"
+                )
+            core.filesystem_no_workspace_system_prompt(env.system_prompt)
+            return env
+        except Exception:
+            try:
+                env.close()
+            except Exception:
+                pass
+            raise
 
     def _source_session(
         self,
@@ -388,8 +414,9 @@ class FilesystemCausalEvalRunner:
         close_errors = []
         try:
             target_source_env = self._new_env()
+            clients.append(target_source_env)
             paired_source_env = self._new_env()
-            clients.extend((target_source_env, paired_source_env))
+            clients.append(paired_source_env)
             target_source = self._source_session(
                 target_source_env,
                 data_idx=data_idx,
@@ -435,8 +462,11 @@ class FilesystemCausalEvalRunner:
                 ]
                 return result
 
-            arm_envs = {arm: self._new_env() for arm in ARMS}
-            clients.extend(arm_envs.values())
+            arm_envs = {}
+            for arm in ARMS:
+                arm_env = self._new_env()
+                clients.append(arm_env)
+                arm_envs[arm] = arm_env
             replays = {
                 arm: self._replay_target_source(env, source=target_source)
                 for arm, env in arm_envs.items()
