@@ -17,12 +17,18 @@ This is not meant to prove that the model already knows elementary science facts
 ## Non-negotiable memory boundary
 
 For long-horizon SciWorld tasks, the harness must not hand the model a helpful rolling history window.
+The formal task is one continuous native ScienceWorld episode. It must not be
+split into artificial sessions or reset at handcrafted semantic phase
+boundaries merely to create a memory problem. The interaction trace grows
+naturally until the policy decides to compress it.
 
 Allowed:
 
 - current SciWorld observation and action feedback;
 - ordinary model context/token limits;
 - policy-facing memory tools such as `ADD`, `UPDATE`, `RETRIEVE`, `SUMMARY`, and `FILTER`;
+- policy-authored compaction of the visible trace before it exceeds the model
+  context budget;
 - context failure if the policy refuses to manage its own notes.
 
 Not allowed for the main memory surface:
@@ -32,8 +38,14 @@ Not allowed for the main memory surface:
 - ground-truth lab notes;
 - curated recent-window transcripts;
 - automatic compression by the harness.
+- artificial session/reset boundaries whose only purpose is to clear history.
 
-The model itself must choose what to compress, what to store, and what to retrieve. Any environment-provided summary or handcrafted rolling transcript is only a scaffold/control variant, not evidence of learned long-term memory use.
+The model itself must choose when to summarize or filter the visible trace,
+what to store in long-term memory, and what to retrieve. The harness may execute
+those explicit policy actions and enforce the physical context limit; it may
+not decide their contents or timing. Any environment-provided summary,
+handcrafted rolling transcript, or fixture phase reset is only a
+scaffold/control variant, not evidence of learned long-term memory use.
 
 ## Registered SciWorld memory surfaces
 
@@ -193,7 +205,10 @@ What it tests:
 - retrieving the right old note from many policy-written notes;
 - succeeding without a harness-generated history summary.
 
-This is the long-context surface. The raw interaction can become too large to rely on ordinary prompt context; success should come from policy-authored `ADD/UPDATE/RETRIEVE`, not environment curation.
+This is the long-context surface. It remains one continuous native episode.
+The raw interaction can become too large to retain verbatim; success should
+come from policy-authored `SUMMARY/FILTER` plus `ADD/UPDATE/RETRIEVE`, not
+environment curation or artificial sessions.
 
 ## Acceptance bar for this skeleton
 
@@ -207,3 +222,7 @@ This code drop may claim only environment-support progress when it has:
 6. fixture-tested at least one minimal memory chain for every registered surface.
 
 It must not claim full native SciWorld training readiness until the real Java/Python SciWorld runtime smoke passes.
+Fixture phases are static plumbing only. They must not be cited as evidence for
+the continuous long-horizon contract, which additionally requires a native
+single-episode trace that crosses a frozen context-pressure threshold and a
+verifier linking policy-authored compaction/memory to later dependent actions.
