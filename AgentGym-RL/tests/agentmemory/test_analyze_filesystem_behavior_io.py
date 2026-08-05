@@ -190,6 +190,8 @@ class AnalyzeFilesystemBehaviorIoTest(unittest.TestCase):
         self.assertNotIn("six reported source writes", rendered)
         self.assertIn("Every source-write timing candidate", rendered)
         self.assertNotIn("generic certified/natural labels", rendered)
+        self.assertIn("content writes in sessions 2+", rendered)
+        self.assertNotIn("preceding session trace", rendered)
 
     def test_training_post_adv_layout_preserves_exact_io_and_strict_chain(self) -> None:
         version = {"path": ".agent_memory/fact.md", "sha256": "c" * 64, "bytes": 39}

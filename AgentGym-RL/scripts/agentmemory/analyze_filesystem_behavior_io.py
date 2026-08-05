@@ -721,7 +721,7 @@ def render_markdown(audit: dict[str, Any]) -> str:
                     f"({exact_sources} exact field/value).",
                     f"  Accepted patch/shell: {step_summary['accepted_apply_patch_count']}/"
                     f"{step_summary['accepted_shell_command_count']}; invalid actions: "
-                    f"{step_summary['invalid_action_count']}; post-transition writes: "
+                    f"{step_summary['invalid_action_count']}; writes in sessions 2+: "
                     f"{step_summary['post_transition_content_write_count']}; session-1 "
                     f"failures: {step_summary['session1_failure_trajectory_count']}; wrong "
                     f"BUYs: {step_summary['wrong_buy_count']}.",
@@ -754,10 +754,17 @@ def render_markdown(audit: dict[str, Any]) -> str:
         f"{summary['accepted_shell_command_count']}",
         f"- bare shell_command-prefix submissions: "
         f"{summary['submitted_shell_command_prefix_count']}",
-        f"- post-transition content writes: {summary['post_transition_content_write_count']}",
+        f"- content writes in sessions 2+: {summary['post_transition_content_write_count']}",
         f"- session-1 failures: {summary['session1_failure_trajectory_count']}",
         f"- wrong BUYs: {summary['wrong_buy_count']}",
         *training_rollout_breakdown,
+        "",
+        "## Timing note",
+        "",
+        f"- {summary['post_transition_content_write_count']} accepted content writes occurred "
+        "in sessions 2 or later. This is expected when the agent records a current-session "
+        "fact and is not evidence of a late write by itself; lateness requires aligning the "
+        "write to the source card whose information was still visible.",
         "",
         "## Observed failure modes",
         "",
@@ -765,9 +772,6 @@ def render_markdown(audit: dict[str, Any]) -> str:
         "trajectories wrote anything before a later accepted BUY in that session; the "
         f"{summary['source_write_action_count']} reported source writes are actions, not "
         "trajectories.",
-        f"- {summary['post_transition_content_write_count']} accepted content writes happened "
-        "after at least one session transition, when the preceding session trace had already "
-        "been removed from model input.",
         source_semantics,
         f"- {summary['submitted_apply_patch_prefix_count'] - summary['accepted_apply_patch_count']}"
         f"/{summary['submitted_apply_patch_prefix_count']} bare apply_patch submissions were "
