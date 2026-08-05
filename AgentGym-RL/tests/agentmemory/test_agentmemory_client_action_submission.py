@@ -184,6 +184,33 @@ def recency_override_metadata():
     return metadata
 
 
+def recency_override_filesystem_metadata():
+    metadata = recency_override_metadata()
+    filesystem = filesystem_metadata()
+    metadata.update(
+        {
+            key: deepcopy(filesystem[key])
+            for key in (
+                "memory_management",
+                "workspace_surface",
+                "workspace_tool_contract",
+                "workspace_tool_ops",
+                "workspace_persistence",
+                "workspace_episode_isolation",
+                "workspace_shell_enabled",
+                "workspace_apply_patch_enabled",
+                "workspace_host_path_exposed",
+                "workspace_limits",
+                "workspace_sandbox",
+                "reward_contract",
+            )
+        }
+    )
+    metadata["surface"] = "agentmemory_webshop_recency_override_filesystem_v2"
+    metadata["memory_prompt_mode"] = "natural_filesystem"
+    return metadata
+
+
 def distractor_robustness_metadata():
     metadata = latent_preference_metadata()
     metadata["surface"] = (
@@ -761,6 +788,44 @@ class ProceduralAgentMemoryClientContractTest(unittest.TestCase):
         self.assertIn("use UPDATE", prompt)
         self.assertIn("use RETRIEVE", prompt)
         post.assert_called_once()
+
+    def test_recency_override_filesystem_surface_combines_both_contracts(self) -> None:
+        client = self.create_client(recency_override_filesystem_metadata())
+        self.assertTrue(client.is_procedural)
+        self.assertTrue(client.is_filesystem)
+        self.assertTrue(client.is_recency_override)
+        self.assertFalse(client.requires_latent_preference_sop)
+        self.assertIs(client.adapter_cls, FilesystemAgentMemoryAdapter)
+        self.assertEqual(client.memory_prompt_mode, "natural_filesystem")
+        prompt = client.conversation_start[0]["value"]
+        for fragment in (
+            "current confirmed preference",
+            "update the existing current-state record",
+            "no conflicting stale value",
+            "use the current recorded value rather than an older one",
+        ):
+            self.assertIn(fragment, prompt)
+        for forbidden in ("ADD stores", "RETRIEVE", "memory_id"):
+            self.assertNotIn(forbidden, prompt)
+
+        bad_recency = recency_override_filesystem_metadata()
+        bad_recency["provider"]["override_phase_index"] = 1
+        post = Mock()
+        with (
+            patch.object(
+                AgentMemoryEnvClient,
+                "get_metadata",
+                return_value=bad_recency,
+            ),
+            patch("agentenv.envs.agentmemory.requests.post", post),
+            self.assertRaisesRegex(RuntimeError, "Recency-override"),
+        ):
+            AgentMemoryEnvClient(
+                "http://recency-filesystem.invalid",
+                None,
+                action_format=ActionFormat.REACT,
+            )
+        post.assert_not_called()
 
     def test_distractor_surface_uses_query_only_top1_without_ask(self) -> None:
         client = self.create_client(distractor_robustness_metadata())

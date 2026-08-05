@@ -38,8 +38,34 @@ WEBSHOP_V2_SURFACE = "memoryarena_webshop_native_v1"
 FILESYSTEM_WEBSHOP_V2_SURFACE = (
     "agentmemory_webshop_procedural_natural_chain_filesystem_v2"
 )
+RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE = (
+    "agentmemory_webshop_recency_override_filesystem_v2"
+)
+FILESYSTEM_WEBSHOP_V2_SURFACES = frozenset(
+    {
+        FILESYSTEM_WEBSHOP_V2_SURFACE,
+        RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE,
+    }
+)
 FILESYSTEM_TOOL_OPS = ("SHELL_COMMAND", "APPLY_PATCH")
 FILESYSTEM_CAUSAL_ARMS = ("correct", "blank", "swapped", "no_workspace")
+RECENCY_FILESYSTEM_CAUSAL_ARMS = (
+    "correct",
+    "blank",
+    "swapped",
+    "stale",
+    "no_workspace",
+)
+FILESYSTEM_CAUSAL_ARMS_BY_SURFACE = {
+    FILESYSTEM_WEBSHOP_V2_SURFACE: FILESYSTEM_CAUSAL_ARMS,
+    RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE: (
+        RECENCY_FILESYSTEM_CAUSAL_ARMS
+    ),
+}
+FILESYSTEM_INTERVENTION_BOUNDARY_BY_SURFACE = {
+    FILESYSTEM_WEBSHOP_V2_SURFACE: 1,
+    RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE: 3,
+}
 FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS = (
     'shell_command {"command":"rg -n pattern ."',
     "apply_patch is followed on the next line",
@@ -75,6 +101,41 @@ FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS = (
     "Later turn (complete reply):\n"
     "shell_command {\"command\":\"rg --hidden -n '^service port:' .\"",
 )
+RECENCY_FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS = (
+    'shell_command {"command":"rg -n pattern ."',
+    "apply_patch is followed on the next line",
+    "*** Begin Patch",
+    "*** End Patch",
+    "workspace persists across shopping sessions within this episode",
+    "Workspace actions have zero task reward",
+    "has no network",
+    "no host-path access",
+    "no dedicated memory API",
+    "workspace starts empty and contains only files that you create",
+    "one ordinary file as the current confirmed user-preference record",
+    "write the exact policy-visible preference field and value",
+    "use apply_patch Update File on the existing current-state file",
+    "new value replaces the old value",
+    "do not leave conflicting current and stale values",
+    "rg --hidden -n '^Current preference:' .",
+    "first use shell_command to print the current preference record",
+    "choose only from the exact current value printed there",
+    "Do not infer the missing value from the choice table or reuse an older value",
+    "Every Add File content line must begin with `+`",
+    "Update File uses context lines prefixed by one space",
+    "never append Result or feedback text to the action",
+    "three complete replies are separate turns and must never be emitted together",
+    "*** Add File: .agent_memory/current.md\n+Current service region: east",
+    "*** Update File: .agent_memory/current.md",
+    "-Current service region: east\n+Current service region: west",
+    "shell_command {\"command\":\"rg --hidden -n '^Current service region:' .\"",
+)
+FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS_BY_SURFACE = {
+    FILESYSTEM_WEBSHOP_V2_SURFACE: FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS,
+    RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE: (
+        RECENCY_FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS
+    ),
+}
 FILESYSTEM_PROMPT_FORBIDDEN_FRAGMENTS = (
     'Read {"path"',
     'Write {"path"',
@@ -743,6 +804,11 @@ EVIDENCE_SURFACE_REGISTRY = {
         "metric_mode": "filesystem_behavior_v2",
         "paper_macro_eligible": False,
     },
+    RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE: {
+        "variant": "recency_override_filesystem_v2",
+        "metric_mode": "filesystem_behavior_v2",
+        "paper_macro_eligible": False,
+    },
 }
 
 # Native WebShop v2 predates the v3 metadata contract and therefore does not
@@ -800,15 +866,40 @@ def _load_legacy_webshop_system_prompt(
                 raise RuntimeError(
                     "reply_style is valid only for the natural filesystem prompt"
                 )
+            enabled_prompt_names = (
+                {
+                    "no_thinking": (
+                        "AGENTMEMORY_ACTION_SYSTEM_PROMPT_RECENCY_FILESYSTEM"
+                    ),
+                    "thinking": (
+                        "AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_RECENCY_FILESYSTEM"
+                    ),
+                    "reasoning": (
+                        "AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_RECENCY_FILESYSTEM"
+                    ),
+                }
+                if surface == RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE
+                else {
+                    "no_thinking": (
+                        "AGENTMEMORY_ACTION_SYSTEM_PROMPT_NATURAL_FILESYSTEM"
+                    ),
+                    "thinking": (
+                        "AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NATURAL_FILESYSTEM"
+                    ),
+                    "reasoning": (
+                        "AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NATURAL_FILESYSTEM"
+                    ),
+                }
+            )
             prompt_names = {
                 (True, "no_thinking"): (
-                    "AGENTMEMORY_ACTION_SYSTEM_PROMPT_NATURAL_FILESYSTEM"
+                    enabled_prompt_names["no_thinking"]
                 ),
                 (True, "thinking"): (
-                    "AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NATURAL_FILESYSTEM"
+                    enabled_prompt_names["thinking"]
                 ),
                 (True, "reasoning"): (
-                    "AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NATURAL_FILESYSTEM"
+                    enabled_prompt_names["reasoning"]
                 ),
                 (False, "no_thinking"): (
                     "AGENTMEMORY_ACTION_SYSTEM_PROMPT_NO_WORKSPACE"
@@ -846,6 +937,11 @@ FILESYSTEM_WEBSHOP_SYSTEM_PROMPT = _load_legacy_webshop_system_prompt(
     memory_prompt_mode="natural_filesystem",
     surface=FILESYSTEM_WEBSHOP_V2_SURFACE,
 )
+RECENCY_FILESYSTEM_WEBSHOP_SYSTEM_PROMPT = _load_legacy_webshop_system_prompt(
+    ltm_inventory_mode="hidden",
+    memory_prompt_mode="natural_filesystem",
+    surface=RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE,
+)
 FILESYSTEM_WEBSHOP_PROMPT_PAIRS = {
     _load_legacy_webshop_system_prompt(
         ltm_inventory_mode="hidden",
@@ -861,6 +957,30 @@ FILESYSTEM_WEBSHOP_PROMPT_PAIRS = {
         reply_style=style,
     )
     for style in ("no_thinking", "thinking", "reasoning")
+}
+FILESYSTEM_WEBSHOP_PROMPT_PAIRS.update(
+    {
+        _load_legacy_webshop_system_prompt(
+            ltm_inventory_mode="hidden",
+            memory_prompt_mode="natural_filesystem",
+            surface=RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE,
+            workspace_enabled=True,
+            reply_style=style,
+        ): _load_legacy_webshop_system_prompt(
+            ltm_inventory_mode="hidden",
+            memory_prompt_mode="natural_filesystem",
+            surface=RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE,
+            workspace_enabled=False,
+            reply_style=style,
+        )
+        for style in ("no_thinking", "thinking", "reasoning")
+    }
+)
+FILESYSTEM_WEBSHOP_SYSTEM_PROMPTS = {
+    FILESYSTEM_WEBSHOP_V2_SURFACE: FILESYSTEM_WEBSHOP_SYSTEM_PROMPT,
+    RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE: (
+        RECENCY_FILESYSTEM_WEBSHOP_SYSTEM_PROMPT
+    ),
 }
 FILESYSTEM_WEBSHOP_NO_WORKSPACE_SYSTEM_PROMPT = (
     FILESYSTEM_WEBSHOP_PROMPT_PAIRS[FILESYSTEM_WEBSHOP_SYSTEM_PROMPT]
@@ -987,9 +1107,10 @@ def _validate_filesystem_sandbox_metadata(metadata: Mapping[str, Any]) -> None:
 
 
 def validate_filesystem_surface_metadata(metadata: Mapping[str, Any]) -> None:
-    """Validate the non-paper natural-filesystem evaluation contract."""
+    """Validate a non-paper Codex-filesystem evaluation contract."""
 
-    if metadata.get("surface") != FILESYSTEM_WEBSHOP_V2_SURFACE:
+    surface = metadata.get("surface")
+    if surface not in FILESYSTEM_WEBSHOP_V2_SURFACES:
         return
     expected = {
         "memory_prompt_mode": "natural_filesystem",
@@ -1046,9 +1167,12 @@ def validate_filesystem_surface_metadata(metadata: Mapping[str, Any]) -> None:
     prompt = metadata.get("system_prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         raise EvalError("filesystem-v2 metadata lacks its effective system prompt")
+    required_prompt_fragments = FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS_BY_SURFACE[
+        surface
+    ]
     missing = [
         fragment
-        for fragment in FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS
+        for fragment in required_prompt_fragments
         if fragment not in prompt
     ]
     forbidden = [
@@ -1071,7 +1195,8 @@ def validate_filesystem_intervention_control(
     """Bind a causal evaluator to the authenticated, answer-free control plane."""
 
     validate_filesystem_surface_metadata(metadata)
-    if metadata.get("surface") != FILESYSTEM_WEBSHOP_V2_SURFACE:
+    surface = metadata.get("surface")
+    if surface not in FILESYSTEM_WEBSHOP_V2_SURFACES:
         raise EvalError("causal intervention requires filesystem WebShop v2")
     if not isinstance(token, str) or len(token) < 32:
         raise EvalError("workspace intervention token is missing or too short")
@@ -1088,9 +1213,11 @@ def validate_filesystem_intervention_control(
     control = metadata.get("workspace_intervention_control")
     expected = {
         "enabled": True,
-        "contract": "authenticated_first_boundary_counterfactual_copy_v1",
-        "allowed_arms": list(FILESYSTEM_CAUSAL_ARMS),
-        "boundary_session_index": 1,
+        "contract": "authenticated_session_boundary_counterfactual_copy_v1",
+        "allowed_arms": list(FILESYSTEM_CAUSAL_ARMS_BY_SURFACE[surface]),
+        "boundary_session_index": (
+            FILESYSTEM_INTERVENTION_BOUNDARY_BY_SURFACE[surface]
+        ),
         "source_state": "policy_authored_workspace_only",
         "authenticated_export": True,
         "hidden_answer_injection": False,
@@ -3325,6 +3452,9 @@ def summarize_filesystem_surface(
     metadata: Mapping[str, Any],
 ) -> dict[str, Any]:
     validate_filesystem_surface_metadata(metadata)
+    surface = metadata.get("surface")
+    if surface not in FILESYSTEM_WEBSHOP_V2_SURFACES:
+        raise EvalError("filesystem summary requires a filesystem WebShop v2 surface")
     metrics_module = _load_formal_training_metrics_module()
     try:
         metrics = metrics_module.summarize_formal_training_rows(
@@ -3356,9 +3486,9 @@ def summarize_filesystem_surface(
     summary = summarize_episodes(episodes)
     summary.update(
         {
-            "evidence_surface": FILESYSTEM_WEBSHOP_V2_SURFACE,
+            "evidence_surface": surface,
             "evidence_variant": EVIDENCE_SURFACE_REGISTRY[
-                FILESYSTEM_WEBSHOP_V2_SURFACE
+                surface
             ]["variant"],
             "evidence_metric_mode": "filesystem_behavior_v2",
             "filesystem_evidence_contract": (
@@ -3367,12 +3497,9 @@ def summarize_filesystem_surface(
             "filesystem_metrics": {name: metrics[name] for name in selected_names},
             "operation_counts_prove_memory_capability": False,
             "causal_intervention_required": True,
-            "required_intervention_arms": [
-                "correct",
-                "blank",
-                "swapped",
-                "no_workspace",
-            ],
+            "required_intervention_arms": list(
+                FILESYSTEM_CAUSAL_ARMS_BY_SURFACE[surface]
+            ),
             "paper_macro_eligible": False,
         }
     )
@@ -3387,7 +3514,7 @@ def summarize_paper_surface(
 
     summary = summarize_episodes(episodes)
     surface = metadata.get("surface") if isinstance(metadata, Mapping) else None
-    if surface == FILESYSTEM_WEBSHOP_V2_SURFACE:
+    if surface in FILESYSTEM_WEBSHOP_V2_SURFACES:
         return summarize_filesystem_surface(episodes, metadata)
     if surface not in PAPER_SURFACE_REGISTRY:
         return summary
@@ -3661,9 +3788,10 @@ class AgentMemoryEnvClient:
         if schema not in (FORMAL_SCHEMA_V3, FORMAL_WEBSHOP_SCHEMA_V2, None):
             raise EvalError(f"Unsupported AgentMemory formal schema: {schema!r}")
         surface = self.metadata.get("surface")
-        if schema in (None, FORMAL_WEBSHOP_SCHEMA_V2) and surface not in (
-            WEBSHOP_V2_SURFACE,
-            FILESYSTEM_WEBSHOP_V2_SURFACE,
+        if (
+            schema in (None, FORMAL_WEBSHOP_SCHEMA_V2)
+            and surface != WEBSHOP_V2_SURFACE
+            and surface not in FILESYSTEM_WEBSHOP_V2_SURFACES
         ):
             raise EvalError(
                 "WebShop v2 metadata is accepted only for recognized WebShop v2 surfaces"
@@ -3682,8 +3810,8 @@ class AgentMemoryEnvClient:
             validate_filesystem_surface_metadata(self.metadata)
             return
 
-        if surface == FILESYSTEM_WEBSHOP_V2_SURFACE:
-            canonical_prompt = FILESYSTEM_WEBSHOP_SYSTEM_PROMPT
+        if surface in FILESYSTEM_WEBSHOP_V2_SURFACES:
+            canonical_prompt = FILESYSTEM_WEBSHOP_SYSTEM_PROMPTS[surface]
             if system_prompt is None:
                 self.metadata["system_prompt"] = canonical_prompt
                 self.metadata["system_prompt_sha256"] = hashlib.sha256(
@@ -3791,7 +3919,7 @@ class AgentMemoryEnvClient:
         if not self.is_v3:
             submitted = extract_webshop_v2_action(
                 submitted,
-                allow_workspace=(self.surface == FILESYSTEM_WEBSHOP_V2_SURFACE),
+                allow_workspace=(self.surface in FILESYSTEM_WEBSHOP_V2_SURFACES),
             )
         self.last_submitted_action = submitted
         result = self._post("step", {"id": self.env_id, "action": submitted})
@@ -3805,13 +3933,13 @@ class AgentMemoryEnvClient:
         token: str,
         source_env_id: int | None = None,
     ) -> dict[str, Any]:
-        if self.surface != FILESYSTEM_WEBSHOP_V2_SURFACE:
+        if self.surface not in FILESYSTEM_WEBSHOP_V2_SURFACES:
             raise EvalError(
                 "workspace intervention is valid only for filesystem WebShop v2"
             )
         if self.env_id is None:
             raise EvalError("Environment was not created")
-        if arm not in ("correct", "blank", "swapped", "no_workspace"):
+        if arm not in FILESYSTEM_CAUSAL_ARMS_BY_SURFACE[self.surface]:
             raise EvalError(f"unsupported workspace intervention arm: {arm!r}")
         if not isinstance(token, str) or len(token) < 32:
             raise EvalError("workspace intervention token is missing or too short")
@@ -3840,7 +3968,7 @@ class AgentMemoryEnvClient:
         return _json_copy(result)
 
     def workspace_export(self, *, token: str) -> dict[str, Any]:
-        if self.surface != FILESYSTEM_WEBSHOP_V2_SURFACE:
+        if self.surface not in FILESYSTEM_WEBSHOP_V2_SURFACES:
             raise EvalError("workspace export is valid only for filesystem WebShop v2")
         if self.env_id is None:
             raise EvalError("Environment was not created")

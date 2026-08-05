@@ -43,6 +43,15 @@ NATURAL_FILESYSTEM_PROMPT_MODE = "natural_filesystem"
 NATURAL_FILESYSTEM_SURFACE = (
     "agentmemory_webshop_procedural_natural_chain_filesystem_v2"
 )
+RECENCY_OVERRIDE_FILESYSTEM_SURFACE = (
+    "agentmemory_webshop_recency_override_filesystem_v2"
+)
+FILESYSTEM_SURFACES = frozenset(
+    {
+        NATURAL_FILESYSTEM_SURFACE,
+        RECENCY_OVERRIDE_FILESYSTEM_SURFACE,
+    }
+)
 
 
 def agentmemory_memory_prompt_mode() -> str:
@@ -285,6 +294,43 @@ _AGENTMEMORY_FILESYSTEM_MEMORY_GUIDANCE = (
     "Choose filenames and note contents from the actual future need; the example value and "
     "path are illustrative, not requirements. Keep each reply to exactly one action."
 )
+_AGENTMEMORY_RECENCY_FILESYSTEM_MEMORY_GUIDANCE = (
+    " The workspace starts empty and contains only files that you create; it is not a "
+    "catalog, hidden cache, or automatic session log. Maintain one ordinary file as the "
+    "current confirmed user-preference record. Before advancing beyond the first session, "
+    "write the exact policy-visible preference field and value that later choices may need. "
+    "The user may explicitly replace that preference in a later session. When that happens, "
+    "use apply_patch Update File on the existing current-state file so the new value replaces "
+    "the old value; do not leave conflicting current and stale values in separate notes. If "
+    "the path is no longer visible, discover it with `rg --hidden -n '^Current preference:' .` "
+    "before editing. In every later application session, first use shell_command to print the "
+    "current preference record, and choose only from the exact current value printed there. "
+    "Do not infer the missing value from the choice table or reuse an older value. Every Add "
+    "File content line must begin with `+`; Update File uses context lines prefixed by one "
+    "space, removed lines prefixed by `-`, and replacement lines prefixed by `+`. The "
+    "environment supplies tool feedback on the next turn, so never append Result or feedback "
+    "text to the action. Here is a generic Codex example unrelated to shopping; the three "
+    "complete replies are separate turns and must never be emitted together. Initial state "
+    "turn (complete reply):\n"
+    "apply_patch\n"
+    "*** Begin Patch\n"
+    "*** Add File: .agent_memory/current.md\n"
+    "+Current service region: east\n"
+    "*** End Patch\n"
+    "After an explicit change, a later turn may replace that state (complete reply):\n"
+    "apply_patch\n"
+    "*** Begin Patch\n"
+    "*** Update File: .agent_memory/current.md\n"
+    "@@\n"
+    "-Current service region: east\n"
+    "+Current service region: west\n"
+    "*** End Patch\n"
+    "After tool feedback, another later turn may read it (complete reply):\n"
+    "shell_command {\"command\":\"rg --hidden -n '^Current service region:' .\","
+    "\"workdir\":\".\",\"timeout_ms\":10000}\n"
+    "Choose the actual filename and record contents from policy-visible facts. Keep each "
+    "reply to exactly one action."
+)
 _AGENTMEMORY_NO_WORKSPACE_ACTION_CONTRACT = (
     "Native browser actions use square-bracket syntax. search[keywords] searches the visible "
     "catalog. click[value] clicks one value in the current available-actions list; an ASIN "
@@ -315,6 +361,27 @@ AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NATURAL_FILESYSTEM = (
     + _AGENTMEMORY_FILESYSTEM_REPLY_RULE_REASONING
     + _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT
     + _AGENTMEMORY_FILESYSTEM_MEMORY_GUIDANCE
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_RECENCY_FILESYSTEM = (
+    "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
+    "with a persistent workspace. "
+    + _AGENTMEMORY_FILESYSTEM_REPLY_RULE_NO_THINKING
+    + _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT
+    + _AGENTMEMORY_RECENCY_FILESYSTEM_MEMORY_GUIDANCE
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_RECENCY_FILESYSTEM = (
+    "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
+    "with a persistent workspace. "
+    + _AGENTMEMORY_FILESYSTEM_REPLY_RULE_THINKING
+    + _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT
+    + _AGENTMEMORY_RECENCY_FILESYSTEM_MEMORY_GUIDANCE
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_RECENCY_FILESYSTEM = (
+    "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
+    "with a persistent workspace. "
+    + _AGENTMEMORY_FILESYSTEM_REPLY_RULE_REASONING
+    + _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT
+    + _AGENTMEMORY_RECENCY_FILESYSTEM_MEMORY_GUIDANCE
 )
 AGENTMEMORY_ACTION_SYSTEM_PROMPT_NO_WORKSPACE = (
     "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
@@ -569,10 +636,10 @@ def agentmemory_action_system_prompt(
             raise ValueError(
                 "natural_filesystem requires ltm_inventory_mode='hidden'."
             )
-        if surface not in (None, NATURAL_FILESYSTEM_SURFACE):
+        if surface is not None and surface not in FILESYSTEM_SURFACES:
             raise ValueError(
                 "natural_filesystem is only valid for the persistent-workspace "
-                f"surface {NATURAL_FILESYSTEM_SURFACE!r}."
+                "surfaces: " + ", ".join(sorted(FILESYSTEM_SURFACES)) + "."
             )
         if not workspace_enabled:
             if _agentmemory_thinking_enabled():
@@ -580,11 +647,24 @@ def agentmemory_action_system_prompt(
             if _agentmemory_reasoning_enabled():
                 return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NO_WORKSPACE
             return AGENTMEMORY_ACTION_SYSTEM_PROMPT_NO_WORKSPACE
+        recency_override = surface == RECENCY_OVERRIDE_FILESYSTEM_SURFACE
         if _agentmemory_thinking_enabled():
-            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NATURAL_FILESYSTEM
+            return (
+                AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_RECENCY_FILESYSTEM
+                if recency_override
+                else AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NATURAL_FILESYSTEM
+            )
         if _agentmemory_reasoning_enabled():
-            return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NATURAL_FILESYSTEM
-        return AGENTMEMORY_ACTION_SYSTEM_PROMPT_NATURAL_FILESYSTEM
+            return (
+                AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_RECENCY_FILESYSTEM
+                if recency_override
+                else AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NATURAL_FILESYSTEM
+            )
+        return (
+            AGENTMEMORY_ACTION_SYSTEM_PROMPT_RECENCY_FILESYSTEM
+            if recency_override
+            else AGENTMEMORY_ACTION_SYSTEM_PROMPT_NATURAL_FILESYSTEM
+        )
     key_inventory = inventory_mode == "keys"
     latent_preference = prompt_mode == "latent_preference_sop"
     selective_memory = prompt_mode == "selective_memory_sop"

@@ -18,7 +18,7 @@ LATEST_OBSERVATION = "latest"
 VISIBLE_PROMPT = f"{SYSTEM_PROMPT}\n{LATEST_OBSERVATION}"
 
 
-def filesystem_contract_metadata():
+def filesystem_contract_metadata(*, surface=None):
     workspace_limits = {
         "max_path_chars": 240,
         "max_files": 64,
@@ -53,7 +53,7 @@ def filesystem_contract_metadata():
         }
     )
     return {
-        "surface": MODULE.FORMAL_WEBSHOP_FILESYSTEM_SURFACE_V2,
+        "surface": surface or MODULE.FORMAL_WEBSHOP_FILESYSTEM_SURFACE_V2,
         "paper_eligible": False,
         "memory_prompt_mode": "natural_filesystem",
         "memory_management": "policy_managed_persistent_workspace",
@@ -363,8 +363,10 @@ class FormalDomainV3Test(unittest.TestCase):
         for surface in (
             MODULE.FORMAL_WEBSHOP_SURFACE_V2,
             MODULE.FORMAL_WEBSHOP_PROCEDURAL_SURFACE_V2,
+            MODULE.FORMAL_WEBSHOP_FILESYSTEM_SURFACE_V2,
             MODULE.FORMAL_WEBSHOP_LATENT_PREFERENCE_SURFACE_V2,
             MODULE.FORMAL_WEBSHOP_RECENCY_OVERRIDE_SURFACE_V2,
+            MODULE.FORMAL_WEBSHOP_RECENCY_OVERRIDE_FILESYSTEM_SURFACE_V2,
             MODULE.FORMAL_WEBSHOP_DISTRACTOR_ROBUSTNESS_SURFACE_V2,
             MODULE.FORMAL_WEBSHOP_COMPOSITIONAL_RECALL_SURFACE_V2,
             MODULE.FORMAL_WEBSHOP_INTENT_CLARIFICATION_SURFACE_V2,
@@ -500,6 +502,22 @@ class FormalDomainV3Test(unittest.TestCase):
                     "surface": MODULE.FORMAL_WEBSHOP_PROCEDURAL_SURFACE_V2,
                     "memory_prompt_mode": "natural_filesystem",
                 },
+                expected_prompt_mode="natural_filesystem",
+            )
+
+    def test_recency_filesystem_surface_uses_shared_workspace_validator(self):
+        metadata = filesystem_contract_metadata(
+            surface=MODULE.FORMAL_WEBSHOP_RECENCY_OVERRIDE_FILESYSTEM_SURFACE_V2,
+        )
+        MODULE.validate_webshop_filesystem_surface(
+            metadata,
+            expected_prompt_mode="natural_filesystem",
+        )
+        tampered = deepcopy(metadata)
+        tampered["workspace_tool_ops"] = ["SHELL_COMMAND"]
+        with self.assertRaisesRegex(MODULE.FormalDomainV3Error, "exactly"):
+            MODULE.validate_webshop_filesystem_surface(
+                tampered,
                 expected_prompt_mode="natural_filesystem",
             )
 

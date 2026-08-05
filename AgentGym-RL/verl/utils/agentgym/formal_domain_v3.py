@@ -17,6 +17,9 @@ FORMAL_WEBSHOP_PROCEDURAL_SURFACE_V2 = (
 FORMAL_WEBSHOP_FILESYSTEM_SURFACE_V2 = (
     "agentmemory_webshop_procedural_natural_chain_filesystem_v2"
 )
+FORMAL_WEBSHOP_RECENCY_OVERRIDE_FILESYSTEM_SURFACE_V2 = (
+    "agentmemory_webshop_recency_override_filesystem_v2"
+)
 FORMAL_WEBSHOP_LATENT_PREFERENCE_SURFACE_V2 = (
     "agentmemory_webshop_latent_preference_train_v1"
 )
@@ -40,12 +43,19 @@ FORMAL_WEBSHOP_SURFACES_V2 = frozenset(
         FORMAL_WEBSHOP_SURFACE_V2,
         FORMAL_WEBSHOP_PROCEDURAL_SURFACE_V2,
         FORMAL_WEBSHOP_FILESYSTEM_SURFACE_V2,
+        FORMAL_WEBSHOP_RECENCY_OVERRIDE_FILESYSTEM_SURFACE_V2,
         FORMAL_WEBSHOP_LATENT_PREFERENCE_SURFACE_V2,
         FORMAL_WEBSHOP_RECENCY_OVERRIDE_SURFACE_V2,
         FORMAL_WEBSHOP_DISTRACTOR_ROBUSTNESS_SURFACE_V2,
         FORMAL_WEBSHOP_COMPOSITIONAL_RECALL_SURFACE_V2,
         FORMAL_WEBSHOP_INTENT_CLARIFICATION_SURFACE_V2,
         FORMAL_WEBSHOP_SELECTIVE_MEMORY_USE_SURFACE_V2,
+    }
+)
+FORMAL_WEBSHOP_FILESYSTEM_SURFACES_V2 = frozenset(
+    {
+        FORMAL_WEBSHOP_FILESYSTEM_SURFACE_V2,
+        FORMAL_WEBSHOP_RECENCY_OVERRIDE_FILESYSTEM_SURFACE_V2,
     }
 )
 LTM_INVENTORY_MODES = ("hidden", "keys")
@@ -328,11 +338,12 @@ def validate_webshop_filesystem_surface(
     """Fail closed if the natural filesystem surface is wired to legacy state."""
 
     surface = metadata.get("surface")
-    is_filesystem = surface == FORMAL_WEBSHOP_FILESYSTEM_SURFACE_V2
+    is_filesystem = surface in FORMAL_WEBSHOP_FILESYSTEM_SURFACES_V2
     if expected_prompt_mode == "natural_filesystem" and not is_filesystem:
         raise FormalDomainV3Error(
             "natural_filesystem prompt mode is only valid for the persistent-workspace "
-            f"surface {FORMAL_WEBSHOP_FILESYSTEM_SURFACE_V2!r}"
+            "surfaces: "
+            + ", ".join(sorted(FORMAL_WEBSHOP_FILESYSTEM_SURFACES_V2))
         )
     if not is_filesystem:
         return

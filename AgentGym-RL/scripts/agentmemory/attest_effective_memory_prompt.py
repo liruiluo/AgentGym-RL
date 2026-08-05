@@ -42,6 +42,12 @@ SELECTIVE_MEMORY_USE_SURFACE = (
 FILESYSTEM_SURFACE = (
     "agentmemory_webshop_procedural_natural_chain_filesystem_v2"
 )
+RECENCY_OVERRIDE_FILESYSTEM_SURFACE = (
+    "agentmemory_webshop_recency_override_filesystem_v2"
+)
+FILESYSTEM_SURFACES = frozenset(
+    {FILESYSTEM_SURFACE, RECENCY_OVERRIDE_FILESYSTEM_SURFACE}
+)
 QUERY_TOP1_REQUIRED_FRAGMENTS = (
     "RETRIEVE requires exactly query:string",
     "returns exactly one highest-ranked matching memory",
@@ -98,6 +104,35 @@ FILESYSTEM_REQUIRED_FRAGMENTS = (
     "Later turn (complete reply):\n"
     "shell_command {\"command\":\"rg --hidden -n '^service port:' .\"",
 )
+RECENCY_FILESYSTEM_REQUIRED_FRAGMENTS = (
+    'shell_command {"command":"rg -n pattern ."',
+    "apply_patch is followed on the next line",
+    "*** Begin Patch",
+    "*** End Patch",
+    "workspace persists across shopping sessions within this episode",
+    "Workspace actions have zero task reward",
+    "has no network",
+    "no host-path access",
+    "no dedicated memory API",
+    "workspace starts empty and contains only files that you create",
+    "one ordinary file as the current confirmed user-preference record",
+    "write the exact policy-visible preference field and value",
+    "use apply_patch Update File on the existing current-state file",
+    "new value replaces the old value",
+    "do not leave conflicting current and stale values",
+    "rg --hidden -n '^Current preference:' .",
+    "first use shell_command to print the current preference record",
+    "choose only from the exact current value printed there",
+    "Do not infer the missing value from the choice table or reuse an older value",
+    "Every Add File content line must begin with `+`",
+    "Update File uses context lines prefixed by one space",
+    "never append Result or feedback text to the action",
+    "three complete replies are separate turns and must never be emitted together",
+    "*** Add File: .agent_memory/current.md\n+Current service region: east",
+    "*** Update File: .agent_memory/current.md",
+    "-Current service region: east\n+Current service region: west",
+    "shell_command {\"command\":\"rg --hidden -n '^Current service region:' .\"",
+)
 FILESYSTEM_FORBIDDEN_FRAGMENTS = (
     'Read {"path"',
     'Write {"path"',
@@ -126,13 +161,18 @@ def build_attestation(
 ) -> dict[str, Any]:
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("effective AgentMemory system prompt is empty")
-    filesystem_required = surface == FILESYSTEM_SURFACE
+    filesystem_required = surface in FILESYSTEM_SURFACES
     if (memory_prompt_mode == "natural_filesystem") != filesystem_required:
         raise RuntimeError(
             "natural_filesystem prompt mode and filesystem surface must be paired"
         )
+    required_filesystem_fragments = (
+        RECENCY_FILESYSTEM_REQUIRED_FRAGMENTS
+        if surface == RECENCY_OVERRIDE_FILESYSTEM_SURFACE
+        else FILESYSTEM_REQUIRED_FRAGMENTS
+    )
     missing_filesystem = [
-        fragment for fragment in FILESYSTEM_REQUIRED_FRAGMENTS if fragment not in prompt
+        fragment for fragment in required_filesystem_fragments if fragment not in prompt
     ]
     forbidden_filesystem = [
         fragment for fragment in FILESYSTEM_FORBIDDEN_FRAGMENTS if fragment in prompt

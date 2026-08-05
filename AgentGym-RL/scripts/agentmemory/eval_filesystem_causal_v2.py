@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Run a real-model four-arm causal evaluation of filesystem memory.
+"""Run a real-model causal evaluation of a filesystem-memory surface.
 
 The evaluator never preloads an answer. It first lets the policy solve the
-source session for a target task and its exact counterfactual pair. Four fresh
+pre-boundary sessions for a target task and its exact counterfactual pair. Fresh
 target environments then replay the target's exact policy actions before the
-server installs correct, blank, swapped, or no-workspace state out of band.
-Only dependent sessions are sampled again.
+server installs the surface-specific intervention arms out of band. Only
+dependent sessions are sampled again.
 """
 
 from __future__ import annotations
@@ -24,7 +24,6 @@ import eval_v3_openai as core
 
 
 SCHEMA = "agentmemory_filesystem_causal_eval_v1"
-ARMS = core.FILESYSTEM_CAUSAL_ARMS
 _INFO_EXCLUDED_FROM_NATIVE_COMPARISON = frozenset(
     {
         "tool_ops",
@@ -126,7 +125,7 @@ class FilesystemCausalEvalRunner:
             raise ValueError("max_policy_turns must allow source and dependent actions")
         if not math.isclose(model.temperature, 0.0, rel_tol=0.0, abs_tol=0.0):
             raise ValueError(
-                "four-arm causal evaluation requires temperature=0 for paired decoding"
+                "filesystem causal evaluation requires temperature=0 for paired decoding"
             )
         self.env_factory = env_factory
         self.model = model
@@ -137,6 +136,21 @@ class FilesystemCausalEvalRunner:
         self._reference_fingerprint: str | None = None
         self._reference_contract_sha256: str | None = None
         self._reference_metadata: dict[str, Any] | None = None
+        self._surface: str | None = None
+        self._arms: tuple[str, ...] | None = None
+        self._boundary_session_index: int | None = None
+
+    @property
+    def arms(self) -> tuple[str, ...]:
+        if self._arms is None:
+            raise core.EvalError("filesystem causal contract has not been resolved")
+        return self._arms
+
+    @property
+    def boundary_session_index(self) -> int:
+        if self._boundary_session_index is None:
+            raise core.EvalError("filesystem causal boundary has not been resolved")
+        return self._boundary_session_index
 
     def _new_env(self) -> core.AgentMemoryEnvClient:
         env = self.env_factory()
@@ -145,6 +159,11 @@ class FilesystemCausalEvalRunner:
                 env.metadata,
                 token=self.token,
             )
+            surface = env.metadata.get("surface")
+            if surface not in core.FILESYSTEM_WEBSHOP_V2_SURFACES:
+                raise core.EvalError("unrecognized filesystem causal surface")
+            arms = tuple(core.FILESYSTEM_CAUSAL_ARMS_BY_SURFACE[surface])
+            boundary = core.FILESYSTEM_INTERVENTION_BOUNDARY_BY_SURFACE[surface]
             service = env.metadata.get("service")
             fingerprint = (
                 service.get("fingerprint_sha256")
@@ -168,6 +187,9 @@ class FilesystemCausalEvalRunner:
                     env.metadata
                 )
                 self._reference_metadata = _json_copy(env.metadata)
+                self._surface = surface
+                self._arms = arms
+                self._boundary_session_index = boundary
             elif fingerprint != self._reference_fingerprint:
                 raise core.EvalError(
                     "causal arms resolved to different environment fingerprints"
@@ -178,6 +200,14 @@ class FilesystemCausalEvalRunner:
             ):
                 raise core.EvalError(
                     "causal arms resolved to different environment contracts"
+                )
+            elif (
+                surface != self._surface
+                or arms != self._arms
+                or boundary != self._boundary_session_index
+            ):
+                raise core.EvalError(
+                    "causal arms resolved to different surface intervention contracts"
                 )
             prompt_has_native_thinking = (
                 "You may first reason inside" in env.system_prompt
@@ -219,12 +249,13 @@ class FilesystemCausalEvalRunner:
             )
             steps.append(step)
             index = _session_index(step["env_info_after"])
-            if index > 1:
+            boundary = self.boundary_session_index
+            if index > boundary:
                 raise core.EvalError(f"{label} source skipped the frozen intervention boundary")
-            if index == 1:
+            if index == boundary:
                 if done:
                     raise core.EvalError(
-                        f"{label} source terminated while advancing to session one"
+                        f"{label} source terminated while advancing to session {boundary}"
                     )
                 reached_boundary = True
                 break
@@ -234,6 +265,7 @@ class FilesystemCausalEvalRunner:
             "label": label,
             "data_idx": data_idx,
             "paired_data_idx": data_idx ^ 1,
+            "boundary_session_index": self.boundary_session_index,
             "reset_response": _json_copy(reset),
             "initial_env_info": initial_info,
             "steps": steps,
@@ -305,7 +337,10 @@ class FilesystemCausalEvalRunner:
             if response.get("done") is not False and index != len(actions) - 1:
                 mismatches.append(f"step_{index}_premature_done")
         info = env.info.get("env_info", {})
-        if _session_index(info) != 1 or env.info.get("done") is not False:
+        if (
+            _session_index(info) != self.boundary_session_index
+            or env.info.get("done") is not False
+        ):
             mismatches.append("final_boundary")
         exported = env.workspace_export(token=self.token) if not mismatches else None
         if exported is not None and exported["workspace_state"] != source["workspace_export"]["workspace_state"]:
@@ -348,6 +383,7 @@ class FilesystemCausalEvalRunner:
             "correct": target_state["tree_sha256"],
             "blank": _empty_workspace_tree_sha256(),
             "swapped": paired_state["tree_sha256"],
+            "stale": paired_state["tree_sha256"],
             "no_workspace": _empty_workspace_tree_sha256(),
         }[arm]
         if snapshot.get("tree_sha256") != expected_tree:
@@ -429,6 +465,9 @@ class FilesystemCausalEvalRunner:
             )
             result = {
                 "schema": SCHEMA,
+                "surface": self._surface,
+                "causal_arms": list(self.arms),
+                "boundary_session_index": self.boundary_session_index,
                 "target_data_idx": data_idx,
                 "paired_data_idx": data_idx ^ 1,
                 "sources": {
@@ -447,6 +486,13 @@ class FilesystemCausalEvalRunner:
             if source_reasons:
                 result["ineligible_reasons"] = source_reasons
                 return result
+            if "stale" in self.arms:
+                target_branch = target_source["boundary_env_info"].get("branch_kind")
+                paired_branch = paired_source["boundary_env_info"].get("branch_kind")
+                if (target_branch, paired_branch) != ("flip", "stay"):
+                    raise core.EvalError(
+                        "stale causal arm requires a flip target and stay paired source"
+                    )
             target_source_state = target_source["workspace_export"][
                 "workspace_state"
             ]
@@ -463,7 +509,7 @@ class FilesystemCausalEvalRunner:
                 return result
 
             arm_envs = {}
-            for arm in ARMS:
+            for arm in self.arms:
                 arm_env = self._new_env()
                 clients.append(arm_env)
                 arm_envs[arm] = arm_env
@@ -495,7 +541,9 @@ class FilesystemCausalEvalRunner:
                     arm,
                     token=self.token,
                     source_env_id=(
-                        paired_source_env.env_id if arm == "swapped" else None
+                        paired_source_env.env_id
+                        if arm in {"swapped", "stale"}
+                        else None
                     ),
                 )
                 self._validate_intervention_result(
@@ -507,7 +555,8 @@ class FilesystemCausalEvalRunner:
                 intervention_responses[arm] = response
             enabled_observations = {
                 intervention_responses[arm]["observation"]
-                for arm in ("correct", "blank", "swapped")
+                for arm in self.arms
+                if arm != "no_workspace"
             }
             if len(enabled_observations) != 1:
                 raise core.EvalError(
@@ -573,7 +622,7 @@ class FilesystemCausalEvalRunner:
                 orbit,
             )
             orbits.append(orbit)
-        summary = summarize_causal_orbits(orbits)
+        summary = summarize_causal_orbits(orbits, arms=self.arms)
         manifest = {
             "schema": SCHEMA,
             "started_unix": started,
@@ -592,6 +641,9 @@ class FilesystemCausalEvalRunner:
             },
             "indices": self.indices,
             "max_policy_turns": self.max_policy_turns,
+            "surface": self._surface,
+            "causal_arms": list(self.arms),
+            "boundary_session_index": self.boundary_session_index,
             "prompt_history_policy": "latest_observation_only",
             "source_actions_replayed_exactly": True,
             "hidden_answer_injection": False,
@@ -603,13 +655,20 @@ class FilesystemCausalEvalRunner:
         return manifest
 
 
-def summarize_causal_orbits(orbits: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def summarize_causal_orbits(
+    orbits: Sequence[Mapping[str, Any]],
+    *,
+    arms: Sequence[str],
+) -> dict[str, Any]:
+    arms = tuple(arms)
+    if not arms or arms[0] != "correct" or "no_workspace" not in arms:
+        raise core.EvalError("invalid filesystem causal arm panel")
     eligible = [orbit for orbit in orbits if orbit.get("eligible") is True]
-    arms = {}
-    for arm in ARMS:
+    arm_metrics = {}
+    for arm in arms:
         outcomes = [orbit["arms"][arm] for orbit in eligible]
         success_count = sum(outcome.get("episode_success") is True for outcome in outcomes)
-        arms[arm] = {
+        arm_metrics[arm] = {
             "episode_count": len(outcomes),
             "success_count": success_count,
             "success_rate": success_count / len(outcomes) if outcomes else 0.0,
@@ -630,20 +689,31 @@ def summarize_causal_orbits(orbits: Sequence[Mapping[str, Any]]) -> dict[str, An
         orbit["arms"]["correct"].get("episode_success") is True
         and all(
             orbit["arms"][arm].get("episode_success") is False
-            for arm in ("blank", "swapped", "no_workspace")
+            for arm in arms
+            if arm != "correct"
         )
         for orbit in eligible
     )
-    return {
+    arm_count_name = {
+        4: "four",
+        5: "five",
+    }.get(len(arms), str(len(arms)))
+    summary = {
         "orbit_count": len(orbits),
         "eligible_orbit_count": len(eligible),
         "ineligible_orbit_count": len(orbits) - len(eligible),
-        "strict_four_arm_separation_count": strict,
-        "strict_four_arm_separation_rate": strict / len(eligible) if eligible else 0.0,
-        "arm_metrics": arms,
+        "required_intervention_arms": list(arms),
+        "strict_separation_count": strict,
+        "strict_separation_rate": strict / len(eligible) if eligible else 0.0,
+        "arm_metrics": arm_metrics,
         "operation_counts_prove_memory_capability": False,
         "causal_claim_requires_panel_level_intervention_effect": True,
     }
+    summary[f"strict_{arm_count_name}_arm_separation_count"] = strict
+    summary[f"strict_{arm_count_name}_arm_separation_rate"] = (
+        strict / len(eligible) if eligible else 0.0
+    )
+    return summary
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

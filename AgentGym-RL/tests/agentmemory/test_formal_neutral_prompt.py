@@ -562,6 +562,42 @@ class FormalPromptTests(unittest.TestCase):
                 workspace_enabled=0,
             )
 
+    def test_recency_filesystem_prompt_requires_current_state_replacement(self) -> None:
+        module = load_schemas_module()
+        prompt = module.agentmemory_action_system_prompt(
+            memory_prompt_mode="natural_filesystem",
+            surface=module.RECENCY_OVERRIDE_FILESYSTEM_SURFACE,
+        )
+        for fragment in (
+            "one ordinary file as the current confirmed user-preference record",
+            "use apply_patch Update File on the existing current-state file",
+            "new value replaces the old value",
+            "do not leave conflicting current and stale values",
+            "rg --hidden -n '^Current preference:' .",
+            "first use shell_command to print the current preference record",
+            "Do not infer the missing value from the choice table",
+            "*** Update File: .agent_memory/current.md",
+            "-Current service region: east",
+            "+Current service region: west",
+        ):
+            self.assertIn(fragment, prompt)
+        for forbidden in (
+            "After an Add File action returns Done!, keep that successful note unchanged",
+            "ADD requires",
+            "RETRIEVE accepts",
+            "memory_id",
+            "Long-term memory",
+        ):
+            self.assertNotIn(forbidden, prompt)
+
+        no_workspace = module.agentmemory_action_system_prompt(
+            memory_prompt_mode="natural_filesystem",
+            surface=module.RECENCY_OVERRIDE_FILESYSTEM_SURFACE,
+            workspace_enabled=False,
+        )
+        self.assertIn("without a persistent workspace", no_workspace)
+        self.assertNotIn("current confirmed user-preference record", no_workspace)
+
     def test_surface_specific_top1_and_clarification_contracts(self) -> None:
         module = load_schemas_module()
         distractor_surface = (

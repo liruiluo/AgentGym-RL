@@ -25,6 +25,12 @@ NEGATIVE_CONSTRAINT_SURFACE = (
 FILESYSTEM_SURFACE = (
     "agentmemory_webshop_procedural_natural_chain_filesystem_v2"
 )
+RECENCY_OVERRIDE_FILESYSTEM_SURFACE = (
+    "agentmemory_webshop_recency_override_filesystem_v2"
+)
+FILESYSTEM_SURFACES = frozenset(
+    {FILESYSTEM_SURFACE, RECENCY_OVERRIDE_FILESYSTEM_SURFACE}
+)
 SUPPORTED_SERVER_SURFACE_CONTRACTS = {
     "agentmemory_webshop_procedural_natural_chain_train_v1": (
         "agentmemory_verified_natural_chain_provider_v4",
@@ -32,6 +38,10 @@ SUPPORTED_SERVER_SURFACE_CONTRACTS = {
     ),
     FILESYSTEM_SURFACE: (
         "agentmemory_verified_natural_chain_provider_v4",
+        2,
+    ),
+    RECENCY_OVERRIDE_FILESYSTEM_SURFACE: (
+        "agentmemory_verified_recency_override_provider_v1",
         2,
     ),
     "agentmemory_webshop_latent_preference_train_v1": (
@@ -450,7 +460,7 @@ class ProceduralIndexSource:
             )
         if provider.get("native_click_action_uses_asin_handle") is not True:
             raise ProceduralIndexError("server no longer uses native click[ASIN]")
-        if surface == FILESYSTEM_SURFACE:
+        if surface in FILESYSTEM_SURFACES:
             if metadata.get("memory_prompt_mode") != "natural_filesystem":
                 raise ProceduralIndexError(
                     "filesystem surface requires natural_filesystem prompt mode"

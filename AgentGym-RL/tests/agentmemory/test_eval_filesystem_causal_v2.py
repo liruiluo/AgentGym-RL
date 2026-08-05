@@ -153,7 +153,7 @@ def filesystem_metadata(token: str) -> dict:
         },
         "workspace_intervention_control": {
             "enabled": True,
-            "contract": "authenticated_first_boundary_counterfactual_copy_v1",
+            "contract": "authenticated_session_boundary_counterfactual_copy_v1",
             "allowed_arms": list(CORE.FILESYSTEM_CAUSAL_ARMS),
             "boundary_session_index": 1,
             "source_state": "policy_authored_workspace_only",
@@ -162,6 +162,27 @@ def filesystem_metadata(token: str) -> dict:
             "token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest(),
         },
     }
+
+
+def recency_filesystem_metadata(token: str) -> dict:
+    metadata = filesystem_metadata(token)
+    prompt = CORE.RECENCY_FILESYSTEM_WEBSHOP_SYSTEM_PROMPT
+    metadata.update(
+        {
+            "surface": CORE.RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE,
+            "system_prompt": prompt,
+            "system_prompt_sha256": hashlib.sha256(
+                prompt.encode("utf-8")
+            ).hexdigest(),
+        }
+    )
+    metadata["workspace_intervention_control"].update(
+        {
+            "allowed_arms": list(CORE.RECENCY_FILESYSTEM_CAUSAL_ARMS),
+            "boundary_session_index": 3,
+        }
+    )
+    return metadata
 
 
 class FakeModel:
@@ -373,6 +394,164 @@ class FakeEnv:
         return True
 
 
+class RecencyFakeModel(FakeModel):
+    def complete(self, messages):
+        system = messages[0]["content"]
+        observation = messages[-1]["content"]
+        if "session=0" in observation and "value=<empty>" in observation:
+            action = (
+                "apply_patch\n*** Begin Patch\n*** Add File: MEMORY.md\n"
+                "+black\n*** End Patch"
+            )
+        elif (
+            "session=2" in observation
+            and "override=gray" in observation
+            and "value=black" in observation
+        ):
+            action = (
+                "apply_patch\n*** Begin Patch\n*** Update File: MEMORY.md\n"
+                "@@\n-black\n+gray\n*** End Patch"
+            )
+        elif "tool_output=" in observation:
+            action = "click[Buy Now]"
+        elif "dependent:" in observation and "without a persistent workspace" not in system:
+            action = 'shell_command {"command":"cat MEMORY.md","workdir":"."}'
+        else:
+            action = "click[Buy Now]"
+        return {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": action},
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+
+
+class RecencyFakeEnv(FakeEnv):
+    def __init__(self, registry, env_id: int, metadata: dict):
+        super().__init__(registry, env_id, metadata)
+        self.branch_kind = "stay"
+
+    def _observation(self):
+        value = self.value or "<empty>"
+        if self.session == 0:
+            return f"recency:session=0;confirmed=black;value={value}"
+        if self.session == 1:
+            return f"recency:session=1;apply=black;value={value}"
+        if self.session == 2:
+            override = "gray" if self.branch_kind == "flip" else "black"
+            return f"recency:session=2;override={override};value={value}"
+        contract = (
+            "Persistent workspace: available."
+            if self.enabled
+            else "Persistent workspace: unavailable in this intervention."
+        )
+        tool_output = (
+            f";tool_output={self.tool_output}"
+            if hasattr(self, "tool_output")
+            else ""
+        )
+        return f"dependent:session={self.session}{tool_output}\n{contract}"
+
+    def _info(self, *, success=False, reward_components=()):
+        info = super()._info(
+            success=success,
+            reward_components=reward_components,
+        )
+        info.update(
+            {
+                "phase_count": 6,
+                "branch_kind": self.branch_kind,
+                "override_mode": (
+                    "update_or_delete_add"
+                    if self.branch_kind == "flip"
+                    else "none"
+                ),
+            }
+        )
+        return info
+
+    def reset(self, data_idx):
+        self.branch_kind = "flip" if data_idx % 2 else "stay"
+        return super().reset(data_idx)
+
+    def step(self, action):
+        self.last_submitted_action = action
+        if action.startswith("apply_patch"):
+            self.value = "gray" if "+gray" in action else "black"
+            self.audit_count += 1
+            return self._response()
+        if action.startswith("shell_command"):
+            self.tool_output = self.value or "<empty>"
+            self.audit_count += 1
+            return self._response()
+        if action != "click[Buy Now]":
+            raise AssertionError(f"unexpected action: {action}")
+
+        expected = (
+            "black"
+            if self.session < 2 or self.branch_kind == "stay"
+            else "gray"
+        )
+        if self.session < 3:
+            if self.value != expected:
+                raise AssertionError("source policy used the wrong current preference")
+            self.session += 1
+            return self._response(
+                1.0,
+                reward_components=(
+                    {"name": "correct_buy", "value": 1.0, "op": "BUY"},
+                ),
+            )
+
+        read_value = getattr(self, "tool_output", None)
+        if self.value != expected or read_value != expected:
+            self.done = True
+            return self._response(
+                -1.0,
+                success=False,
+                reward_components=(
+                    {"name": "wrong_buy", "value": -1.0, "op": "BUY"},
+                ),
+            )
+        del self.tool_output
+        self.session += 1
+        self.done = self.session == 6
+        reward = 2.0 if self.done else 1.0
+        return self._response(
+            reward,
+            success=self.done,
+            reward_components=(
+                {"name": "correct_buy", "value": reward, "op": "BUY"},
+            ),
+        )
+
+    def workspace_intervention(self, arm, *, token, source_env_id=None):
+        if arm != "stale":
+            return super().workspace_intervention(
+                arm,
+                token=token,
+                source_env_id=source_env_id,
+            )
+        del token
+        source = self.registry[source_env_id]
+        if self.branch_kind != "flip" or source.branch_kind != "stay":
+            raise AssertionError("stale intervention direction is invalid")
+        before = snapshot(self.value)["tree_sha256"]
+        self.value = source.value
+        self.audit_count = 0
+        self.control_event = {
+            "arm": arm,
+            "policy_action": False,
+            "task_reward": 0.0,
+            "source_tree_sha256": snapshot(source.value)["tree_sha256"],
+            "workspace_tree_sha256_before": before,
+            "workspace_tree_sha256_after": snapshot(self.value)["tree_sha256"],
+        }
+        return self._response()
+
+
 class FilesystemCausalEvalTest(unittest.TestCase):
     def test_contract_hash_ignores_only_dynamic_environment_counts(self):
         token = "t" * 48
@@ -499,6 +678,100 @@ class FilesystemCausalEvalTest(unittest.TestCase):
         self.assertNotIn("shell_command JSON action", no_workspace_prompt)
         self.assertEqual(persisted["summary"], manifest["summary"])
         self.assertNotIn(token, json.dumps(persisted))
+
+    def test_recency_flip_target_runs_five_arms_at_session_three(self):
+        token = "r" * 48
+        metadata = recency_filesystem_metadata(token)
+        registry = {}
+        next_id = 0
+
+        def factory():
+            nonlocal next_id
+            env = RecencyFakeEnv(registry, next_id, metadata)
+            registry[next_id] = env
+            next_id += 1
+            return env
+
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = CAUSAL.FilesystemCausalEvalRunner(
+                factory,
+                RecencyFakeModel(),
+                indices=[1],
+                max_policy_turns=16,
+                output_dir=Path(temporary),
+                intervention_token=token,
+            ).run()
+
+        orbit = manifest["orbits"][0]
+        self.assertTrue(orbit["eligible"])
+        self.assertEqual(orbit["boundary_session_index"], 3)
+        self.assertEqual(
+            orbit["causal_arms"],
+            ["correct", "blank", "swapped", "stale", "no_workspace"],
+        )
+        self.assertEqual(
+            orbit["sources"]["target"]["boundary_env_info"]["branch_kind"],
+            "flip",
+        )
+        self.assertEqual(
+            orbit["sources"]["paired"]["boundary_env_info"]["branch_kind"],
+            "stay",
+        )
+        self.assertIn(
+            "*** Update File: MEMORY.md",
+            "\n".join(orbit["sources"]["target"]["actions"]),
+        )
+        target_tree = orbit["sources"]["target"]["workspace_export"][
+            "workspace_state"
+        ]["tree_sha256"]
+        paired_tree = orbit["sources"]["paired"]["workspace_export"][
+            "workspace_state"
+        ]["tree_sha256"]
+        self.assertNotEqual(target_tree, paired_tree)
+        self.assertTrue(all(item["matches_source"] for item in orbit["replays"].values()))
+        self.assertTrue(orbit["arms"]["correct"]["episode_success"])
+        for arm in ("blank", "swapped", "stale", "no_workspace"):
+            self.assertFalse(orbit["arms"][arm]["episode_success"])
+        self.assertEqual(
+            orbit["arms"]["stale"]["intervention_response"]["info"][
+                "workspace_snapshot"
+            ]["tree_sha256"],
+            paired_tree,
+        )
+        self.assertEqual(
+            manifest["summary"]["strict_five_arm_separation_count"],
+            1,
+        )
+        self.assertEqual(manifest["summary"]["strict_separation_count"], 1)
+
+    def test_recency_stale_arm_rejects_stay_target_direction(self):
+        token = "r" * 48
+        metadata = recency_filesystem_metadata(token)
+        registry = {}
+        next_id = 0
+
+        def factory():
+            nonlocal next_id
+            env = RecencyFakeEnv(registry, next_id, metadata)
+            registry[next_id] = env
+            next_id += 1
+            return env
+
+        with tempfile.TemporaryDirectory() as temporary:
+            runner = CAUSAL.FilesystemCausalEvalRunner(
+                factory,
+                RecencyFakeModel(),
+                indices=[0],
+                max_policy_turns=16,
+                output_dir=Path(temporary),
+                intervention_token=token,
+            )
+            with self.assertRaisesRegex(
+                CORE.EvalError,
+                "stale causal arm requires a flip target",
+            ):
+                runner.run_orbit(0)
+        self.assertTrue(all(env.closed for env in registry.values()))
 
 
 if __name__ == "__main__":

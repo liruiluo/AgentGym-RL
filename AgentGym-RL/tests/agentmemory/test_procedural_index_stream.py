@@ -162,6 +162,30 @@ def recency_override_server_metadata(*, generator_seed: int = 233) -> dict:
     return metadata
 
 
+def recency_override_filesystem_server_metadata(
+    *, generator_seed: int = 233
+) -> dict:
+    metadata = recency_override_server_metadata(generator_seed=generator_seed)
+    filesystem = filesystem_server_metadata(generator_seed=generator_seed)
+    metadata.update(
+        {
+            key: deepcopy(filesystem[key])
+            for key in (
+                "workspace_surface",
+                "workspace_tool_contract",
+                "workspace_tool_ops",
+                "workspace_shell_enabled",
+                "workspace_apply_patch_enabled",
+                "workspace_host_path_exposed",
+                "reward_contract",
+            )
+        }
+    )
+    metadata["surface"] = "agentmemory_webshop_recency_override_filesystem_v2"
+    metadata["memory_prompt_mode"] = "natural_filesystem"
+    return metadata
+
+
 def distractor_robustness_server_metadata(*, generator_seed: int = 233) -> dict:
     metadata = latent_preference_server_metadata(generator_seed=generator_seed)
     metadata["surface"] = (
@@ -461,6 +485,7 @@ class ProceduralIndexSourceTests(unittest.TestCase):
         source.validate_server_metadata(filesystem_server_metadata())
         source.validate_server_metadata(latent_preference_server_metadata())
         source.validate_server_metadata(recency_override_server_metadata())
+        source.validate_server_metadata(recency_override_filesystem_server_metadata())
         source.validate_server_metadata(distractor_robustness_server_metadata())
         source.validate_server_metadata(intent_clarification_server_metadata())
         compositional_source = ProceduralIndexSource(
@@ -503,6 +528,15 @@ class ProceduralIndexSourceTests(unittest.TestCase):
         with self.assertRaisesRegex(ProceduralIndexError, "approved pair"):
             source.validate_server_metadata(recency_mismatched_schema)
 
+        recency_filesystem_mismatched_schema = (
+            recency_override_filesystem_server_metadata()
+        )
+        recency_filesystem_mismatched_schema["provider"]["schema"] = (
+            "agentmemory_verified_natural_chain_provider_v4"
+        )
+        with self.assertRaisesRegex(ProceduralIndexError, "approved pair"):
+            source.validate_server_metadata(recency_filesystem_mismatched_schema)
+
         negative_mismatched_schema = negative_constraint_server_metadata()
         negative_mismatched_schema["provider"]["schema"] = (
             "agentmemory_verified_selective_memory_use_provider_v1"
@@ -538,6 +572,12 @@ class ProceduralIndexSourceTests(unittest.TestCase):
         legacy["memory_prompt_mode"] = "natural_filesystem"
         with self.assertRaisesRegex(ProceduralIndexError, "bound"):
             source.validate_server_metadata(legacy)
+
+        recency_filesystem = recency_override_filesystem_server_metadata()
+        source.validate_server_metadata(recency_filesystem)
+        recency_filesystem["workspace_apply_patch_enabled"] = False
+        with self.assertRaisesRegex(ProceduralIndexError, "apply_patch"):
+            source.validate_server_metadata(recency_filesystem)
 
     def test_batch_indices_preserve_complete_adjacent_orbits(self) -> None:
         validate_paired_batch_indices([200, 201, 202, 203])

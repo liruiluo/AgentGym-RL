@@ -176,6 +176,7 @@ def _filesystem_info(
     *,
     snapshot,
     audit_count,
+    reward_components=(),
     tool_ops=(),
     workspace_ops=(),
     latest_event=None,
@@ -185,7 +186,7 @@ def _filesystem_info(
         "current_subtask_index": session_index,
         "phase_count": 2,
         "episode_success": episode_success,
-        "reward_components": [],
+        "reward_components": list(reward_components),
         "tool_ops": list(tool_ops),
         "workspace_ops": list(workspace_ops),
         "memory_ops": [],
@@ -257,6 +258,9 @@ def _filesystem_eval_episode():
         0,
         snapshot=written,
         audit_count=1,
+        reward_components=(
+            {"name": "apply_patch_transition", "value": 0.0, "op": "APPLY_PATCH"},
+        ),
         tool_ops=(write,),
         workspace_ops=(write,),
         latest_event=write,
@@ -277,6 +281,9 @@ def _filesystem_eval_episode():
         1,
         snapshot=written,
         audit_count=2,
+        reward_components=(
+            {"name": "shell_command_transition", "value": 0.0, "op": "SHELL_COMMAND"},
+        ),
         tool_ops=(shell,),
         workspace_ops=(shell,),
         latest_event=shell,
@@ -1925,7 +1932,7 @@ class EvalV3OpenAITest(unittest.TestCase):
                 "workspace_intervention_control": {
                     "enabled": True,
                     "contract": (
-                        "authenticated_first_boundary_counterfactual_copy_v1"
+                        "authenticated_session_boundary_counterfactual_copy_v1"
                     ),
                     "allowed_arms": list(MODULE.FILESYSTEM_CAUSAL_ARMS),
                     "boundary_session_index": 1,
