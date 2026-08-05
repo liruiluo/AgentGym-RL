@@ -12,6 +12,9 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
+TRAINING_DIAGNOSTIC_RE = re.compile(r"ppo_batch_step([0-9]+)_post_adv[.]json$")
+
+
 def _sha256_json(value: Any) -> str:
     payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -322,15 +325,23 @@ def _later_shell_links(
 
 
 def _io_record(step: dict[str, Any]) -> dict[str, Any]:
+    exact_model_input = step.get("exact_model_input")
     return {
         "turn": step.get("turn"),
         "phase_before": step.get("env_info_before", {}).get("current_subtask_index"),
         "phase_after": step.get("env_info_after", {}).get("current_subtask_index"),
+        "exact_model_input_sha256": (
+            hashlib.sha256(exact_model_input.encode("utf-8")).hexdigest()
+            if isinstance(exact_model_input, str)
+            else None
+        ),
+        "exact_model_input": exact_model_input,
         "request_messages_sha256": _sha256_json(step.get("request_messages", [])),
         "request_messages": step.get("request_messages", []),
         "raw_model_response": step.get("raw_model_response"),
         "model_text": step.get("model_text"),
         "action_submitted": step.get("action_submitted"),
+        "action_submission": step.get("action_submission"),
         "environment_step_request": step.get("environment_step_request"),
         "env_response": step.get("env_response"),
         "reward": step.get("reward"),
@@ -339,8 +350,9 @@ def _io_record(step: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _analyze_episode(path: Path, run_dir: Path) -> dict[str, Any]:
-    episode = json.loads(path.read_text(encoding="utf-8"))
+def _analyze_episode_data(
+    episode: dict[str, Any], episode_path: str
+) -> dict[str, Any]:
     steps = list(episode.get("steps", []))
     buys = _correct_buys(steps)
     sources = _source_writes(steps, buys)
@@ -372,7 +384,10 @@ def _analyze_episode(path: Path, run_dir: Path) -> dict[str, Any]:
         )
     ]
     return {
-        "episode_path": str(path.relative_to(run_dir)),
+        "episode_path": episode_path,
+        "rollout_step": episode.get("rollout_step"),
+        "policy_updates_before_rollout": episode.get("policy_updates_before_rollout"),
+        "trajectory_uid": episode.get("trajectory_uid"),
         "data_idx": episode.get("data_idx"),
         "final_phase_progress": episode.get("final_phase_progress"),
         "episode_return": episode.get("episode_return"),
@@ -390,11 +405,140 @@ def _analyze_episode(path: Path, run_dir: Path) -> dict[str, Any]:
     }
 
 
-def analyze_run(run_dir: Path) -> dict[str, Any]:
+def _analyze_episode(path: Path, run_dir: Path) -> dict[str, Any]:
+    episode = json.loads(path.read_text(encoding="utf-8"))
+    return _analyze_episode_data(episode, str(path.relative_to(run_dir)))
+
+
+def _training_step_from_row(row: dict[str, Any]) -> dict[str, Any]:
+    record = row.get("formal_step_record")
+    if not isinstance(record, dict):
+        raise ValueError("training row has no formal_step_record")
+    submission = record.get("action_submission")
+    if not isinstance(submission, dict):
+        submission = {}
+    raw_output = submission.get("raw_policy_output", record.get("action", ""))
+    submitted = submission.get("submitted_action", record.get("action", ""))
+    env_info_before = record.get("env_info_before")
+    env_info_after = record.get("env_info_after")
+    if not isinstance(env_info_before, dict) or not isinstance(env_info_after, dict):
+        raise ValueError("training formal_step_record lacks environment state")
+    latest_observation = str(record.get("latest_observation", ""))
+    immediate_reward = record.get("immediate_reward", row.get("agentmemory_immediate_reward"))
+    env_result = str(record.get("env_result", ""))
+    return {
+        "turn": int(record.get("trajectory_row_order", 0)) + 1,
+        "exact_model_input": record.get("visible_prompt"),
+        "request_messages": [{"role": "user", "content": latest_observation}],
+        "raw_model_response": {
+            "raw_policy_output": raw_output,
+            "generation_response_digest": record.get("generation_response_digest"),
+            "generation_response_length": record.get("generation_response_length"),
+            "finish_reason": record.get("finish_reason"),
+            "generation_stop_reason": record.get("generation_stop_reason"),
+        },
+        "model_text": raw_output,
+        "action_submitted": submitted,
+        "action_submission": submission,
+        "environment_step_request": {
+            "action": submitted,
+            "item_id": record.get("item_id"),
+        },
+        "env_response": {
+            "observation": env_result,
+            "reward": immediate_reward,
+            "done": record.get("done"),
+            "info": env_info_after,
+        },
+        "env_info_before": env_info_before,
+        "env_info_after": env_info_after,
+        "reward": immediate_reward,
+        "reward_components": env_info_after.get("reward_components", []),
+    }
+
+
+def _training_episodes(path: Path, run_dir: Path) -> list[dict[str, Any]]:
+    match = TRAINING_DIAGNOSTIC_RE.fullmatch(path.name)
+    if match is None:
+        raise ValueError(f"Cannot infer rollout step from {path}")
+    rollout_step = int(match.group(1))
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    rows = payload.get("rows")
+    if not isinstance(rows, list):
+        raise ValueError(f"Training diagnostic has no rows list: {path}")
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    metadata: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict) or not row.get("ppo_valid_sample", True):
+            continue
+        record = row.get("formal_step_record")
+        if not isinstance(record, dict):
+            continue
+        trajectory_uid = str(
+            record.get("trajectory_uid") or row.get("agentmemory_trajectory_uid") or ""
+        )
+        if not trajectory_uid:
+            raise ValueError(f"Training row has no trajectory uid: {path}")
+        grouped.setdefault(trajectory_uid, []).append(_training_step_from_row(row))
+        metadata[trajectory_uid] = {
+            "data_idx": record.get("parent_index", row.get("parent_index")),
+            "trajectory_return": record.get(
+                "trajectory_return", row.get("agentmemory_trajectory_return")
+            ),
+        }
+
+    episodes = []
+    for trajectory_uid, steps in sorted(grouped.items()):
+        steps.sort(key=lambda step: int(step["turn"]))
+        last = steps[-1]
+        final_info = last["env_info_after"]
+        final_progress = int(final_info.get("current_subtask_index", 0))
+        episode = {
+            "rollout_step": rollout_step,
+            "policy_updates_before_rollout": max(rollout_step - 1, 0),
+            "trajectory_uid": trajectory_uid,
+            "data_idx": metadata[trajectory_uid]["data_idx"],
+            "final_phase_progress": final_progress,
+            "episode_return": metadata[trajectory_uid]["trajectory_return"],
+            "episode_success": bool(final_info.get("episode_success", False)),
+            "timed_out": str(last.get("env_response", {}).get("observation", "")).startswith(
+                "Maximum rounds reached"
+            ),
+            "steps": steps,
+        }
+        episode_path = (
+            f"{path.relative_to(run_dir)}#trajectory_uid={trajectory_uid}"
+        )
+        episodes.append(_analyze_episode_data(episode, episode_path))
+    return episodes
+
+
+def analyze_run(run_dir: Path, layout: str = "auto") -> dict[str, Any]:
     paths = sorted(run_dir.glob("replicas/*/output/episode_*.json"))
-    if not paths:
-        raise ValueError(f"No episode JSON files found under {run_dir}")
-    episodes = [_analyze_episode(path, run_dir) for path in paths]
+    diagnostic_paths = [
+        path
+        for path in run_dir.glob("diagnostics/ppo_batch_step*_post_adv.json")
+        if TRAINING_DIAGNOSTIC_RE.fullmatch(path.name)
+    ]
+    diagnostic_paths.sort(
+        key=lambda path: int(TRAINING_DIAGNOSTIC_RE.fullmatch(path.name).group(1))
+    )
+    if layout not in {"auto", "eval", "training"}:
+        raise ValueError(f"Unsupported layout: {layout}")
+    if layout == "eval" or (layout == "auto" and paths):
+        if not paths:
+            raise ValueError(f"No eval episode JSON files found under {run_dir}")
+        source_layout = "eval_replicas"
+        episodes = [_analyze_episode(path, run_dir) for path in paths]
+    else:
+        if not diagnostic_paths:
+            raise ValueError(f"No training diagnostic JSON files found under {run_dir}")
+        source_layout = "training_post_adv"
+        episodes = [
+            episode
+            for path in diagnostic_paths
+            for episode in _training_episodes(path, run_dir)
+        ]
 
     invalid_reasons: Counter[str] = Counter()
     accepted_patch_count = 0
@@ -439,8 +583,34 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
         for episode in episodes
         for link in episode["later_shell_timing_links"]
     }
+    rollout_steps = sorted(
+        {
+            int(episode["rollout_step"])
+            for episode in episodes
+            if episode["rollout_step"] is not None
+        }
+    )
     summary = {
+        "source_layout": source_layout,
         "trajectory_count": len(episodes),
+        "trajectory_count_by_rollout_step": {
+            str(step): count
+            for step, count in sorted(
+                Counter(
+                    episode["rollout_step"]
+                    for episode in episodes
+                    if episode["rollout_step"] is not None
+                ).items()
+            )
+        },
+        "strict_content_chain_count_by_rollout_step": {
+            str(step): sum(
+                int(episode["strict_content_chain_count"])
+                for episode in episodes
+                if episode["rollout_step"] == step
+            )
+            for step in rollout_steps
+        },
         "filesystem_intent_record_count": sum(
             len(episode["filesystem_io"]) for episode in episodes
         ),
@@ -512,6 +682,15 @@ def render_markdown(audit: dict[str, Any]) -> str:
             "contained the selected card's exact field/value pair; any remaining failure is "
             "in timing, later readback, or the dependent purchase."
         )
+    training_rollout_lines = []
+    if summary.get("source_layout") == "training_post_adv":
+        training_rollout_lines = [
+            "- Training rollout steps use pre-update sampling semantics: step 1 is the base "
+            "policy, and step N is sampled after N-1 optimizer updates.",
+            f"- Trajectories by rollout step: "
+            f"`{summary['trajectory_count_by_rollout_step']}`; strict chains by rollout "
+            f"step: `{summary['strict_content_chain_count_by_rollout_step']}`.",
+        ]
     lines = [
         "# Filesystem behavior exact I/O audit",
         "",
@@ -519,12 +698,14 @@ def render_markdown(audit: dict[str, Any]) -> str:
         "",
         "## Verdict",
         "",
+        f"- Source layout: `{summary.get('source_layout', 'eval_replicas')}`.",
         f"- Strict same-content cross-session chains: **{summary['strict_content_chain_count']}**.",
         f"- Timing-only source writes: {summary['source_write_action_count']} actions in "
         f"{summary['source_write_trajectory_count']}/{summary['trajectory_count']} trajectories.",
         f"- Timing-only later-shell actions: {summary['later_shell_timing_action_count']} "
         f"({summary['later_shell_timing_link_count']} source/action pairs); "
         f"source content actually observed: {summary['later_shell_source_content_observed_count']}.",
+        *training_rollout_lines,
         "- A file merely remaining in the workspace does not count as retrieval.",
         "",
         "## Counts",
@@ -623,12 +804,13 @@ def render_markdown(audit: dict[str, Any]) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("run_dir", type=Path)
+    parser.add_argument("--layout", choices=("auto", "eval", "training"), default="auto")
     parser.add_argument("--json-out", type=Path)
     parser.add_argument("--markdown-out", type=Path)
     args = parser.parse_args()
 
     run_dir = args.run_dir.resolve()
-    audit = analyze_run(run_dir)
+    audit = analyze_run(run_dir, layout=args.layout)
     json_text = json.dumps(audit, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     markdown_text = render_markdown(audit)
     if args.json_out:

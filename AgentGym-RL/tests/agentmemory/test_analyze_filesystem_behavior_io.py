@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -188,6 +190,116 @@ class AnalyzeFilesystemBehaviorIoTest(unittest.TestCase):
         self.assertNotIn("six reported source writes", rendered)
         self.assertIn("Every source-write timing candidate", rendered)
         self.assertNotIn("generic certified/natural labels", rendered)
+
+    def test_training_post_adv_layout_preserves_exact_io_and_strict_chain(self) -> None:
+        version = {"path": ".agent_memory/fact.md", "sha256": "c" * 64, "bytes": 39}
+        patch = (
+            "apply_patch\n*** Begin Patch\n*** Add File: .agent_memory/fact.md\n"
+            "+Confirmed listed cake flavor: vanilla\n*** End Patch"
+        )
+        buy_input = (
+            "Customer-approved product cards:\n"
+            "- Product: Vanilla Cake\n"
+            "  Confirmed listed cake flavor: vanilla [SEP] Back to Search "
+            "[SEP] Vanilla Cake [SEP] Price: $10"
+        )
+
+        def row(
+            order: int,
+            before: int,
+            after: int,
+            action: str,
+            *,
+            latest: str = "",
+            event: dict[str, object] | None = None,
+        ) -> dict[str, object]:
+            before_info = {"current_subtask_index": before}
+            after_info: dict[str, object] = {
+                "current_subtask_index": after,
+                "episode_success": after == 2,
+                "reward_components": [],
+                "workspace_snapshot": {"files": [version] if order > 0 else []},
+            }
+            if event is not None:
+                after_info["workspace_latest_event"] = event
+            return {
+                "ppo_valid_sample": True,
+                "formal_step_record": {
+                    "trajectory_uid": "trajectory-0",
+                    "trajectory_row_order": order,
+                    "trajectory_return": 2.0,
+                    "parent_index": 7,
+                    "item_id": "agentmemory-7",
+                    "visible_prompt": f"exact-visible-prompt-{order}",
+                    "latest_observation": latest,
+                    "action": action,
+                    "action_submission": {
+                        "raw_policy_output": action,
+                        "submitted_action": action,
+                        "parser_status": "raw_fallback",
+                    },
+                    "env_info_before": before_info,
+                    "env_info_after": after_info,
+                    "env_result": "Done!",
+                    "immediate_reward": 0.0,
+                    "done": after == 2,
+                    "generation_response_digest": f"digest-{order}",
+                    "generation_response_length": 1,
+                },
+            }
+
+        patch_event = {
+            "op": "APPLY_PATCH",
+            "workspace_diff": {"added": [version], "modified": [], "deleted": []},
+        }
+        shell_action = (
+            'shell_command {"command":"rg --hidden -n \'^Confirmed \' .",'
+            '"workdir":"."}'
+        )
+        shell_event = {
+            "op": "SHELL_COMMAND",
+            "command": "rg --hidden -n '^Confirmed ' .",
+            "stdout": "./.agent_memory/fact.md:1:Confirmed listed cake flavor: vanilla\n",
+            "stderr": "",
+            "exit_code": 0,
+            "workspace_diff": {"added": [], "modified": [], "deleted": []},
+        }
+        payload = {
+            "global_step": 1,
+            "rows": [
+                row(0, 0, 0, patch, event=patch_event),
+                row(1, 0, 1, "click[Buy Now]", latest=buy_input),
+                row(2, 1, 1, shell_action, event=shell_event),
+                row(3, 1, 2, "click[Buy Now]"),
+                {"ppo_valid_sample": False, "formal_step_record": None},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            diagnostic_dir = run_dir / "diagnostics"
+            diagnostic_dir.mkdir()
+            (diagnostic_dir / "ppo_batch_step1_post_adv.json").write_text(
+                json.dumps(payload), encoding="utf-8"
+            )
+            audit = MODULE.analyze_run(run_dir)
+
+        self.assertEqual(audit["summary"]["source_layout"], "training_post_adv")
+        self.assertEqual(audit["summary"]["trajectory_count"], 1)
+        self.assertEqual(audit["summary"]["strict_content_chain_count"], 1)
+        self.assertEqual(
+            audit["summary"]["strict_content_chain_count_by_rollout_step"], {"1": 1}
+        )
+        episode = audit["episodes"][0]
+        self.assertEqual(episode["policy_updates_before_rollout"], 0)
+        self.assertEqual(episode["filesystem_io"][0]["exact_model_input"], "exact-visible-prompt-0")
+        self.assertEqual(
+            episode["filesystem_io"][0]["raw_model_response"]["raw_policy_output"],
+            patch,
+        )
+        self.assertEqual(
+            episode["filesystem_io"][0]["action_submission"]["submitted_action"],
+            patch,
+        )
 
 
 if __name__ == "__main__":
