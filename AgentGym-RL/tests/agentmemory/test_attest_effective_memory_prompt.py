@@ -361,6 +361,23 @@ class EffectiveMemoryPromptAttestationTests(unittest.TestCase):
                         surface=self.module.FILESYSTEM_SURFACE,
                     )
 
+    def test_each_recency_filesystem_fragment_is_fail_closed(self) -> None:
+        for missing_fragment in self.module.RECENCY_FILESYSTEM_REQUIRED_FRAGMENTS:
+            with self.subTest(missing_fragment=missing_fragment):
+                prompt = " ".join(
+                    self.module.RECENCY_FILESYSTEM_REQUIRED_FRAGMENTS
+                ).replace(missing_fragment, "<removed-required-fragment>")
+                with self.assertRaisesRegex(RuntimeError, "filesystem prompt contract"):
+                    self.module.build_attestation(
+                        prompt=prompt,
+                        memory_prompt_mode="natural_filesystem",
+                        ltm_inventory_mode="hidden",
+                        thinking_enabled=False,
+                        reasoning_enabled=True,
+                        require_lifecycle_sop=False,
+                        surface=self.module.RECENCY_OVERRIDE_FILESYSTEM_SURFACE,
+                    )
+
     def test_filesystem_surface_rejects_every_legacy_memory_fragment(self) -> None:
         for forbidden_fragment in self.module.FILESYSTEM_FORBIDDEN_FRAGMENTS:
             with self.subTest(forbidden_fragment=forbidden_fragment):

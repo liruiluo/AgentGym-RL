@@ -580,10 +580,19 @@ class FormalPromptTests(unittest.TestCase):
             "rg --hidden -n '^Current preference:' .",
             "first use shell_command to print the current preference record",
             "Do not infer the missing value from the choice table",
-            "*** Add File with a new path",
-            "*** Update File on that same path",
-            "one - line exactly matching the old record",
-            "one + line exactly matching the new task-provided record",
+            "A merchandise category, product title, or option-table entry is not the preference record",
+            "correct and retry the workspace read before any search or click",
+            "use exactly five physical lines",
+            "line 3 begins with `*** Add File: `, including the colon and following space",
+            "line 4 begins with `+` immediately followed by the task's exact record",
+            "Never combine two patch lines on one physical line",
+            "use exactly seven physical lines",
+            "line 3 begins with `*** Update File: `, including the colon and following space",
+            "line 4 is exactly `@@`",
+            "line 5 begins with `-` immediately followed by the exact old record",
+            "line 6 begins with `+` immediately followed by the exact new task-provided record",
+            "assume the workspace is unchanged and fix and retry the workspace action",
+            "only `Done!` proves that the patch succeeded",
             "No concrete preference value or filename is demonstrated here",
         ):
             self.assertIn(fragment, prompt)
@@ -595,6 +604,8 @@ class FormalPromptTests(unittest.TestCase):
             "Long-term memory",
             "Current service region:",
             ".agent_memory/current.md",
+            "Current preference: east",
+            "Current preference: west",
         ):
             self.assertNotIn(forbidden, prompt)
 
