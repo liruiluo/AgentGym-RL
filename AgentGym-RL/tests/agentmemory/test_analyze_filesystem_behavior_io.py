@@ -289,6 +289,15 @@ class AnalyzeFilesystemBehaviorIoTest(unittest.TestCase):
         self.assertEqual(
             audit["summary"]["strict_content_chain_count_by_rollout_step"], {"1": 1}
         )
+        step_summary = audit["summary"]["summary_by_rollout_step"]["1"]
+        self.assertEqual(step_summary["trajectory_count"], 1)
+        self.assertEqual(step_summary["strict_content_chain_count"], 1)
+        self.assertEqual(step_summary["strict_content_chain_trajectory_count"], 1)
+        self.assertEqual(
+            step_summary["source_semantic_status_counts"], {"exact_field_value": 1}
+        )
+        rendered = MODULE.render_markdown(audit)
+        self.assertIn("Step 1 (base policy): 1 strict chains in 1/1 trajectories", rendered)
         episode = audit["episodes"][0]
         self.assertEqual(episode["policy_updates_before_rollout"], 0)
         self.assertEqual(episode["filesystem_io"][0]["exact_model_input"], "exact-visible-prompt-0")

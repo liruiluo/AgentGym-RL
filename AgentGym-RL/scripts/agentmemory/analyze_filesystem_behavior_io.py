@@ -513,33 +513,7 @@ def _training_episodes(path: Path, run_dir: Path) -> list[dict[str, Any]]:
     return episodes
 
 
-def analyze_run(run_dir: Path, layout: str = "auto") -> dict[str, Any]:
-    paths = sorted(run_dir.glob("replicas/*/output/episode_*.json"))
-    diagnostic_paths = [
-        path
-        for path in run_dir.glob("diagnostics/ppo_batch_step*_post_adv.json")
-        if TRAINING_DIAGNOSTIC_RE.fullmatch(path.name)
-    ]
-    diagnostic_paths.sort(
-        key=lambda path: int(TRAINING_DIAGNOSTIC_RE.fullmatch(path.name).group(1))
-    )
-    if layout not in {"auto", "eval", "training"}:
-        raise ValueError(f"Unsupported layout: {layout}")
-    if layout == "eval" or (layout == "auto" and paths):
-        if not paths:
-            raise ValueError(f"No eval episode JSON files found under {run_dir}")
-        source_layout = "eval_replicas"
-        episodes = [_analyze_episode(path, run_dir) for path in paths]
-    else:
-        if not diagnostic_paths:
-            raise ValueError(f"No training diagnostic JSON files found under {run_dir}")
-        source_layout = "training_post_adv"
-        episodes = [
-            episode
-            for path in diagnostic_paths
-            for episode in _training_episodes(path, run_dir)
-        ]
-
+def _summarize_episodes(episodes: list[dict[str, Any]]) -> dict[str, Any]:
     invalid_reasons: Counter[str] = Counter()
     accepted_patch_count = 0
     accepted_shell_count = 0
@@ -583,34 +557,8 @@ def analyze_run(run_dir: Path, layout: str = "auto") -> dict[str, Any]:
         for episode in episodes
         for link in episode["later_shell_timing_links"]
     }
-    rollout_steps = sorted(
-        {
-            int(episode["rollout_step"])
-            for episode in episodes
-            if episode["rollout_step"] is not None
-        }
-    )
-    summary = {
-        "source_layout": source_layout,
+    return {
         "trajectory_count": len(episodes),
-        "trajectory_count_by_rollout_step": {
-            str(step): count
-            for step, count in sorted(
-                Counter(
-                    episode["rollout_step"]
-                    for episode in episodes
-                    if episode["rollout_step"] is not None
-                ).items()
-            )
-        },
-        "strict_content_chain_count_by_rollout_step": {
-            str(step): sum(
-                int(episode["strict_content_chain_count"])
-                for episode in episodes
-                if episode["rollout_step"] == step
-            )
-            for step in rollout_steps
-        },
         "filesystem_intent_record_count": sum(
             len(episode["filesystem_io"]) for episode in episodes
         ),
@@ -624,7 +572,7 @@ def analyze_run(run_dir: Path, layout: str = "auto") -> dict[str, Any]:
         "invalid_action_first_line_counts": dict(invalid_reasons.most_common()),
         "source_write_action_count": len(sources),
         "source_write_trajectory_count": source_episodes,
-        "source_write_trajectory_rate": source_episodes / len(episodes),
+        "source_write_trajectory_rate": source_episodes / len(episodes) if episodes else 0.0,
         "source_semantic_status_counts": dict(
             Counter(source["semantic_evidence"]["status"] for source in sources)
         ),
@@ -645,6 +593,70 @@ def analyze_run(run_dir: Path, layout: str = "auto") -> dict[str, Any]:
             not episode["correct_buy_turns"] for episode in episodes
         ),
         "wrong_buy_count": sum(len(episode["wrong_buy_io"]) for episode in episodes),
+    }
+
+
+def analyze_run(run_dir: Path, layout: str = "auto") -> dict[str, Any]:
+    paths = sorted(run_dir.glob("replicas/*/output/episode_*.json"))
+    diagnostic_paths = [
+        path
+        for path in run_dir.glob("diagnostics/ppo_batch_step*_post_adv.json")
+        if TRAINING_DIAGNOSTIC_RE.fullmatch(path.name)
+    ]
+    diagnostic_paths.sort(
+        key=lambda path: int(TRAINING_DIAGNOSTIC_RE.fullmatch(path.name).group(1))
+    )
+    if layout not in {"auto", "eval", "training"}:
+        raise ValueError(f"Unsupported layout: {layout}")
+    if layout == "eval" or (layout == "auto" and paths):
+        if not paths:
+            raise ValueError(f"No eval episode JSON files found under {run_dir}")
+        source_layout = "eval_replicas"
+        episodes = [_analyze_episode(path, run_dir) for path in paths]
+    else:
+        if not diagnostic_paths:
+            raise ValueError(f"No training diagnostic JSON files found under {run_dir}")
+        source_layout = "training_post_adv"
+        episodes = [
+            episode
+            for path in diagnostic_paths
+            for episode in _training_episodes(path, run_dir)
+        ]
+
+    rollout_steps = sorted(
+        {
+            int(episode["rollout_step"])
+            for episode in episodes
+            if episode["rollout_step"] is not None
+        }
+    )
+    summary = {
+        "source_layout": source_layout,
+        "trajectory_count_by_rollout_step": {
+            str(step): count
+            for step, count in sorted(
+                Counter(
+                    episode["rollout_step"]
+                    for episode in episodes
+                    if episode["rollout_step"] is not None
+                ).items()
+            )
+        },
+        "strict_content_chain_count_by_rollout_step": {
+            str(step): sum(
+                int(episode["strict_content_chain_count"])
+                for episode in episodes
+                if episode["rollout_step"] == step
+            )
+            for step in rollout_steps
+        },
+        "summary_by_rollout_step": {
+            str(step): _summarize_episodes(
+                [episode for episode in episodes if episode["rollout_step"] == step]
+            )
+            for step in rollout_steps
+        },
+        **_summarize_episodes(episodes),
     }
     aggregate_path = run_dir / "aggregate.json"
     aggregate = (
@@ -683,6 +695,7 @@ def render_markdown(audit: dict[str, Any]) -> str:
             "in timing, later readback, or the dependent purchase."
         )
     training_rollout_lines = []
+    training_rollout_breakdown = []
     if summary.get("source_layout") == "training_post_adv":
         training_rollout_lines = [
             "- Training rollout steps use pre-update sampling semantics: step 1 is the base "
@@ -691,6 +704,29 @@ def render_markdown(audit: dict[str, Any]) -> str:
             f"`{summary['trajectory_count_by_rollout_step']}`; strict chains by rollout "
             f"step: `{summary['strict_content_chain_count_by_rollout_step']}`.",
         ]
+        training_rollout_breakdown = ["", "## Per-rollout-step breakdown", ""]
+        for step, step_summary in summary.get("summary_by_rollout_step", {}).items():
+            semantic_counts = step_summary["source_semantic_status_counts"]
+            exact_sources = semantic_counts.get("exact_field_value", 0)
+            updates = max(int(step) - 1, 0)
+            policy_label = "base policy" if updates == 0 else f"after {updates} update(s)"
+            training_rollout_breakdown.extend(
+                [
+                    f"- Step {step} ({policy_label}): "
+                    f"{step_summary['strict_content_chain_count']} strict chains in "
+                    f"{step_summary['strict_content_chain_trajectory_count']}/"
+                    f"{step_summary['trajectory_count']} trajectories; "
+                    f"{step_summary['source_write_action_count']} source writes in "
+                    f"{step_summary['source_write_trajectory_count']} trajectories "
+                    f"({exact_sources} exact field/value).",
+                    f"  Accepted patch/shell: {step_summary['accepted_apply_patch_count']}/"
+                    f"{step_summary['accepted_shell_command_count']}; invalid actions: "
+                    f"{step_summary['invalid_action_count']}; post-transition writes: "
+                    f"{step_summary['post_transition_content_write_count']}; session-1 "
+                    f"failures: {step_summary['session1_failure_trajectory_count']}; wrong "
+                    f"BUYs: {step_summary['wrong_buy_count']}.",
+                ]
+            )
     lines = [
         "# Filesystem behavior exact I/O audit",
         "",
@@ -721,6 +757,7 @@ def render_markdown(audit: dict[str, Any]) -> str:
         f"- post-transition content writes: {summary['post_transition_content_write_count']}",
         f"- session-1 failures: {summary['session1_failure_trajectory_count']}",
         f"- wrong BUYs: {summary['wrong_buy_count']}",
+        *training_rollout_breakdown,
         "",
         "## Observed failure modes",
         "",
