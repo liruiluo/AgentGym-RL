@@ -104,6 +104,30 @@ python3 AgentGym-RL/scripts/agentmemory/analyze_filesystem_behavior_io.py \
   --markdown-out /path/to/exact-io-audit.md
 ```
 
+For task-specific semantic admission checks, feed that frozen exact-I/O JSON to
+the matching analyzer instead of interpreting the generic selected-product
+fields:
+
+```bash
+python3 AgentGym-RL/scripts/agentmemory/analyze_compositional_filesystem_io.py \
+  /path/to/exact-io-audit.json \
+  --json-out /path/to/compositional-io-audit.json \
+  --markdown-out /path/to/compositional-io-audit.md
+
+python3 AgentGym-RL/scripts/agentmemory/analyze_negative_constraint_filesystem_io.py \
+  /path/to/exact-io-audit.json \
+  --json-out /path/to/negative-constraint-io-audit.json \
+  --markdown-out /path/to/negative-constraint-io-audit.md
+```
+
+The compositional audit requires separate exact customer-to-profile and
+profile-directory facts to be observed from later shell output before the same
+native correct BUY. The negative-constraint audit requires the exact forbidden
+values, excludes a source that also records the allowed value, and links the
+later readback to a native correct BUY. These are policy-behavior diagnostics;
+task-level scripted causal oracles and multitask held-out results remain
+separate evidence layers.
+
 It preserves the exact request messages, raw model response, submitted action,
 environment feedback, and workspace event for filesystem-related turns. Its
 strict chain requires source content to appear in a later shell result before a
