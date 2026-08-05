@@ -2334,12 +2334,15 @@ class EvalV3OpenAITest(unittest.TestCase):
             "*** End Patch"
         )
         shell_action = (
-            "shell_command {\"command\":\"rg -n 'service port' "
-            ".agent_memory/example.md\",\"workdir\":\".\","
+            "shell_command {\"command\":\"rg -n '^service port:' .\","
+            "\"workdir\":\".\","
             "\"timeout_ms\":10000}"
         )
         self.assertIn(patch_action, prompt)
         self.assertIn(shell_action, prompt)
+        self.assertIn("latest-observation-only input", prompt)
+        self.assertIn("do not guess a path", prompt)
+        self.assertIn("every Add File content line must begin with `+`", prompt)
         self.assertEqual(
             MODULE.extract_webshop_v2_action(
                 patch_action,

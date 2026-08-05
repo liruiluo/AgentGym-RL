@@ -76,9 +76,12 @@ FILESYSTEM_REQUIRED_FRAGMENTS = (
     "workspace starts empty and contains only files that you create",
     "Before an action that advances to a new shopping session",
     "Copy the exact policy-visible field name and value needed later",
-    "do not search, click, or write a replacement fact until you have used",
-    "locate the candidate note and then read that file",
-    "never infer or recreate the missing value from the choice table",
+    "every Add File content line must begin with `+`",
+    "latest-observation-only input",
+    "first action must use shell_command to discover and print saved Confirmed lines",
+    "do not guess a path",
+    "until the preceding session's note contents have appeared in shell output",
+    "Never infer or recreate the missing value from the choice table",
     "Listing a directory or reading a different file is not reading the note",
     "After an Add File action returns Done!, keep that successful note unchanged",
     "new note, use Add File with a new path",
@@ -87,7 +90,7 @@ FILESYSTEM_REQUIRED_FRAGMENTS = (
     "Earlier turn (complete reply):\napply_patch",
     "*** Add File: .agent_memory/example.md\n+service port: 4317",
     "Later turn (complete reply):\n"
-    "shell_command {\"command\":\"rg -n 'service port' .agent_memory/example.md\"",
+    "shell_command {\"command\":\"rg -n '^service port:' .\"",
 )
 FILESYSTEM_FORBIDDEN_FRAGMENTS = (
     'Read {"path"',
