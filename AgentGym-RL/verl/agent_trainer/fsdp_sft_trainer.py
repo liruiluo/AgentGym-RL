@@ -121,12 +121,7 @@ class FSDPSFTTrainer(object):
         # build dataset
         self.train_dataset = SFTDataset(json_file=config.data.train_files,
                                         tokenizer=self.tokenizer,
-                                        prompt_key=config.data.prompt_key,
-                                        max_length=config.data.max_length,
-                                        truncation=config.data.truncation,
-                                        data_mode=config.data.get(
-                                            'data_mode', 'conversations'
-                                        ))
+                                        prompt_key=config.data.prompt_key)
 
         # build dataloader
         # Use data parallel rank and size instead of global rank and world size
@@ -270,9 +265,7 @@ class FSDPSFTTrainer(object):
         input_ids = batch['input_ids'].cuda()
         attention_mask = batch['attention_mask'].cuda()
         position_ids = batch['position_ids'].cuda()
-        # ``loss_mask`` marks target token positions.  Logits at position i-1
-        # predict token i, so align it with labels ``input_ids[:, 1:]``.
-        loss_mask = batch.pop('loss_mask')[:, 1:].reshape(-1).cuda()
+        loss_mask = batch.pop('loss_mask')[:, :-1].reshape(-1).cuda()
         loss_fct = nn.CrossEntropyLoss(reduction='none')
 
         # Context manager for sequence parallel if needed
