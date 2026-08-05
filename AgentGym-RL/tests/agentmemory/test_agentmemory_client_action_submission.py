@@ -827,6 +827,28 @@ class ProceduralAgentMemoryClientContractTest(unittest.TestCase):
             )
         post.assert_not_called()
 
+    def test_natural_filesystem_surface_rejects_recency_provider_schema(self) -> None:
+        bad_natural = filesystem_metadata()
+        bad_natural["provider"] = deepcopy(
+            recency_override_filesystem_metadata()["provider"]
+        )
+        post = Mock()
+        with (
+            patch.object(
+                AgentMemoryEnvClient,
+                "get_metadata",
+                return_value=bad_natural,
+            ),
+            patch("agentenv.envs.agentmemory.requests.post", post),
+            self.assertRaisesRegex(RuntimeError, "provider schema"),
+        ):
+            AgentMemoryEnvClient(
+                "http://natural-filesystem.invalid",
+                None,
+                action_format=ActionFormat.REACT,
+            )
+        post.assert_not_called()
+
     def test_distractor_surface_uses_query_only_top1_without_ask(self) -> None:
         client = self.create_client(distractor_robustness_metadata())
         self.assertTrue(client.is_distractor_robustness)
