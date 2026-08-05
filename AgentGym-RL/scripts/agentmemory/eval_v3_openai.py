@@ -41,10 +41,18 @@ FILESYSTEM_WEBSHOP_V2_SURFACE = (
 RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE = (
     "agentmemory_webshop_recency_override_filesystem_v2"
 )
+COMPOSITIONAL_RECALL_FILESYSTEM_WEBSHOP_V2_SURFACE = (
+    "agentmemory_webshop_compositional_recall_filesystem_v2"
+)
+NEGATIVE_CONSTRAINT_FILESYSTEM_WEBSHOP_V2_SURFACE = (
+    "agentmemory_webshop_negative_constraint_filesystem_v2"
+)
 FILESYSTEM_WEBSHOP_V2_SURFACES = frozenset(
     {
         FILESYSTEM_WEBSHOP_V2_SURFACE,
         RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE,
+        COMPOSITIONAL_RECALL_FILESYSTEM_WEBSHOP_V2_SURFACE,
+        NEGATIVE_CONSTRAINT_FILESYSTEM_WEBSHOP_V2_SURFACE,
     }
 )
 FILESYSTEM_TOOL_OPS = ("SHELL_COMMAND", "APPLY_PATCH")
@@ -61,10 +69,44 @@ FILESYSTEM_CAUSAL_ARMS_BY_SURFACE = {
     RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE: (
         RECENCY_FILESYSTEM_CAUSAL_ARMS
     ),
+    COMPOSITIONAL_RECALL_FILESYSTEM_WEBSHOP_V2_SURFACE: FILESYSTEM_CAUSAL_ARMS,
+    NEGATIVE_CONSTRAINT_FILESYSTEM_WEBSHOP_V2_SURFACE: FILESYSTEM_CAUSAL_ARMS,
 }
 FILESYSTEM_INTERVENTION_BOUNDARY_BY_SURFACE = {
     FILESYSTEM_WEBSHOP_V2_SURFACE: 1,
     RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE: 3,
+    COMPOSITIONAL_RECALL_FILESYSTEM_WEBSHOP_V2_SURFACE: 2,
+    NEGATIVE_CONSTRAINT_FILESYSTEM_WEBSHOP_V2_SURFACE: 1,
+}
+FILESYSTEM_SURFACE_CONTRACTS = {
+    FILESYSTEM_WEBSHOP_V2_SURFACE: {
+        "provider_schema": "agentmemory_verified_natural_chain_provider_v4",
+        "tasks_per_orbit": 2,
+        "candidate_count_per_phase": 2,
+        "source_pairing": "xor_lsb_within_orbit_v1",
+        "prompt_family": "natural_attribute_chain_filesystem_v2",
+    },
+    RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE: {
+        "provider_schema": "agentmemory_verified_recency_override_provider_v1",
+        "tasks_per_orbit": 2,
+        "candidate_count_per_phase": 2,
+        "source_pairing": "xor_lsb_within_orbit_v1",
+        "prompt_family": "recency_override_filesystem_v2",
+    },
+    COMPOSITIONAL_RECALL_FILESYSTEM_WEBSHOP_V2_SURFACE: {
+        "provider_schema": "agentmemory_verified_compositional_recall_provider_v1",
+        "tasks_per_orbit": 4,
+        "candidate_count_per_phase": 2,
+        "source_pairing": "xor_lsb_within_orbit_v1",
+        "prompt_family": "compositional_recall_filesystem_v2",
+    },
+    NEGATIVE_CONSTRAINT_FILESYSTEM_WEBSHOP_V2_SURFACE: {
+        "provider_schema": "agentmemory_verified_negative_constraint_provider_v1",
+        "tasks_per_orbit": 3,
+        "candidate_count_per_phase": 3,
+        "source_pairing": "cyclic_next_within_orbit_v1",
+        "prompt_family": "negative_constraint_filesystem_v2",
+    },
 }
 FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS = (
     'shell_command {"command":"rg -n pattern ."',
@@ -142,10 +184,57 @@ RECENCY_FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS = (
     "only `Done!` proves that the patch succeeded",
     "No concrete preference value or filename is demonstrated here",
 )
+COMPOSITIONAL_FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS = (
+    'shell_command {"command":"rg -n pattern ."',
+    "apply_patch is followed on the next line",
+    "workspace persists across shopping sessions within this episode",
+    "Workspace actions have zero task reward",
+    "has no network",
+    "no host-path access",
+    "no dedicated memory API",
+    "two separate relations",
+    "shopping session 0",
+    "`Customer-to-profile:`",
+    "shopping session 1",
+    "`Profile-directory:`",
+    "Preserve the two hops separately",
+    "customer -> active profile token -> attribute value",
+    "rg --hidden -n '^(Customer-to-profile|Profile-directory):' .",
+    "Do not search or click until shell output contains both records",
+    "never infer the missing hop from the current choice table",
+    "Create each record with exactly five physical lines",
+    "Only `Done!` proves a patch succeeded",
+    "No concrete customer, profile token, attribute value, or filename",
+)
+NEGATIVE_FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS = (
+    'shell_command {"command":"rg -n pattern ."',
+    "apply_patch is followed on the next line",
+    "workspace persists across shopping sessions within this episode",
+    "Workspace actions have zero task reward",
+    "has no network",
+    "no host-path access",
+    "no dedicated memory API",
+    "two standing never-accept values",
+    "`Standing exclusions:`",
+    "Store the exclusions themselves",
+    "rg --hidden -n '^Standing exclusions:' .",
+    "Do not search or click until that exact record appears",
+    "Reject each candidate that matches either forbidden value",
+    "never infer the exclusions from the current choice table",
+    "Create the record with exactly five physical lines",
+    "Only `Done!` proves the patch succeeded",
+    "No concrete axis, forbidden value, or filename",
+)
 FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS_BY_SURFACE = {
     FILESYSTEM_WEBSHOP_V2_SURFACE: FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS,
     RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE: (
         RECENCY_FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS
+    ),
+    COMPOSITIONAL_RECALL_FILESYSTEM_WEBSHOP_V2_SURFACE: (
+        COMPOSITIONAL_FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS
+    ),
+    NEGATIVE_CONSTRAINT_FILESYSTEM_WEBSHOP_V2_SURFACE: (
+        NEGATIVE_FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS
     ),
 }
 FILESYSTEM_PROMPT_FORBIDDEN_FRAGMENTS = (
@@ -823,6 +912,16 @@ EVIDENCE_SURFACE_REGISTRY = {
         "metric_mode": "filesystem_behavior_v2",
         "paper_macro_eligible": False,
     },
+    COMPOSITIONAL_RECALL_FILESYSTEM_WEBSHOP_V2_SURFACE: {
+        "variant": "compositional_recall_filesystem_v2",
+        "metric_mode": "filesystem_behavior_v2",
+        "paper_macro_eligible": False,
+    },
+    NEGATIVE_CONSTRAINT_FILESYSTEM_WEBSHOP_V2_SURFACE: {
+        "variant": "negative_constraint_filesystem_v2",
+        "metric_mode": "filesystem_behavior_v2",
+        "paper_macro_eligible": False,
+    },
 }
 
 # Native WebShop v2 predates the v3 metadata contract and therefore does not
@@ -880,20 +979,8 @@ def _load_legacy_webshop_system_prompt(
                 raise RuntimeError(
                     "reply_style is valid only for the natural filesystem prompt"
                 )
-            enabled_prompt_names = (
-                {
-                    "no_thinking": (
-                        "AGENTMEMORY_ACTION_SYSTEM_PROMPT_RECENCY_FILESYSTEM"
-                    ),
-                    "thinking": (
-                        "AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_RECENCY_FILESYSTEM"
-                    ),
-                    "reasoning": (
-                        "AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_RECENCY_FILESYSTEM"
-                    ),
-                }
-                if surface == RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE
-                else {
+            enabled_prompt_names = {
+                FILESYSTEM_WEBSHOP_V2_SURFACE: {
                     "no_thinking": (
                         "AGENTMEMORY_ACTION_SYSTEM_PROMPT_NATURAL_FILESYSTEM"
                     ),
@@ -903,8 +990,43 @@ def _load_legacy_webshop_system_prompt(
                     "reasoning": (
                         "AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NATURAL_FILESYSTEM"
                     ),
-                }
-            )
+                },
+                RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE: {
+                    "no_thinking": (
+                        "AGENTMEMORY_ACTION_SYSTEM_PROMPT_RECENCY_FILESYSTEM"
+                    ),
+                    "thinking": (
+                        "AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_RECENCY_FILESYSTEM"
+                    ),
+                    "reasoning": (
+                        "AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_RECENCY_FILESYSTEM"
+                    ),
+                },
+                COMPOSITIONAL_RECALL_FILESYSTEM_WEBSHOP_V2_SURFACE: {
+                    "no_thinking": (
+                        "AGENTMEMORY_ACTION_SYSTEM_PROMPT_COMPOSITIONAL_FILESYSTEM"
+                    ),
+                    "thinking": (
+                        "AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_COMPOSITIONAL_FILESYSTEM"
+                    ),
+                    "reasoning": (
+                        "AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_COMPOSITIONAL_FILESYSTEM"
+                    ),
+                },
+                NEGATIVE_CONSTRAINT_FILESYSTEM_WEBSHOP_V2_SURFACE: {
+                    "no_thinking": (
+                        "AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEGATIVE_FILESYSTEM"
+                    ),
+                    "thinking": (
+                        "AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEGATIVE_FILESYSTEM"
+                    ),
+                    "reasoning": (
+                        "AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEGATIVE_FILESYSTEM"
+                    ),
+                },
+            }.get(surface or FILESYSTEM_WEBSHOP_V2_SURFACE)
+            if enabled_prompt_names is None:
+                raise RuntimeError(f"unsupported filesystem prompt surface: {surface}")
             prompt_names = {
                 (True, "no_thinking"): (
                     enabled_prompt_names["no_thinking"]
@@ -956,6 +1078,18 @@ RECENCY_FILESYSTEM_WEBSHOP_SYSTEM_PROMPT = _load_legacy_webshop_system_prompt(
     memory_prompt_mode="natural_filesystem",
     surface=RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE,
 )
+COMPOSITIONAL_FILESYSTEM_WEBSHOP_SYSTEM_PROMPT = (
+    _load_legacy_webshop_system_prompt(
+        ltm_inventory_mode="hidden",
+        memory_prompt_mode="natural_filesystem",
+        surface=COMPOSITIONAL_RECALL_FILESYSTEM_WEBSHOP_V2_SURFACE,
+    )
+)
+NEGATIVE_FILESYSTEM_WEBSHOP_SYSTEM_PROMPT = _load_legacy_webshop_system_prompt(
+    ltm_inventory_mode="hidden",
+    memory_prompt_mode="natural_filesystem",
+    surface=NEGATIVE_CONSTRAINT_FILESYSTEM_WEBSHOP_V2_SURFACE,
+)
 FILESYSTEM_WEBSHOP_PROMPT_PAIRS = {
     _load_legacy_webshop_system_prompt(
         ltm_inventory_mode="hidden",
@@ -972,28 +1106,37 @@ FILESYSTEM_WEBSHOP_PROMPT_PAIRS = {
     )
     for style in ("no_thinking", "thinking", "reasoning")
 }
-FILESYSTEM_WEBSHOP_PROMPT_PAIRS.update(
-    {
+for _filesystem_surface in (
+    RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE,
+    COMPOSITIONAL_RECALL_FILESYSTEM_WEBSHOP_V2_SURFACE,
+    NEGATIVE_CONSTRAINT_FILESYSTEM_WEBSHOP_V2_SURFACE,
+):
+    FILESYSTEM_WEBSHOP_PROMPT_PAIRS.update({
         _load_legacy_webshop_system_prompt(
             ltm_inventory_mode="hidden",
             memory_prompt_mode="natural_filesystem",
-            surface=RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE,
+            surface=_filesystem_surface,
             workspace_enabled=True,
             reply_style=style,
         ): _load_legacy_webshop_system_prompt(
             ltm_inventory_mode="hidden",
             memory_prompt_mode="natural_filesystem",
-            surface=RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE,
+            surface=_filesystem_surface,
             workspace_enabled=False,
             reply_style=style,
         )
         for style in ("no_thinking", "thinking", "reasoning")
-    }
-)
+    })
 FILESYSTEM_WEBSHOP_SYSTEM_PROMPTS = {
     FILESYSTEM_WEBSHOP_V2_SURFACE: FILESYSTEM_WEBSHOP_SYSTEM_PROMPT,
     RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE: (
         RECENCY_FILESYSTEM_WEBSHOP_SYSTEM_PROMPT
+    ),
+    COMPOSITIONAL_RECALL_FILESYSTEM_WEBSHOP_V2_SURFACE: (
+        COMPOSITIONAL_FILESYSTEM_WEBSHOP_SYSTEM_PROMPT
+    ),
+    NEGATIVE_CONSTRAINT_FILESYSTEM_WEBSHOP_V2_SURFACE: (
+        NEGATIVE_FILESYSTEM_WEBSHOP_SYSTEM_PROMPT
     ),
 }
 FILESYSTEM_WEBSHOP_NO_WORKSPACE_SYSTEM_PROMPT = (
@@ -1126,6 +1269,7 @@ def validate_filesystem_surface_metadata(metadata: Mapping[str, Any]) -> None:
     surface = metadata.get("surface")
     if surface not in FILESYSTEM_WEBSHOP_V2_SURFACES:
         return
+    contract = FILESYSTEM_SURFACE_CONTRACTS[surface]
     expected = {
         "memory_prompt_mode": "natural_filesystem",
         "memory_management": "policy_managed_persistent_workspace",
@@ -1137,6 +1281,9 @@ def validate_filesystem_surface_metadata(metadata: Mapping[str, Any]) -> None:
         "workspace_apply_patch_enabled": True,
         "workspace_host_path_exposed": False,
         "paper_eligible": False,
+        "source_pairing": contract["source_pairing"],
+        "tasks_per_orbit": contract["tasks_per_orbit"],
+        "workspace_prompt_family": contract["prompt_family"],
     }
     mismatches = {}
     for name, expected_value in expected.items():
@@ -1178,6 +1325,51 @@ def validate_filesystem_surface_metadata(metadata: Mapping[str, Any]) -> None:
             raise EvalError(f"filesystem-v2 reward field {field} must be zero")
     if reward_contract.get("memory_specific_shaping") != "none":
         raise EvalError("filesystem-v2 must disable memory-specific shaping")
+    provider = metadata.get("provider")
+    provider_expected = {
+        "schema": contract["provider_schema"],
+        "tasks_per_orbit": contract["tasks_per_orbit"],
+        "candidate_count_per_phase": contract["candidate_count_per_phase"],
+    }
+    if not isinstance(provider, Mapping):
+        raise EvalError("filesystem-v2 metadata lacks provider")
+    provider_mismatches = {
+        name: {"expected": expected_value, "observed": provider.get(name)}
+        for name, expected_value in provider_expected.items()
+        if provider.get(name) != expected_value
+    }
+    if provider_mismatches:
+        raise EvalError(
+            "filesystem-v2 provider contract mismatch: "
+            + json.dumps(
+                provider_mismatches,
+                ensure_ascii=True,
+                sort_keys=True,
+            )
+        )
+    control = metadata.get("workspace_intervention_control")
+    control_expected = {
+        "contract": "authenticated_session_boundary_counterfactual_copy_v1",
+        "allowed_arms": list(FILESYSTEM_CAUSAL_ARMS_BY_SURFACE[surface]),
+        "boundary_session_index": (
+            FILESYSTEM_INTERVENTION_BOUNDARY_BY_SURFACE[surface]
+        ),
+        "source_state": "policy_authored_workspace_only",
+        "authenticated_export": True,
+        "hidden_answer_injection": False,
+    }
+    if not isinstance(control, Mapping):
+        raise EvalError("filesystem-v2 metadata lacks intervention control")
+    control_mismatches = {
+        name: {"expected": expected_value, "observed": control.get(name)}
+        for name, expected_value in control_expected.items()
+        if control.get(name) != expected_value
+    }
+    if control_mismatches:
+        raise EvalError(
+            "filesystem-v2 intervention boundary contract mismatch: "
+            + json.dumps(control_mismatches, ensure_ascii=True, sort_keys=True)
+        )
     prompt = metadata.get("system_prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         raise EvalError("filesystem-v2 metadata lacks its effective system prompt")

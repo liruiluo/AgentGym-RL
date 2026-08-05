@@ -41,6 +41,8 @@ _SHELL_WALL_TIME_RE = re.compile(
     flags=re.MULTILINE,
 )
 _BUY_ACTION_RE = re.compile(r"^\s*click\[\s*buy now\s*\]\s*$", re.IGNORECASE)
+SOURCE_PAIRING_XOR_LSB = "xor_lsb_within_orbit_v1"
+SOURCE_PAIRING_CYCLIC_NEXT = "cyclic_next_within_orbit_v1"
 
 
 def _json_copy(value: Any) -> Any:
@@ -105,6 +107,38 @@ def _empty_workspace_tree_sha256() -> str:
     return _sha256_json({"directories": [], "files": []})
 
 
+def resolve_source_data_idx(
+    data_idx: int,
+    *,
+    source_pairing: str,
+    tasks_per_orbit: int,
+) -> int:
+    if isinstance(data_idx, bool) or not isinstance(data_idx, int) or data_idx < 0:
+        raise core.EvalError("causal target data_idx must be a non-negative integer")
+    if (
+        isinstance(tasks_per_orbit, bool)
+        or not isinstance(tasks_per_orbit, int)
+        or tasks_per_orbit < 2
+    ):
+        raise core.EvalError("causal tasks_per_orbit must be an integer >= 2")
+    orbit_start = data_idx - (data_idx % tasks_per_orbit)
+    offset = data_idx - orbit_start
+    if source_pairing == SOURCE_PAIRING_XOR_LSB:
+        if tasks_per_orbit % 2:
+            raise core.EvalError("xor_lsb source pairing requires an even orbit")
+        source_offset = offset ^ 1
+    elif source_pairing == SOURCE_PAIRING_CYCLIC_NEXT:
+        source_offset = (offset + 1) % tasks_per_orbit
+    else:
+        raise core.EvalError(
+            f"unsupported causal source-pairing contract: {source_pairing!r}"
+        )
+    source_data_idx = orbit_start + source_offset
+    if source_data_idx == data_idx:
+        raise core.EvalError("causal source pairing resolved to the target itself")
+    return source_data_idx
+
+
 def _causal_metadata_sha256(metadata: Mapping[str, Any]) -> str:
     payload = _json_copy(metadata)
     payload.pop("active_environment_count", None)
@@ -167,6 +201,8 @@ class FilesystemCausalEvalRunner:
         self._surface: str | None = None
         self._arms: tuple[str, ...] | None = None
         self._boundary_session_index: int | None = None
+        self._source_pairing: str | None = None
+        self._tasks_per_orbit: int | None = None
 
     @property
     def arms(self) -> tuple[str, ...]:
@@ -180,6 +216,15 @@ class FilesystemCausalEvalRunner:
             raise core.EvalError("filesystem causal boundary has not been resolved")
         return self._boundary_session_index
 
+    def source_data_idx(self, data_idx: int) -> int:
+        if self._source_pairing is None or self._tasks_per_orbit is None:
+            raise core.EvalError("filesystem source-pairing contract is unresolved")
+        return resolve_source_data_idx(
+            data_idx,
+            source_pairing=self._source_pairing,
+            tasks_per_orbit=self._tasks_per_orbit,
+        )
+
     def _new_env(self) -> core.AgentMemoryEnvClient:
         env = self.env_factory()
         try:
@@ -192,6 +237,13 @@ class FilesystemCausalEvalRunner:
                 raise core.EvalError("unrecognized filesystem causal surface")
             arms = tuple(core.FILESYSTEM_CAUSAL_ARMS_BY_SURFACE[surface])
             boundary = core.FILESYSTEM_INTERVENTION_BOUNDARY_BY_SURFACE[surface]
+            source_pairing = env.metadata.get("source_pairing")
+            tasks_per_orbit = env.metadata.get("tasks_per_orbit")
+            resolve_source_data_idx(
+                0,
+                source_pairing=source_pairing,
+                tasks_per_orbit=tasks_per_orbit,
+            )
             service = env.metadata.get("service")
             fingerprint = (
                 service.get("fingerprint_sha256")
@@ -218,6 +270,8 @@ class FilesystemCausalEvalRunner:
                 self._surface = surface
                 self._arms = arms
                 self._boundary_session_index = boundary
+                self._source_pairing = source_pairing
+                self._tasks_per_orbit = tasks_per_orbit
             elif fingerprint != self._reference_fingerprint:
                 raise core.EvalError(
                     "causal arms resolved to different environment fingerprints"
@@ -233,6 +287,8 @@ class FilesystemCausalEvalRunner:
                 surface != self._surface
                 or arms != self._arms
                 or boundary != self._boundary_session_index
+                or source_pairing != self._source_pairing
+                or tasks_per_orbit != self._tasks_per_orbit
             ):
                 raise core.EvalError(
                     "causal arms resolved to different surface intervention contracts"
@@ -292,7 +348,7 @@ class FilesystemCausalEvalRunner:
         record = {
             "label": label,
             "data_idx": data_idx,
-            "paired_data_idx": data_idx ^ 1,
+            "paired_data_idx": self.source_data_idx(data_idx),
             "boundary_session_index": self.boundary_session_index,
             "reset_response": _json_copy(reset),
             "initial_env_info": initial_info,
@@ -491,9 +547,10 @@ class FilesystemCausalEvalRunner:
                 data_idx=data_idx,
                 label="target",
             )
+            paired_data_idx = self.source_data_idx(data_idx)
             paired_source = self._source_session(
                 paired_source_env,
-                data_idx=data_idx ^ 1,
+                data_idx=paired_data_idx,
                 label="paired",
             )
             result = {
@@ -502,7 +559,9 @@ class FilesystemCausalEvalRunner:
                 "causal_arms": list(self.arms),
                 "boundary_session_index": self.boundary_session_index,
                 "target_data_idx": data_idx,
-                "paired_data_idx": data_idx ^ 1,
+                "paired_data_idx": paired_data_idx,
+                "source_pairing": self._source_pairing,
+                "tasks_per_orbit": self._tasks_per_orbit,
                 "sources": {
                     "target": target_source,
                     "paired": paired_source,
@@ -677,6 +736,8 @@ class FilesystemCausalEvalRunner:
             "surface": self._surface,
             "causal_arms": list(self.arms),
             "boundary_session_index": self.boundary_session_index,
+            "source_pairing": self._source_pairing,
+            "tasks_per_orbit": self._tasks_per_orbit,
             "prompt_history_policy": "latest_observation_only",
             "source_actions_replayed_exactly": True,
             "replay_comparison": {

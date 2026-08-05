@@ -56,6 +56,12 @@ class EffectiveMemoryPromptAttestationTests(unittest.TestCase):
         self.recency_filesystem_prompt = " ".join(
             self.module.RECENCY_FILESYSTEM_REQUIRED_FRAGMENTS
         )
+        self.compositional_filesystem_prompt = " ".join(
+            self.module.COMPOSITIONAL_FILESYSTEM_REQUIRED_FRAGMENTS
+        )
+        self.negative_filesystem_prompt = " ".join(
+            self.module.NEGATIVE_FILESYSTEM_REQUIRED_FRAGMENTS
+        )
 
     def test_lifecycle_prompt_passes_and_records_hash(self) -> None:
         result = self.module.build_attestation(
@@ -341,6 +347,46 @@ class EffectiveMemoryPromptAttestationTests(unittest.TestCase):
                 require_lifecycle_sop=False,
                 surface=self.module.RECENCY_OVERRIDE_FILESYSTEM_SURFACE,
             )
+
+    def test_new_filesystem_surfaces_use_their_own_prompt_contracts(self) -> None:
+        cases = (
+            (
+                self.module.COMPOSITIONAL_RECALL_FILESYSTEM_SURFACE,
+                self.compositional_filesystem_prompt,
+                self.negative_filesystem_prompt,
+            ),
+            (
+                self.module.NEGATIVE_CONSTRAINT_FILESYSTEM_SURFACE,
+                self.negative_filesystem_prompt,
+                self.compositional_filesystem_prompt,
+            ),
+        )
+        for surface, prompt, wrong_prompt in cases:
+            with self.subTest(surface=surface):
+                result = self.module.build_attestation(
+                    prompt=prompt,
+                    memory_prompt_mode="natural_filesystem",
+                    ltm_inventory_mode="hidden",
+                    thinking_enabled=False,
+                    reasoning_enabled=True,
+                    require_lifecycle_sop=False,
+                    surface=surface,
+                )
+                self.assertTrue(result["filesystem_present"])
+                self.assertEqual(result["missing_filesystem_fragments"], [])
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "filesystem prompt contract",
+                ):
+                    self.module.build_attestation(
+                        prompt=wrong_prompt,
+                        memory_prompt_mode="natural_filesystem",
+                        ltm_inventory_mode="hidden",
+                        thinking_enabled=False,
+                        reasoning_enabled=True,
+                        require_lifecycle_sop=False,
+                        surface=surface,
+                    )
 
     def test_each_filesystem_fragment_is_fail_closed(self) -> None:
         for missing_fragment in self.module.FILESYSTEM_REQUIRED_FRAGMENTS:

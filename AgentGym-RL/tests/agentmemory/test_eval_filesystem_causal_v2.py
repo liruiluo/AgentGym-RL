@@ -122,6 +122,14 @@ def filesystem_metadata(token: str) -> dict:
         "workspace_shell_enabled": True,
         "workspace_apply_patch_enabled": True,
         "workspace_host_path_exposed": False,
+        "source_pairing": "xor_lsb_within_orbit_v1",
+        "tasks_per_orbit": 2,
+        "workspace_prompt_family": "natural_attribute_chain_filesystem_v2",
+        "provider": {
+            "schema": "agentmemory_verified_natural_chain_provider_v4",
+            "tasks_per_orbit": 2,
+            "candidate_count_per_phase": 2,
+        },
         "workspace_limits": limits,
         "workspace_sandbox": {
             **CORE.FILESYSTEM_SANDBOX_FIELDS,
@@ -170,6 +178,7 @@ def recency_filesystem_metadata(token: str) -> dict:
     metadata.update(
         {
             "surface": CORE.RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE,
+            "workspace_prompt_family": "recency_override_filesystem_v2",
             "system_prompt": prompt,
             "system_prompt_sha256": hashlib.sha256(
                 prompt.encode("utf-8")
@@ -180,6 +189,61 @@ def recency_filesystem_metadata(token: str) -> dict:
         {
             "allowed_arms": list(CORE.RECENCY_FILESYSTEM_CAUSAL_ARMS),
             "boundary_session_index": 3,
+        }
+    )
+    metadata["provider"]["schema"] = (
+        "agentmemory_verified_recency_override_provider_v1"
+    )
+    return metadata
+
+
+def compositional_filesystem_metadata(token: str) -> dict:
+    metadata = filesystem_metadata(token)
+    prompt = CORE.COMPOSITIONAL_FILESYSTEM_WEBSHOP_SYSTEM_PROMPT
+    metadata.update(
+        {
+            "surface": CORE.COMPOSITIONAL_RECALL_FILESYSTEM_WEBSHOP_V2_SURFACE,
+            "source_pairing": "xor_lsb_within_orbit_v1",
+            "tasks_per_orbit": 4,
+            "workspace_prompt_family": "compositional_recall_filesystem_v2",
+            "system_prompt": prompt,
+            "system_prompt_sha256": hashlib.sha256(
+                prompt.encode("utf-8")
+            ).hexdigest(),
+        }
+    )
+    metadata["provider"].update(
+        {
+            "schema": "agentmemory_verified_compositional_recall_provider_v1",
+            "tasks_per_orbit": 4,
+        }
+    )
+    metadata["workspace_intervention_control"][
+        "boundary_session_index"
+    ] = 2
+    return metadata
+
+
+def negative_filesystem_metadata(token: str) -> dict:
+    metadata = filesystem_metadata(token)
+    prompt = CORE.NEGATIVE_FILESYSTEM_WEBSHOP_SYSTEM_PROMPT
+    metadata.update(
+        {
+            "surface": CORE.NEGATIVE_CONSTRAINT_FILESYSTEM_WEBSHOP_V2_SURFACE,
+            "source_pairing": "cyclic_next_within_orbit_v1",
+            "tasks_per_orbit": 3,
+            "workspace_prompt_family": "negative_constraint_filesystem_v2",
+            "system_prompt": prompt,
+            "system_prompt_sha256": hashlib.sha256(
+                prompt.encode("utf-8")
+            ).hexdigest(),
+        }
+    )
+    metadata["provider"].update(
+        {
+            "schema": "agentmemory_verified_negative_constraint_provider_v1",
+            "tasks_per_orbit": 3,
+            "candidate_count_per_phase": 3,
         }
     )
     return metadata
@@ -553,6 +617,45 @@ class RecencyFakeEnv(FakeEnv):
 
 
 class FilesystemCausalEvalTest(unittest.TestCase):
+    def test_surface_pairing_resolver_preserves_declared_orbits(self):
+        xor_expected = {0: 1, 1: 0, 2: 3, 3: 2, 4: 5, 5: 4}
+        for data_idx, expected in xor_expected.items():
+            with self.subTest(pairing="xor", data_idx=data_idx):
+                self.assertEqual(
+                    CAUSAL.resolve_source_data_idx(
+                        data_idx,
+                        source_pairing="xor_lsb_within_orbit_v1",
+                        tasks_per_orbit=4,
+                    ),
+                    expected,
+                )
+
+        cyclic_expected = {0: 1, 1: 2, 2: 0, 3: 4, 4: 5, 5: 3}
+        for data_idx, expected in cyclic_expected.items():
+            with self.subTest(pairing="cyclic", data_idx=data_idx):
+                self.assertEqual(
+                    CAUSAL.resolve_source_data_idx(
+                        data_idx,
+                        source_pairing="cyclic_next_within_orbit_v1",
+                        tasks_per_orbit=3,
+                    ),
+                    expected,
+                )
+
+    def test_new_surface_metadata_is_validated_with_distinct_contracts(self):
+        token = "n" * 48
+        for metadata in (
+            compositional_filesystem_metadata(token),
+            negative_filesystem_metadata(token),
+        ):
+            with self.subTest(surface=metadata["surface"]):
+                CORE.validate_filesystem_surface_metadata(metadata)
+
+        tampered = negative_filesystem_metadata(token)
+        tampered["source_pairing"] = "xor_lsb_within_orbit_v1"
+        with self.assertRaisesRegex(CORE.EvalError, "contract mismatch"):
+            CORE.validate_filesystem_surface_metadata(tampered)
+
     def test_buy_action_audit_is_case_insensitive_but_exact(self):
         for action in (
             "click[Buy Now]",

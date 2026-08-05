@@ -28,9 +28,42 @@ FILESYSTEM_SURFACE = (
 RECENCY_OVERRIDE_FILESYSTEM_SURFACE = (
     "agentmemory_webshop_recency_override_filesystem_v2"
 )
-FILESYSTEM_SURFACES = frozenset(
-    {FILESYSTEM_SURFACE, RECENCY_OVERRIDE_FILESYSTEM_SURFACE}
+COMPOSITIONAL_RECALL_FILESYSTEM_SURFACE = (
+    "agentmemory_webshop_compositional_recall_filesystem_v2"
 )
+NEGATIVE_CONSTRAINT_FILESYSTEM_SURFACE = (
+    "agentmemory_webshop_negative_constraint_filesystem_v2"
+)
+FILESYSTEM_SURFACES = frozenset(
+    {
+        FILESYSTEM_SURFACE,
+        RECENCY_OVERRIDE_FILESYSTEM_SURFACE,
+        COMPOSITIONAL_RECALL_FILESYSTEM_SURFACE,
+        NEGATIVE_CONSTRAINT_FILESYSTEM_SURFACE,
+    }
+)
+FILESYSTEM_SURFACE_CONTRACTS = {
+    FILESYSTEM_SURFACE: (
+        "xor_lsb_within_orbit_v1",
+        1,
+        "natural_attribute_chain_filesystem_v2",
+    ),
+    RECENCY_OVERRIDE_FILESYSTEM_SURFACE: (
+        "xor_lsb_within_orbit_v1",
+        3,
+        "recency_override_filesystem_v2",
+    ),
+    COMPOSITIONAL_RECALL_FILESYSTEM_SURFACE: (
+        "xor_lsb_within_orbit_v1",
+        2,
+        "compositional_recall_filesystem_v2",
+    ),
+    NEGATIVE_CONSTRAINT_FILESYSTEM_SURFACE: (
+        "cyclic_next_within_orbit_v1",
+        1,
+        "negative_constraint_filesystem_v2",
+    ),
+}
 SUPPORTED_SERVER_SURFACE_CONTRACTS = {
     "agentmemory_webshop_procedural_natural_chain_train_v1": (
         "agentmemory_verified_natural_chain_provider_v4",
@@ -43,6 +76,14 @@ SUPPORTED_SERVER_SURFACE_CONTRACTS = {
     RECENCY_OVERRIDE_FILESYSTEM_SURFACE: (
         "agentmemory_verified_recency_override_provider_v1",
         2,
+    ),
+    COMPOSITIONAL_RECALL_FILESYSTEM_SURFACE: (
+        "agentmemory_verified_compositional_recall_provider_v1",
+        4,
+    ),
+    NEGATIVE_CONSTRAINT_FILESYSTEM_SURFACE: (
+        "agentmemory_verified_negative_constraint_provider_v1",
+        3,
     ),
     "agentmemory_webshop_latent_preference_train_v1": (
         "agentmemory_verified_latent_preference_provider_v1",
@@ -436,9 +477,10 @@ class ProceduralIndexSource:
                 "dataset/server task counts disagree: "
                 f"{self.task_count!r} != {provider.get('task_count')!r}"
             )
-        expected_candidate_count = (
-            3 if surface == NEGATIVE_CONSTRAINT_SURFACE else 2
-        )
+        expected_candidate_count = 3 if surface in {
+            NEGATIVE_CONSTRAINT_SURFACE,
+            NEGATIVE_CONSTRAINT_FILESYSTEM_SURFACE,
+        } else 2
         if provider.get("candidate_count_per_phase") != expected_candidate_count:
             raise ProceduralIndexError(
                 "server candidate count per phase disagrees with the approved "
@@ -461,6 +503,36 @@ class ProceduralIndexSource:
         if provider.get("native_click_action_uses_asin_handle") is not True:
             raise ProceduralIndexError("server no longer uses native click[ASIN]")
         if surface in FILESYSTEM_SURFACES:
+            source_pairing, boundary, prompt_family = (
+                FILESYSTEM_SURFACE_CONTRACTS[surface]
+            )
+            if metadata.get("source_pairing") != source_pairing:
+                raise ProceduralIndexError(
+                    "filesystem source-pairing metadata disagrees"
+                )
+            if metadata.get("tasks_per_orbit") != self.tasks_per_orbit:
+                raise ProceduralIndexError(
+                    "filesystem top-level tasks_per_orbit metadata disagrees"
+                )
+            if metadata.get("workspace_prompt_family") != prompt_family:
+                raise ProceduralIndexError(
+                    "filesystem prompt-family metadata disagrees"
+                )
+            control = metadata.get("workspace_intervention_control")
+            expected_arms = ["correct", "blank", "swapped", "no_workspace"]
+            if surface == RECENCY_OVERRIDE_FILESYSTEM_SURFACE:
+                expected_arms.insert(3, "stale")
+            if (
+                not isinstance(control, Mapping)
+                or control.get("allowed_arms") != expected_arms
+                or control.get("boundary_session_index") != boundary
+                or control.get("source_state")
+                != "policy_authored_workspace_only"
+                or control.get("hidden_answer_injection") is not False
+            ):
+                raise ProceduralIndexError(
+                    "filesystem intervention-boundary metadata disagrees"
+                )
             if metadata.get("memory_prompt_mode") != "natural_filesystem":
                 raise ProceduralIndexError(
                     "filesystem surface requires natural_filesystem prompt mode"

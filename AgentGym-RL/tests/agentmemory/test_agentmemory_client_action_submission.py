@@ -103,6 +103,26 @@ def filesystem_metadata():
             "workspace_shell_enabled": True,
             "workspace_apply_patch_enabled": True,
             "workspace_host_path_exposed": False,
+            "source_pairing": "xor_lsb_within_orbit_v1",
+            "tasks_per_orbit": 2,
+            "workspace_prompt_family": "natural_attribute_chain_filesystem_v2",
+            "workspace_intervention_control": {
+                "enabled": False,
+                "contract": (
+                    "authenticated_session_boundary_counterfactual_copy_v1"
+                ),
+                "allowed_arms": [
+                    "correct",
+                    "blank",
+                    "swapped",
+                    "no_workspace",
+                ],
+                "boundary_session_index": 1,
+                "source_state": "policy_authored_workspace_only",
+                "authenticated_export": True,
+                "hidden_answer_injection": False,
+                "token_sha256": None,
+            },
             "workspace_limits": workspace_limits,
             "workspace_sandbox": {
                 **FILESYSTEM_SANDBOX_FIELDS,
@@ -200,6 +220,10 @@ def recency_override_filesystem_metadata():
                 "workspace_shell_enabled",
                 "workspace_apply_patch_enabled",
                 "workspace_host_path_exposed",
+                "source_pairing",
+                "tasks_per_orbit",
+                "workspace_prompt_family",
+                "workspace_intervention_control",
                 "workspace_limits",
                 "workspace_sandbox",
                 "reward_contract",
@@ -208,6 +232,12 @@ def recency_override_filesystem_metadata():
     )
     metadata["surface"] = "agentmemory_webshop_recency_override_filesystem_v2"
     metadata["memory_prompt_mode"] = "natural_filesystem"
+    metadata["workspace_prompt_family"] = "recency_override_filesystem_v2"
+    metadata["workspace_intervention_control"]["allowed_arms"].insert(
+        3,
+        "stale",
+    )
+    metadata["workspace_intervention_control"]["boundary_session_index"] = 3
     return metadata
 
 
@@ -262,6 +292,106 @@ def compositional_recall_metadata():
         "counterfactual_pair_never_crosses_seed_epoch"
     )
     return metadata
+
+
+def negative_constraint_metadata():
+    metadata = procedural_metadata()
+    metadata["surface"] = "agentmemory_webshop_negative_constraint_top1_train_v1"
+    metadata["task_count"] = 72
+    metadata["memory_prompt_mode"] = "latent_preference_sop"
+    metadata["provider"] = {
+        **metadata["provider"],
+        "schema": "agentmemory_verified_negative_constraint_provider_v1",
+        "task_count": 72,
+        "tasks_per_orbit": 3,
+        "candidate_count_per_phase": 3,
+        "semantic_period_orbits": 100,
+        "semantic_period_tasks": 300,
+        "distinct_values_per_phase": 3,
+        "counterfactual_branches": 3,
+        "retrieve_policy": "query_top1",
+        "memory_id_lookup_allowed": False,
+        "initial_memory_inventory_visible": False,
+        "purchase_receipt_asin_verification": True,
+        "rules_only": False,
+        "native_certified": True,
+        "training_ready": True,
+        "reseeded_stream": {
+            "tasks_per_seed_epoch": 300,
+            "orbits_per_seed_epoch": 100,
+            "counterfactual_orbit_never_crosses_seed_epoch": True,
+            "seed_epoch_zero_uses_base_seed": True,
+            "collision_free_within_complete_seed_epoch": True,
+            "semantic_uniqueness_guaranteed_through_task_index": 299,
+            "cross_seed_epoch_semantic_uniqueness_guaranteed": False,
+        },
+    }
+    return metadata
+
+
+def _filesystem_variant_metadata(
+    metadata: dict,
+    *,
+    surface: str,
+    source_pairing: str,
+    tasks_per_orbit: int,
+    prompt_family: str,
+    boundary_session_index: int,
+) -> dict:
+    filesystem = filesystem_metadata()
+    for key in (
+        "memory_management",
+        "workspace_surface",
+        "workspace_tool_contract",
+        "workspace_tool_ops",
+        "workspace_persistence",
+        "workspace_episode_isolation",
+        "workspace_shell_enabled",
+        "workspace_apply_patch_enabled",
+        "workspace_host_path_exposed",
+        "workspace_limits",
+        "workspace_sandbox",
+        "reward_contract",
+    ):
+        metadata[key] = deepcopy(filesystem[key])
+    metadata.update(
+        {
+            "surface": surface,
+            "memory_prompt_mode": "natural_filesystem",
+            "source_pairing": source_pairing,
+            "tasks_per_orbit": tasks_per_orbit,
+            "workspace_prompt_family": prompt_family,
+            "workspace_intervention_control": deepcopy(
+                filesystem["workspace_intervention_control"]
+            ),
+        }
+    )
+    metadata["workspace_intervention_control"][
+        "boundary_session_index"
+    ] = boundary_session_index
+    return metadata
+
+
+def compositional_recall_filesystem_metadata():
+    return _filesystem_variant_metadata(
+        compositional_recall_metadata(),
+        surface="agentmemory_webshop_compositional_recall_filesystem_v2",
+        source_pairing="xor_lsb_within_orbit_v1",
+        tasks_per_orbit=4,
+        prompt_family="compositional_recall_filesystem_v2",
+        boundary_session_index=2,
+    )
+
+
+def negative_constraint_filesystem_metadata():
+    return _filesystem_variant_metadata(
+        negative_constraint_metadata(),
+        surface="agentmemory_webshop_negative_constraint_filesystem_v2",
+        source_pairing="cyclic_next_within_orbit_v1",
+        tasks_per_orbit=3,
+        prompt_family="negative_constraint_filesystem_v2",
+        boundary_session_index=1,
+    )
 
 
 def intent_clarification_metadata():
@@ -866,6 +996,39 @@ class ProceduralAgentMemoryClientContractTest(unittest.TestCase):
         prompt = client.conversation_start[0]["value"]
         self.assertIn("RETRIEVE requires exactly query:string", prompt)
         self.assertNotIn("ASK", prompt)
+
+    def test_new_filesystem_surfaces_use_surface_local_contracts(self) -> None:
+        cases = (
+            (
+                compositional_recall_filesystem_metadata(),
+                "is_compositional_recall",
+                (
+                    "customer-to-profile-token link",
+                    "profile-token-to-attribute directory",
+                    "customer -> active profile token -> attribute",
+                ),
+            ),
+            (
+                negative_constraint_filesystem_metadata(),
+                "is_negative_constraint",
+                (
+                    "standing never-accept exclusions",
+                    "reject every listing that violates either exclusion",
+                    "Do not replace the exclusions",
+                ),
+            ),
+        )
+        for metadata, capability_flag, fragments in cases:
+            with self.subTest(surface=metadata["surface"]):
+                client = self.create_client(metadata)
+                self.assertTrue(client.is_filesystem)
+                self.assertTrue(getattr(client, capability_flag))
+                self.assertIs(client.adapter_cls, FilesystemAgentMemoryAdapter)
+                prompt = client.conversation_start[0]["value"]
+                for fragment in fragments:
+                    self.assertIn(fragment, prompt)
+                for forbidden in ("ADD stores", "RETRIEVE", "memory_id"):
+                    self.assertNotIn(forbidden, prompt)
 
     def test_intent_surface_exposes_ask_only_on_that_surface(self) -> None:
         client = self.create_client(intent_clarification_metadata())

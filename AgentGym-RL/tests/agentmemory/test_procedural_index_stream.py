@@ -106,6 +106,20 @@ def filesystem_server_metadata(*, generator_seed: int = 233) -> dict:
             "workspace_shell_enabled": True,
             "workspace_apply_patch_enabled": True,
             "workspace_host_path_exposed": False,
+            "source_pairing": "xor_lsb_within_orbit_v1",
+            "tasks_per_orbit": 2,
+            "workspace_prompt_family": "natural_attribute_chain_filesystem_v2",
+            "workspace_intervention_control": {
+                "allowed_arms": [
+                    "correct",
+                    "blank",
+                    "swapped",
+                    "no_workspace",
+                ],
+                "boundary_session_index": 1,
+                "source_state": "policy_authored_workspace_only",
+                "hidden_answer_injection": False,
+            },
             "reward_contract": {
                 "workspace_action_reward": 0.0,
                 "shell_command_reward": 0.0,
@@ -177,12 +191,22 @@ def recency_override_filesystem_server_metadata(
                 "workspace_shell_enabled",
                 "workspace_apply_patch_enabled",
                 "workspace_host_path_exposed",
+                "source_pairing",
+                "tasks_per_orbit",
+                "workspace_prompt_family",
+                "workspace_intervention_control",
                 "reward_contract",
             )
         }
     )
     metadata["surface"] = "agentmemory_webshop_recency_override_filesystem_v2"
     metadata["memory_prompt_mode"] = "natural_filesystem"
+    metadata["workspace_prompt_family"] = "recency_override_filesystem_v2"
+    metadata["workspace_intervention_control"]["allowed_arms"].insert(
+        3,
+        "stale",
+    )
+    metadata["workspace_intervention_control"]["boundary_session_index"] = 3
     return metadata
 
 
@@ -239,6 +263,46 @@ def compositional_recall_server_metadata(*, generator_seed: int = 233) -> dict:
     provider["reseeded_stream"][
         "semantic_uniqueness_guaranteed_through_task_index"
     ] = 399
+    return metadata
+
+
+def compositional_recall_filesystem_server_metadata(
+    *, generator_seed: int = 233
+) -> dict:
+    metadata = compositional_recall_server_metadata(generator_seed=generator_seed)
+    filesystem = filesystem_server_metadata(generator_seed=generator_seed)
+    for key in (
+        "workspace_surface",
+        "workspace_tool_contract",
+        "workspace_tool_ops",
+        "workspace_shell_enabled",
+        "workspace_apply_patch_enabled",
+        "workspace_host_path_exposed",
+        "reward_contract",
+    ):
+        metadata[key] = deepcopy(filesystem[key])
+    metadata.update(
+        {
+            "surface": (
+                "agentmemory_webshop_compositional_recall_filesystem_v2"
+            ),
+            "memory_prompt_mode": "natural_filesystem",
+            "source_pairing": "xor_lsb_within_orbit_v1",
+            "tasks_per_orbit": 4,
+            "workspace_prompt_family": "compositional_recall_filesystem_v2",
+            "workspace_intervention_control": {
+                "allowed_arms": [
+                    "correct",
+                    "blank",
+                    "swapped",
+                    "no_workspace",
+                ],
+                "boundary_session_index": 2,
+                "source_state": "policy_authored_workspace_only",
+                "hidden_answer_injection": False,
+            },
+        }
+    )
     return metadata
 
 
@@ -327,6 +391,44 @@ def negative_constraint_server_metadata(*, generator_seed: int = 233) -> dict:
             "cross_seed_epoch_semantic_uniqueness_guaranteed": False,
         },
     }
+    return metadata
+
+
+def negative_constraint_filesystem_server_metadata(
+    *, generator_seed: int = 233
+) -> dict:
+    metadata = negative_constraint_server_metadata(generator_seed=generator_seed)
+    filesystem = filesystem_server_metadata(generator_seed=generator_seed)
+    for key in (
+        "workspace_surface",
+        "workspace_tool_contract",
+        "workspace_tool_ops",
+        "workspace_shell_enabled",
+        "workspace_apply_patch_enabled",
+        "workspace_host_path_exposed",
+        "reward_contract",
+    ):
+        metadata[key] = deepcopy(filesystem[key])
+    metadata.update(
+        {
+            "surface": "agentmemory_webshop_negative_constraint_filesystem_v2",
+            "memory_prompt_mode": "natural_filesystem",
+            "source_pairing": "cyclic_next_within_orbit_v1",
+            "tasks_per_orbit": 3,
+            "workspace_prompt_family": "negative_constraint_filesystem_v2",
+            "workspace_intervention_control": {
+                "allowed_arms": [
+                    "correct",
+                    "blank",
+                    "swapped",
+                    "no_workspace",
+                ],
+                "boundary_session_index": 1,
+                "source_state": "policy_authored_workspace_only",
+                "hidden_answer_injection": False,
+            },
+        }
+    )
     return metadata
 
 
@@ -497,6 +599,9 @@ class ProceduralIndexSourceTests(unittest.TestCase):
             compositional_recall_server_metadata()
         )
         compositional_source.validate_server_metadata(
+            compositional_recall_filesystem_server_metadata()
+        )
+        compositional_source.validate_server_metadata(
             selective_memory_use_server_metadata()
         )
         negative_source = ProceduralIndexSource(
@@ -507,6 +612,9 @@ class ProceduralIndexSourceTests(unittest.TestCase):
         negative_source.validate_training_batch_size(72)
         negative_source.validate_server_metadata(
             negative_constraint_server_metadata()
+        )
+        negative_source.validate_server_metadata(
+            negative_constraint_filesystem_server_metadata()
         )
 
         unknown_surface = latent_preference_server_metadata()
@@ -578,6 +686,30 @@ class ProceduralIndexSourceTests(unittest.TestCase):
         recency_filesystem["workspace_apply_patch_enabled"] = False
         with self.assertRaisesRegex(ProceduralIndexError, "apply_patch"):
             source.validate_server_metadata(recency_filesystem)
+
+        compositional_filesystem = compositional_recall_filesystem_server_metadata()
+        compositional_source = ProceduralIndexSource(
+            task_count=64,
+            provider_mode=PROVIDER_MODE_RESEEDED_STREAM,
+            tasks_per_orbit=4,
+        )
+        compositional_source.validate_server_metadata(compositional_filesystem)
+        compositional_filesystem["source_pairing"] = "cyclic_next_within_orbit_v1"
+        with self.assertRaisesRegex(ProceduralIndexError, "source-pairing"):
+            compositional_source.validate_server_metadata(compositional_filesystem)
+
+        negative_filesystem = negative_constraint_filesystem_server_metadata()
+        negative_source = ProceduralIndexSource(
+            task_count=72,
+            provider_mode=PROVIDER_MODE_RESEEDED_STREAM,
+            tasks_per_orbit=3,
+        )
+        negative_source.validate_server_metadata(negative_filesystem)
+        negative_filesystem["workspace_intervention_control"][
+            "boundary_session_index"
+        ] = 2
+        with self.assertRaisesRegex(ProceduralIndexError, "intervention-boundary"):
+            negative_source.validate_server_metadata(negative_filesystem)
 
     def test_batch_indices_preserve_complete_adjacent_orbits(self) -> None:
         validate_paired_batch_indices([200, 201, 202, 203])

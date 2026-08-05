@@ -46,10 +46,18 @@ NATURAL_FILESYSTEM_SURFACE = (
 RECENCY_OVERRIDE_FILESYSTEM_SURFACE = (
     "agentmemory_webshop_recency_override_filesystem_v2"
 )
+COMPOSITIONAL_RECALL_FILESYSTEM_SURFACE = (
+    "agentmemory_webshop_compositional_recall_filesystem_v2"
+)
+NEGATIVE_CONSTRAINT_FILESYSTEM_SURFACE = (
+    "agentmemory_webshop_negative_constraint_filesystem_v2"
+)
 FILESYSTEM_SURFACES = frozenset(
     {
         NATURAL_FILESYSTEM_SURFACE,
         RECENCY_OVERRIDE_FILESYSTEM_SURFACE,
+        COMPOSITIONAL_RECALL_FILESYSTEM_SURFACE,
+        NEGATIVE_CONSTRAINT_FILESYSTEM_SURFACE,
     }
 )
 
@@ -330,6 +338,46 @@ _AGENTMEMORY_RECENCY_FILESYSTEM_MEMORY_GUIDANCE = (
     "concrete preference value or filename is demonstrated here: choose both only from "
     "policy-visible task facts. Keep each reply to exactly one action."
 )
+_AGENTMEMORY_COMPOSITIONAL_FILESYSTEM_MEMORY_GUIDANCE = (
+    " The workspace starts empty and contains only files that you create; it is not a "
+    "catalog, hidden cache, or automatic session log. This task exposes two separate "
+    "relations. In shopping session 0, before buying, save the exact visible customer ID "
+    "and active shopping profile token in one ordinary file as a line beginning with "
+    "`Customer-to-profile:`. In shopping session 1, save both exact visible profile-token "
+    "directory entries, including the attribute axis and values, in another ordinary file "
+    "as a line beginning with `Profile-directory:`. Preserve the two hops separately; do "
+    "not collapse them into a direct customer preference or infer either hop from product "
+    "titles. In every session from session 2 onward, the first action must use shell_command "
+    "to print both records with `rg --hidden -n '^(Customer-to-profile|Profile-directory):' .`. "
+    "Do not search or click until shell output contains both records. Compose the exact chain "
+    "customer -> active profile token -> attribute value, then choose the approved listing "
+    "with that value. If either record is absent, correct and retry the file read; never infer "
+    "the missing hop from the current choice table. Create each record with exactly five "
+    "physical lines: `apply_patch`, `*** Begin Patch`, one `*** Add File: ` line with a new "
+    "relative path, one content line beginning with `+`, and `*** End Patch`. Run file writes, "
+    "reads, and browser actions on separate turns. Only `Done!` proves a patch succeeded, and "
+    "workspace tool feedback must never be appended to the action. No concrete customer, "
+    "profile token, attribute value, or filename is demonstrated here; take them only from "
+    "policy-visible task facts. Keep each reply to exactly one action."
+)
+_AGENTMEMORY_NEGATIVE_FILESYSTEM_MEMORY_GUIDANCE = (
+    " The workspace starts empty and contains only files that you create; it is not a "
+    "catalog, hidden cache, or automatic session log. In shopping session 0, the customer "
+    "states two standing never-accept values on one attribute axis. Before buying, save the "
+    "exact axis and both exact forbidden values in one ordinary file as a line beginning with "
+    "`Standing exclusions:`. Store the exclusions themselves, not only the currently allowed "
+    "value or product title. In every later session, the first action must use shell_command "
+    "to print the record with `rg --hidden -n '^Standing exclusions:' .`. Do not search or "
+    "click until that exact record appears in shell output. Reject each candidate that matches "
+    "either forbidden value and purchase the sole remaining approved listing. If the record is "
+    "absent, correct and retry the file read; never infer the exclusions from the current choice "
+    "table. Create the record with exactly five physical lines: `apply_patch`, `*** Begin Patch`, "
+    "one `*** Add File: ` line with a new relative path, one content line beginning with `+`, "
+    "and `*** End Patch`. Run the write, later read, and browser actions on separate turns. "
+    "Only `Done!` proves the patch succeeded, and workspace tool feedback must never be appended "
+    "to the action. No concrete axis, forbidden value, or filename is demonstrated here; take "
+    "them only from policy-visible task facts. Keep each reply to exactly one action."
+)
 _AGENTMEMORY_NO_WORKSPACE_ACTION_CONTRACT = (
     "Native browser actions use square-bracket syntax. search[keywords] searches the visible "
     "catalog. click[value] clicks one value in the current available-actions list; an ASIN "
@@ -382,6 +430,48 @@ AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_RECENCY_FILESYSTEM = (
     + _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT
     + _AGENTMEMORY_RECENCY_FILESYSTEM_MEMORY_GUIDANCE
 )
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_COMPOSITIONAL_FILESYSTEM = (
+    "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
+    "with a persistent workspace. "
+    + _AGENTMEMORY_FILESYSTEM_REPLY_RULE_NO_THINKING
+    + _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT
+    + _AGENTMEMORY_COMPOSITIONAL_FILESYSTEM_MEMORY_GUIDANCE
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_COMPOSITIONAL_FILESYSTEM = (
+    "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
+    "with a persistent workspace. "
+    + _AGENTMEMORY_FILESYSTEM_REPLY_RULE_THINKING
+    + _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT
+    + _AGENTMEMORY_COMPOSITIONAL_FILESYSTEM_MEMORY_GUIDANCE
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_COMPOSITIONAL_FILESYSTEM = (
+    "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
+    "with a persistent workspace. "
+    + _AGENTMEMORY_FILESYSTEM_REPLY_RULE_REASONING
+    + _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT
+    + _AGENTMEMORY_COMPOSITIONAL_FILESYSTEM_MEMORY_GUIDANCE
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEGATIVE_FILESYSTEM = (
+    "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
+    "with a persistent workspace. "
+    + _AGENTMEMORY_FILESYSTEM_REPLY_RULE_NO_THINKING
+    + _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT
+    + _AGENTMEMORY_NEGATIVE_FILESYSTEM_MEMORY_GUIDANCE
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEGATIVE_FILESYSTEM = (
+    "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
+    "with a persistent workspace. "
+    + _AGENTMEMORY_FILESYSTEM_REPLY_RULE_THINKING
+    + _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT
+    + _AGENTMEMORY_NEGATIVE_FILESYSTEM_MEMORY_GUIDANCE
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEGATIVE_FILESYSTEM = (
+    "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
+    "with a persistent workspace. "
+    + _AGENTMEMORY_FILESYSTEM_REPLY_RULE_REASONING
+    + _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT
+    + _AGENTMEMORY_NEGATIVE_FILESYSTEM_MEMORY_GUIDANCE
+)
 AGENTMEMORY_ACTION_SYSTEM_PROMPT_NO_WORKSPACE = (
     "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
     "without a persistent workspace. "
@@ -407,6 +497,7 @@ AGENTMEMORY_QUERY_TOP1_SURFACES = frozenset(
         "agentmemory_webshop_compositional_recall_top1_train_v1",
         "agentmemory_webshop_intent_clarification_train_v1",
         "agentmemory_webshop_selective_memory_use_top1_train_v1",
+        "agentmemory_webshop_negative_constraint_top1_train_v1",
     }
 )
 AGENTMEMORY_INTENT_CLARIFICATION_SURFACE = (
@@ -646,24 +737,34 @@ def agentmemory_action_system_prompt(
             if _agentmemory_reasoning_enabled():
                 return AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NO_WORKSPACE
             return AGENTMEMORY_ACTION_SYSTEM_PROMPT_NO_WORKSPACE
-        recency_override = surface == RECENCY_OVERRIDE_FILESYSTEM_SURFACE
+        effective_surface = surface or NATURAL_FILESYSTEM_SURFACE
+        prompt_triplet = {
+            NATURAL_FILESYSTEM_SURFACE: (
+                AGENTMEMORY_ACTION_SYSTEM_PROMPT_NATURAL_FILESYSTEM,
+                AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NATURAL_FILESYSTEM,
+                AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NATURAL_FILESYSTEM,
+            ),
+            RECENCY_OVERRIDE_FILESYSTEM_SURFACE: (
+                AGENTMEMORY_ACTION_SYSTEM_PROMPT_RECENCY_FILESYSTEM,
+                AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_RECENCY_FILESYSTEM,
+                AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_RECENCY_FILESYSTEM,
+            ),
+            COMPOSITIONAL_RECALL_FILESYSTEM_SURFACE: (
+                AGENTMEMORY_ACTION_SYSTEM_PROMPT_COMPOSITIONAL_FILESYSTEM,
+                AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_COMPOSITIONAL_FILESYSTEM,
+                AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_COMPOSITIONAL_FILESYSTEM,
+            ),
+            NEGATIVE_CONSTRAINT_FILESYSTEM_SURFACE: (
+                AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEGATIVE_FILESYSTEM,
+                AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEGATIVE_FILESYSTEM,
+                AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEGATIVE_FILESYSTEM,
+            ),
+        }[effective_surface]
         if _agentmemory_thinking_enabled():
-            return (
-                AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_RECENCY_FILESYSTEM
-                if recency_override
-                else AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NATURAL_FILESYSTEM
-            )
+            return prompt_triplet[1]
         if _agentmemory_reasoning_enabled():
-            return (
-                AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_RECENCY_FILESYSTEM
-                if recency_override
-                else AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NATURAL_FILESYSTEM
-            )
-        return (
-            AGENTMEMORY_ACTION_SYSTEM_PROMPT_RECENCY_FILESYSTEM
-            if recency_override
-            else AGENTMEMORY_ACTION_SYSTEM_PROMPT_NATURAL_FILESYSTEM
-        )
+            return prompt_triplet[2]
+        return prompt_triplet[0]
     key_inventory = inventory_mode == "keys"
     latent_preference = prompt_mode == "latent_preference_sop"
     selective_memory = prompt_mode == "selective_memory_sop"

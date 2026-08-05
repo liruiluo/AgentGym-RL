@@ -31,6 +31,7 @@ QUERY_TOP1_SURFACES = frozenset(
         "agentmemory_webshop_compositional_recall_top1_train_v1",
         "agentmemory_webshop_intent_clarification_train_v1",
         "agentmemory_webshop_selective_memory_use_top1_train_v1",
+        "agentmemory_webshop_negative_constraint_top1_train_v1",
     }
 )
 INTENT_CLARIFICATION_SURFACE = (
@@ -45,8 +46,19 @@ FILESYSTEM_SURFACE = (
 RECENCY_OVERRIDE_FILESYSTEM_SURFACE = (
     "agentmemory_webshop_recency_override_filesystem_v2"
 )
+COMPOSITIONAL_RECALL_FILESYSTEM_SURFACE = (
+    "agentmemory_webshop_compositional_recall_filesystem_v2"
+)
+NEGATIVE_CONSTRAINT_FILESYSTEM_SURFACE = (
+    "agentmemory_webshop_negative_constraint_filesystem_v2"
+)
 FILESYSTEM_SURFACES = frozenset(
-    {FILESYSTEM_SURFACE, RECENCY_OVERRIDE_FILESYSTEM_SURFACE}
+    {
+        FILESYSTEM_SURFACE,
+        RECENCY_OVERRIDE_FILESYSTEM_SURFACE,
+        COMPOSITIONAL_RECALL_FILESYSTEM_SURFACE,
+        NEGATIVE_CONSTRAINT_FILESYSTEM_SURFACE,
+    }
 )
 QUERY_TOP1_REQUIRED_FRAGMENTS = (
     "RETRIEVE requires exactly query:string",
@@ -145,6 +157,65 @@ RECENCY_FILESYSTEM_REQUIRED_FRAGMENTS = (
     "only `Done!` proves that the patch succeeded",
     "No concrete preference value or filename is demonstrated here",
 )
+COMPOSITIONAL_FILESYSTEM_REQUIRED_FRAGMENTS = (
+    'shell_command {"command":"rg -n pattern ."',
+    "apply_patch is followed on the next line",
+    "*** Begin Patch",
+    "*** End Patch",
+    "workspace persists across shopping sessions within this episode",
+    "Workspace actions have zero task reward",
+    "has no network",
+    "no host-path access",
+    "no dedicated memory API",
+    "workspace starts empty and contains only files that you create",
+    "two separate relations",
+    "shopping session 0",
+    "`Customer-to-profile:`",
+    "shopping session 1",
+    "`Profile-directory:`",
+    "Preserve the two hops separately",
+    "customer -> active profile token -> attribute value",
+    "rg --hidden -n '^(Customer-to-profile|Profile-directory):' .",
+    "Do not search or click until shell output contains both records",
+    "never infer the missing hop from the current choice table",
+    "Create each record with exactly five physical lines",
+    "Only `Done!` proves a patch succeeded",
+    "No concrete customer, profile token, attribute value, or filename",
+)
+NEGATIVE_FILESYSTEM_REQUIRED_FRAGMENTS = (
+    'shell_command {"command":"rg -n pattern ."',
+    "apply_patch is followed on the next line",
+    "*** Begin Patch",
+    "*** End Patch",
+    "workspace persists across shopping sessions within this episode",
+    "Workspace actions have zero task reward",
+    "has no network",
+    "no host-path access",
+    "no dedicated memory API",
+    "workspace starts empty and contains only files that you create",
+    "two standing never-accept values",
+    "`Standing exclusions:`",
+    "Store the exclusions themselves",
+    "rg --hidden -n '^Standing exclusions:' .",
+    "Do not search or click until that exact record appears",
+    "Reject each candidate that matches either forbidden value",
+    "never infer the exclusions from the current choice table",
+    "Create the record with exactly five physical lines",
+    "Only `Done!` proves the patch succeeded",
+    "No concrete axis, forbidden value, or filename",
+)
+FILESYSTEM_REQUIRED_FRAGMENTS_BY_SURFACE = {
+    FILESYSTEM_SURFACE: FILESYSTEM_REQUIRED_FRAGMENTS,
+    RECENCY_OVERRIDE_FILESYSTEM_SURFACE: (
+        RECENCY_FILESYSTEM_REQUIRED_FRAGMENTS
+    ),
+    COMPOSITIONAL_RECALL_FILESYSTEM_SURFACE: (
+        COMPOSITIONAL_FILESYSTEM_REQUIRED_FRAGMENTS
+    ),
+    NEGATIVE_CONSTRAINT_FILESYSTEM_SURFACE: (
+        NEGATIVE_FILESYSTEM_REQUIRED_FRAGMENTS
+    ),
+}
 FILESYSTEM_FORBIDDEN_FRAGMENTS = (
     'Read {"path"',
     'Write {"path"',
@@ -179,10 +250,9 @@ def build_attestation(
         raise RuntimeError(
             "natural_filesystem prompt mode and filesystem surface must be paired"
         )
-    required_filesystem_fragments = (
-        RECENCY_FILESYSTEM_REQUIRED_FRAGMENTS
-        if surface == RECENCY_OVERRIDE_FILESYSTEM_SURFACE
-        else FILESYSTEM_REQUIRED_FRAGMENTS
+    required_filesystem_fragments = FILESYSTEM_REQUIRED_FRAGMENTS_BY_SURFACE.get(
+        surface,
+        (),
     )
     missing_filesystem = [
         fragment for fragment in required_filesystem_fragments if fragment not in prompt
