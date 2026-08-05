@@ -95,6 +95,24 @@ requires the frozen `correct`, `blank`, `swapped`, and `no_workspace`
 intervention arms. This surface lives in `EVIDENCE_SURFACE_REGISTRY`, not
 `PAPER_SURFACE_REGISTRY`, and always reports `paper_macro_eligible=false`.
 
+Before interpreting a behavior sample, run the exact-I/O analyzer:
+
+```bash
+python3 AgentGym-RL/scripts/agentmemory/analyze_filesystem_behavior_io.py \
+  /path/to/run \
+  --json-out /path/to/exact-io-audit.json \
+  --markdown-out /path/to/exact-io-audit.md
+```
+
+It preserves the exact request messages, raw model response, submitted action,
+environment feedback, and workspace event for filesystem-related turns. Its
+strict chain requires source content to appear in a later shell result before a
+correct dependent BUY. An `ls`, an unrelated command, or a different file read
+does not qualify merely because the source file version still exists. Keep
+`source_workspace_write_before_correct_buy_count` labeled as an **action count**;
+compute the distinct trajectory count from episode identities instead of
+dividing that action count by the number of trajectories.
+
 Run those four arms with `eval_filesystem_causal_v2.py` against a dedicated
 `intervention_eval` environment service. The driver first samples policy-owned
 target and paired source workspaces, exports their exact files through the
