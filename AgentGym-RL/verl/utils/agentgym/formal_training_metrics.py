@@ -166,6 +166,44 @@ def _current_workspace_ops(record: dict[str, Any]) -> list[dict[str, Any]]:
     return workspace_ops
 
 
+def _validate_zero_workspace_reward_component(
+    record: dict[str, Any], *, op: str
+) -> None:
+    info = record.get("env_info_after")
+    if not isinstance(info, dict):
+        raise ValueError("Filesystem evidence lacks post-step environment info.")
+    components = info.get("reward_components")
+    if not isinstance(components, list) or any(
+        not isinstance(component, dict) for component in components
+    ):
+        raise ValueError("Filesystem reward_components ledger must be a list of objects.")
+    expected_name = f"{op.lower()}_transition"
+    matching = [
+        component
+        for component in components
+        if component.get("name") == expected_name
+    ]
+    if len(matching) != 1:
+        raise ValueError(
+            "Filesystem workspace action lacks exactly one matching reward component."
+        )
+    component = matching[0]
+    if component.get("name") != expected_name:
+        raise ValueError("Filesystem workspace reward component has the wrong name.")
+    component_op = component.get("op")
+    if component_op is not None and str(component_op).upper() != op:
+        raise ValueError("Filesystem workspace reward component has the wrong operation.")
+    value = component.get("value")
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError("Filesystem workspace reward component is not numeric.")
+    if not math.isfinite(float(value)) or not math.isclose(
+        float(value), 0.0, rel_tol=0.0, abs_tol=1e-12
+    ):
+        raise ValueError(
+            "Filesystem workspace action received non-zero task reward."
+        )
+
+
 def _workspace_diff(
     before: dict[str, Any], after: dict[str, Any]
 ) -> dict[str, Any]:
@@ -462,15 +500,7 @@ def summarize_formal_training_rows(rows: list[dict[str, Any]]) -> dict[str, floa
                         raise ValueError(
                             "Filesystem workspace_diff disagrees with before/after snapshots."
                         )
-                    if not math.isclose(
-                        float(row["immediate_reward"]),
-                        0.0,
-                        rel_tol=0.0,
-                        abs_tol=1e-12,
-                    ):
-                        raise ValueError(
-                            "Filesystem workspace action received non-zero task reward."
-                        )
+                    _validate_zero_workspace_reward_component(record, op=op)
                     counts["workspace_action_count"] += 1
                     counts[f"workspace_{op.lower()}_count"] += 1
                     if _workspace_diff_has_changes(expected_diff):

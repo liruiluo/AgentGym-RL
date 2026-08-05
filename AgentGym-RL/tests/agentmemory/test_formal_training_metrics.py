@@ -190,6 +190,16 @@ def attach_workspace(
         workspace_event=workspace_event,
     )
     after_info["reward_components"] = step["env_info_after"]["reward_components"]
+    if workspace_event is not None:
+        op = str(workspace_event["op"]).upper()
+        expected_name = f"{op.lower()}_transition"
+        if not any(
+            component.get("name") == expected_name
+            for component in after_info["reward_components"]
+        ):
+            after_info["reward_components"].append(
+                {"name": expected_name, "op": op, "value": 0.0}
+            )
     step["env_info_after"] = after_info
     return step
 
@@ -1043,6 +1053,7 @@ class FormalTrainingMetricsTests(unittest.TestCase):
                                 "apply_patch\n*** Begin Patch\n*** Add File: notes.md\n+black\n*** End Patch",
                                 before=0,
                                 after=0,
+                                components=(("apply_patch_transition", 0.1),),
                             ),
                             before_snapshot=empty,
                             after_snapshot=written,
@@ -1080,6 +1091,38 @@ class FormalTrainingMetricsTests(unittest.TestCase):
                     )
                 ]
             )
+
+    def test_workspace_zero_reward_allows_separate_max_round_penalty(self) -> None:
+        empty = workspace_snapshot()
+        event = workspace_event(
+            "SHELL_COMMAND",
+            event_id=0,
+            phase_index=0,
+            before=empty,
+            after=empty,
+        )
+        step = attach_workspace(
+            record(
+                'shell_command {"command":"rg --hidden -n pattern ."}',
+                before=0,
+                after=0,
+                components=(
+                    ("shell_command_transition", 0.0),
+                    ("max_round_timeout_failure", -0.01),
+                ),
+            ),
+            before_snapshot=empty,
+            after_snapshot=empty,
+            before_audit_count=0,
+            after_audit_count=1,
+            workspace_event=event,
+        )
+        summary = summarize_formal_training_rows(
+            [row("timeout", 0, -0.01, -0.01, -0.01, 0.0, step, terminal=True)]
+        )
+        self.assertEqual(summary["workspace_action_count"], 1.0)
+        self.assertEqual(summary["workspace_shell_command_count"], 1.0)
+        self.assertEqual(summary["timeout_trajectory_count"], 1.0)
 
     def test_fails_closed_on_reward_or_terminal_mismatch(self) -> None:
         terminal = record('ANSWER {"text":"x"}', before=0, after=0)
