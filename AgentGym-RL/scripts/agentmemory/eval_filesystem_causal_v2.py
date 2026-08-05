@@ -14,6 +14,7 @@ import argparse
 import hashlib
 import json
 import math
+import re
 import stat
 import sys
 import time
@@ -34,10 +35,32 @@ _INFO_EXCLUDED_FROM_NATIVE_COMPARISON = frozenset(
         "workspace_control_event",
     }
 )
+_SHELL_WALL_TIME_RE = re.compile(
+    r"(^|Result: )(Exit code: -?\d+\n)"
+    r"Wall time: \d+(?:\.\d+)? seconds(?=\n|$)",
+    flags=re.MULTILINE,
+)
 
 
 def _json_copy(value: Any) -> Any:
     return json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False))
+
+
+def _replay_comparison_projection(value: Any) -> Any:
+    """Remove only nondeterministic shell-wrapper timing from replay checks."""
+    if isinstance(value, str):
+        return _SHELL_WALL_TIME_RE.sub(
+            r"\1\2Wall time: <normalized> seconds",
+            value,
+        )
+    if isinstance(value, Mapping):
+        return {
+            key: _replay_comparison_projection(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_replay_comparison_projection(item) for item in value]
+    return _json_copy(value)
 
 
 def _sha256_json(value: Any) -> str:
@@ -62,7 +85,7 @@ def _session_index(info: Mapping[str, Any]) -> int:
 
 def _native_info_projection(info: Mapping[str, Any]) -> dict[str, Any]:
     return {
-        key: _json_copy(value)
+        key: _replay_comparison_projection(value)
         for key, value in info.items()
         if key not in _INFO_EXCLUDED_FROM_NATIVE_COMPARISON
         and not key.startswith("workspace_")
@@ -328,7 +351,9 @@ class FilesystemCausalEvalRunner:
                 }
             )
             expected = source["steps"][index]["env_response"]
-            if response.get("observation") != expected.get("observation"):
+            if _replay_comparison_projection(
+                response.get("observation")
+            ) != _replay_comparison_projection(expected.get("observation")):
                 mismatches.append(f"step_{index}_observation")
             observed_projection = _native_info_projection(response.get("info", {}))
             expected_projection = _native_info_projection(expected.get("info", {}))
@@ -478,6 +503,13 @@ class FilesystemCausalEvalRunner:
                 "ineligible_reasons": [],
                 "arms": {},
             }
+            if "stale" in self.arms:
+                target_branch = target_source["initial_env_info"].get("branch_kind")
+                paired_branch = paired_source["initial_env_info"].get("branch_kind")
+                if (target_branch, paired_branch) != ("flip", "stay"):
+                    raise core.EvalError(
+                        "stale causal arm requires a flip target and stay paired source"
+                    )
             source_reasons = [
                 source.get("ineligible_reason")
                 for source in (target_source, paired_source)
@@ -486,13 +518,6 @@ class FilesystemCausalEvalRunner:
             if source_reasons:
                 result["ineligible_reasons"] = source_reasons
                 return result
-            if "stale" in self.arms:
-                target_branch = target_source["boundary_env_info"].get("branch_kind")
-                paired_branch = paired_source["boundary_env_info"].get("branch_kind")
-                if (target_branch, paired_branch) != ("flip", "stay"):
-                    raise core.EvalError(
-                        "stale causal arm requires a flip target and stay paired source"
-                    )
             target_source_state = target_source["workspace_export"][
                 "workspace_state"
             ]
@@ -646,6 +671,10 @@ class FilesystemCausalEvalRunner:
             "boundary_session_index": self.boundary_session_index,
             "prompt_history_policy": "latest_observation_only",
             "source_actions_replayed_exactly": True,
+            "replay_comparison": {
+                "raw_records_preserved": True,
+                "normalized_dynamic_fields": ["shell_wrapper_wall_time"],
+            },
             "hidden_answer_injection": False,
             "intervention_token_persisted": False,
             "orbits": orbits,

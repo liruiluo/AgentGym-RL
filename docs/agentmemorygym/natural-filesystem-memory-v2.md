@@ -197,7 +197,10 @@ as evaluator evidence and are never appended to the model observation.
 3. Create four fresh target environments and replay the target's exact submitted
    source actions in each one.
 4. Require exact visible observations, native-state projections, and exported
-   workspace bytes to match the target source run before intervention.
+   workspace bytes to match the target source run before intervention. The
+   comparison normalizes only the shell wrapper's measured `Wall time`, which
+   is nondeterministic across exact action replays; persisted raw responses
+   retain the original timing values.
 5. Install the four arms. `correct`, `blank`, and `swapped` retain the identical
    enabled prompt. `no_workspace` receives a dedicated prompt permitting only
    native WebShop actions and explicitly declaring both workspace tools absent.
@@ -223,6 +226,12 @@ cannot reach the boundary, writes no workspace, or produces a source action
 sequence whose replay is not byte-for-byte reproducible. Runtime metadata,
 authentication, state hashes, or intervention-contract mismatches fail the
 whole run closed.
+
+Recency override adds the `stale` arm and requires the target source to be the
+`flip` member while its paired source is `stay`. Its generator emits each pair
+in `(stay, flip)` order, so direct evaluator indices for flip targets are odd
+(`1,3,5,...`). The evaluator rejects the opposite orientation before accepting
+an orbit.
 
 ## 8. Migration gate
 

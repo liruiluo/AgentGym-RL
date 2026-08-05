@@ -553,6 +553,32 @@ class RecencyFakeEnv(FakeEnv):
 
 
 class FilesystemCausalEvalTest(unittest.TestCase):
+    def test_replay_projection_normalizes_only_shell_wrapper_wall_time(self):
+        source = (
+            "Exit code: 0\n"
+            "Wall time: 0.190 seconds\n"
+            "Output:\n"
+            "preference=gray\n"
+            "Result: Exit code: 0\n"
+            "Wall time: 1.250 seconds\n"
+            "Output:\n"
+            "done\n"
+        )
+        replay = source.replace("0.190", "0.189").replace("1.250", "1.251")
+        self.assertEqual(
+            CAUSAL._replay_comparison_projection(source),
+            CAUSAL._replay_comparison_projection(replay),
+        )
+        self.assertEqual(
+            CAUSAL._native_info_projection({"session_trace": [source]}),
+            CAUSAL._native_info_projection({"session_trace": [replay]}),
+        )
+        task_text = "Customer note: Wall time: 0.190 seconds"
+        self.assertEqual(
+            CAUSAL._replay_comparison_projection(task_text),
+            task_text,
+        )
+
     def test_contract_hash_ignores_only_dynamic_environment_counts(self):
         token = "t" * 48
         metadata = filesystem_metadata(token)
