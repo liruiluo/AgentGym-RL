@@ -682,6 +682,14 @@ class FilesystemCausalEvalTest(unittest.TestCase):
     def test_recency_flip_target_runs_five_arms_at_session_three(self):
         token = "r" * 48
         metadata = recency_filesystem_metadata(token)
+        CORE.validate_filesystem_surface_metadata(metadata)
+        for concrete_example in (
+            "Current service region:",
+            ".agent_memory/current.md",
+            "east",
+            "west",
+        ):
+            self.assertNotIn(concrete_example, metadata["system_prompt"])
         registry = {}
         next_id = 0
 
