@@ -50,6 +50,13 @@ FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS = (
     "has no network",
     "no host-path access",
     "no dedicated memory API",
+    "workspace starts empty and contains only files that you create",
+    "Before an action that advances to a new shopping session",
+    "separate turns and must never be emitted together",
+    "Earlier turn (complete reply):\napply_patch",
+    "*** Add File: .agent_memory/example.md\n+service port: 4317",
+    "Later turn (complete reply):\n"
+    "shell_command {\"command\":\"rg -n 'service port' .agent_memory/example.md\"",
 )
 FILESYSTEM_PROMPT_FORBIDDEN_FRAGMENTS = (
     'Read {"path"',

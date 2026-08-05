@@ -2325,6 +2325,36 @@ class EvalV3OpenAITest(unittest.TestCase):
                     response,
                 )
 
+    def test_filesystem_prompt_examples_are_parser_valid_separate_actions(self):
+        prompt = MODULE.FILESYSTEM_WEBSHOP_SYSTEM_PROMPT
+        patch_action = (
+            "apply_patch\n*** Begin Patch\n"
+            "*** Add File: .agent_memory/example.md\n"
+            "+service port: 4317\n"
+            "*** End Patch"
+        )
+        shell_action = (
+            "shell_command {\"command\":\"rg -n 'service port' "
+            ".agent_memory/example.md\",\"workdir\":\".\","
+            "\"timeout_ms\":10000}"
+        )
+        self.assertIn(patch_action, prompt)
+        self.assertIn(shell_action, prompt)
+        self.assertEqual(
+            MODULE.extract_webshop_v2_action(
+                patch_action,
+                allow_workspace=True,
+            ),
+            patch_action,
+        )
+        self.assertEqual(
+            MODULE.extract_webshop_v2_action(
+                shell_action,
+                allow_workspace=True,
+            ),
+            shell_action,
+        )
+
     def test_native_webshop_v2_derives_key_inventory_prompt_from_server(self):
         metadata = {
             "surface": MODULE.WEBSHOP_V2_SURFACE,

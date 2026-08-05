@@ -238,6 +238,27 @@ _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT = (
     "current observation. There is no host-path access and no dedicated memory API. Use one "
     "browser or workspace action per turn."
 )
+_AGENTMEMORY_FILESYSTEM_MEMORY_GUIDANCE = (
+    " The workspace starts empty and contains only files that you create; it is not a "
+    "catalog, hidden cache, or automatic session log. Before an action that advances to a "
+    "new shopping session and removes facts from the current-session trace, decide whether "
+    "a later decision will need a fact visible now. If it will, write a concise note on a "
+    "separate workspace turn before advancing. Do not write on every turn and do not write "
+    "when no later decision needs the fact. Here is one generic Codex example unrelated to "
+    "the shopping task; the two complete replies are separate turns and must never be emitted "
+    "together. Earlier turn (complete reply):\n"
+    "apply_patch\n"
+    "*** Begin Patch\n"
+    "*** Add File: .agent_memory/example.md\n"
+    "+service port: 4317\n"
+    "*** End Patch\n"
+    "After the environment returns feedback, a later turn may read that note when the fact "
+    "is no longer visible. Later turn (complete reply):\n"
+    "shell_command {\"command\":\"rg -n 'service port' "
+    ".agent_memory/example.md\",\"workdir\":\".\",\"timeout_ms\":10000}\n"
+    "Choose filenames and note contents from the actual future need; the example value and "
+    "path are illustrative, not requirements. Keep each reply to exactly one action."
+)
 _AGENTMEMORY_NO_WORKSPACE_ACTION_CONTRACT = (
     "Native browser actions use square-bracket syntax. search[keywords] searches the visible "
     "catalog. click[value] clicks one value in the current available-actions list; an ASIN "
@@ -253,18 +274,21 @@ AGENTMEMORY_ACTION_SYSTEM_PROMPT_NATURAL_FILESYSTEM = (
     "with a persistent workspace. "
     + _AGENTMEMORY_FILESYSTEM_REPLY_RULE_NO_THINKING
     + _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT
+    + _AGENTMEMORY_FILESYSTEM_MEMORY_GUIDANCE
 )
 AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NATURAL_FILESYSTEM = (
     "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
     "with a persistent workspace. "
     + _AGENTMEMORY_FILESYSTEM_REPLY_RULE_THINKING
     + _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT
+    + _AGENTMEMORY_FILESYSTEM_MEMORY_GUIDANCE
 )
 AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NATURAL_FILESYSTEM = (
     "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
     "with a persistent workspace. "
     + _AGENTMEMORY_FILESYSTEM_REPLY_RULE_REASONING
     + _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT
+    + _AGENTMEMORY_FILESYSTEM_MEMORY_GUIDANCE
 )
 AGENTMEMORY_ACTION_SYSTEM_PROMPT_NO_WORKSPACE = (
     "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "

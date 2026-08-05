@@ -462,8 +462,21 @@ class FormalPromptTests(unittest.TestCase):
             "workspace persists across shopping sessions within this episode",
             "Workspace actions have zero task reward",
             "no host-path access and no dedicated memory API",
+            "workspace starts empty and contains only files that you create",
+            "Before an action that advances to a new shopping session",
+            "separate turns and must never be emitted together",
+            "Earlier turn (complete reply):\napply_patch",
+            "*** Add File: .agent_memory/example.md\n+service port: 4317",
+            "Later turn (complete reply):\n"
+            "shell_command {\"command\":\"rg -n 'service port' .agent_memory/example.md\"",
         ):
             self.assertIn(fragment, prompt)
+        self.assertLess(
+            prompt.index("Earlier turn (complete reply):"),
+            prompt.index("Later turn (complete reply):"),
+        )
+        self.assertNotIn("Paula Deen", prompt)
+        self.assertNotIn("Betty Crocker", prompt)
         for forbidden in (
             'Read {"path"',
             'Write {"path"',
@@ -511,6 +524,9 @@ class FormalPromptTests(unittest.TestCase):
             "multiline apply_patch action",
             "workspace persists across shopping sessions",
             "Workspace actions have zero task reward",
+            "workspace starts empty",
+            "Earlier turn (complete reply)",
+            "+service port: 4317",
             "ADD requires",
             "RETRIEVE accepts",
         ):
