@@ -493,6 +493,25 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
 
 def render_markdown(audit: dict[str, Any]) -> str:
     summary = audit["summary"]
+    status_counts = summary["source_semantic_status_counts"]
+    non_exact_sources = sum(
+        count for status, count in status_counts.items() if status != "exact_field_value"
+    )
+    if not summary["source_write_action_count"]:
+        source_semantics = (
+            "- Source semantics: no source-write timing candidate was observed."
+        )
+    elif non_exact_sources:
+        source_semantics = (
+            f"- Source semantics: `{status_counts}`. {non_exact_sources} source-write "
+            "timing candidates did not contain the selected card's exact field/value pair."
+        )
+    else:
+        source_semantics = (
+            f"- Source semantics: `{status_counts}`. Every source-write timing candidate "
+            "contained the selected card's exact field/value pair; any remaining failure is "
+            "in timing, later readback, or the dependent purchase."
+        )
     lines = [
         "# Filesystem behavior exact I/O audit",
         "",
@@ -526,13 +545,12 @@ def render_markdown(audit: dict[str, Any]) -> str:
         "",
         f"- Only {summary['source_write_trajectory_count']}/{summary['trajectory_count']} "
         "trajectories wrote anything before a later accepted BUY in that session; the "
-        f"six reported source writes are actions, not six trajectories.",
+        f"{summary['source_write_action_count']} reported source writes are actions, not "
+        "trajectories.",
         f"- {summary['post_transition_content_write_count']} accepted content writes happened "
         "after at least one session transition, when the preceding session trace had already "
         "been removed from model input.",
-        f"- Source semantics: `{summary['source_semantic_status_counts']}`. The outputs include "
-        "generic certified/natural labels, earlier-session facts written too late, and "
-        "irrelevant notes instead of the selected card's exact field/value pair.",
+        source_semantics,
         f"- {summary['submitted_apply_patch_prefix_count'] - summary['accepted_apply_patch_count']}"
         f"/{summary['submitted_apply_patch_prefix_count']} bare apply_patch submissions were "
         "rejected; malformed Update File hunks, repeated Add File paths, appended feedback, "
@@ -571,15 +589,31 @@ def render_markdown(audit: dict[str, Any]) -> str:
                     f"  - stdout: `{str(link['stdout']).replace(chr(10), ' | ')}`",
                 ]
             )
+    if summary["strict_content_chain_count"]:
+        interpretation = (
+            "The run demonstrates at least one strict same-content cross-session chain. "
+            "Inspect `exact-io-audit.json` for the exact request messages, raw completion, "
+            "submitted action, environment feedback, and workspace event."
+        )
+    elif summary["source_write_action_count"]:
+        interpretation = (
+            "The run activates legal filesystem writes, but it does not demonstrate a "
+            "functional memory chain. Inspect `exact-io-audit.json` for the exact request "
+            "messages, raw completion, submitted action, environment feedback, and workspace "
+            "event for every filesystem-related turn."
+        )
+    else:
+        interpretation = (
+            "The run does not demonstrate a source write or a functional memory chain. "
+            "Inspect `exact-io-audit.json` for the exact request messages, raw completion, "
+            "submitted action, environment feedback, and workspace event."
+        )
     lines.extend(
         [
             "",
             "## Interpretation",
             "",
-            "The run activates legal filesystem writes, but it does not demonstrate a "
-            "functional memory chain. Inspect `exact-io-audit.json` for the exact request "
-            "messages, raw completion, submitted action, environment feedback, and workspace "
-            "event for every filesystem-related turn.",
+            interpretation,
             "",
         ]
     )

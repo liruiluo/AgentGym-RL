@@ -161,6 +161,34 @@ class AnalyzeFilesystemBehaviorIoTest(unittest.TestCase):
         self.assertTrue(links[0]["source_content_observed_in_stdout"])
         self.assertTrue(links[0]["strict_content_chain"])
 
+    def test_markdown_uses_current_counts_and_semantic_statuses(self) -> None:
+        summary = {
+            "strict_content_chain_count": 0,
+            "source_write_action_count": 2,
+            "source_write_trajectory_count": 1,
+            "trajectory_count": 2,
+            "later_shell_timing_action_count": 0,
+            "later_shell_timing_link_count": 0,
+            "later_shell_source_content_observed_count": 0,
+            "apply_patch_mention_count": 2,
+            "accepted_apply_patch_count": 2,
+            "submitted_apply_patch_prefix_count": 2,
+            "shell_command_mention_count": 0,
+            "accepted_shell_command_count": 0,
+            "submitted_shell_command_prefix_count": 0,
+            "post_transition_content_write_count": 0,
+            "session1_failure_trajectory_count": 0,
+            "wrong_buy_count": 1,
+            "source_semantic_status_counts": {"exact_field_value": 2},
+        }
+        rendered = MODULE.render_markdown(
+            {"run_dir": "/tmp/run", "summary": summary, "episodes": []}
+        )
+        self.assertIn("2 reported source writes are actions", rendered)
+        self.assertNotIn("six reported source writes", rendered)
+        self.assertIn("Every source-write timing candidate", rendered)
+        self.assertNotIn("generic certified/natural labels", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()
