@@ -79,6 +79,7 @@ FILESYSTEM_REQUIRED_FRAGMENTS = (
     "every Add File content line must begin with `+`",
     "latest-observation-only input",
     "first action must use shell_command to discover and print saved Confirmed lines",
+    "rg --hidden -n '^Confirmed ' .",
     "do not guess a path",
     "until the preceding session's note contents have appeared in shell output",
     "Never infer or recreate the missing value from the choice table",
@@ -90,7 +91,7 @@ FILESYSTEM_REQUIRED_FRAGMENTS = (
     "Earlier turn (complete reply):\napply_patch",
     "*** Add File: .agent_memory/example.md\n+service port: 4317",
     "Later turn (complete reply):\n"
-    "shell_command {\"command\":\"rg -n '^service port:' .\"",
+    "shell_command {\"command\":\"rg --hidden -n '^service port:' .\"",
 )
 FILESYSTEM_FORBIDDEN_FRAGMENTS = (
     'Read {"path"',
