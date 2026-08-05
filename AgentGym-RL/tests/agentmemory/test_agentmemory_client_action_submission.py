@@ -272,7 +272,12 @@ def compositional_recall_metadata():
             "schema": "agentmemory_verified_compositional_recall_provider_v1",
             "tasks_per_orbit": 4,
             "semantic_period_tasks": 400,
-            "factorial_coordinates": [[0, 0], [0, 1], [1, 0], [1, 1]],
+            "factorial_coordinates": [
+                ["token_a", "identity"],
+                ["token_a", "swapped"],
+                ["token_b", "identity"],
+                ["token_b", "swapped"],
+            ],
             "canonical_memory_count": 2,
             "retrieve_policy": "query_top1",
             "required_sequential_retrievals": 2,
