@@ -233,6 +233,16 @@ in `(stay, flip)` order, so direct evaluator indices for flip targets are odd
 (`1,3,5,...`). The evaluator rejects the opposite orientation before accepting
 an orbit.
 
+The summary reports two distinct causal endpoints. Full-episode strict
+separation requires the `correct` arm to complete every remaining session while
+all control arms fail. First-dependent strict separation requires only that the
+`correct` arm advance past the frozen boundary while every control arm remains
+at it. On these fail-fast WebShop surfaces, that advancement is evidence of one
+correct dependent purchase. It is useful for locating a causal effect before a
+later navigation error, but it never replaces or upgrades full-episode success.
+BUY-action auditing preserves the submitted action and recognizes the native
+parser's case-insensitive `click[buy now]` spelling.
+
 ## 8. Migration gate
 
 1. Validate parser, patch transaction, persistence, isolation, quotas, and audit continuity.

@@ -553,6 +553,23 @@ class RecencyFakeEnv(FakeEnv):
 
 
 class FilesystemCausalEvalTest(unittest.TestCase):
+    def test_buy_action_audit_is_case_insensitive_but_exact(self):
+        for action in (
+            "click[Buy Now]",
+            "click[buy now]",
+            "  click[BUY NOW]  ",
+        ):
+            with self.subTest(action=action):
+                self.assertTrue(CAUSAL._is_buy_action(action))
+        for action in (
+            "click[Buy Later]",
+            "prefix click[Buy Now]",
+            "click[Buy Now] trailing",
+            None,
+        ):
+            with self.subTest(action=action):
+                self.assertFalse(CAUSAL._is_buy_action(action))
+
     def test_replay_projection_normalizes_only_shell_wrapper_wall_time(self):
         source = (
             "Exit code: 0\n"
@@ -777,6 +794,25 @@ class FilesystemCausalEvalTest(unittest.TestCase):
             1,
         )
         self.assertEqual(manifest["summary"]["strict_separation_count"], 1)
+        self.assertEqual(
+            manifest["summary"]["full_episode_strict_separation_count"],
+            1,
+        )
+        self.assertEqual(
+            manifest["summary"]["first_dependent_strict_separation_count"],
+            1,
+        )
+        self.assertEqual(
+            manifest["summary"]["arm_metrics"]["correct"][
+                "first_dependent_session_advance_count"
+            ],
+            1,
+        )
+        self.assertFalse(
+            manifest["summary"][
+                "first_dependent_metric_replaces_full_episode_success"
+            ]
+        )
 
     def test_recency_stale_arm_rejects_stay_target_direction(self):
         token = "r" * 48

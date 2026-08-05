@@ -40,6 +40,7 @@ _SHELL_WALL_TIME_RE = re.compile(
     r"Wall time: \d+(?:\.\d+)? seconds(?=\n|$)",
     flags=re.MULTILINE,
 )
+_BUY_ACTION_RE = re.compile(r"^\s*click\[\s*buy now\s*\]\s*$", re.IGNORECASE)
 
 
 def _json_copy(value: Any) -> Any:
@@ -94,6 +95,10 @@ def _native_info_projection(info: Mapping[str, Any]) -> dict[str, Any]:
 
 def _workspace_nonempty(state: Mapping[str, Any]) -> bool:
     return bool(state.get("file_count") or state.get("directory_count"))
+
+
+def _is_buy_action(action: Any) -> bool:
+    return isinstance(action, str) and _BUY_ACTION_RE.fullmatch(action) is not None
 
 
 def _empty_workspace_tree_sha256() -> str:
@@ -451,6 +456,7 @@ class FilesystemCausalEvalRunner:
             if done:
                 break
         final_info = _json_copy(env.info.get("env_info", {}))
+        final_session_index = _session_index(final_info)
         return {
             "arm": arm,
             "system_prompt": prompt,
@@ -460,13 +466,15 @@ class FilesystemCausalEvalRunner:
             "done": done,
             "episode_success": success,
             "timed_out": not done,
-            "final_session_index": _session_index(final_info),
+            "final_session_index": final_session_index,
+            "first_dependent_session_advanced": (
+                final_session_index > self.boundary_session_index
+            ),
             "final_env_info": final_info,
             "buy_actions": [
                 step["action_submitted"]
                 for step in steps
-                if isinstance(step.get("action_submitted"), str)
-                and step["action_submitted"].startswith("click[Buy Now]")
+                if _is_buy_action(step.get("action_submitted"))
             ],
         }
 
@@ -697,10 +705,19 @@ def summarize_causal_orbits(
     for arm in arms:
         outcomes = [orbit["arms"][arm] for orbit in eligible]
         success_count = sum(outcome.get("episode_success") is True for outcome in outcomes)
+        first_dependent_advance_count = sum(
+            int(outcome["final_session_index"])
+            > int(orbit["boundary_session_index"])
+            for orbit, outcome in zip(eligible, outcomes)
+        )
         arm_metrics[arm] = {
             "episode_count": len(outcomes),
             "success_count": success_count,
             "success_rate": success_count / len(outcomes) if outcomes else 0.0,
+            "first_dependent_session_advance_count": first_dependent_advance_count,
+            "first_dependent_session_advance_rate": (
+                first_dependent_advance_count / len(outcomes) if outcomes else 0.0
+            ),
             "mean_final_session_index": (
                 sum(float(outcome["final_session_index"]) for outcome in outcomes)
                 / len(outcomes)
@@ -723,6 +740,17 @@ def summarize_causal_orbits(
         )
         for orbit in eligible
     )
+    first_dependent_strict = sum(
+        int(orbit["arms"]["correct"]["final_session_index"])
+        > int(orbit["boundary_session_index"])
+        and all(
+            int(orbit["arms"][arm]["final_session_index"])
+            <= int(orbit["boundary_session_index"])
+            for arm in arms
+            if arm != "correct"
+        )
+        for orbit in eligible
+    )
     arm_count_name = {
         4: "four",
         5: "five",
@@ -734,6 +762,15 @@ def summarize_causal_orbits(
         "required_intervention_arms": list(arms),
         "strict_separation_count": strict,
         "strict_separation_rate": strict / len(eligible) if eligible else 0.0,
+        "full_episode_strict_separation_count": strict,
+        "full_episode_strict_separation_rate": (
+            strict / len(eligible) if eligible else 0.0
+        ),
+        "first_dependent_strict_separation_count": first_dependent_strict,
+        "first_dependent_strict_separation_rate": (
+            first_dependent_strict / len(eligible) if eligible else 0.0
+        ),
+        "first_dependent_metric_replaces_full_episode_success": False,
         "arm_metrics": arm_metrics,
         "operation_counts_prove_memory_capability": False,
         "causal_claim_requires_panel_level_intervention_effect": True,
