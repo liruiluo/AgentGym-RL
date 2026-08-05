@@ -455,6 +455,8 @@ class FormalPromptTests(unittest.TestCase):
             "native WebShop bundled-shopping environment",
             "search[keywords]",
             "click[Buy Now]",
+            "click[its displayed ASIN]",
+            "after the exact product page opens",
             'shell_command {"command":"rg -n pattern .","workdir":".","timeout_ms":10000}',
             "apply_patch is followed on the next line",
             "ordinary file utilities and pinned rg",
@@ -570,15 +572,19 @@ class FormalPromptTests(unittest.TestCase):
         )
         for fragment in (
             "one ordinary file as the current confirmed user-preference record",
+            "exact policy-visible record line beginning with `Current preference:`",
+            "copy that exact line verbatim",
             "use apply_patch Update File on the existing current-state file",
             "new value replaces the old value",
             "do not leave conflicting current and stale values",
             "rg --hidden -n '^Current preference:' .",
             "first use shell_command to print the current preference record",
             "Do not infer the missing value from the choice table",
-            "*** Update File: .agent_memory/current.md",
-            "-Current service region: east",
-            "+Current service region: west",
+            "*** Add File with a new path",
+            "*** Update File on that same path",
+            "one - line exactly matching the old record",
+            "one + line exactly matching the new task-provided record",
+            "No concrete preference value or filename is demonstrated here",
         ):
             self.assertIn(fragment, prompt)
         for forbidden in (
@@ -587,6 +593,8 @@ class FormalPromptTests(unittest.TestCase):
             "RETRIEVE accepts",
             "memory_id",
             "Long-term memory",
+            "Current service region:",
+            ".agent_memory/current.md",
         ):
             self.assertNotIn(forbidden, prompt)
 

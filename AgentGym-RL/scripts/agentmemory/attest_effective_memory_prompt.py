@@ -116,7 +116,8 @@ RECENCY_FILESYSTEM_REQUIRED_FRAGMENTS = (
     "no dedicated memory API",
     "workspace starts empty and contains only files that you create",
     "one ordinary file as the current confirmed user-preference record",
-    "write the exact policy-visible preference field and value",
+    "exact policy-visible record line beginning with `Current preference:`",
+    "copy that exact line verbatim",
     "use apply_patch Update File on the existing current-state file",
     "new value replaces the old value",
     "do not leave conflicting current and stale values",
@@ -127,11 +128,11 @@ RECENCY_FILESYSTEM_REQUIRED_FRAGMENTS = (
     "Every Add File content line must begin with `+`",
     "Update File uses context lines prefixed by one space",
     "never append Result or feedback text to the action",
-    "three complete replies are separate turns and must never be emitted together",
-    "*** Add File: .agent_memory/current.md\n+Current service region: east",
-    "*** Update File: .agent_memory/current.md",
-    "-Current service region: east\n+Current service region: west",
-    "shell_command {\"command\":\"rg --hidden -n '^Current service region:' .\"",
+    "*** Add File with a new path",
+    "*** Update File on that same path",
+    "one - line exactly matching the old record",
+    "one + line exactly matching the new task-provided record",
+    "No concrete preference value or filename is demonstrated here",
 )
 FILESYSTEM_FORBIDDEN_FRAGMENTS = (
     'Read {"path"',
@@ -145,6 +146,7 @@ FILESYSTEM_FORBIDDEN_FRAGMENTS = (
     "use ADD before",
     "use RETRIEVE",
     "Long-term memory persists",
+    "Current service region:",
 )
 
 
