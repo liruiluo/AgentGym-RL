@@ -27,7 +27,12 @@ PROVIDER_MODE_FIXED_WINDOW = MODULE.PROVIDER_MODE_FIXED_WINDOW
 PROVIDER_MODE_RESEEDED_STREAM = MODULE.PROVIDER_MODE_RESEEDED_STREAM
 ProceduralIndexError = MODULE.ProceduralIndexError
 ProceduralIndexSource = MODULE.ProceduralIndexSource
+TaskBalancedMultitaskIndexSource = MODULE.TaskBalancedMultitaskIndexSource
 StatefulProceduralStreamSampler = MODULE.StatefulProceduralStreamSampler
+FILESYSTEM_MULTITASK_CYCLE_SIZE = MODULE.FILESYSTEM_MULTITASK_CYCLE_SIZE
+FILESYSTEM_MULTITASK_KIND = MODULE.FILESYSTEM_MULTITASK_KIND
+MULTITASK_LOCAL_DATA_INDEX_KEY = MODULE.MULTITASK_LOCAL_DATA_INDEX_KEY
+MULTITASK_SURFACE_SLOT_KEY = MODULE.MULTITASK_SURFACE_SLOT_KEY
 build_stream_checkpoint = MODULE.build_stream_checkpoint
 generation_non_tensor_keys = MODULE.generation_non_tensor_keys
 procedural_index_source_from_config = MODULE.procedural_index_source_from_config
@@ -35,6 +40,7 @@ promote_data_idx_for_rollout = MODULE.promote_data_idx_for_rollout
 restore_stream_checkpoint = MODULE.restore_stream_checkpoint
 validate_paired_batch_indices = MODULE.validate_paired_batch_indices
 validate_orbit_batch_indices = MODULE.validate_orbit_batch_indices
+validate_multitask_route_triplet = MODULE.validate_multitask_route_triplet
 validate_rollout_parent_coverage = MODULE.validate_rollout_parent_coverage
 
 
@@ -543,6 +549,68 @@ def negative_constraint_filesystem_server_metadata(
     return metadata
 
 
+def _with_filesystem_contract(
+    metadata: dict,
+    *,
+    surface: str,
+    prompt_family: str,
+    tasks_per_orbit: int,
+) -> dict:
+    filesystem = filesystem_server_metadata()
+    for key in (
+        "memory_management",
+        "workspace_surface",
+        "workspace_tool_contract",
+        "workspace_tool_ops",
+        "workspace_persistence",
+        "workspace_episode_isolation",
+        "workspace_shell_enabled",
+        "workspace_apply_patch_enabled",
+        "workspace_host_path_exposed",
+        "workspace_seed_contract",
+        "workspace_evaluation_contract",
+        "workspace_intervention_control",
+        "workspace_limits",
+        "workspace_sandbox",
+        "reward_contract",
+    ):
+        if key in filesystem:
+            metadata[key] = deepcopy(filesystem[key])
+    metadata.update(
+        {
+            "surface": surface,
+            "memory_prompt_mode": "natural_filesystem",
+            "source_pairing": "xor_lsb_within_orbit_v1",
+            "tasks_per_orbit": tasks_per_orbit,
+            "workspace_prompt_family": prompt_family,
+        }
+    )
+    return metadata
+
+
+def filesystem_multitask_server_metadatas() -> list[dict]:
+    return [
+        filesystem_server_metadata(),
+        _with_filesystem_contract(
+            latent_preference_server_metadata(),
+            surface="agentmemory_webshop_latent_preference_filesystem_v2",
+            prompt_family="latent_preference_filesystem_v2",
+            tasks_per_orbit=2,
+        ),
+        recency_override_filesystem_server_metadata(),
+        distractor_robustness_filesystem_server_metadata(),
+        compositional_recall_filesystem_server_metadata(),
+        negative_constraint_filesystem_server_metadata(),
+        _with_filesystem_contract(
+            intent_clarification_server_metadata(),
+            surface="agentmemory_webshop_intent_clarification_filesystem_v2",
+            prompt_family="intent_clarification_filesystem_v2",
+            tasks_per_orbit=2,
+        ),
+        selective_memory_use_filesystem_server_metadata(),
+    ]
+
+
 class ProceduralIndexSourceTests(unittest.TestCase):
     def test_explicit_data_index_is_promoted_for_environment_reset(self) -> None:
         indices = [200_000, 200_001]
@@ -566,6 +634,147 @@ class ProceduralIndexSourceTests(unittest.TestCase):
             ["item_id", "raw_prompt"],
         )
         self.assertFalse(promote_data_idx_for_rollout(non_tensor_batch))
+
+    def test_task_balanced_multitask_cycle_routes_equal_complete_blocks(self) -> None:
+        source = TaskBalancedMultitaskIndexSource(
+            task_count=FILESYSTEM_MULTITASK_CYCLE_SIZE * 3,
+            provider_mode=PROVIDER_MODE_RESEEDED_STREAM,
+            tasks_per_orbit=FILESYSTEM_MULTITASK_CYCLE_SIZE,
+        )
+        first_cycle = [
+            source.row_for_position(position)
+            for position in range(FILESYSTEM_MULTITASK_CYCLE_SIZE)
+        ]
+        for surface_slot in range(8):
+            routed = [
+                row
+                for row in first_cycle
+                if row[MULTITASK_SURFACE_SLOT_KEY] == surface_slot
+            ]
+            self.assertEqual(len(routed), 12)
+            self.assertEqual(
+                [row[MULTITASK_LOCAL_DATA_INDEX_KEY] for row in routed],
+                list(range(12)),
+            )
+        next_cycle = source.row_for_position(FILESYSTEM_MULTITASK_CYCLE_SIZE)
+        self.assertEqual(next_cycle[MULTITASK_SURFACE_SLOT_KEY], 0)
+        self.assertEqual(next_cycle[MULTITASK_LOCAL_DATA_INDEX_KEY], 12)
+        self.assertEqual(next_cycle["data_idx"], FILESYSTEM_MULTITASK_CYCLE_SIZE)
+        self.assertEqual(
+            generation_non_tensor_keys(
+                {
+                    "item_id": [first_cycle[0]["item_id"]],
+                    "raw_prompt": [[]],
+                    "data_idx": [0],
+                    MULTITASK_SURFACE_SLOT_KEY: [0],
+                    MULTITASK_LOCAL_DATA_INDEX_KEY: [0],
+                }
+            ),
+            [
+                "item_id",
+                "raw_prompt",
+                "data_idx",
+                MULTITASK_SURFACE_SLOT_KEY,
+                MULTITASK_LOCAL_DATA_INDEX_KEY,
+            ],
+        )
+
+    def test_task_balanced_route_triplets_are_exact_and_fail_closed(self) -> None:
+        source = TaskBalancedMultitaskIndexSource(
+            task_count=FILESYSTEM_MULTITASK_CYCLE_SIZE * 3,
+            provider_mode=PROVIDER_MODE_RESEEDED_STREAM,
+            tasks_per_orbit=FILESYSTEM_MULTITASK_CYCLE_SIZE,
+        )
+        for position in (0, 11, 12, 47, 95, 96, 191):
+            row = source.row_for_position(position)
+            self.assertEqual(
+                validate_multitask_route_triplet(
+                    row["data_idx"],
+                    row[MULTITASK_SURFACE_SLOT_KEY],
+                    row[MULTITASK_LOCAL_DATA_INDEX_KEY],
+                ),
+                (
+                    row["data_idx"],
+                    row[MULTITASK_SURFACE_SLOT_KEY],
+                    row[MULTITASK_LOCAL_DATA_INDEX_KEY],
+                ),
+            )
+
+        for values in (
+            (12, 0, 0),
+            (12, 1, 1),
+            (96, 0, 0),
+            (0, 0, 1),
+            (0, 0.0, 0),
+            (0, "0", 0),
+            (0, False, 0),
+            (-1, 0, 0),
+        ):
+            with self.subTest(values=values), self.assertRaises(
+                ProceduralIndexError
+            ):
+                validate_multitask_route_triplet(*values)
+
+    def test_task_balanced_multitask_config_and_batch_are_fail_closed(self) -> None:
+        source = procedural_index_source_from_config(
+            {
+                "procedural_index": {
+                    "enabled": True,
+                    "kind": FILESYSTEM_MULTITASK_KIND,
+                    "task_count": FILESYSTEM_MULTITASK_CYCLE_SIZE * 3,
+                    "provider_mode": PROVIDER_MODE_RESEEDED_STREAM,
+                }
+            }
+        )
+        self.assertIsInstance(source, TaskBalancedMultitaskIndexSource)
+        source.validate_training_batch_size(FILESYSTEM_MULTITASK_CYCLE_SIZE)
+        for invalid_batch_size in (64, 192 - 1):
+            with self.subTest(batch_size=invalid_batch_size), self.assertRaises(
+                ProceduralIndexError
+            ):
+                source.validate_training_batch_size(invalid_batch_size)
+        with self.assertRaisesRegex(ProceduralIndexError, "cycle size"):
+            TaskBalancedMultitaskIndexSource(
+                task_count=64,
+                provider_mode=PROVIDER_MODE_RESEEDED_STREAM,
+                tasks_per_orbit=2,
+            )
+
+    def test_task_balanced_multitask_attests_every_server_in_order(self) -> None:
+        source = TaskBalancedMultitaskIndexSource(
+            task_count=FILESYSTEM_MULTITASK_CYCLE_SIZE * 3,
+            provider_mode=PROVIDER_MODE_RESEEDED_STREAM,
+            tasks_per_orbit=FILESYSTEM_MULTITASK_CYCLE_SIZE,
+        )
+        metadatas = filesystem_multitask_server_metadatas()
+        source.validate_server_metadatas(metadatas)
+        identity = source.training_identity(
+            server_metadata=metadatas,
+            train_batch_size=FILESYSTEM_MULTITASK_CYCLE_SIZE,
+        )
+        self.assertTrue(identity["training_geometry"]["task_balanced"])
+        self.assertEqual(len(identity["server_metadata"]), 8)
+        self.assertEqual(source.required_local_task_count, 36)
+        self.assertEqual(
+            identity["index_source"]["required_local_task_count"],
+            36,
+        )
+
+        swapped = deepcopy(metadatas)
+        swapped[0], swapped[1] = swapped[1], swapped[0]
+        with self.assertRaisesRegex(ProceduralIndexError, "route order"):
+            source.validate_server_metadatas(swapped)
+        with self.assertRaisesRegex(ProceduralIndexError, "each of 8"):
+            source.validate_server_metadatas(metadatas[:-1])
+
+        undersized = deepcopy(metadatas)
+        undersized[3]["task_count"] = 24
+        undersized[3]["provider"]["task_count"] = 24
+        with self.assertRaisesRegex(
+            ProceduralIndexError,
+            "cannot cover the frozen stream",
+        ):
+            source.validate_server_metadatas(undersized)
 
     def test_conflicting_explicit_rollout_indices_fail_closed(self) -> None:
         with self.assertRaisesRegex(ProceduralIndexError, "both data_idx"):

@@ -13,6 +13,8 @@ PROCEDURAL_STREAM_CHECKPOINT_SCHEMA = (
     "agentmemory_procedural_stream_checkpoint_v1"
 )
 ROLLOUT_REPLICA_INDEX_KEY = "agentmemory_replica_index"
+MULTITASK_SURFACE_SLOT_KEY = "agentmemory_surface_slot"
+MULTITASK_LOCAL_DATA_INDEX_KEY = "agentmemory_local_data_idx"
 PROVIDER_MODE_FIXED_WINDOW = "fixed_window"
 PROVIDER_MODE_RESEEDED_STREAM = "reseeded_stream"
 PROVIDER_MODES = (
@@ -57,6 +59,23 @@ FILESYSTEM_SURFACES = frozenset(
         SELECTIVE_MEMORY_USE_FILESYSTEM_SURFACE,
         NEGATIVE_CONSTRAINT_FILESYSTEM_SURFACE,
     }
+)
+FILESYSTEM_MULTITASK_KIND = "filesystem_task_balanced_v1"
+FILESYSTEM_MULTITASK_SURFACE_ORDER = (
+    FILESYSTEM_SURFACE,
+    LATENT_PREFERENCE_FILESYSTEM_SURFACE,
+    RECENCY_OVERRIDE_FILESYSTEM_SURFACE,
+    DISTRACTOR_ROBUSTNESS_FILESYSTEM_SURFACE,
+    COMPOSITIONAL_RECALL_FILESYSTEM_SURFACE,
+    NEGATIVE_CONSTRAINT_FILESYSTEM_SURFACE,
+    INTENT_CLARIFICATION_FILESYSTEM_SURFACE,
+    SELECTIVE_MEMORY_USE_FILESYSTEM_SURFACE,
+)
+FILESYSTEM_MULTITASK_ROUTE_ORBIT_SIZES = (2, 2, 2, 2, 4, 3, 2, 4)
+FILESYSTEM_MULTITASK_ROWS_PER_SURFACE = 12
+FILESYSTEM_MULTITASK_CYCLE_SIZE = (
+    len(FILESYSTEM_MULTITASK_SURFACE_ORDER)
+    * FILESYSTEM_MULTITASK_ROWS_PER_SURFACE
 )
 FILESYSTEM_SURFACE_CONTRACTS = {
     FILESYSTEM_SURFACE: (
@@ -198,7 +217,61 @@ def generation_non_tensor_keys(
     keys = ["item_id", "raw_prompt"]
     if "data_idx" in non_tensor_batch:
         keys.append("data_idx")
+    for key in (MULTITASK_SURFACE_SLOT_KEY, MULTITASK_LOCAL_DATA_INDEX_KEY):
+        if key in non_tensor_batch:
+            keys.append(key)
     return keys
+
+
+def validate_multitask_route_triplet(
+    global_data_idx: Any,
+    surface_slot: Any,
+    local_data_idx: Any,
+) -> tuple[int, int, int]:
+    """Validate and normalize one frozen task-balanced routing row."""
+
+    normalized = []
+    for field, value in (
+        ("global_data_idx", global_data_idx),
+        (MULTITASK_SURFACE_SLOT_KEY, surface_slot),
+        (MULTITASK_LOCAL_DATA_INDEX_KEY, local_data_idx),
+    ):
+        if isinstance(value, bool):
+            raise ProceduralIndexError(f"{field} must be an integer, got bool")
+        try:
+            normalized.append(operator.index(value))
+        except TypeError as exc:
+            raise ProceduralIndexError(
+                f"{field} must be an integer, got {value!r}"
+            ) from exc
+
+    normalized_global, normalized_slot, normalized_local = normalized
+    if min(normalized) < 0:
+        raise ProceduralIndexError(
+            "multitask global index, surface slot, and local index must be "
+            "non-negative"
+        )
+    cycle_index, cycle_offset = divmod(
+        normalized_global,
+        FILESYSTEM_MULTITASK_CYCLE_SIZE,
+    )
+    expected_slot, within_surface = divmod(
+        cycle_offset,
+        FILESYSTEM_MULTITASK_ROWS_PER_SURFACE,
+    )
+    expected_local = (
+        cycle_index * FILESYSTEM_MULTITASK_ROWS_PER_SURFACE
+        + within_surface
+    )
+    if normalized_slot != expected_slot or normalized_local != expected_local:
+        raise ProceduralIndexError(
+            "multitask route identity disagrees with the frozen global-index "
+            "mapping: "
+            f"global={normalized_global} expected_slot={expected_slot} "
+            f"observed_slot={normalized_slot} expected_local={expected_local} "
+            f"observed_local={normalized_local}"
+        )
+    return normalized_global, normalized_slot, normalized_local
 
 
 def promote_data_idx_for_rollout(
@@ -738,6 +811,174 @@ class ProceduralIndexSource:
         }
 
 
+@dataclass(frozen=True)
+class TaskBalancedMultitaskIndexSource(ProceduralIndexSource):
+    """Emit complete, equally sized task blocks for eight filesystem surfaces."""
+
+    kind: str = FILESYSTEM_MULTITASK_KIND
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.kind != FILESYSTEM_MULTITASK_KIND:
+            raise ProceduralIndexError(
+                f"unsupported multitask procedural kind: {self.kind!r}"
+            )
+        if self.tasks_per_orbit != FILESYSTEM_MULTITASK_CYCLE_SIZE:
+            raise ProceduralIndexError(
+                "filesystem multitask tasks_per_orbit must equal the frozen "
+                f"cycle size {FILESYSTEM_MULTITASK_CYCLE_SIZE}"
+            )
+        if self.start_index % FILESYSTEM_MULTITASK_CYCLE_SIZE:
+            raise ProceduralIndexError(
+                "filesystem multitask start_index must begin at a complete "
+                "task-balanced cycle"
+            )
+
+    def row_for_position(self, position: int) -> dict[str, Any]:
+        if (
+            isinstance(position, bool)
+            or not isinstance(position, int)
+            or position < 0
+        ):
+            raise IndexError(f"invalid procedural dataset position {position!r}")
+        if (
+            self.provider_mode == PROVIDER_MODE_FIXED_WINDOW
+            and position >= self.task_count
+        ):
+            raise IndexError(
+                f"procedural dataset position {position} is outside [0, "
+                f"{self.task_count})"
+            )
+        absolute_index = self.start_index + position
+        cycle_index, cycle_offset = divmod(
+            absolute_index,
+            FILESYSTEM_MULTITASK_CYCLE_SIZE,
+        )
+        surface_slot, within_surface = divmod(
+            cycle_offset,
+            FILESYSTEM_MULTITASK_ROWS_PER_SURFACE,
+        )
+        local_data_idx = (
+            cycle_index * FILESYSTEM_MULTITASK_ROWS_PER_SURFACE
+            + within_surface
+        )
+        return {
+            "item_id": f"{self.item_id_prefix}_m{surface_slot}_{absolute_index}",
+            "data_idx": absolute_index,
+            MULTITASK_SURFACE_SLOT_KEY: surface_slot,
+            MULTITASK_LOCAL_DATA_INDEX_KEY: local_data_idx,
+            "extra_info": {"index": absolute_index},
+        }
+
+    @property
+    def required_local_task_count(self) -> int:
+        """Return the exclusive local index bound every routed server needs."""
+
+        global_stop = self.start_index + self.task_count
+        complete_cycles, remainder = divmod(
+            global_stop,
+            FILESYSTEM_MULTITASK_CYCLE_SIZE,
+        )
+        if remainder:
+            raise ProceduralIndexError(
+                "filesystem multitask stream must end at a complete cycle"
+            )
+        return complete_cycles * FILESYSTEM_MULTITASK_ROWS_PER_SURFACE
+
+    def metadata(self) -> dict[str, Any]:
+        metadata = super().metadata()
+        metadata.update(
+            {
+                "kind": self.kind,
+                "task_balanced": True,
+                "surface_order": list(FILESYSTEM_MULTITASK_SURFACE_ORDER),
+                "route_orbit_sizes": list(
+                    FILESYSTEM_MULTITASK_ROUTE_ORBIT_SIZES
+                ),
+                "rows_per_surface_per_cycle": (
+                    FILESYSTEM_MULTITASK_ROWS_PER_SURFACE
+                ),
+                "cycle_size": FILESYSTEM_MULTITASK_CYCLE_SIZE,
+                "required_local_task_count": self.required_local_task_count,
+            }
+        )
+        return metadata
+
+    def validate_server_metadatas(
+        self,
+        server_metadatas: Sequence[Mapping[str, Any]],
+    ) -> None:
+        if len(server_metadatas) != len(FILESYSTEM_MULTITASK_SURFACE_ORDER):
+            raise ProceduralIndexError(
+                "filesystem multitask requires one server metadata record for "
+                f"each of {len(FILESYSTEM_MULTITASK_SURFACE_ORDER)} surfaces"
+            )
+        for slot, (metadata, expected_surface, route_orbit_size) in enumerate(
+            zip(
+                server_metadatas,
+                FILESYSTEM_MULTITASK_SURFACE_ORDER,
+                FILESYSTEM_MULTITASK_ROUTE_ORBIT_SIZES,
+            )
+        ):
+            if not isinstance(metadata, Mapping):
+                raise ProceduralIndexError(
+                    f"filesystem multitask route {slot} metadata must be a mapping"
+                )
+            if metadata.get("surface") != expected_surface:
+                raise ProceduralIndexError(
+                    "filesystem multitask route order drifted: "
+                    f"slot={slot} expected={expected_surface!r} "
+                    f"observed={metadata.get('surface')!r}"
+                )
+            provider = metadata.get("provider")
+            if not isinstance(provider, Mapping):
+                raise ProceduralIndexError(
+                    f"filesystem multitask route {slot} is missing provider metadata"
+                )
+            route_source = ProceduralIndexSource(
+                task_count=provider.get("task_count"),
+                provider_mode=self.provider_mode,
+                tasks_per_orbit=route_orbit_size,
+                start_index=0,
+                item_id_prefix=self.item_id_prefix,
+            )
+            route_source.validate_server_metadata(metadata)
+            if route_source.task_count < self.required_local_task_count:
+                raise ProceduralIndexError(
+                    "filesystem multitask route cannot cover the frozen stream: "
+                    f"slot={slot} surface={expected_surface!r} "
+                    f"required_local_task_count={self.required_local_task_count} "
+                    f"server_task_count={route_source.task_count}"
+                )
+
+    def training_identity(
+        self,
+        *,
+        server_metadata: Sequence[Mapping[str, Any]],
+        train_batch_size: int,
+    ) -> dict[str, Any]:
+        self.validate_training_batch_size(train_batch_size)
+        self.validate_server_metadatas(server_metadata)
+        return {
+            "schema": PROCEDURAL_STREAM_IDENTITY_SCHEMA,
+            "index_source": self.metadata(),
+            "training_geometry": {
+                "train_batch_size": train_batch_size,
+                "shuffle": False,
+                "drop_last": True,
+                "tasks_per_orbit": self.tasks_per_orbit,
+                "task_balanced": True,
+            },
+            "server_metadata": [
+                _canonical_json_mapping(
+                    metadata,
+                    field=f"server metadata route {slot}",
+                )
+                for slot, metadata in enumerate(server_metadata)
+            ],
+        }
+
+
 class StatefulProceduralStreamSampler:
     """Yield disjoint contiguous windows and preserve the cursor in checkpoints."""
 
@@ -808,10 +1049,27 @@ def procedural_index_source_from_config(
         return None
     if enabled is not True:
         raise ProceduralIndexError("procedural_index.enabled must be a boolean")
-    return ProceduralIndexSource(
+    source_class = (
+        TaskBalancedMultitaskIndexSource
+        if raw.get("kind") == FILESYSTEM_MULTITASK_KIND
+        else ProceduralIndexSource
+    )
+    return source_class(
         task_count=raw.get("task_count"),
         provider_mode=raw.get("provider_mode"),
-        tasks_per_orbit=raw.get("tasks_per_orbit", 2),
+        tasks_per_orbit=raw.get(
+            "tasks_per_orbit",
+            (
+                FILESYSTEM_MULTITASK_CYCLE_SIZE
+                if source_class is TaskBalancedMultitaskIndexSource
+                else 2
+            ),
+        ),
         start_index=raw.get("start_index", 0),
         item_id_prefix=raw.get("item_id_prefix", "agentmemory"),
+        **(
+            {"kind": raw.get("kind")}
+            if source_class is TaskBalancedMultitaskIndexSource
+            else {}
+        ),
     )

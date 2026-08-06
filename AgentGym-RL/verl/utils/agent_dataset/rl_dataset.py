@@ -30,10 +30,17 @@ from transformers import PreTrainedTokenizer, ProcessorMixin
 
 import verl.utils.torch_functional as verl_F
 from verl.utils.model import compute_position_id_with_mask
-from verl.utils.agentgym.client import init_env_client
+from verl.utils.agentgym.client import (
+    configured_multitask_env_addrs,
+    init_env_client,
+)
 from verl.utils.agent_dataset.procedural_index import (
+    MULTITASK_LOCAL_DATA_INDEX_KEY,
+    MULTITASK_SURFACE_SLOT_KEY,
     ProceduralIndexSource,
+    TaskBalancedMultitaskIndexSource,
     procedural_index_source_from_config,
+    validate_multitask_route_triplet,
 )
 logger = logging.getLogger(__name__)
 
@@ -99,12 +106,58 @@ class RLHFDataset(Dataset):
             procedural_index_source_from_config(data_config)
         )
         self._read_files_and_tokenize()
-        # get agentgym client
-        self.env_client = init_env_client(self.agentgym_config)
-        if self.procedural_index_source is not None:
-            self.procedural_index_source.validate_server_metadata(
-                self.env_client.metadata
+        # Get the bootstrap client and attest every routed server before the
+        # dataloader can emit a single multitask row.
+        route_addrs = configured_multitask_env_addrs(self.agentgym_config)
+        if isinstance(
+            self.procedural_index_source,
+            TaskBalancedMultitaskIndexSource,
+        ):
+            if len(route_addrs) != 8:
+                raise ValueError(
+                    "filesystem task-balanced training requires exactly eight "
+                    "multitask_env_addrs"
+                )
+            self.env_client = init_env_client(
+                self.agentgym_config,
+                env_addr=route_addrs[0],
             )
+            server_metadatas = [copy.deepcopy(self.env_client.metadata)]
+            conversation_starts = [
+                copy.deepcopy(self.env_client.conversation_start)
+            ]
+            for env_addr in route_addrs[1:]:
+                route_client = init_env_client(
+                    self.agentgym_config,
+                    env_addr=env_addr,
+                )
+                try:
+                    server_metadatas.append(
+                        copy.deepcopy(route_client.metadata)
+                    )
+                    conversation_starts.append(
+                        copy.deepcopy(route_client.conversation_start)
+                    )
+                finally:
+                    route_client.close()
+            self.procedural_index_source.validate_server_metadatas(
+                server_metadatas
+            )
+            self.procedural_server_metadata = server_metadatas
+            self.multitask_conversation_starts = conversation_starts
+        else:
+            if route_addrs:
+                raise ValueError(
+                    "multitask_env_addrs requires the task-balanced procedural "
+                    "index kind"
+                )
+            self.env_client = init_env_client(self.agentgym_config)
+            self.procedural_server_metadata = self.env_client.metadata
+            self.multitask_conversation_starts = None
+            if self.procedural_index_source is not None:
+                self.procedural_index_source.validate_server_metadata(
+                    self.env_client.metadata
+                )
 
     def _read_files_and_tokenize(self):
         if getattr(self, "procedural_index_source", None) is not None:
@@ -138,9 +191,34 @@ class RLHFDataset(Dataset):
             example["data_source"] = "agentmemory"
         else:
             example["data_source"] = example[self.prompt_key].split("_")[0]
-        messages = [{"role": "user", "content": self.env_client.conversation_start[0]["value"]},
-                     {"role": "assistant", "content": self.env_client.conversation_start[1]["value"]}]
-        prompt_with_chat_template = "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\n" + self.env_client.conversation_start[0]["value"] + "<|im_end|>\n<|im_start|>assistant\n" + self.env_client.conversation_start[1]["value"] + "<|im_end|>"
+        conversation_start = self.env_client.conversation_start
+        if isinstance(
+            self.procedural_index_source,
+            TaskBalancedMultitaskIndexSource,
+        ):
+            _, surface_slot, _ = validate_multitask_route_triplet(
+                example["data_idx"],
+                example[MULTITASK_SURFACE_SLOT_KEY],
+                example[MULTITASK_LOCAL_DATA_INDEX_KEY],
+            )
+            conversation_start = self.multitask_conversation_starts[
+                surface_slot
+            ]
+        messages = [
+            {"role": "user", "content": conversation_start[0]["value"]},
+            {
+                "role": "assistant",
+                "content": conversation_start[1]["value"],
+            },
+        ]
+        prompt_with_chat_template = (
+            "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. "
+            "You are a helpful assistant.<|im_end|>\n<|im_start|>user\n"
+            + conversation_start[0]["value"]
+            + "<|im_end|>\n<|im_start|>assistant\n"
+            + conversation_start[1]["value"]
+            + "<|im_end|>"
+        )
         return messages, prompt_with_chat_template
 
     def __getitem__(self, item):

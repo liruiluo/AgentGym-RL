@@ -49,7 +49,17 @@ import requests
 from copy import deepcopy
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.torch_functional import get_eos_mask, pad_sequence_to_length
-from verl.utils.agentgym.client import init_env_client
+from verl.utils.agentgym.client import (
+    configured_multitask_env_addrs,
+    env_addr_for_surface_slot,
+    init_env_client,
+)
+from verl.utils.agent_dataset.procedural_index import (
+    MULTITASK_LOCAL_DATA_INDEX_KEY,
+    MULTITASK_SURFACE_SLOT_KEY,
+    ProceduralIndexError,
+    validate_multitask_route_triplet,
+)
 from verl.utils.agentgym.context_policy import assert_rollout_context_supported, read_config, rollout_context_policy
 from verl.utils.agentgym.formal_domain_v3 import (
     FORMAL_DOMAIN_SCHEMA_V3,
@@ -934,6 +944,12 @@ class vLLMRollout(BaseRollout):
         handler_list = []
         eval_parent_indices = prompts.non_tensor_batch.get("rollout_eval_parent_indices")
         eval_data_indices = prompts.non_tensor_batch.get("rollout_data_indices")
+        multitask_surface_slots = prompts.non_tensor_batch.get(
+            MULTITASK_SURFACE_SLOT_KEY
+        )
+        multitask_local_data_indices = prompts.non_tensor_batch.get(
+            MULTITASK_LOCAL_DATA_INDEX_KEY
+        )
         source_parent_indices = prompts.non_tensor_batch.get(
             "rollout_source_parent_indices"
         )
@@ -945,6 +961,25 @@ class vLLMRollout(BaseRollout):
                 f"indices={len(eval_data_indices)} "
                 f"prompts={len(prompts.non_tensor_batch['raw_prompt'])}"
             )
+        if (multitask_surface_slots is None) != (
+            multitask_local_data_indices is None
+        ):
+            raise RuntimeError(
+                "multitask rollout rows must carry both surface slots and local "
+                "data indices"
+            )
+        for field, values in (
+            (MULTITASK_SURFACE_SLOT_KEY, multitask_surface_slots),
+            (MULTITASK_LOCAL_DATA_INDEX_KEY, multitask_local_data_indices),
+        ):
+            if values is not None and len(values) != len(
+                prompts.non_tensor_batch["raw_prompt"]
+            ):
+                raise RuntimeError(
+                    f"{field} must align with raw_prompt rows: "
+                    f"values={len(values)} "
+                    f"prompts={len(prompts.non_tensor_batch['raw_prompt'])}"
+                )
         for i, raw_prompt in enumerate(prompts.non_tensor_batch["raw_prompt"]):
             parent_index_for_eval = resolve_rollout_parent_index(
                 i,
@@ -1004,6 +1039,21 @@ class vLLMRollout(BaseRollout):
                         ) from exc
                 else:
                     handler.data_idx = int(handler.item_id)
+                if multitask_surface_slots is not None:
+                    try:
+                        (
+                            handler.data_idx,
+                            handler.agentmemory_surface_slot,
+                            handler.agentmemory_local_data_idx,
+                        ) = validate_multitask_route_triplet(
+                            handler.data_idx,
+                            multitask_surface_slots[i],
+                            multitask_local_data_indices[i],
+                        )
+                    except ProceduralIndexError as exc:
+                        raise RuntimeError(
+                            f"multitask rollout route row {i} is invalid: {exc}"
+                        ) from exc
                 handler.rollout_replica_index = replica_index
                 handler_list.append(handler)
         return handler_list
@@ -1532,7 +1582,15 @@ class vLLMRollout(BaseRollout):
                 _agentmemory_debug(f"reset_start idx={idx} item_id={rollout_handler.item_id}")
                 reset_started = time.time()
                 env_clients[idx].reset(
-                    getattr(rollout_handler, "data_idx", rollout_handler.item_id)
+                    getattr(
+                        rollout_handler,
+                        "agentmemory_local_data_idx",
+                        getattr(
+                            rollout_handler,
+                            "data_idx",
+                            rollout_handler.item_id,
+                        ),
+                    )
                 )
                 task = env_clients[idx].observe()
                 rollout_handler.add_user_message(self.tokenizer, task)
@@ -2190,7 +2248,45 @@ class vLLMRollout(BaseRollout):
         batch_size *= self.config.n
         rollout_handler_ls = self.preprocess_prompt_to_rollout_handler(prompts, n=self.config.n)
         assert_rollout_context_supported(self.agentgym_config)
-        env_clients = [init_env_client(self.agentgym_config) for _ in range(batch_size)]
+        multitask_env_addrs = configured_multitask_env_addrs(
+            self.agentgym_config
+        )
+        if multitask_env_addrs:
+            missing_slots = [
+                index
+                for index, handler in enumerate(rollout_handler_ls)
+                if not hasattr(handler, "agentmemory_surface_slot")
+            ]
+            if missing_slots:
+                raise RuntimeError(
+                    "multitask endpoints were configured but rollout rows are "
+                    f"missing surface slots: rows={missing_slots[:8]}"
+                )
+            env_clients = [
+                init_env_client(
+                    self.agentgym_config,
+                    env_addr=env_addr_for_surface_slot(
+                        self.agentgym_config,
+                        handler.agentmemory_surface_slot,
+                    ),
+                )
+                for handler in rollout_handler_ls
+            ]
+        else:
+            routed_rows = [
+                index
+                for index, handler in enumerate(rollout_handler_ls)
+                if hasattr(handler, "agentmemory_surface_slot")
+            ]
+            if routed_rows:
+                raise RuntimeError(
+                    "multitask rollout rows require configured endpoints: "
+                    f"rows={routed_rows[:8]}"
+                )
+            env_clients = [
+                init_env_client(self.agentgym_config)
+                for _ in range(batch_size)
+            ]
         time.sleep(self.config.send_interval) # take a break before sendng request
         task_name = str(read_config(self.agentgym_config, "task_name", "")).lower()
         if task_name == "agentmemory" and rollout_context_policy(self.agentgym_config) == "latest_observation_only":

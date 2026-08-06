@@ -1424,7 +1424,7 @@ class RayPPOTrainer(object):
             sampler = StatefulProceduralStreamSampler(procedural_source)
             self.procedural_tasks_per_orbit = procedural_source.tasks_per_orbit
             self.procedural_stream_identity = procedural_source.training_identity(
-                server_metadata=self.train_dataset.env_client.metadata,
+                server_metadata=self.train_dataset.procedural_server_metadata,
                 train_batch_size=self.config.data.train_batch_size,
             )
         # use sampler for better ckpt resume
