@@ -11,6 +11,7 @@ from agentenv.envs.agentmemory import (
     FILESYSTEM_SANDBOX_FIELDS,
     FILESYSTEM_SANDBOX_SHARED_LIMIT_FIELDS,
     FilesystemAgentMemoryAdapter,
+    IntentClarificationFilesystemAgentMemoryAdapter,
     build_procedural_conversation_start,
 )
 
@@ -106,6 +107,10 @@ def filesystem_metadata():
             "source_pairing": "xor_lsb_within_orbit_v1",
             "tasks_per_orbit": 2,
             "workspace_prompt_family": "natural_attribute_chain_filesystem_v2",
+            "workspace_seed_contract": "none",
+            "workspace_evaluation_contract": (
+                "directional_counterfactual_separation_v1"
+            ),
             "workspace_intervention_control": {
                 "enabled": False,
                 "contract": (
@@ -223,6 +228,8 @@ def recency_override_filesystem_metadata():
                 "source_pairing",
                 "tasks_per_orbit",
                 "workspace_prompt_family",
+                "workspace_seed_contract",
+                "workspace_evaluation_contract",
                 "workspace_intervention_control",
                 "workspace_limits",
                 "workspace_sandbox",
@@ -354,6 +361,8 @@ def _filesystem_variant_metadata(
         "workspace_shell_enabled",
         "workspace_apply_patch_enabled",
         "workspace_host_path_exposed",
+        "workspace_seed_contract",
+        "workspace_evaluation_contract",
         "workspace_limits",
         "workspace_sandbox",
         "reward_contract",
@@ -388,6 +397,32 @@ def compositional_recall_filesystem_metadata():
     )
 
 
+def distractor_robustness_filesystem_metadata():
+    metadata = _filesystem_variant_metadata(
+        distractor_robustness_metadata(),
+        surface="agentmemory_webshop_distractor_robustness_filesystem_v2",
+        source_pairing="xor_distractor_condition_within_orbit_v1",
+        tasks_per_orbit=2,
+        prompt_family="distractor_robustness_filesystem_v2",
+        boundary_session_index=1,
+    )
+    metadata["workspace_seed_contract"] = (
+        "branch_conditioned_ordinary_profile_files_v1"
+    )
+    metadata["workspace_evaluation_contract"] = (
+        "paired_distractor_robustness_v1"
+    )
+    metadata["workspace_intervention_control"].update(
+        {
+            "allowed_arms": ["correct", "blank", "no_workspace"],
+            "source_state": (
+                "policy_authored_current_record_plus_branch_distractors"
+            ),
+        }
+    )
+    return metadata
+
+
 def negative_constraint_filesystem_metadata():
     return _filesystem_variant_metadata(
         negative_constraint_metadata(),
@@ -419,6 +454,18 @@ def intent_clarification_metadata():
         "ltm_inventory_visible": False,
         "training_ready": True,
     }
+    return metadata
+
+
+def intent_clarification_filesystem_metadata():
+    metadata = _filesystem_variant_metadata(
+        intent_clarification_metadata(),
+        surface="agentmemory_webshop_intent_clarification_filesystem_v2",
+        source_pairing="xor_lsb_within_orbit_v1",
+        tasks_per_orbit=2,
+        prompt_family="intent_clarification_filesystem_v2",
+        boundary_session_index=1,
+    )
     return metadata
 
 
@@ -1005,6 +1052,15 @@ class ProceduralAgentMemoryClientContractTest(unittest.TestCase):
     def test_new_filesystem_surfaces_use_surface_local_contracts(self) -> None:
         cases = (
             (
+                distractor_robustness_filesystem_metadata(),
+                "is_distractor_robustness",
+                (
+                    "harness-seeded ordinary profile notes",
+                    "untrusted background records",
+                    "policy-authored current record",
+                ),
+            ),
+            (
                 compositional_recall_filesystem_metadata(),
                 "is_compositional_recall",
                 (
@@ -1041,6 +1097,62 @@ class ProceduralAgentMemoryClientContractTest(unittest.TestCase):
         prompt = client.conversation_start[0]["value"]
         self.assertIn('ASK {"field":"..."}', prompt)
         self.assertIn("CLARIFY observation", prompt)
+
+    def test_intent_filesystem_surface_parses_ask_in_all_action_formats(self) -> None:
+        for action_format, raw in (
+            (
+                ActionFormat.REACT,
+                'Thought: clarify\n\nAction:\nASK {"field":"color"}',
+            ),
+            (
+                ActionFormat.FUNCTION_CALLING,
+                '{"thought":"clarify","function_name":"ask",'
+                '"arguments":{"field":"color"}}',
+            ),
+            (
+                ActionFormat.CODE_AS_ACTION,
+                '```python\n# clarify\nask(field="color")\n```',
+            ),
+        ):
+            with self.subTest(action_format=action_format):
+                client = self.create_client(
+                    intent_clarification_filesystem_metadata(),
+                    action_format=action_format,
+                )
+                self.assertTrue(client.is_filesystem)
+                self.assertTrue(client.is_intent_clarification)
+                self.assertIs(
+                    client.adapter_cls,
+                    IntentClarificationFilesystemAgentMemoryAdapter,
+                )
+                self.assertEqual(
+                    client.adapter_cls.action_parser(raw, action_format),
+                    'ASK {"field": "color"}',
+                )
+                prompt = client.conversation_start[0]["value"]
+                self.assertIn('ASK {"field":"..."}', prompt)
+                self.assertNotIn("ltm_inventory_mode", client.metadata)
+
+    def test_regular_filesystem_surface_rejects_ask(self) -> None:
+        client = self.create_client(filesystem_metadata())
+        self.assertEqual(
+            client.adapter_cls.action_parser(
+                'Thought: x\n\nAction:\nASK {"field":"color"}',
+                ActionFormat.REACT,
+            ),
+            "",
+        )
+        with self.assertRaises(ValueError):
+            client.adapter_cls.action_parser(
+                '{"thought":"x","function_name":"ask",'
+                '"arguments":{"field":"color"}}',
+                ActionFormat.FUNCTION_CALLING,
+            )
+        with self.assertRaises(ValueError):
+            client.adapter_cls.action_parser(
+                '```python\nask(field="color")\n```',
+                ActionFormat.CODE_AS_ACTION,
+            )
 
     def test_selective_surface_uses_decide_then_use_or_abstain_sop(self) -> None:
         client = self.create_client(selective_memory_use_metadata())

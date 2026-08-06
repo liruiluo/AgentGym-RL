@@ -109,6 +109,10 @@ def filesystem_server_metadata(*, generator_seed: int = 233) -> dict:
             "source_pairing": "xor_lsb_within_orbit_v1",
             "tasks_per_orbit": 2,
             "workspace_prompt_family": "natural_attribute_chain_filesystem_v2",
+            "workspace_seed_contract": "none",
+            "workspace_evaluation_contract": (
+                "directional_counterfactual_separation_v1"
+            ),
             "workspace_intervention_control": {
                 "allowed_arms": [
                     "correct",
@@ -140,7 +144,8 @@ def latent_preference_server_metadata(*, generator_seed: int = 233) -> dict:
         "supporting_evidence_counts": [1, 2, 3],
         "resolution_step": 1,
         "preference_hypothesis": "one_value_on_one_natural_attribute_axis",
-        "counterfactual_pairing": True,
+        "counterfactual_pairing": False,
+        "answer_preserving_robustness_pairing": True,
         "application_observation_identity": True,
         "application_target_flip": True,
         "purchase_receipt_asin_verification": True,
@@ -194,6 +199,7 @@ def recency_override_filesystem_server_metadata(
                 "source_pairing",
                 "tasks_per_orbit",
                 "workspace_prompt_family",
+                "workspace_evaluation_contract",
                 "workspace_intervention_control",
                 "reward_contract",
             )
@@ -228,6 +234,54 @@ def distractor_robustness_server_metadata(*, generator_seed: int = 233) -> dict:
         "strict_top1_certified": True,
         "purchase_receipt_asin_verification": True,
     }
+    return metadata
+
+
+def distractor_robustness_filesystem_server_metadata(
+    *, generator_seed: int = 233
+) -> dict:
+    metadata = distractor_robustness_server_metadata(generator_seed=generator_seed)
+    filesystem = filesystem_server_metadata(generator_seed=generator_seed)
+    for key in (
+        "workspace_surface",
+        "workspace_tool_contract",
+        "workspace_tool_ops",
+        "workspace_shell_enabled",
+        "workspace_apply_patch_enabled",
+        "workspace_host_path_exposed",
+        "source_pairing",
+        "tasks_per_orbit",
+        "workspace_prompt_family",
+        "workspace_seed_contract",
+        "workspace_evaluation_contract",
+        "workspace_intervention_control",
+        "reward_contract",
+    ):
+        metadata[key] = deepcopy(filesystem[key])
+    metadata.update(
+        {
+            "surface": "agentmemory_webshop_distractor_robustness_filesystem_v2",
+            "memory_prompt_mode": "natural_filesystem",
+            "source_pairing": "xor_distractor_condition_within_orbit_v1",
+            "workspace_prompt_family": "distractor_robustness_filesystem_v2",
+            "workspace_seed_contract": (
+                "branch_conditioned_ordinary_profile_files_v1"
+            ),
+            "workspace_intervention_control": {
+                "allowed_arms": [
+                    "correct",
+                    "blank",
+                    "no_workspace",
+                ],
+                "boundary_session_index": 1,
+                "source_state": (
+                    "policy_authored_current_record_plus_branch_distractors"
+                ),
+                "hidden_answer_injection": False,
+            },
+            "workspace_evaluation_contract": "paired_distractor_robustness_v1",
+        }
+    )
     return metadata
 
 
@@ -306,6 +360,9 @@ def compositional_recall_filesystem_server_metadata(
                 "source_state": "policy_authored_workspace_only",
                 "hidden_answer_injection": False,
             },
+            "workspace_evaluation_contract": (
+                "directional_counterfactual_separation_v1"
+            ),
         }
     )
     return metadata
@@ -356,6 +413,52 @@ def selective_memory_use_server_metadata(*, generator_seed: int = 233) -> dict:
     }
     provider["reseeded_stream"].pop(
         "counterfactual_pair_never_crosses_seed_epoch"
+    )
+    return metadata
+
+
+def selective_memory_use_filesystem_server_metadata(
+    *, generator_seed: int = 233
+) -> dict:
+    metadata = selective_memory_use_server_metadata(generator_seed=generator_seed)
+    filesystem = filesystem_server_metadata(generator_seed=generator_seed)
+    for key in (
+        "workspace_surface",
+        "workspace_tool_contract",
+        "workspace_tool_ops",
+        "workspace_shell_enabled",
+        "workspace_apply_patch_enabled",
+        "workspace_host_path_exposed",
+        "reward_contract",
+    ):
+        metadata[key] = deepcopy(filesystem[key])
+    metadata.update(
+        {
+            "surface": "agentmemory_webshop_selective_memory_use_filesystem_v2",
+            "memory_prompt_mode": "natural_filesystem",
+            "source_pairing": "xor_preference_coordinate_within_factorial_v1",
+            "tasks_per_orbit": 4,
+            "workspace_prompt_family": "selective_memory_use_filesystem_v2",
+            "workspace_seed_contract": (
+                "branch_conditioned_initial_profile_files_v1"
+            ),
+            "workspace_intervention_control": {
+                "allowed_arms": [
+                    "correct",
+                    "blank",
+                    "swapped",
+                    "no_workspace",
+                ],
+                "boundary_session_index": 1,
+                "source_state": (
+                    "harness_seeded_branch_profile_with_optional_policy_edits"
+                ),
+                "hidden_answer_injection": False,
+            },
+            "workspace_evaluation_contract": (
+                "selective_required_separation_not_required_invariance_v1"
+            ),
+        }
     )
     return metadata
 
@@ -432,6 +535,9 @@ def negative_constraint_filesystem_server_metadata(
                 "source_state": "policy_authored_workspace_only",
                 "hidden_answer_injection": False,
             },
+            "workspace_evaluation_contract": (
+                "directional_counterfactual_separation_v1"
+            ),
         }
     )
     return metadata
@@ -593,6 +699,9 @@ class ProceduralIndexSourceTests(unittest.TestCase):
         source.validate_server_metadata(latent_preference_server_metadata())
         source.validate_server_metadata(recency_override_server_metadata())
         source.validate_server_metadata(recency_override_filesystem_server_metadata())
+        source.validate_server_metadata(
+            distractor_robustness_filesystem_server_metadata()
+        )
         source.validate_server_metadata(distractor_robustness_server_metadata())
         source.validate_server_metadata(intent_clarification_server_metadata())
         compositional_source = ProceduralIndexSource(
@@ -608,6 +717,9 @@ class ProceduralIndexSourceTests(unittest.TestCase):
         )
         compositional_source.validate_server_metadata(
             selective_memory_use_server_metadata()
+        )
+        compositional_source.validate_server_metadata(
+            selective_memory_use_filesystem_server_metadata()
         )
         negative_source = ProceduralIndexSource(
             task_count=72,
@@ -702,6 +814,27 @@ class ProceduralIndexSourceTests(unittest.TestCase):
         compositional_filesystem["source_pairing"] = "cyclic_next_within_orbit_v1"
         with self.assertRaisesRegex(ProceduralIndexError, "source-pairing"):
             compositional_source.validate_server_metadata(compositional_filesystem)
+
+        selective_filesystem = selective_memory_use_filesystem_server_metadata()
+        compositional_source.validate_server_metadata(selective_filesystem)
+        for field, value in (
+            ("workspace_seed_contract", "none"),
+            (
+                "workspace_intervention_control.source_state",
+                "policy_authored_workspace_only",
+            ),
+        ):
+            with self.subTest(selective_tamper=field):
+                tampered = deepcopy(selective_filesystem)
+                if field == "workspace_seed_contract":
+                    tampered[field] = value
+                else:
+                    tampered["workspace_intervention_control"]["source_state"] = value
+                with self.assertRaisesRegex(
+                    ProceduralIndexError,
+                    "intervention-boundary",
+                ):
+                    compositional_source.validate_server_metadata(tampered)
 
         negative_filesystem = negative_constraint_filesystem_server_metadata()
         negative_source = ProceduralIndexSource(

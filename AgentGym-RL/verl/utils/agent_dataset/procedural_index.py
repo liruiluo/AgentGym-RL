@@ -25,8 +25,14 @@ NEGATIVE_CONSTRAINT_SURFACE = (
 FILESYSTEM_SURFACE = (
     "agentmemory_webshop_procedural_natural_chain_filesystem_v2"
 )
+LATENT_PREFERENCE_FILESYSTEM_SURFACE = (
+    "agentmemory_webshop_latent_preference_filesystem_v2"
+)
 RECENCY_OVERRIDE_FILESYSTEM_SURFACE = (
     "agentmemory_webshop_recency_override_filesystem_v2"
+)
+DISTRACTOR_ROBUSTNESS_FILESYSTEM_SURFACE = (
+    "agentmemory_webshop_distractor_robustness_filesystem_v2"
 )
 COMPOSITIONAL_RECALL_FILESYSTEM_SURFACE = (
     "agentmemory_webshop_compositional_recall_filesystem_v2"
@@ -34,11 +40,21 @@ COMPOSITIONAL_RECALL_FILESYSTEM_SURFACE = (
 NEGATIVE_CONSTRAINT_FILESYSTEM_SURFACE = (
     "agentmemory_webshop_negative_constraint_filesystem_v2"
 )
+INTENT_CLARIFICATION_FILESYSTEM_SURFACE = (
+    "agentmemory_webshop_intent_clarification_filesystem_v2"
+)
+SELECTIVE_MEMORY_USE_FILESYSTEM_SURFACE = (
+    "agentmemory_webshop_selective_memory_use_filesystem_v2"
+)
 FILESYSTEM_SURFACES = frozenset(
     {
         FILESYSTEM_SURFACE,
+        LATENT_PREFERENCE_FILESYSTEM_SURFACE,
         RECENCY_OVERRIDE_FILESYSTEM_SURFACE,
+        DISTRACTOR_ROBUSTNESS_FILESYSTEM_SURFACE,
         COMPOSITIONAL_RECALL_FILESYSTEM_SURFACE,
+        INTENT_CLARIFICATION_FILESYSTEM_SURFACE,
+        SELECTIVE_MEMORY_USE_FILESYSTEM_SURFACE,
         NEGATIVE_CONSTRAINT_FILESYSTEM_SURFACE,
     }
 )
@@ -47,21 +63,59 @@ FILESYSTEM_SURFACE_CONTRACTS = {
         "xor_lsb_within_orbit_v1",
         1,
         "natural_attribute_chain_filesystem_v2",
+        "directional_counterfactual_separation_v1",
+    ),
+    LATENT_PREFERENCE_FILESYSTEM_SURFACE: (
+        "xor_lsb_within_orbit_v1",
+        1,
+        "latent_preference_filesystem_v2",
+        "directional_counterfactual_separation_v1",
     ),
     RECENCY_OVERRIDE_FILESYSTEM_SURFACE: (
         "xor_lsb_within_orbit_v1",
         3,
         "recency_override_filesystem_v2",
+        "directional_counterfactual_separation_v1",
+    ),
+    DISTRACTOR_ROBUSTNESS_FILESYSTEM_SURFACE: (
+        "xor_distractor_condition_within_orbit_v1",
+        1,
+        "distractor_robustness_filesystem_v2",
+        "paired_distractor_robustness_v1",
     ),
     COMPOSITIONAL_RECALL_FILESYSTEM_SURFACE: (
         "xor_lsb_within_orbit_v1",
         2,
         "compositional_recall_filesystem_v2",
+        "directional_counterfactual_separation_v1",
     ),
     NEGATIVE_CONSTRAINT_FILESYSTEM_SURFACE: (
         "cyclic_next_within_orbit_v1",
         1,
         "negative_constraint_filesystem_v2",
+        "directional_counterfactual_separation_v1",
+    ),
+    INTENT_CLARIFICATION_FILESYSTEM_SURFACE: (
+        "xor_lsb_within_orbit_v1",
+        1,
+        "intent_clarification_filesystem_v2",
+        "directional_counterfactual_separation_v1",
+    ),
+    SELECTIVE_MEMORY_USE_FILESYSTEM_SURFACE: (
+        "xor_preference_coordinate_within_factorial_v1",
+        1,
+        "selective_memory_use_filesystem_v2",
+        "selective_required_separation_not_required_invariance_v1",
+    ),
+}
+FILESYSTEM_SEEDED_WORKSPACE_CONTRACTS = {
+    DISTRACTOR_ROBUSTNESS_FILESYSTEM_SURFACE: (
+        "policy_authored_current_record_plus_branch_distractors",
+        "branch_conditioned_ordinary_profile_files_v1",
+    ),
+    SELECTIVE_MEMORY_USE_FILESYSTEM_SURFACE: (
+        "harness_seeded_branch_profile_with_optional_policy_edits",
+        "branch_conditioned_initial_profile_files_v1",
     ),
 }
 SUPPORTED_SERVER_SURFACE_CONTRACTS = {
@@ -77,6 +131,10 @@ SUPPORTED_SERVER_SURFACE_CONTRACTS = {
         "agentmemory_verified_recency_override_provider_v1",
         2,
     ),
+    DISTRACTOR_ROBUSTNESS_FILESYSTEM_SURFACE: (
+        "agentmemory_verified_distractor_robustness_provider_v1",
+        2,
+    ),
     COMPOSITIONAL_RECALL_FILESYSTEM_SURFACE: (
         "agentmemory_verified_compositional_recall_provider_v1",
         4,
@@ -84,6 +142,18 @@ SUPPORTED_SERVER_SURFACE_CONTRACTS = {
     NEGATIVE_CONSTRAINT_FILESYSTEM_SURFACE: (
         "agentmemory_verified_negative_constraint_provider_v1",
         3,
+    ),
+    LATENT_PREFERENCE_FILESYSTEM_SURFACE: (
+        "agentmemory_verified_latent_preference_provider_v1",
+        2,
+    ),
+    INTENT_CLARIFICATION_FILESYSTEM_SURFACE: (
+        "agentmemory_verified_intent_clarification_provider_v1",
+        2,
+    ),
+    SELECTIVE_MEMORY_USE_FILESYSTEM_SURFACE: (
+        "agentmemory_verified_selective_memory_use_provider_v1",
+        4,
     ),
     "agentmemory_webshop_latent_preference_train_v1": (
         "agentmemory_verified_latent_preference_provider_v1",
@@ -503,7 +573,7 @@ class ProceduralIndexSource:
         if provider.get("native_click_action_uses_asin_handle") is not True:
             raise ProceduralIndexError("server no longer uses native click[ASIN]")
         if surface in FILESYSTEM_SURFACES:
-            source_pairing, boundary, prompt_family = (
+            source_pairing, boundary, prompt_family, evaluation_contract = (
                 FILESYSTEM_SURFACE_CONTRACTS[surface]
             )
             if metadata.get("source_pairing") != source_pairing:
@@ -518,17 +588,34 @@ class ProceduralIndexSource:
                 raise ProceduralIndexError(
                     "filesystem prompt-family metadata disagrees"
                 )
+            if (
+                metadata.get("workspace_evaluation_contract")
+                != evaluation_contract
+            ):
+                raise ProceduralIndexError(
+                    "filesystem evaluation-contract metadata disagrees"
+                )
             control = metadata.get("workspace_intervention_control")
             expected_arms = ["correct", "blank", "swapped", "no_workspace"]
-            if surface == RECENCY_OVERRIDE_FILESYSTEM_SURFACE:
+            if surface == DISTRACTOR_ROBUSTNESS_FILESYSTEM_SURFACE:
+                expected_arms = ["correct", "blank", "no_workspace"]
+            elif surface == RECENCY_OVERRIDE_FILESYSTEM_SURFACE:
                 expected_arms.insert(3, "stale")
+            expected_source_state, expected_seed_contract = (
+                FILESYSTEM_SEEDED_WORKSPACE_CONTRACTS.get(
+                    surface,
+                    ("policy_authored_workspace_only", "none"),
+                )
+            )
             if (
                 not isinstance(control, Mapping)
                 or control.get("allowed_arms") != expected_arms
                 or control.get("boundary_session_index") != boundary
                 or control.get("source_state")
-                != "policy_authored_workspace_only"
+                != expected_source_state
                 or control.get("hidden_answer_injection") is not False
+                or metadata.get("workspace_seed_contract", "none")
+                != expected_seed_contract
             ):
                 raise ProceduralIndexError(
                     "filesystem intervention-boundary metadata disagrees"

@@ -38,11 +38,23 @@ WEBSHOP_V2_SURFACE = "memoryarena_webshop_native_v1"
 FILESYSTEM_WEBSHOP_V2_SURFACE = (
     "agentmemory_webshop_procedural_natural_chain_filesystem_v2"
 )
+LATENT_PREFERENCE_FILESYSTEM_WEBSHOP_V2_SURFACE = (
+    "agentmemory_webshop_latent_preference_filesystem_v2"
+)
 RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE = (
     "agentmemory_webshop_recency_override_filesystem_v2"
 )
+DISTRACTOR_ROBUSTNESS_FILESYSTEM_WEBSHOP_V2_SURFACE = (
+    "agentmemory_webshop_distractor_robustness_filesystem_v2"
+)
 COMPOSITIONAL_RECALL_FILESYSTEM_WEBSHOP_V2_SURFACE = (
     "agentmemory_webshop_compositional_recall_filesystem_v2"
+)
+INTENT_CLARIFICATION_FILESYSTEM_WEBSHOP_V2_SURFACE = (
+    "agentmemory_webshop_intent_clarification_filesystem_v2"
+)
+SELECTIVE_MEMORY_USE_FILESYSTEM_WEBSHOP_V2_SURFACE = (
+    "agentmemory_webshop_selective_memory_use_filesystem_v2"
 )
 NEGATIVE_CONSTRAINT_FILESYSTEM_WEBSHOP_V2_SURFACE = (
     "agentmemory_webshop_negative_constraint_filesystem_v2"
@@ -50,13 +62,18 @@ NEGATIVE_CONSTRAINT_FILESYSTEM_WEBSHOP_V2_SURFACE = (
 FILESYSTEM_WEBSHOP_V2_SURFACES = frozenset(
     {
         FILESYSTEM_WEBSHOP_V2_SURFACE,
+        LATENT_PREFERENCE_FILESYSTEM_WEBSHOP_V2_SURFACE,
         RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE,
+        DISTRACTOR_ROBUSTNESS_FILESYSTEM_WEBSHOP_V2_SURFACE,
         COMPOSITIONAL_RECALL_FILESYSTEM_WEBSHOP_V2_SURFACE,
+        INTENT_CLARIFICATION_FILESYSTEM_WEBSHOP_V2_SURFACE,
+        SELECTIVE_MEMORY_USE_FILESYSTEM_WEBSHOP_V2_SURFACE,
         NEGATIVE_CONSTRAINT_FILESYSTEM_WEBSHOP_V2_SURFACE,
     }
 )
 FILESYSTEM_TOOL_OPS = ("SHELL_COMMAND", "APPLY_PATCH")
 FILESYSTEM_CAUSAL_ARMS = ("correct", "blank", "swapped", "no_workspace")
+DISTRACTOR_FILESYSTEM_CAUSAL_ARMS = ("correct", "blank", "no_workspace")
 RECENCY_FILESYSTEM_CAUSAL_ARMS = (
     "correct",
     "blank",
@@ -69,14 +86,24 @@ FILESYSTEM_CAUSAL_ARMS_BY_SURFACE = {
     RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE: (
         RECENCY_FILESYSTEM_CAUSAL_ARMS
     ),
+    DISTRACTOR_ROBUSTNESS_FILESYSTEM_WEBSHOP_V2_SURFACE: (
+        DISTRACTOR_FILESYSTEM_CAUSAL_ARMS
+    ),
     COMPOSITIONAL_RECALL_FILESYSTEM_WEBSHOP_V2_SURFACE: FILESYSTEM_CAUSAL_ARMS,
     NEGATIVE_CONSTRAINT_FILESYSTEM_WEBSHOP_V2_SURFACE: FILESYSTEM_CAUSAL_ARMS,
+    LATENT_PREFERENCE_FILESYSTEM_WEBSHOP_V2_SURFACE: FILESYSTEM_CAUSAL_ARMS,
+    INTENT_CLARIFICATION_FILESYSTEM_WEBSHOP_V2_SURFACE: FILESYSTEM_CAUSAL_ARMS,
+    SELECTIVE_MEMORY_USE_FILESYSTEM_WEBSHOP_V2_SURFACE: FILESYSTEM_CAUSAL_ARMS,
 }
 FILESYSTEM_INTERVENTION_BOUNDARY_BY_SURFACE = {
     FILESYSTEM_WEBSHOP_V2_SURFACE: 1,
     RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE: 3,
+    DISTRACTOR_ROBUSTNESS_FILESYSTEM_WEBSHOP_V2_SURFACE: 1,
     COMPOSITIONAL_RECALL_FILESYSTEM_WEBSHOP_V2_SURFACE: 2,
     NEGATIVE_CONSTRAINT_FILESYSTEM_WEBSHOP_V2_SURFACE: 1,
+    LATENT_PREFERENCE_FILESYSTEM_WEBSHOP_V2_SURFACE: 1,
+    INTENT_CLARIFICATION_FILESYSTEM_WEBSHOP_V2_SURFACE: 1,
+    SELECTIVE_MEMORY_USE_FILESYSTEM_WEBSHOP_V2_SURFACE: 1,
 }
 FILESYSTEM_SURFACE_CONTRACTS = {
     FILESYSTEM_WEBSHOP_V2_SURFACE: {
@@ -85,6 +112,19 @@ FILESYSTEM_SURFACE_CONTRACTS = {
         "candidate_count_per_phase": 2,
         "source_pairing": "xor_lsb_within_orbit_v1",
         "prompt_family": "natural_attribute_chain_filesystem_v2",
+        "source_state": "policy_authored_workspace_only",
+        "seed_contract": "none",
+        "evaluation_contract": "directional_counterfactual_separation_v1",
+    },
+    LATENT_PREFERENCE_FILESYSTEM_WEBSHOP_V2_SURFACE: {
+        "provider_schema": "agentmemory_verified_latent_preference_provider_v1",
+        "tasks_per_orbit": 2,
+        "candidate_count_per_phase": 2,
+        "source_pairing": "xor_lsb_within_orbit_v1",
+        "prompt_family": "latent_preference_filesystem_v2",
+        "source_state": "policy_authored_workspace_only",
+        "seed_contract": "none",
+        "evaluation_contract": "directional_counterfactual_separation_v1",
     },
     RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE: {
         "provider_schema": "agentmemory_verified_recency_override_provider_v1",
@@ -92,6 +132,19 @@ FILESYSTEM_SURFACE_CONTRACTS = {
         "candidate_count_per_phase": 2,
         "source_pairing": "xor_lsb_within_orbit_v1",
         "prompt_family": "recency_override_filesystem_v2",
+        "source_state": "policy_authored_workspace_only",
+        "seed_contract": "none",
+        "evaluation_contract": "directional_counterfactual_separation_v1",
+    },
+    DISTRACTOR_ROBUSTNESS_FILESYSTEM_WEBSHOP_V2_SURFACE: {
+        "provider_schema": "agentmemory_verified_distractor_robustness_provider_v1",
+        "tasks_per_orbit": 2,
+        "candidate_count_per_phase": 2,
+        "source_pairing": "xor_distractor_condition_within_orbit_v1",
+        "prompt_family": "distractor_robustness_filesystem_v2",
+        "source_state": "policy_authored_current_record_plus_branch_distractors",
+        "seed_contract": "branch_conditioned_ordinary_profile_files_v1",
+        "evaluation_contract": "paired_distractor_robustness_v1",
     },
     COMPOSITIONAL_RECALL_FILESYSTEM_WEBSHOP_V2_SURFACE: {
         "provider_schema": "agentmemory_verified_compositional_recall_provider_v1",
@@ -99,6 +152,31 @@ FILESYSTEM_SURFACE_CONTRACTS = {
         "candidate_count_per_phase": 2,
         "source_pairing": "xor_lsb_within_orbit_v1",
         "prompt_family": "compositional_recall_filesystem_v2",
+        "source_state": "policy_authored_workspace_only",
+        "seed_contract": "none",
+        "evaluation_contract": "directional_counterfactual_separation_v1",
+    },
+    INTENT_CLARIFICATION_FILESYSTEM_WEBSHOP_V2_SURFACE: {
+        "provider_schema": "agentmemory_verified_intent_clarification_provider_v1",
+        "tasks_per_orbit": 2,
+        "candidate_count_per_phase": 2,
+        "source_pairing": "xor_lsb_within_orbit_v1",
+        "prompt_family": "intent_clarification_filesystem_v2",
+        "source_state": "policy_authored_workspace_only",
+        "seed_contract": "none",
+        "evaluation_contract": "directional_counterfactual_separation_v1",
+    },
+    SELECTIVE_MEMORY_USE_FILESYSTEM_WEBSHOP_V2_SURFACE: {
+        "provider_schema": "agentmemory_verified_selective_memory_use_provider_v1",
+        "tasks_per_orbit": 4,
+        "candidate_count_per_phase": 2,
+        "source_pairing": "xor_preference_coordinate_within_factorial_v1",
+        "prompt_family": "selective_memory_use_filesystem_v2",
+        "source_state": "harness_seeded_branch_profile_with_optional_policy_edits",
+        "seed_contract": "branch_conditioned_initial_profile_files_v1",
+        "evaluation_contract": (
+            "selective_required_separation_not_required_invariance_v1"
+        ),
     },
     NEGATIVE_CONSTRAINT_FILESYSTEM_WEBSHOP_V2_SURFACE: {
         "provider_schema": "agentmemory_verified_negative_constraint_provider_v1",
@@ -106,6 +184,9 @@ FILESYSTEM_SURFACE_CONTRACTS = {
         "candidate_count_per_phase": 3,
         "source_pairing": "cyclic_next_within_orbit_v1",
         "prompt_family": "negative_constraint_filesystem_v2",
+        "source_state": "policy_authored_workspace_only",
+        "seed_contract": "none",
+        "evaluation_contract": "directional_counterfactual_separation_v1",
     },
 }
 FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS = (
@@ -184,6 +265,30 @@ RECENCY_FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS = (
     "only `Done!` proves that the patch succeeded",
     "No concrete preference value or filename is demonstrated here",
 )
+DISTRACTOR_FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS = (
+    'shell_command {"command":"rg -n pattern ."',
+    "apply_patch is followed on the next line",
+    "*** Begin Patch",
+    "*** End Patch",
+    "workspace persists across shopping sessions within this episode",
+    "Workspace actions have zero task reward",
+    "has no network",
+    "no host-path access",
+    "no dedicated memory API",
+    "workspace may start with harness-seeded ordinary profile notes",
+    "background records, not policy actions, hidden answers",
+    "beginning with `Current preference:`",
+    "copy that exact line verbatim",
+    "do not rewrite or delete the seeded notes",
+    "rg --hidden -n -i '(current|preference|profile)' .",
+    "Ignore superseded history, another customer's record",
+    "Do not rely on filenames, directory order, or the number of files",
+    "exact policy-authored `Current preference:` line",
+    "never infer the missing value from the current choice table",
+    "Create the current record with exactly five physical lines",
+    "Only `Done!` proves a patch succeeded",
+    "No concrete customer, axis, preference value, or filename",
+)
 COMPOSITIONAL_FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS = (
     'shell_command {"command":"rg -n pattern ."',
     "apply_patch is followed on the next line",
@@ -225,16 +330,60 @@ NEGATIVE_FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS = (
     "Only `Done!` proves the patch succeeded",
     "No concrete axis, forbidden value, or filename",
 )
+FILESYSTEM_COMMON_PROMPT_REQUIRED_FRAGMENTS = (
+    'shell_command {"command":"rg -n pattern ."',
+    "apply_patch is followed on the next line",
+    "workspace persists across shopping sessions within this episode",
+    "Workspace actions have zero task reward",
+    "has no network",
+    "no host-path access",
+    "no dedicated memory API",
+)
+LATENT_PREFERENCE_FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS = (
+    *FILESYSTEM_COMMON_PROMPT_REQUIRED_FRAGMENTS,
+    "confirmed choice as preference evidence",
+    "customer-profile memory",
+    "preference axis",
+    "inferred value",
+    "preserve confirmed preference evidence in an ordinary workspace file",
+    "apply the retrieved preference in later application sessions",
+)
+INTENT_CLARIFICATION_FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS = (
+    *FILESYSTEM_COMMON_PROMPT_REQUIRED_FRAGMENTS,
+    'ASK {"field":"..."}',
+    "ASK is available only in the first shopping session",
+    "CLARIFY observation",
+    "store the clarification in an ordinary workspace file",
+)
+SELECTIVE_MEMORY_USE_FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS = (
+    *FILESYSTEM_COMMON_PROMPT_REQUIRED_FRAGMENTS,
+    "workspace may start with one branch-conditioned ordinary profile file",
+    "first decide whether the current request already states every attribute needed",
+    "do not read the profile merely by habit",
+    "read the profile when the current request omits the preference",
+)
 FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS_BY_SURFACE = {
     FILESYSTEM_WEBSHOP_V2_SURFACE: FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS,
     RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE: (
         RECENCY_FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS
+    ),
+    DISTRACTOR_ROBUSTNESS_FILESYSTEM_WEBSHOP_V2_SURFACE: (
+        DISTRACTOR_FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS
     ),
     COMPOSITIONAL_RECALL_FILESYSTEM_WEBSHOP_V2_SURFACE: (
         COMPOSITIONAL_FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS
     ),
     NEGATIVE_CONSTRAINT_FILESYSTEM_WEBSHOP_V2_SURFACE: (
         NEGATIVE_FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS
+    ),
+    LATENT_PREFERENCE_FILESYSTEM_WEBSHOP_V2_SURFACE: (
+        LATENT_PREFERENCE_FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS
+    ),
+    INTENT_CLARIFICATION_FILESYSTEM_WEBSHOP_V2_SURFACE: (
+        INTENT_CLARIFICATION_FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS
+    ),
+    SELECTIVE_MEMORY_USE_FILESYSTEM_WEBSHOP_V2_SURFACE: (
+        SELECTIVE_MEMORY_USE_FILESYSTEM_PROMPT_REQUIRED_FRAGMENTS
     ),
 }
 FILESYSTEM_PROMPT_FORBIDDEN_FRAGMENTS = (
@@ -907,8 +1056,18 @@ EVIDENCE_SURFACE_REGISTRY = {
         "metric_mode": "filesystem_behavior_v2",
         "paper_macro_eligible": False,
     },
+    LATENT_PREFERENCE_FILESYSTEM_WEBSHOP_V2_SURFACE: {
+        "variant": "latent_preference_filesystem_v2",
+        "metric_mode": "filesystem_behavior_v2",
+        "paper_macro_eligible": False,
+    },
     RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE: {
         "variant": "recency_override_filesystem_v2",
+        "metric_mode": "filesystem_behavior_v2",
+        "paper_macro_eligible": False,
+    },
+    DISTRACTOR_ROBUSTNESS_FILESYSTEM_WEBSHOP_V2_SURFACE: {
+        "variant": "distractor_robustness_filesystem_v2",
         "metric_mode": "filesystem_behavior_v2",
         "paper_macro_eligible": False,
     },
@@ -919,6 +1078,16 @@ EVIDENCE_SURFACE_REGISTRY = {
     },
     NEGATIVE_CONSTRAINT_FILESYSTEM_WEBSHOP_V2_SURFACE: {
         "variant": "negative_constraint_filesystem_v2",
+        "metric_mode": "filesystem_behavior_v2",
+        "paper_macro_eligible": False,
+    },
+    INTENT_CLARIFICATION_FILESYSTEM_WEBSHOP_V2_SURFACE: {
+        "variant": "intent_clarification_filesystem_v2",
+        "metric_mode": "filesystem_behavior_v2",
+        "paper_macro_eligible": False,
+    },
+    SELECTIVE_MEMORY_USE_FILESYSTEM_WEBSHOP_V2_SURFACE: {
+        "variant": "selective_memory_use_filesystem_v2",
         "metric_mode": "filesystem_behavior_v2",
         "paper_macro_eligible": False,
     },
@@ -991,6 +1160,11 @@ def _load_legacy_webshop_system_prompt(
                         "AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NATURAL_FILESYSTEM"
                     ),
                 },
+                LATENT_PREFERENCE_FILESYSTEM_WEBSHOP_V2_SURFACE: {
+                    "no_thinking": "AGENTMEMORY_ACTION_SYSTEM_PROMPT_LATENT_FILESYSTEM",
+                    "thinking": "AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_LATENT_FILESYSTEM",
+                    "reasoning": "AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_LATENT_FILESYSTEM",
+                },
                 RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE: {
                     "no_thinking": (
                         "AGENTMEMORY_ACTION_SYSTEM_PROMPT_RECENCY_FILESYSTEM"
@@ -1000,6 +1174,17 @@ def _load_legacy_webshop_system_prompt(
                     ),
                     "reasoning": (
                         "AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_RECENCY_FILESYSTEM"
+                    ),
+                },
+                DISTRACTOR_ROBUSTNESS_FILESYSTEM_WEBSHOP_V2_SURFACE: {
+                    "no_thinking": (
+                        "AGENTMEMORY_ACTION_SYSTEM_PROMPT_DISTRACTOR_FILESYSTEM"
+                    ),
+                    "thinking": (
+                        "AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_DISTRACTOR_FILESYSTEM"
+                    ),
+                    "reasoning": (
+                        "AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_DISTRACTOR_FILESYSTEM"
                     ),
                 },
                 COMPOSITIONAL_RECALL_FILESYSTEM_WEBSHOP_V2_SURFACE: {
@@ -1012,6 +1197,16 @@ def _load_legacy_webshop_system_prompt(
                     "reasoning": (
                         "AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_COMPOSITIONAL_FILESYSTEM"
                     ),
+                },
+                INTENT_CLARIFICATION_FILESYSTEM_WEBSHOP_V2_SURFACE: {
+                    "no_thinking": "AGENTMEMORY_ACTION_SYSTEM_PROMPT_INTENT_FILESYSTEM",
+                    "thinking": "AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_INTENT_FILESYSTEM",
+                    "reasoning": "AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_INTENT_FILESYSTEM",
+                },
+                SELECTIVE_MEMORY_USE_FILESYSTEM_WEBSHOP_V2_SURFACE: {
+                    "no_thinking": "AGENTMEMORY_ACTION_SYSTEM_PROMPT_SELECTIVE_FILESYSTEM",
+                    "thinking": "AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_SELECTIVE_FILESYSTEM",
+                    "reasoning": "AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_SELECTIVE_FILESYSTEM",
                 },
                 NEGATIVE_CONSTRAINT_FILESYSTEM_WEBSHOP_V2_SURFACE: {
                     "no_thinking": (
@@ -1090,6 +1285,26 @@ NEGATIVE_FILESYSTEM_WEBSHOP_SYSTEM_PROMPT = _load_legacy_webshop_system_prompt(
     memory_prompt_mode="natural_filesystem",
     surface=NEGATIVE_CONSTRAINT_FILESYSTEM_WEBSHOP_V2_SURFACE,
 )
+DISTRACTOR_FILESYSTEM_WEBSHOP_SYSTEM_PROMPT = _load_legacy_webshop_system_prompt(
+    ltm_inventory_mode="hidden",
+    memory_prompt_mode="natural_filesystem",
+    surface=DISTRACTOR_ROBUSTNESS_FILESYSTEM_WEBSHOP_V2_SURFACE,
+)
+LATENT_FILESYSTEM_WEBSHOP_SYSTEM_PROMPT = _load_legacy_webshop_system_prompt(
+    ltm_inventory_mode="hidden",
+    memory_prompt_mode="natural_filesystem",
+    surface=LATENT_PREFERENCE_FILESYSTEM_WEBSHOP_V2_SURFACE,
+)
+INTENT_FILESYSTEM_WEBSHOP_SYSTEM_PROMPT = _load_legacy_webshop_system_prompt(
+    ltm_inventory_mode="hidden",
+    memory_prompt_mode="natural_filesystem",
+    surface=INTENT_CLARIFICATION_FILESYSTEM_WEBSHOP_V2_SURFACE,
+)
+SELECTIVE_FILESYSTEM_WEBSHOP_SYSTEM_PROMPT = _load_legacy_webshop_system_prompt(
+    ltm_inventory_mode="hidden",
+    memory_prompt_mode="natural_filesystem",
+    surface=SELECTIVE_MEMORY_USE_FILESYSTEM_WEBSHOP_V2_SURFACE,
+)
 FILESYSTEM_WEBSHOP_PROMPT_PAIRS = {
     _load_legacy_webshop_system_prompt(
         ltm_inventory_mode="hidden",
@@ -1108,8 +1323,12 @@ FILESYSTEM_WEBSHOP_PROMPT_PAIRS = {
 }
 for _filesystem_surface in (
     RECENCY_OVERRIDE_FILESYSTEM_WEBSHOP_V2_SURFACE,
+    DISTRACTOR_ROBUSTNESS_FILESYSTEM_WEBSHOP_V2_SURFACE,
     COMPOSITIONAL_RECALL_FILESYSTEM_WEBSHOP_V2_SURFACE,
     NEGATIVE_CONSTRAINT_FILESYSTEM_WEBSHOP_V2_SURFACE,
+    LATENT_PREFERENCE_FILESYSTEM_WEBSHOP_V2_SURFACE,
+    INTENT_CLARIFICATION_FILESYSTEM_WEBSHOP_V2_SURFACE,
+    SELECTIVE_MEMORY_USE_FILESYSTEM_WEBSHOP_V2_SURFACE,
 ):
     FILESYSTEM_WEBSHOP_PROMPT_PAIRS.update({
         _load_legacy_webshop_system_prompt(
@@ -1137,6 +1356,18 @@ FILESYSTEM_WEBSHOP_SYSTEM_PROMPTS = {
     ),
     NEGATIVE_CONSTRAINT_FILESYSTEM_WEBSHOP_V2_SURFACE: (
         NEGATIVE_FILESYSTEM_WEBSHOP_SYSTEM_PROMPT
+    ),
+    DISTRACTOR_ROBUSTNESS_FILESYSTEM_WEBSHOP_V2_SURFACE: (
+        DISTRACTOR_FILESYSTEM_WEBSHOP_SYSTEM_PROMPT
+    ),
+    LATENT_PREFERENCE_FILESYSTEM_WEBSHOP_V2_SURFACE: (
+        LATENT_FILESYSTEM_WEBSHOP_SYSTEM_PROMPT
+    ),
+    INTENT_CLARIFICATION_FILESYSTEM_WEBSHOP_V2_SURFACE: (
+        INTENT_FILESYSTEM_WEBSHOP_SYSTEM_PROMPT
+    ),
+    SELECTIVE_MEMORY_USE_FILESYSTEM_WEBSHOP_V2_SURFACE: (
+        SELECTIVE_FILESYSTEM_WEBSHOP_SYSTEM_PROMPT
     ),
 }
 FILESYSTEM_WEBSHOP_NO_WORKSPACE_SYSTEM_PROMPT = (
@@ -1284,10 +1515,18 @@ def validate_filesystem_surface_metadata(metadata: Mapping[str, Any]) -> None:
         "source_pairing": contract["source_pairing"],
         "tasks_per_orbit": contract["tasks_per_orbit"],
         "workspace_prompt_family": contract["prompt_family"],
+        "workspace_seed_contract": contract["seed_contract"],
+        "workspace_evaluation_contract": contract["evaluation_contract"],
     }
     mismatches = {}
     for name, expected_value in expected.items():
         observed = metadata.get(name)
+        if (
+            name == "workspace_seed_contract"
+            and expected_value == "none"
+            and observed is None
+        ):
+            observed = expected_value
         if type(expected_value) is bool:
             matches = type(observed) is bool and observed is expected_value
         else:
@@ -1354,7 +1593,7 @@ def validate_filesystem_surface_metadata(metadata: Mapping[str, Any]) -> None:
         "boundary_session_index": (
             FILESYSTEM_INTERVENTION_BOUNDARY_BY_SURFACE[surface]
         ),
-        "source_state": "policy_authored_workspace_only",
+        "source_state": contract["source_state"],
         "authenticated_export": True,
         "hidden_answer_injection": False,
     }
@@ -1424,7 +1663,7 @@ def validate_filesystem_intervention_control(
         "boundary_session_index": (
             FILESYSTEM_INTERVENTION_BOUNDARY_BY_SURFACE[surface]
         ),
-        "source_state": "policy_authored_workspace_only",
+        "source_state": FILESYSTEM_SURFACE_CONTRACTS[surface]["source_state"],
         "authenticated_export": True,
         "hidden_answer_injection": False,
         "token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest(),
@@ -1443,16 +1682,104 @@ def validate_filesystem_intervention_control(
         )
 
 
+def _validate_workspace_seed_manifest(
+    raw_manifest: Any,
+    *,
+    limits: Mapping[str, Any] | None,
+) -> None:
+    if raw_manifest is None:
+        return
+    if not isinstance(raw_manifest, Mapping):
+        raise EvalError("workspace export seed manifest is not an object")
+    required = {
+        "schema",
+        "source_label",
+        "seed_tree_sha256",
+        "files",
+        "manifest_sha256",
+    }
+    if set(raw_manifest) != required:
+        raise EvalError("workspace export seed manifest fields are invalid")
+    if raw_manifest.get("schema") != "agentmemory_workspace_seed_manifest_v1":
+        raise EvalError("workspace export seed manifest schema is invalid")
+    source_label = raw_manifest.get("source_label")
+    if not isinstance(source_label, str) or not source_label.strip():
+        raise EvalError("workspace export seed manifest source label is invalid")
+    seed_tree_sha256 = raw_manifest.get("seed_tree_sha256")
+    if (
+        not isinstance(seed_tree_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", seed_tree_sha256) is None
+    ):
+        raise EvalError("workspace export seed tree digest is invalid")
+    raw_files = raw_manifest.get("files")
+    if not isinstance(raw_files, list) or not raw_files:
+        raise EvalError("workspace export seed manifest has no files")
+    files = []
+    total_bytes = 0
+    for item in raw_files:
+        if not isinstance(item, Mapping) or set(item) != {"path", "bytes", "sha256"}:
+            raise EvalError("workspace export seed file record is invalid")
+        path = item.get("path")
+        size = item.get("bytes")
+        digest = item.get("sha256")
+        if (
+            not isinstance(path, str)
+            or not path
+            or path.startswith(("/", "~"))
+            or "\\" in path
+            or any(part in ("", ".", "..") for part in path.split("/"))
+            or (limits is not None and len(path) > limits["max_path_chars"])
+            or type(size) is not int
+            or size < 0
+            or (limits is not None and size > limits["max_file_bytes"])
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            raise EvalError("workspace export seed file metadata is invalid")
+        files.append({"path": path, "bytes": size, "sha256": digest})
+        total_bytes += size
+    paths = [item["path"] for item in files]
+    if paths != sorted(set(paths)):
+        raise EvalError("workspace export seed paths are not sorted and unique")
+    if limits is not None and (
+        len(files) > limits["max_files"]
+        or total_bytes > limits["max_total_bytes"]
+    ):
+        raise EvalError("workspace export seed manifest exceeds runtime limits")
+    payload = {
+        "schema": "agentmemory_workspace_seed_manifest_v1",
+        "source_label": source_label,
+        "seed_tree_sha256": seed_tree_sha256,
+        "files": files,
+    }
+    manifest_sha256 = raw_manifest.get("manifest_sha256")
+    expected_manifest_sha256 = hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    if (
+        not isinstance(manifest_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", manifest_sha256) is None
+        or manifest_sha256 != expected_manifest_sha256
+    ):
+        raise EvalError("workspace export seed manifest digest is inconsistent")
+
+
 def validate_workspace_transfer_state(
     state: Mapping[str, Any],
     *,
     limits: Mapping[str, Any] | None = None,
 ) -> None:
-    if (
-        not isinstance(state, Mapping)
-        or state.get("schema") != "agentmemory_workspace_transfer_state_v1"
-    ):
+    if not isinstance(state, Mapping) or state.get("schema") not in {
+        "agentmemory_workspace_transfer_state_v1",
+        "agentmemory_workspace_transfer_state_v2",
+    }:
         raise EvalError("workspace export has an invalid transfer-state schema")
+    state_schema = state.get("schema")
     directories = state.get("directories")
     files = state.get("files")
     if not isinstance(directories, list) or not isinstance(files, list):
@@ -1529,6 +1856,11 @@ def validate_workspace_transfer_state(
         or total_bytes > limits["max_total_bytes"]
     ):
         raise EvalError("workspace export exceeds its attested runtime limits")
+    if state_schema == "agentmemory_workspace_transfer_state_v2":
+        _validate_workspace_seed_manifest(
+            state.get("seed_manifest"),
+            limits=limits,
+        )
 
 
 def resolve_paper_surface(metadata: Mapping[str, Any]) -> dict[str, Any]:
@@ -4190,11 +4522,46 @@ class AgentMemoryEnvClient:
             or result.get("schema")
             != "agentmemory_workspace_authenticated_export_v1"
             or result.get("id") != self.env_id
-            or result.get("policy_authored") is not True
+            or type(result.get("policy_authored")) is not bool
             or result.get("hidden_answer_injection") is not False
             or not isinstance(result.get("workspace_state"), Mapping)
         ):
             raise EvalError("workspace export response violates its evidence contract")
+        surface_contract = FILESYSTEM_SURFACE_CONTRACTS[self.surface]
+        expected_seed = surface_contract["seed_contract"] != "none"
+        requires_policy_authored = surface_contract["source_state"] != (
+            "harness_seeded_branch_profile_with_optional_policy_edits"
+        )
+        if requires_policy_authored and result.get("policy_authored") is not True:
+            raise EvalError(
+                "workspace export lacks the required policy-authored state"
+            )
+        if expected_seed:
+            if result.get("contains_harness_seed") is not True:
+                raise EvalError(
+                    "workspace export seed presence disagrees with surface contract"
+                )
+            provenance = result.get("workspace_provenance")
+            if (
+                not isinstance(provenance, Mapping)
+                or provenance.get("contains_harness_seed") is not True
+                or provenance.get("policy_authored")
+                is not result.get("policy_authored")
+            ):
+                raise EvalError(
+                    "workspace export provenance violates its evidence contract"
+                )
+        elif "contains_harness_seed" in result or "workspace_provenance" in result:
+            provenance = result.get("workspace_provenance")
+            if (
+                result.get("contains_harness_seed") is not False
+                or not isinstance(provenance, Mapping)
+                or provenance.get("contains_harness_seed") is not False
+                or provenance.get("policy_authored") is not True
+            ):
+                raise EvalError(
+                    "workspace export provenance violates its evidence contract"
+                )
         validate_workspace_transfer_state(
             result["workspace_state"],
             limits=self.metadata.get("workspace_limits"),

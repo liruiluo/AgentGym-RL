@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Run a real-model causal evaluation of a filesystem-memory surface.
 
-The evaluator never preloads an answer. It first lets the policy solve the
-pre-boundary sessions for a target task and its exact counterfactual pair. Fresh
+The evaluator never injects an answer. It first lets the policy solve the
+pre-boundary sessions for a target task and its declared paired control. Fresh
 target environments then replay the target's exact policy actions before the
-server installs the surface-specific intervention arms out of band. Only
-dependent sessions are sampled again.
+server installs surface-specific intervention arms out of band. Directional
+counterfactual, selective-use, and distractor-robustness outcomes are summarized
+under distinct contracts. Only dependent sessions are sampled again.
 """
 
 from __future__ import annotations
@@ -42,6 +43,12 @@ _SHELL_WALL_TIME_RE = re.compile(
 )
 _BUY_ACTION_RE = re.compile(r"^\s*click\[\s*buy now\s*\]\s*$", re.IGNORECASE)
 SOURCE_PAIRING_XOR_LSB = "xor_lsb_within_orbit_v1"
+SOURCE_PAIRING_XOR_DISTRACTOR_CONDITION = (
+    "xor_distractor_condition_within_orbit_v1"
+)
+SOURCE_PAIRING_XOR_PREFERENCE_COORDINATE = (
+    "xor_preference_coordinate_within_factorial_v1"
+)
 SOURCE_PAIRING_CYCLIC_NEXT = "cyclic_next_within_orbit_v1"
 
 
@@ -127,6 +134,18 @@ def resolve_source_data_idx(
         if tasks_per_orbit % 2:
             raise core.EvalError("xor_lsb source pairing requires an even orbit")
         source_offset = offset ^ 1
+    elif source_pairing == SOURCE_PAIRING_XOR_DISTRACTOR_CONDITION:
+        if tasks_per_orbit != 2:
+            raise core.EvalError(
+                "distractor-condition pairing requires exactly two tasks per orbit"
+            )
+        source_offset = offset ^ 1
+    elif source_pairing == SOURCE_PAIRING_XOR_PREFERENCE_COORDINATE:
+        if tasks_per_orbit != 4:
+            raise core.EvalError(
+                "preference-coordinate pairing requires exactly four tasks per orbit"
+            )
+        source_offset = offset ^ 2
     elif source_pairing == SOURCE_PAIRING_CYCLIC_NEXT:
         source_offset = (offset + 1) % tasks_per_orbit
     else:
@@ -203,6 +222,7 @@ class FilesystemCausalEvalRunner:
         self._boundary_session_index: int | None = None
         self._source_pairing: str | None = None
         self._tasks_per_orbit: int | None = None
+        self._evaluation_contract: str | None = None
 
     @property
     def arms(self) -> tuple[str, ...]:
@@ -215,6 +235,12 @@ class FilesystemCausalEvalRunner:
         if self._boundary_session_index is None:
             raise core.EvalError("filesystem causal boundary has not been resolved")
         return self._boundary_session_index
+
+    @property
+    def evaluation_contract(self) -> str:
+        if self._evaluation_contract is None:
+            raise core.EvalError("filesystem evaluation contract is unresolved")
+        return self._evaluation_contract
 
     def source_data_idx(self, data_idx: int) -> int:
         if self._source_pairing is None or self._tasks_per_orbit is None:
@@ -239,6 +265,9 @@ class FilesystemCausalEvalRunner:
             boundary = core.FILESYSTEM_INTERVENTION_BOUNDARY_BY_SURFACE[surface]
             source_pairing = env.metadata.get("source_pairing")
             tasks_per_orbit = env.metadata.get("tasks_per_orbit")
+            evaluation_contract = env.metadata.get(
+                "workspace_evaluation_contract"
+            )
             resolve_source_data_idx(
                 0,
                 source_pairing=source_pairing,
@@ -272,6 +301,7 @@ class FilesystemCausalEvalRunner:
                 self._boundary_session_index = boundary
                 self._source_pairing = source_pairing
                 self._tasks_per_orbit = tasks_per_orbit
+                self._evaluation_contract = evaluation_contract
             elif fingerprint != self._reference_fingerprint:
                 raise core.EvalError(
                     "causal arms resolved to different environment fingerprints"
@@ -289,6 +319,7 @@ class FilesystemCausalEvalRunner:
                 or boundary != self._boundary_session_index
                 or source_pairing != self._source_pairing
                 or tasks_per_orbit != self._tasks_per_orbit
+                or evaluation_contract != self._evaluation_contract
             ):
                 raise core.EvalError(
                     "causal arms resolved to different surface intervention contracts"
@@ -308,6 +339,78 @@ class FilesystemCausalEvalRunner:
             except Exception:
                 pass
             raise
+
+    def _source_contract_reason(
+        self,
+        source: Mapping[str, Any],
+    ) -> str | None:
+        if not source.get("eligible"):
+            return str(source.get("ineligible_reason"))
+        exported = source.get("workspace_export")
+        if not isinstance(exported, Mapping):
+            return f"{source.get('label', 'source')}_workspace_export_missing"
+        branch = source.get("initial_env_info", {}).get("branch_kind")
+        if self.evaluation_contract == "paired_distractor_robustness_v1":
+            expected_seed = branch == "distracted"
+            if branch not in {"clean", "distracted"}:
+                return "distractor_source_branch_invalid"
+            if exported.get("contains_harness_seed") is not expected_seed:
+                return f"distractor_{branch}_seed_condition_mismatch"
+            provenance = exported.get("workspace_provenance")
+            created_paths = (
+                provenance.get("policy_created_paths", [])
+                if isinstance(provenance, Mapping)
+                else []
+            )
+            if not created_paths:
+                return f"distractor_{branch}_policy_current_record_missing"
+        elif (
+            self.evaluation_contract
+            == "selective_required_separation_not_required_invariance_v1"
+        ):
+            if exported.get("contains_harness_seed") is not True:
+                return "selective_branch_seeded_profile_missing"
+            requirement = source.get("initial_env_info", {}).get(
+                "memory_requirement"
+            )
+            if requirement not in {"memory_required", "memory_not_required"}:
+                return "selective_memory_requirement_invalid"
+        return None
+
+    def _validate_source_pair_semantics(
+        self,
+        target: Mapping[str, Any],
+        paired: Mapping[str, Any],
+    ) -> None:
+        target_info = target.get("initial_env_info", {})
+        paired_info = paired.get("initial_env_info", {})
+        target_branch = target_info.get("branch_kind")
+        paired_branch = paired_info.get("branch_kind")
+        if self.evaluation_contract == "paired_distractor_robustness_v1":
+            if {target_branch, paired_branch} != {"clean", "distracted"}:
+                raise core.EvalError(
+                    "distractor robustness source pair must be clean/distracted"
+                )
+        elif (
+            self.evaluation_contract
+            == "selective_required_separation_not_required_invariance_v1"
+        ):
+            target_requirement = target_info.get("memory_requirement")
+            paired_requirement = paired_info.get("memory_requirement")
+            if (
+                target_requirement not in {
+                    "memory_required",
+                    "memory_not_required",
+                }
+                or target_requirement != paired_requirement
+                or not isinstance(target_branch, str)
+                or not isinstance(paired_branch, str)
+                or target_branch[-2:] == paired_branch[-2:]
+                or {target_branch[-1:], paired_branch[-1:]} != {"a", "b"}
+            ):
+                raise core.EvalError(
+                    "selective source pair must hold memory requirement fixed and flip A/B"
+                )
 
     def _source_session(
         self,
@@ -562,6 +665,7 @@ class FilesystemCausalEvalRunner:
                 "paired_data_idx": paired_data_idx,
                 "source_pairing": self._source_pairing,
                 "tasks_per_orbit": self._tasks_per_orbit,
+                "evaluation_contract": self.evaluation_contract,
                 "sources": {
                     "target": target_source,
                     "paired": paired_source,
@@ -577,10 +681,11 @@ class FilesystemCausalEvalRunner:
                     raise core.EvalError(
                         "stale causal arm requires a flip target and stay paired source"
                     )
+            self._validate_source_pair_semantics(target_source, paired_source)
             source_reasons = [
-                source.get("ineligible_reason")
+                reason
                 for source in (target_source, paired_source)
-                if not source.get("eligible")
+                if (reason := self._source_contract_reason(source)) is not None
             ]
             if source_reasons:
                 result["ineligible_reasons"] = source_reasons
@@ -714,7 +819,11 @@ class FilesystemCausalEvalRunner:
                 orbit,
             )
             orbits.append(orbit)
-        summary = summarize_causal_orbits(orbits, arms=self.arms)
+        summary = summarize_causal_orbits(
+            orbits,
+            arms=self.arms,
+            evaluation_contract=self.evaluation_contract,
+        )
         manifest = {
             "schema": SCHEMA,
             "started_unix": started,
@@ -738,6 +847,7 @@ class FilesystemCausalEvalRunner:
             "boundary_session_index": self.boundary_session_index,
             "source_pairing": self._source_pairing,
             "tasks_per_orbit": self._tasks_per_orbit,
+            "evaluation_contract": self.evaluation_contract,
             "prompt_history_policy": "latest_observation_only",
             "source_actions_replayed_exactly": True,
             "replay_comparison": {
@@ -757,6 +867,7 @@ def summarize_causal_orbits(
     orbits: Sequence[Mapping[str, Any]],
     *,
     arms: Sequence[str],
+    evaluation_contract: str = "directional_counterfactual_separation_v1",
 ) -> dict[str, Any]:
     arms = tuple(arms)
     if not arms or arms[0] != "correct" or "no_workspace" not in arms:
@@ -792,27 +903,168 @@ def summarize_causal_orbits(
                 else 0.0
             ),
         }
-    strict = sum(
-        orbit["arms"]["correct"].get("episode_success") is True
-        and all(
+    def is_strict(orbit: Mapping[str, Any]) -> bool:
+        return orbit["arms"]["correct"].get("episode_success") is True and all(
             orbit["arms"][arm].get("episode_success") is False
             for arm in arms
             if arm != "correct"
         )
-        for orbit in eligible
-    )
-    first_dependent_strict = sum(
-        int(orbit["arms"]["correct"]["final_session_index"])
-        > int(orbit["boundary_session_index"])
-        and all(
-            int(orbit["arms"][arm]["final_session_index"])
-            <= int(orbit["boundary_session_index"])
-            for arm in arms
-            if arm != "correct"
+
+    def is_first_dependent_strict(orbit: Mapping[str, Any]) -> bool:
+        boundary = int(orbit["boundary_session_index"])
+        return (
+            int(orbit["arms"]["correct"]["final_session_index"]) > boundary
+            and all(
+                int(orbit["arms"][arm]["final_session_index"]) <= boundary
+                for arm in arms
+                if arm != "correct"
+            )
         )
-        for orbit in eligible
+
+    strict_applicable = eligible
+    invariance_applicable: list[Mapping[str, Any]] = []
+    extra_metrics: dict[str, Any] = {}
+    if (
+        evaluation_contract
+        == "selective_required_separation_not_required_invariance_v1"
+    ):
+        required = []
+        not_required = []
+        for orbit in eligible:
+            requirement = orbit["sources"]["target"]["initial_env_info"].get(
+                "memory_requirement"
+            )
+            if requirement == "memory_required":
+                required.append(orbit)
+            elif requirement == "memory_not_required":
+                not_required.append(orbit)
+            else:
+                raise core.EvalError(
+                    "selective causal orbit lacks a valid memory requirement"
+                )
+        strict_applicable = required
+        invariance_applicable = not_required
+        invariant_agreement = sum(
+            len(
+                {
+                    orbit["arms"][arm].get("episode_success") is True
+                    for arm in arms
+                }
+            )
+            == 1
+            for orbit in not_required
+        )
+        invariant_success = sum(
+            all(
+                orbit["arms"][arm].get("episode_success") is True
+                for arm in arms
+            )
+            for orbit in not_required
+        )
+        invariant_first_advance = sum(
+            all(
+                int(orbit["arms"][arm]["final_session_index"])
+                > int(orbit["boundary_session_index"])
+                for arm in arms
+            )
+            for orbit in not_required
+        )
+        extra_metrics.update(
+            {
+                "memory_required_orbit_count": len(required),
+                "memory_not_required_orbit_count": len(not_required),
+                "not_required_invariant_agreement_count": invariant_agreement,
+                "not_required_invariant_agreement_rate": (
+                    invariant_agreement / len(not_required)
+                    if not_required
+                    else 0.0
+                ),
+                "not_required_all_arm_success_count": invariant_success,
+                "not_required_all_arm_success_rate": (
+                    invariant_success / len(not_required)
+                    if not_required
+                    else 0.0
+                ),
+                "not_required_all_arm_first_advance_count": (
+                    invariant_first_advance
+                ),
+                "not_required_all_arm_first_advance_rate": (
+                    invariant_first_advance / len(not_required)
+                    if not_required
+                    else 0.0
+                ),
+            }
+        )
+    elif evaluation_contract == "paired_distractor_robustness_v1":
+        grouped: dict[int, dict[str, Mapping[str, Any]]] = {}
+        for orbit in eligible:
+            tasks_per_orbit = int(orbit["tasks_per_orbit"])
+            target_idx = int(orbit["target_data_idx"])
+            group = target_idx - (target_idx % tasks_per_orbit)
+            branch = orbit["sources"]["target"]["initial_env_info"].get(
+                "branch_kind"
+            )
+            if branch not in {"clean", "distracted"}:
+                raise core.EvalError(
+                    "distractor causal orbit lacks a clean/distracted branch"
+                )
+            if branch in grouped.setdefault(group, {}):
+                raise core.EvalError(
+                    "distractor causal summary contains a duplicate branch"
+                )
+            grouped[group][branch] = orbit
+        complete_pairs = [
+            pair
+            for pair in grouped.values()
+            if set(pair) == {"clean", "distracted"}
+        ]
+        outcome_agreement = sum(
+            pair["clean"]["arms"]["correct"].get("episode_success")
+            is pair["distracted"]["arms"]["correct"].get("episode_success")
+            for pair in complete_pairs
+        )
+        both_success = sum(
+            pair["clean"]["arms"]["correct"].get("episode_success") is True
+            and pair["distracted"]["arms"]["correct"].get("episode_success")
+            is True
+            for pair in complete_pairs
+        )
+        extra_metrics.update(
+            {
+                "distractor_condition_group_count": len(grouped),
+                "complete_clean_distracted_pair_count": len(complete_pairs),
+                "incomplete_clean_distracted_pair_count": (
+                    len(grouped) - len(complete_pairs)
+                ),
+                "correct_arm_clean_distracted_agreement_count": outcome_agreement,
+                "correct_arm_clean_distracted_agreement_rate": (
+                    outcome_agreement / len(complete_pairs)
+                    if complete_pairs
+                    else 0.0
+                ),
+                "correct_arm_clean_distracted_both_success_count": both_success,
+                "correct_arm_clean_distracted_both_success_rate": (
+                    both_success / len(complete_pairs)
+                    if complete_pairs
+                    else 0.0
+                ),
+                "answer_flip_expected_between_conditions": False,
+            }
+        )
+    elif evaluation_contract != "directional_counterfactual_separation_v1":
+        raise core.EvalError(
+            f"unsupported filesystem evaluation contract: {evaluation_contract!r}"
+        )
+
+    strict = sum(is_strict(orbit) for orbit in strict_applicable)
+    first_dependent_strict = sum(
+        is_first_dependent_strict(orbit) for orbit in strict_applicable
     )
+    invariant_success = int(extra_metrics.get("not_required_all_arm_success_count", 0))
+    contract_satisfied = strict + invariant_success
+    contract_applicable_count = len(strict_applicable) + len(invariance_applicable)
     arm_count_name = {
+        3: "three",
         4: "four",
         5: "five",
     }.get(len(arms), str(len(arms)))
@@ -820,25 +1072,39 @@ def summarize_causal_orbits(
         "orbit_count": len(orbits),
         "eligible_orbit_count": len(eligible),
         "ineligible_orbit_count": len(orbits) - len(eligible),
+        "evaluation_contract": evaluation_contract,
         "required_intervention_arms": list(arms),
+        "strict_separation_applicable_orbit_count": len(strict_applicable),
         "strict_separation_count": strict,
-        "strict_separation_rate": strict / len(eligible) if eligible else 0.0,
+        "strict_separation_rate": (
+            strict / len(strict_applicable) if strict_applicable else 0.0
+        ),
         "full_episode_strict_separation_count": strict,
         "full_episode_strict_separation_rate": (
-            strict / len(eligible) if eligible else 0.0
+            strict / len(strict_applicable) if strict_applicable else 0.0
         ),
         "first_dependent_strict_separation_count": first_dependent_strict,
         "first_dependent_strict_separation_rate": (
-            first_dependent_strict / len(eligible) if eligible else 0.0
+            first_dependent_strict / len(strict_applicable)
+            if strict_applicable
+            else 0.0
+        ),
+        "evaluation_contract_applicable_orbit_count": contract_applicable_count,
+        "evaluation_contract_satisfied_count": contract_satisfied,
+        "evaluation_contract_satisfied_rate": (
+            contract_satisfied / contract_applicable_count
+            if contract_applicable_count
+            else 0.0
         ),
         "first_dependent_metric_replaces_full_episode_success": False,
         "arm_metrics": arm_metrics,
         "operation_counts_prove_memory_capability": False,
         "causal_claim_requires_panel_level_intervention_effect": True,
+        **extra_metrics,
     }
     summary[f"strict_{arm_count_name}_arm_separation_count"] = strict
     summary[f"strict_{arm_count_name}_arm_separation_rate"] = (
-        strict / len(eligible) if eligible else 0.0
+        strict / len(strict_applicable) if strict_applicable else 0.0
     )
     return summary
 

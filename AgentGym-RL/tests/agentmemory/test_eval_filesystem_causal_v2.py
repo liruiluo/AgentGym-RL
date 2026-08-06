@@ -125,6 +125,10 @@ def filesystem_metadata(token: str) -> dict:
         "source_pairing": "xor_lsb_within_orbit_v1",
         "tasks_per_orbit": 2,
         "workspace_prompt_family": "natural_attribute_chain_filesystem_v2",
+        "workspace_seed_contract": "none",
+        "workspace_evaluation_contract": (
+            "directional_counterfactual_separation_v1"
+        ),
         "provider": {
             "schema": "agentmemory_verified_natural_chain_provider_v4",
             "tasks_per_orbit": 2,
@@ -221,6 +225,40 @@ def compositional_filesystem_metadata(token: str) -> dict:
     metadata["workspace_intervention_control"][
         "boundary_session_index"
     ] = 2
+    return metadata
+
+
+def distractor_filesystem_metadata(token: str) -> dict:
+    metadata = filesystem_metadata(token)
+    prompt = CORE.DISTRACTOR_FILESYSTEM_WEBSHOP_SYSTEM_PROMPT
+    metadata.update(
+        {
+            "surface": (
+                CORE.DISTRACTOR_ROBUSTNESS_FILESYSTEM_WEBSHOP_V2_SURFACE
+            ),
+            "source_pairing": "xor_distractor_condition_within_orbit_v1",
+            "workspace_prompt_family": "distractor_robustness_filesystem_v2",
+            "workspace_seed_contract": (
+                "branch_conditioned_ordinary_profile_files_v1"
+            ),
+            "workspace_evaluation_contract": "paired_distractor_robustness_v1",
+            "system_prompt": prompt,
+            "system_prompt_sha256": hashlib.sha256(
+                prompt.encode("utf-8")
+            ).hexdigest(),
+        }
+    )
+    metadata["provider"]["schema"] = (
+        "agentmemory_verified_distractor_robustness_provider_v1"
+    )
+    metadata["workspace_intervention_control"].update(
+        {
+            "allowed_arms": list(CORE.DISTRACTOR_FILESYSTEM_CAUSAL_ARMS),
+            "source_state": (
+                "policy_authored_current_record_plus_branch_distractors"
+            ),
+        }
+    )
     return metadata
 
 
@@ -630,6 +668,34 @@ class FilesystemCausalEvalTest(unittest.TestCase):
                     expected,
                 )
 
+        preference_expected = {0: 2, 1: 3, 2: 0, 3: 1, 4: 6, 5: 7}
+        for data_idx, expected in preference_expected.items():
+            with self.subTest(pairing="preference", data_idx=data_idx):
+                self.assertEqual(
+                    CAUSAL.resolve_source_data_idx(
+                        data_idx,
+                        source_pairing=(
+                            "xor_preference_coordinate_within_factorial_v1"
+                        ),
+                        tasks_per_orbit=4,
+                    ),
+                    expected,
+                )
+
+        distractor_expected = {0: 1, 1: 0, 2: 3, 3: 2}
+        for data_idx, expected in distractor_expected.items():
+            with self.subTest(pairing="distractor", data_idx=data_idx):
+                self.assertEqual(
+                    CAUSAL.resolve_source_data_idx(
+                        data_idx,
+                        source_pairing=(
+                            "xor_distractor_condition_within_orbit_v1"
+                        ),
+                        tasks_per_orbit=2,
+                    ),
+                    expected,
+                )
+
         cyclic_expected = {0: 1, 1: 2, 2: 0, 3: 4, 4: 5, 5: 3}
         for data_idx, expected in cyclic_expected.items():
             with self.subTest(pairing="cyclic", data_idx=data_idx):
@@ -645,6 +711,7 @@ class FilesystemCausalEvalTest(unittest.TestCase):
     def test_new_surface_metadata_is_validated_with_distinct_contracts(self):
         token = "n" * 48
         for metadata in (
+            distractor_filesystem_metadata(token),
             compositional_filesystem_metadata(token),
             negative_filesystem_metadata(token),
         ):
@@ -672,6 +739,107 @@ class FilesystemCausalEvalTest(unittest.TestCase):
         ):
             with self.subTest(action=action):
                 self.assertFalse(CAUSAL._is_buy_action(action))
+
+    def test_selective_summary_separates_dependency_from_invariance(self):
+        arms = CORE.FILESYSTEM_CAUSAL_ARMS
+
+        def outcome(success: bool) -> dict:
+            return {
+                "episode_success": success,
+                "final_session_index": 2 if success else 1,
+                "dependent_return": 1.0 if success else 0.0,
+            }
+
+        orbits = []
+        branch_specs = (
+            ("memory_required_a", "memory_required"),
+            ("memory_not_required_a", "memory_not_required"),
+            ("memory_required_b", "memory_required"),
+            ("memory_not_required_b", "memory_not_required"),
+        )
+        for data_idx, (branch, requirement) in enumerate(branch_specs):
+            expected = {
+                arm: outcome(arm == "correct")
+                for arm in arms
+            }
+            if requirement == "memory_not_required":
+                expected = {arm: outcome(True) for arm in arms}
+            orbits.append(
+                {
+                    "eligible": True,
+                    "target_data_idx": data_idx,
+                    "tasks_per_orbit": 4,
+                    "boundary_session_index": 1,
+                    "sources": {
+                        "target": {
+                            "initial_env_info": {
+                                "branch_kind": branch,
+                                "memory_requirement": requirement,
+                            }
+                        }
+                    },
+                    "arms": expected,
+                }
+            )
+
+        summary = CAUSAL.summarize_causal_orbits(
+            orbits,
+            arms=arms,
+            evaluation_contract=(
+                "selective_required_separation_not_required_invariance_v1"
+            ),
+        )
+        self.assertEqual(summary["memory_required_orbit_count"], 2)
+        self.assertEqual(summary["strict_separation_applicable_orbit_count"], 2)
+        self.assertEqual(summary["strict_separation_count"], 2)
+        self.assertEqual(summary["memory_not_required_orbit_count"], 2)
+        self.assertEqual(summary["not_required_all_arm_success_count"], 2)
+        self.assertEqual(summary["evaluation_contract_satisfied_count"], 4)
+        self.assertEqual(summary["evaluation_contract_satisfied_rate"], 1.0)
+
+    def test_distractor_summary_uses_answer_preserving_condition_pair(self):
+        arms = CORE.DISTRACTOR_FILESYSTEM_CAUSAL_ARMS
+
+        def orbit(data_idx: int, branch: str) -> dict:
+            return {
+                "eligible": True,
+                "target_data_idx": data_idx,
+                "tasks_per_orbit": 2,
+                "boundary_session_index": 1,
+                "sources": {
+                    "target": {"initial_env_info": {"branch_kind": branch}}
+                },
+                "arms": {
+                    "correct": {
+                        "episode_success": True,
+                        "final_session_index": 2,
+                        "dependent_return": 1.0,
+                    },
+                    "blank": {
+                        "episode_success": False,
+                        "final_session_index": 1,
+                        "dependent_return": 0.0,
+                    },
+                    "no_workspace": {
+                        "episode_success": False,
+                        "final_session_index": 1,
+                        "dependent_return": 0.0,
+                    },
+                },
+            }
+
+        summary = CAUSAL.summarize_causal_orbits(
+            [orbit(0, "clean"), orbit(1, "distracted")],
+            arms=arms,
+            evaluation_contract="paired_distractor_robustness_v1",
+        )
+        self.assertEqual(summary["strict_three_arm_separation_count"], 2)
+        self.assertEqual(summary["complete_clean_distracted_pair_count"], 1)
+        self.assertEqual(
+            summary["correct_arm_clean_distracted_both_success_count"],
+            1,
+        )
+        self.assertFalse(summary["answer_flip_expected_between_conditions"])
 
     def test_replay_projection_normalizes_only_shell_wrapper_wall_time(self):
         source = (

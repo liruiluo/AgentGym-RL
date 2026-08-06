@@ -617,6 +617,88 @@ class FormalPromptTests(unittest.TestCase):
         self.assertIn("without a persistent workspace", no_workspace)
         self.assertNotIn("current confirmed user-preference record", no_workspace)
 
+    def test_distractor_filesystem_prompt_requires_seed_aware_search(self) -> None:
+        module = load_schemas_module()
+        prompt = module.agentmemory_action_system_prompt(
+            memory_prompt_mode="natural_filesystem",
+            surface=module.DISTRACTOR_ROBUSTNESS_FILESYSTEM_SURFACE,
+        )
+        for fragment in (
+            "workspace may start with harness-seeded ordinary profile notes",
+            "background records, not policy actions, hidden answers",
+            "do not rewrite or delete the seeded notes",
+            "rg --hidden -n -i '(current|preference|profile)' .",
+            "Ignore superseded history, another customer's record",
+            "Do not rely on filenames, directory order, or the number of files",
+            "exact policy-authored `Current preference:` line",
+            "never infer the missing value from the current choice table",
+            "Create the current record with exactly five physical lines",
+            "Only `Done!` proves a patch succeeded",
+        ):
+            self.assertIn(fragment, prompt)
+        for forbidden in (
+            "workspace starts empty and contains only files that you create",
+            "Current preference: east",
+            "Current preference: west",
+            "ADD requires",
+            "RETRIEVE accepts",
+        ):
+            self.assertNotIn(forbidden, prompt)
+        no_workspace = module.agentmemory_action_system_prompt(
+            memory_prompt_mode="natural_filesystem",
+            surface=module.DISTRACTOR_ROBUSTNESS_FILESYSTEM_SURFACE,
+            workspace_enabled=False,
+        )
+        self.assertIn("without a persistent workspace", no_workspace)
+        self.assertNotIn("harness-seeded ordinary profile notes", no_workspace)
+
+    def test_all_filesystem_surfaces_have_surface_specific_prompts(self) -> None:
+        module = load_schemas_module()
+        expected_surfaces = {
+            module.NATURAL_FILESYSTEM_SURFACE,
+            module.LATENT_PREFERENCE_FILESYSTEM_SURFACE,
+            module.RECENCY_OVERRIDE_FILESYSTEM_SURFACE,
+            module.DISTRACTOR_ROBUSTNESS_FILESYSTEM_SURFACE,
+            module.COMPOSITIONAL_RECALL_FILESYSTEM_SURFACE,
+            module.INTENT_CLARIFICATION_FILESYSTEM_SURFACE,
+            module.SELECTIVE_MEMORY_USE_FILESYSTEM_SURFACE,
+            module.NEGATIVE_CONSTRAINT_FILESYSTEM_SURFACE,
+        }
+        self.assertEqual(set(module.FILESYSTEM_SURFACES), expected_surfaces)
+        cases = {
+            module.LATENT_PREFERENCE_FILESYSTEM_SURFACE: (
+                "confirmed choice as preference evidence",
+                "customer-profile memory",
+                "apply the retrieved preference in later application sessions",
+            ),
+            module.INTENT_CLARIFICATION_FILESYSTEM_SURFACE: (
+                'ASK {"field":"..."}',
+                "infer and fill the missing field",
+                "CLARIFY observation",
+            ),
+            module.SELECTIVE_MEMORY_USE_FILESYSTEM_SURFACE: (
+                "branch-conditioned ordinary profile file",
+                "first decide whether the current request already states every attribute needed",
+                "do not read the profile merely by habit",
+            ),
+        }
+        prompts = {}
+        for surface, fragments in cases.items():
+            prompt = module.agentmemory_action_system_prompt(
+                memory_prompt_mode="natural_filesystem",
+                surface=surface,
+            )
+            prompts[surface] = prompt
+            for fragment in fragments:
+                self.assertIn(fragment, prompt)
+            for forbidden in ("ADD requires", "RETRIEVE accepts", "memory_id:string"):
+                self.assertNotIn(forbidden, prompt)
+        self.assertNotIn(
+            'ASK {"field":"color"}',
+            prompts[module.INTENT_CLARIFICATION_FILESYSTEM_SURFACE],
+        )
+        self.assertEqual(len(set(prompts.values())), len(prompts))
+
     def test_surface_specific_top1_and_clarification_contracts(self) -> None:
         module = load_schemas_module()
         distractor_surface = (

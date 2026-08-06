@@ -56,6 +56,9 @@ class EffectiveMemoryPromptAttestationTests(unittest.TestCase):
         self.recency_filesystem_prompt = " ".join(
             self.module.RECENCY_FILESYSTEM_REQUIRED_FRAGMENTS
         )
+        self.distractor_filesystem_prompt = " ".join(
+            self.module.DISTRACTOR_FILESYSTEM_REQUIRED_FRAGMENTS
+        )
         self.compositional_filesystem_prompt = " ".join(
             self.module.COMPOSITIONAL_FILESYSTEM_REQUIRED_FRAGMENTS
         )
@@ -351,6 +354,11 @@ class EffectiveMemoryPromptAttestationTests(unittest.TestCase):
     def test_new_filesystem_surfaces_use_their_own_prompt_contracts(self) -> None:
         cases = (
             (
+                self.module.DISTRACTOR_ROBUSTNESS_FILESYSTEM_SURFACE,
+                self.distractor_filesystem_prompt,
+                self.compositional_filesystem_prompt,
+            ),
+            (
                 self.module.COMPOSITIONAL_RECALL_FILESYSTEM_SURFACE,
                 self.compositional_filesystem_prompt,
                 self.negative_filesystem_prompt,
@@ -422,6 +430,25 @@ class EffectiveMemoryPromptAttestationTests(unittest.TestCase):
                         reasoning_enabled=True,
                         require_lifecycle_sop=False,
                         surface=self.module.RECENCY_OVERRIDE_FILESYSTEM_SURFACE,
+                    )
+
+    def test_each_distractor_filesystem_fragment_is_fail_closed(self) -> None:
+        for missing_fragment in self.module.DISTRACTOR_FILESYSTEM_REQUIRED_FRAGMENTS:
+            with self.subTest(missing_fragment=missing_fragment):
+                prompt = " ".join(
+                    fragment
+                    for fragment in self.module.DISTRACTOR_FILESYSTEM_REQUIRED_FRAGMENTS
+                    if fragment != missing_fragment
+                )
+                with self.assertRaisesRegex(RuntimeError, "filesystem prompt contract"):
+                    self.module.build_attestation(
+                        prompt=prompt,
+                        memory_prompt_mode="natural_filesystem",
+                        ltm_inventory_mode="hidden",
+                        thinking_enabled=False,
+                        reasoning_enabled=True,
+                        require_lifecycle_sop=False,
+                        surface=self.module.DISTRACTOR_ROBUSTNESS_FILESYSTEM_SURFACE,
                     )
 
     def test_filesystem_surface_rejects_every_legacy_memory_fragment(self) -> None:

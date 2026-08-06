@@ -46,18 +46,34 @@ NATURAL_FILESYSTEM_SURFACE = (
 RECENCY_OVERRIDE_FILESYSTEM_SURFACE = (
     "agentmemory_webshop_recency_override_filesystem_v2"
 )
+LATENT_PREFERENCE_FILESYSTEM_SURFACE = (
+    "agentmemory_webshop_latent_preference_filesystem_v2"
+)
+DISTRACTOR_ROBUSTNESS_FILESYSTEM_SURFACE = (
+    "agentmemory_webshop_distractor_robustness_filesystem_v2"
+)
 COMPOSITIONAL_RECALL_FILESYSTEM_SURFACE = (
     "agentmemory_webshop_compositional_recall_filesystem_v2"
 )
 NEGATIVE_CONSTRAINT_FILESYSTEM_SURFACE = (
     "agentmemory_webshop_negative_constraint_filesystem_v2"
 )
+INTENT_CLARIFICATION_FILESYSTEM_SURFACE = (
+    "agentmemory_webshop_intent_clarification_filesystem_v2"
+)
+SELECTIVE_MEMORY_USE_FILESYSTEM_SURFACE = (
+    "agentmemory_webshop_selective_memory_use_filesystem_v2"
+)
 FILESYSTEM_SURFACES = frozenset(
     {
         NATURAL_FILESYSTEM_SURFACE,
         RECENCY_OVERRIDE_FILESYSTEM_SURFACE,
+        LATENT_PREFERENCE_FILESYSTEM_SURFACE,
+        DISTRACTOR_ROBUSTNESS_FILESYSTEM_SURFACE,
         COMPOSITIONAL_RECALL_FILESYSTEM_SURFACE,
         NEGATIVE_CONSTRAINT_FILESYSTEM_SURFACE,
+        INTENT_CLARIFICATION_FILESYSTEM_SURFACE,
+        SELECTIVE_MEMORY_USE_FILESYSTEM_SURFACE,
     }
 )
 
@@ -338,6 +354,71 @@ _AGENTMEMORY_RECENCY_FILESYSTEM_MEMORY_GUIDANCE = (
     "concrete preference value or filename is demonstrated here: choose both only from "
     "policy-visible task facts. Keep each reply to exactly one action."
 )
+_AGENTMEMORY_DISTRACTOR_FILESYSTEM_MEMORY_GUIDANCE = (
+    " The workspace may start with harness-seeded ordinary profile notes. Those files are "
+    "background records, not policy actions, hidden answers, or automatically trusted current "
+    "state. In shopping session 0, the task provides one exact authoritative record line "
+    "beginning with `Current preference:`. Before buying, copy that exact line verbatim into "
+    "a new ordinary file using apply_patch; do not rewrite or delete the seeded notes. In every "
+    "later session whose decision depends on the profile, first use shell_command to inspect "
+    "the workspace with `rg --hidden -n -i '(current|preference|profile)' .`. Read the returned "
+    "file contents and select the authoritative current record for the active customer and "
+    "attribute axis. Ignore superseded history, another customer's record, and records about a "
+    "different axis. Do not rely on filenames, directory order, or the number of files. Do not "
+    "search or click until shell output contains the exact policy-authored `Current preference:` "
+    "line. If it is absent, correct and retry the file read; never infer the missing value from "
+    "the current choice table. Create the current record with exactly five physical lines: "
+    "`apply_patch`, `*** Begin Patch`, one `*** Add File: ` line with a new relative path, one "
+    "content line beginning with `+`, and `*** End Patch`. Run the write, later read, and browser "
+    "actions on separate turns. Only `Done!` proves a patch succeeded, and workspace feedback "
+    "must never be appended to the action. No concrete customer, axis, preference value, or "
+    "filename is demonstrated here; take them only from policy-visible task facts. Keep each "
+    "reply to exactly one action."
+)
+_AGENTMEMORY_LATENT_PREFERENCE_FILESYSTEM_MEMORY_GUIDANCE = (
+    " The workspace starts empty and contains only files that you create; it is not a "
+    "catalog, hidden answer, or automatic session log. Treat every confirmed choice as "
+    "preference evidence, and preserve confirmed preference evidence in an ordinary workspace "
+    "file before advancing when a later application session will need it. A later profile "
+    "note may be a customer-profile memory: keep the customer identity, preference axis, "
+    "and inferred value together, and retain the supporting confirmed choices instead of "
+    "overwriting them with a bare label. Use shell_command to read the relevant note before "
+    "searching or clicking, then apply the retrieved preference in later application sessions "
+    "to the approved listings. If the note is absent or the field is not visible, read and "
+    "retry rather than infer it from product titles or the current choice table. Workspace "
+    "writes and reads are separate turns, have zero task reward, and are optional when the "
+    "current request already contains everything needed. No concrete customer, preference "
+    "axis, inferred value, or filename is demonstrated here; take them only from policy-visible "
+    "task facts. Keep each reply to exactly one action."
+)
+_AGENTMEMORY_INTENT_CLARIFICATION_FILESYSTEM_MEMORY_GUIDANCE = (
+    " The workspace starts empty and contains only files that you create; it is not a "
+    "catalog, hidden answer, or automatic session log. The first shopping request is "
+    "intentionally ambiguous: both approved listings satisfy the stated requirements, and "
+    "the missing preference must be identified from the request and candidate attributes. "
+    "ASK {\"field\":\"...\"} is the generic clarification schema; infer and fill the "
+    "missing field rather than copying a task-specific field from the action contract. ASK "
+    "is available only in the first shopping session and is allowed once. The environment "
+    "returns a CLARIFY observation; store the clarification in an ordinary workspace file "
+    "before the first purchase when later sessions need it. In later sessions, use "
+    "shell_command to read that note before choosing the matching approved listing. Do not "
+    "purchase before a valid clarification, do not repeat ASK, and do not infer the answer "
+    "from the choice table. Keep workspace writes and reads on separate turns and keep each "
+    "reply to exactly one action."
+)
+_AGENTMEMORY_SELECTIVE_MEMORY_USE_FILESYSTEM_MEMORY_GUIDANCE = (
+    " The workspace may start with one branch-conditioned ordinary profile file. It is "
+    "harness-seeded background state, not a hidden answer and not a policy action. You must "
+    "first decide whether the current request already states every attribute needed to choose between "
+    "the approved listings. When it is complete, follow the current request directly and do "
+    "not read the profile merely by habit; explicit current requirements override profile "
+    "history, and do not write a redundant note. When the current request omits the preference, "
+    "read the profile when the current request omits the preference using shell_command, copy "
+    "the relevant policy-visible record into a new ordinary note if a later session needs it, "
+    "and apply that preference to the approved listings. Do not rely on filenames or directory "
+    "order, and do not infer a missing profile value from the choice table. Workspace actions "
+    "have zero task reward and each reply contains exactly one action."
+)
 _AGENTMEMORY_COMPOSITIONAL_FILESYSTEM_MEMORY_GUIDANCE = (
     " The workspace starts empty and contains only files that you create; it is not a "
     "catalog, hidden cache, or automatic session log. This task exposes two separate "
@@ -430,6 +511,48 @@ AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_RECENCY_FILESYSTEM = (
     + _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT
     + _AGENTMEMORY_RECENCY_FILESYSTEM_MEMORY_GUIDANCE
 )
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_DISTRACTOR_FILESYSTEM = (
+    "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
+    "with a persistent workspace. "
+    + _AGENTMEMORY_FILESYSTEM_REPLY_RULE_NO_THINKING
+    + _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT
+    + _AGENTMEMORY_DISTRACTOR_FILESYSTEM_MEMORY_GUIDANCE
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_DISTRACTOR_FILESYSTEM = (
+    "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
+    "with a persistent workspace. "
+    + _AGENTMEMORY_FILESYSTEM_REPLY_RULE_THINKING
+    + _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT
+    + _AGENTMEMORY_DISTRACTOR_FILESYSTEM_MEMORY_GUIDANCE
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_DISTRACTOR_FILESYSTEM = (
+    "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
+    "with a persistent workspace. "
+    + _AGENTMEMORY_FILESYSTEM_REPLY_RULE_REASONING
+    + _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT
+    + _AGENTMEMORY_DISTRACTOR_FILESYSTEM_MEMORY_GUIDANCE
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_LATENT_PREFERENCE_FILESYSTEM = (
+    "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
+    "with a persistent workspace. "
+    + _AGENTMEMORY_FILESYSTEM_REPLY_RULE_NO_THINKING
+    + _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT
+    + _AGENTMEMORY_LATENT_PREFERENCE_FILESYSTEM_MEMORY_GUIDANCE
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_LATENT_PREFERENCE_FILESYSTEM = (
+    "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
+    "with a persistent workspace. "
+    + _AGENTMEMORY_FILESYSTEM_REPLY_RULE_THINKING
+    + _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT
+    + _AGENTMEMORY_LATENT_PREFERENCE_FILESYSTEM_MEMORY_GUIDANCE
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_LATENT_PREFERENCE_FILESYSTEM = (
+    "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
+    "with a persistent workspace. "
+    + _AGENTMEMORY_FILESYSTEM_REPLY_RULE_REASONING
+    + _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT
+    + _AGENTMEMORY_LATENT_PREFERENCE_FILESYSTEM_MEMORY_GUIDANCE
+)
 AGENTMEMORY_ACTION_SYSTEM_PROMPT_COMPOSITIONAL_FILESYSTEM = (
     "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
     "with a persistent workspace. "
@@ -471,6 +594,77 @@ AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEGATIVE_FILESYSTEM = (
     + _AGENTMEMORY_FILESYSTEM_REPLY_RULE_REASONING
     + _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT
     + _AGENTMEMORY_NEGATIVE_FILESYSTEM_MEMORY_GUIDANCE
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_INTENT_CLARIFICATION_FILESYSTEM = (
+    "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
+    "with a persistent workspace. "
+    + _AGENTMEMORY_FILESYSTEM_REPLY_RULE_NO_THINKING
+    + _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT
+    + _AGENTMEMORY_INTENT_CLARIFICATION_FILESYSTEM_MEMORY_GUIDANCE
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_INTENT_CLARIFICATION_FILESYSTEM = (
+    "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
+    "with a persistent workspace. "
+    + _AGENTMEMORY_FILESYSTEM_REPLY_RULE_THINKING
+    + _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT
+    + _AGENTMEMORY_INTENT_CLARIFICATION_FILESYSTEM_MEMORY_GUIDANCE
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_INTENT_CLARIFICATION_FILESYSTEM = (
+    "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
+    "with a persistent workspace. "
+    + _AGENTMEMORY_FILESYSTEM_REPLY_RULE_REASONING
+    + _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT
+    + _AGENTMEMORY_INTENT_CLARIFICATION_FILESYSTEM_MEMORY_GUIDANCE
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_SELECTIVE_MEMORY_USE_FILESYSTEM = (
+    "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
+    "with a persistent workspace. "
+    + _AGENTMEMORY_FILESYSTEM_REPLY_RULE_NO_THINKING
+    + _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT
+    + _AGENTMEMORY_SELECTIVE_MEMORY_USE_FILESYSTEM_MEMORY_GUIDANCE
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_SELECTIVE_MEMORY_USE_FILESYSTEM = (
+    "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
+    "with a persistent workspace. "
+    + _AGENTMEMORY_FILESYSTEM_REPLY_RULE_THINKING
+    + _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT
+    + _AGENTMEMORY_SELECTIVE_MEMORY_USE_FILESYSTEM_MEMORY_GUIDANCE
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_SELECTIVE_MEMORY_USE_FILESYSTEM = (
+    "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
+    "with a persistent workspace. "
+    + _AGENTMEMORY_FILESYSTEM_REPLY_RULE_REASONING
+    + _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT
+    + _AGENTMEMORY_SELECTIVE_MEMORY_USE_FILESYSTEM_MEMORY_GUIDANCE
+)
+# Keep the short names used by the evidence/evaluation loader as canonical
+# aliases; the longer names above make the task family explicit in this file.
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_LATENT_FILESYSTEM = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_LATENT_PREFERENCE_FILESYSTEM
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_LATENT_FILESYSTEM = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_LATENT_PREFERENCE_FILESYSTEM
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_LATENT_FILESYSTEM = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_LATENT_PREFERENCE_FILESYSTEM
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_INTENT_FILESYSTEM = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_INTENT_CLARIFICATION_FILESYSTEM
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_INTENT_FILESYSTEM = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_INTENT_CLARIFICATION_FILESYSTEM
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_INTENT_FILESYSTEM = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_INTENT_CLARIFICATION_FILESYSTEM
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_SELECTIVE_FILESYSTEM = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_SELECTIVE_MEMORY_USE_FILESYSTEM
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_SELECTIVE_FILESYSTEM = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_SELECTIVE_MEMORY_USE_FILESYSTEM
+)
+AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_SELECTIVE_FILESYSTEM = (
+    AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_SELECTIVE_MEMORY_USE_FILESYSTEM
 )
 AGENTMEMORY_ACTION_SYSTEM_PROMPT_NO_WORKSPACE = (
     "You are acting inside AgentMemoryGym, a native WebShop bundled-shopping environment "
@@ -749,6 +943,16 @@ def agentmemory_action_system_prompt(
                 AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_RECENCY_FILESYSTEM,
                 AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_RECENCY_FILESYSTEM,
             ),
+            LATENT_PREFERENCE_FILESYSTEM_SURFACE: (
+                AGENTMEMORY_ACTION_SYSTEM_PROMPT_LATENT_PREFERENCE_FILESYSTEM,
+                AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_LATENT_PREFERENCE_FILESYSTEM,
+                AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_LATENT_PREFERENCE_FILESYSTEM,
+            ),
+            DISTRACTOR_ROBUSTNESS_FILESYSTEM_SURFACE: (
+                AGENTMEMORY_ACTION_SYSTEM_PROMPT_DISTRACTOR_FILESYSTEM,
+                AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_DISTRACTOR_FILESYSTEM,
+                AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_DISTRACTOR_FILESYSTEM,
+            ),
             COMPOSITIONAL_RECALL_FILESYSTEM_SURFACE: (
                 AGENTMEMORY_ACTION_SYSTEM_PROMPT_COMPOSITIONAL_FILESYSTEM,
                 AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_COMPOSITIONAL_FILESYSTEM,
@@ -758,6 +962,16 @@ def agentmemory_action_system_prompt(
                 AGENTMEMORY_ACTION_SYSTEM_PROMPT_NEGATIVE_FILESYSTEM,
                 AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_NEGATIVE_FILESYSTEM,
                 AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_NEGATIVE_FILESYSTEM,
+            ),
+            INTENT_CLARIFICATION_FILESYSTEM_SURFACE: (
+                AGENTMEMORY_ACTION_SYSTEM_PROMPT_INTENT_CLARIFICATION_FILESYSTEM,
+                AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_INTENT_CLARIFICATION_FILESYSTEM,
+                AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_INTENT_CLARIFICATION_FILESYSTEM,
+            ),
+            SELECTIVE_MEMORY_USE_FILESYSTEM_SURFACE: (
+                AGENTMEMORY_ACTION_SYSTEM_PROMPT_SELECTIVE_MEMORY_USE_FILESYSTEM,
+                AGENTMEMORY_ACTION_SYSTEM_PROMPT_THINKING_SELECTIVE_MEMORY_USE_FILESYSTEM,
+                AGENTMEMORY_ACTION_SYSTEM_PROMPT_REASONING_SELECTIVE_MEMORY_USE_FILESYSTEM,
             ),
         }[effective_surface]
         if _agentmemory_thinking_enabled():

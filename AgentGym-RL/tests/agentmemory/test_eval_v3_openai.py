@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import copy
 import hashlib
 import importlib.util
@@ -134,6 +135,10 @@ def _filesystem_metadata():
         "source_pairing": "xor_lsb_within_orbit_v1",
         "tasks_per_orbit": 2,
         "workspace_prompt_family": "natural_attribute_chain_filesystem_v2",
+        "workspace_seed_contract": "none",
+        "workspace_evaluation_contract": (
+            "directional_counterfactual_separation_v1"
+        ),
         "provider": {
             "schema": "agentmemory_verified_natural_chain_provider_v4",
             "tasks_per_orbit": 2,
@@ -184,6 +189,80 @@ def _resolved_filesystem_metadata():
                 prompt.encode("utf-8")
             ).hexdigest(),
             "system_prompt_source": "webshop_v2_rollout_fallback",
+        }
+    )
+    return metadata
+
+
+def _distractor_filesystem_metadata():
+    metadata = _filesystem_metadata()
+    prompt = MODULE.DISTRACTOR_FILESYSTEM_WEBSHOP_SYSTEM_PROMPT
+    metadata.update(
+        {
+            "surface": (
+                MODULE.DISTRACTOR_ROBUSTNESS_FILESYSTEM_WEBSHOP_V2_SURFACE
+            ),
+            "source_pairing": "xor_distractor_condition_within_orbit_v1",
+            "workspace_prompt_family": "distractor_robustness_filesystem_v2",
+            "workspace_seed_contract": (
+                "branch_conditioned_ordinary_profile_files_v1"
+            ),
+            "workspace_evaluation_contract": "paired_distractor_robustness_v1",
+            "provider": {
+                "schema": "agentmemory_verified_distractor_robustness_provider_v1",
+                "tasks_per_orbit": 2,
+                "candidate_count_per_phase": 2,
+            },
+            "workspace_intervention_control": {
+                **metadata["workspace_intervention_control"],
+                "allowed_arms": list(
+                    MODULE.DISTRACTOR_FILESYSTEM_CAUSAL_ARMS
+                ),
+                "source_state": (
+                    "policy_authored_current_record_plus_branch_distractors"
+                ),
+            },
+            "system_prompt": prompt,
+            "system_prompt_sha256": hashlib.sha256(
+                prompt.encode("utf-8")
+            ).hexdigest(),
+        }
+    )
+    return metadata
+
+
+def _selective_filesystem_metadata():
+    metadata = _filesystem_metadata()
+    prompt = MODULE.SELECTIVE_FILESYSTEM_WEBSHOP_SYSTEM_PROMPT
+    metadata.update(
+        {
+            "surface": MODULE.SELECTIVE_MEMORY_USE_FILESYSTEM_WEBSHOP_V2_SURFACE,
+            "source_pairing": (
+                "xor_preference_coordinate_within_factorial_v1"
+            ),
+            "tasks_per_orbit": 4,
+            "workspace_prompt_family": "selective_memory_use_filesystem_v2",
+            "workspace_seed_contract": (
+                "branch_conditioned_initial_profile_files_v1"
+            ),
+            "workspace_evaluation_contract": (
+                "selective_required_separation_not_required_invariance_v1"
+            ),
+            "provider": {
+                "schema": "agentmemory_verified_selective_memory_use_provider_v1",
+                "tasks_per_orbit": 4,
+                "candidate_count_per_phase": 2,
+            },
+            "workspace_intervention_control": {
+                **metadata["workspace_intervention_control"],
+                "source_state": (
+                    "harness_seeded_branch_profile_with_optional_policy_edits"
+                ),
+            },
+            "system_prompt": prompt,
+            "system_prompt_sha256": hashlib.sha256(
+                prompt.encode("utf-8")
+            ).hexdigest(),
         }
     )
     return metadata
@@ -366,9 +445,16 @@ def _filesystem_eval_episode():
 
 
 class _FakeOpen:
-    def __init__(self, metadata, *, model_text="Action: ADVANCE {}"):
+    def __init__(
+        self,
+        metadata,
+        *,
+        model_text="Action: ADVANCE {}",
+        workspace_export_policy_authored=True,
+    ):
         self.metadata = metadata
         self.model_text = model_text
+        self.workspace_export_policy_authored = workspace_export_policy_authored
         self.requests = []
         self.authorization_headers = []
         self.request_headers = []
@@ -467,26 +553,58 @@ class _FakeOpen:
                 sort_keys=True,
                 separators=(",", ":"),
             ).encode("utf-8")
+            contains_harness_seed = (
+                self.metadata.get("workspace_seed_contract", "none") != "none"
+            )
+            workspace_state = {
+                "schema": "agentmemory_workspace_transfer_state_v1",
+                "file_count": 1,
+                "directory_count": 0,
+                "total_bytes": 5,
+                "directories": [],
+                "files": [
+                    {
+                        **files[0],
+                        "content_base64": "YmxhY2s=",
+                    }
+                ],
+                "tree_sha256": hashlib.sha256(manifest).hexdigest(),
+            }
+            if contains_harness_seed:
+                seed_payload = {
+                    "schema": "agentmemory_workspace_seed_manifest_v1",
+                    "source_label": "test_seed",
+                    "seed_tree_sha256": hashlib.sha256(manifest).hexdigest(),
+                    "files": files,
+                }
+                workspace_state.update(
+                    {
+                        "schema": "agentmemory_workspace_transfer_state_v2",
+                        "seed_manifest": {
+                            **seed_payload,
+                            "manifest_sha256": hashlib.sha256(
+                                json.dumps(
+                                    seed_payload,
+                                    ensure_ascii=False,
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                ).encode("utf-8")
+                            ).hexdigest(),
+                        },
+                    }
+                )
             return _Response(
                 {
                     "schema": "agentmemory_workspace_authenticated_export_v1",
                     "id": 7,
                     "data_idx": 0,
-                    "workspace_state": {
-                        "schema": "agentmemory_workspace_transfer_state_v1",
-                        "file_count": 1,
-                        "directory_count": 0,
-                        "total_bytes": 5,
-                        "directories": [],
-                        "files": [
-                            {
-                                **files[0],
-                                "content_base64": "YmxhY2s=",
-                            }
-                        ],
-                        "tree_sha256": hashlib.sha256(manifest).hexdigest(),
+                    "workspace_state": workspace_state,
+                    "policy_authored": self.workspace_export_policy_authored,
+                    "contains_harness_seed": contains_harness_seed,
+                    "workspace_provenance": {
+                        "contains_harness_seed": contains_harness_seed,
+                        "policy_authored": self.workspace_export_policy_authored,
                     },
-                    "policy_authored": True,
                     "hidden_answer_injection": False,
                 }
             )
@@ -1852,6 +1970,10 @@ class EvalV3OpenAITest(unittest.TestCase):
 
     def test_filesystem_surface_is_registered_as_nonpaper_and_validated(self):
         metadata = _filesystem_metadata()
+        self.assertEqual(
+            set(MODULE.EVIDENCE_SURFACE_REGISTRY),
+            set(MODULE.FILESYSTEM_WEBSHOP_V2_SURFACES),
+        )
         self.assertNotIn("formal_schema_version", metadata)
         self.assertNotIn("system_prompt", metadata)
         self.assertNotIn(
@@ -1932,6 +2054,118 @@ class EvalV3OpenAITest(unittest.TestCase):
                     "http://env.test",
                     MODULE.JsonHttp(opener=_FakeOpen(drift)),
                 )
+
+    def test_distractor_filesystem_surface_binds_seed_provenance(self):
+        metadata = _distractor_filesystem_metadata()
+        MODULE.validate_filesystem_surface_metadata(metadata)
+        surface = MODULE.DISTRACTOR_ROBUSTNESS_FILESYSTEM_WEBSHOP_V2_SURFACE
+        self.assertIn(surface, MODULE.FILESYSTEM_WEBSHOP_V2_SURFACES)
+        self.assertFalse(
+            MODULE.EVIDENCE_SURFACE_REGISTRY[surface]["paper_macro_eligible"]
+        )
+        self.assertIn(
+            "harness-seeded ordinary profile notes",
+            MODULE.FILESYSTEM_WEBSHOP_SYSTEM_PROMPTS[surface],
+        )
+        for label, mutate in (
+            (
+                "seed contract",
+                lambda item: item.__setitem__("workspace_seed_contract", "none"),
+            ),
+            (
+                "source state",
+                lambda item: item["workspace_intervention_control"].__setitem__(
+                    "source_state", "policy_authored_workspace_only"
+                ),
+            ),
+        ):
+            drift = copy.deepcopy(metadata)
+            mutate(drift)
+            with self.subTest(label=label), self.assertRaises(MODULE.EvalError):
+                MODULE.validate_filesystem_surface_metadata(drift)
+
+    def test_selective_filesystem_surface_binds_seed_provenance(self):
+        metadata = _selective_filesystem_metadata()
+        MODULE.validate_filesystem_surface_metadata(metadata)
+        surface = MODULE.SELECTIVE_MEMORY_USE_FILESYSTEM_WEBSHOP_V2_SURFACE
+        self.assertIn(surface, MODULE.FILESYSTEM_WEBSHOP_V2_SURFACES)
+        self.assertFalse(
+            MODULE.EVIDENCE_SURFACE_REGISTRY[surface]["paper_macro_eligible"]
+        )
+        for label, mutate in (
+            (
+                "seed contract",
+                lambda item: item.__setitem__("workspace_seed_contract", "none"),
+            ),
+            (
+                "source state",
+                lambda item: item["workspace_intervention_control"].__setitem__(
+                    "source_state", "policy_authored_workspace_only"
+                ),
+            ),
+        ):
+            drift = copy.deepcopy(metadata)
+            mutate(drift)
+            with self.subTest(label=label), self.assertRaises(MODULE.EvalError):
+                MODULE.validate_filesystem_surface_metadata(drift)
+
+    def test_workspace_transfer_v2_validates_seed_manifest(self):
+        content = b"# profile\ncustomer=7\n"
+        digest = hashlib.sha256(content).hexdigest()
+        file_record = {
+            "path": ".agent_memory/inbox/profile-01.md",
+            "bytes": len(content),
+            "sha256": digest,
+        }
+        seed_payload = {
+            "schema": "agentmemory_workspace_seed_manifest_v1",
+            "source_label": "distractor_task:test",
+            "seed_tree_sha256": "a" * 64,
+            "files": [file_record],
+        }
+        seed_manifest = {
+            **seed_payload,
+            "manifest_sha256": hashlib.sha256(
+                json.dumps(
+                    seed_payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+        }
+        manifest = json.dumps(
+            {"directories": [], "files": [file_record]},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        state = {
+            "schema": "agentmemory_workspace_transfer_state_v2",
+            "file_count": 1,
+            "directory_count": 0,
+            "total_bytes": len(content),
+            "directories": [],
+            "files": [
+                {
+                    **file_record,
+                    "content_base64": base64.b64encode(content).decode("ascii"),
+                }
+            ],
+            "tree_sha256": hashlib.sha256(manifest).hexdigest(),
+            "seed_manifest": seed_manifest,
+        }
+        MODULE.validate_workspace_transfer_state(
+            state,
+            limits=_filesystem_metadata()["workspace_limits"],
+        )
+        drift = copy.deepcopy(state)
+        drift["seed_manifest"]["manifest_sha256"] = "0" * 64
+        with self.assertRaisesRegex(MODULE.EvalError, "seed manifest digest"):
+            MODULE.validate_workspace_transfer_state(
+                drift,
+                limits=_filesystem_metadata()["workspace_limits"],
+            )
 
     def test_filesystem_intervention_control_is_token_and_source_bound(self):
         token = "intervention-secret-" + "x" * 32
@@ -2044,6 +2278,39 @@ class EvalV3OpenAITest(unittest.TestCase):
                 ],
                 token,
             )
+        finally:
+            env.close()
+
+    def test_selective_export_accepts_seeded_profile_without_policy_edits(self):
+        fake = _FakeOpen(
+            _selective_filesystem_metadata(),
+            workspace_export_policy_authored=False,
+        )
+        env = MODULE.AgentMemoryEnvClient(
+            "http://env.test", MODULE.JsonHttp(opener=fake)
+        )
+        try:
+            exported = env.workspace_export(token="s" * 48)
+            self.assertFalse(exported["policy_authored"])
+            self.assertTrue(exported["contains_harness_seed"])
+            self.assertEqual(
+                exported["workspace_state"]["schema"],
+                "agentmemory_workspace_transfer_state_v2",
+            )
+        finally:
+            env.close()
+
+    def test_distractor_export_still_requires_policy_authored_record(self):
+        fake = _FakeOpen(
+            _distractor_filesystem_metadata(),
+            workspace_export_policy_authored=False,
+        )
+        env = MODULE.AgentMemoryEnvClient(
+            "http://env.test", MODULE.JsonHttp(opener=fake)
+        )
+        try:
+            with self.assertRaisesRegex(MODULE.EvalError, "policy-authored"):
+                env.workspace_export(token="d" * 48)
         finally:
             env.close()
 

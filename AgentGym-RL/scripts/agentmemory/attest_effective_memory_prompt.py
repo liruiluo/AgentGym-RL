@@ -37,8 +37,14 @@ QUERY_TOP1_SURFACES = frozenset(
 INTENT_CLARIFICATION_SURFACE = (
     "agentmemory_webshop_intent_clarification_train_v1"
 )
+INTENT_CLARIFICATION_FILESYSTEM_SURFACE = (
+    "agentmemory_webshop_intent_clarification_filesystem_v2"
+)
 SELECTIVE_MEMORY_USE_SURFACE = (
     "agentmemory_webshop_selective_memory_use_top1_train_v1"
+)
+SELECTIVE_MEMORY_USE_FILESYSTEM_SURFACE = (
+    "agentmemory_webshop_selective_memory_use_filesystem_v2"
 )
 FILESYSTEM_SURFACE = (
     "agentmemory_webshop_procedural_natural_chain_filesystem_v2"
@@ -46,18 +52,28 @@ FILESYSTEM_SURFACE = (
 RECENCY_OVERRIDE_FILESYSTEM_SURFACE = (
     "agentmemory_webshop_recency_override_filesystem_v2"
 )
+DISTRACTOR_ROBUSTNESS_FILESYSTEM_SURFACE = (
+    "agentmemory_webshop_distractor_robustness_filesystem_v2"
+)
 COMPOSITIONAL_RECALL_FILESYSTEM_SURFACE = (
     "agentmemory_webshop_compositional_recall_filesystem_v2"
 )
 NEGATIVE_CONSTRAINT_FILESYSTEM_SURFACE = (
     "agentmemory_webshop_negative_constraint_filesystem_v2"
 )
+LATENT_PREFERENCE_FILESYSTEM_SURFACE = (
+    "agentmemory_webshop_latent_preference_filesystem_v2"
+)
 FILESYSTEM_SURFACES = frozenset(
     {
         FILESYSTEM_SURFACE,
         RECENCY_OVERRIDE_FILESYSTEM_SURFACE,
+        DISTRACTOR_ROBUSTNESS_FILESYSTEM_SURFACE,
         COMPOSITIONAL_RECALL_FILESYSTEM_SURFACE,
         NEGATIVE_CONSTRAINT_FILESYSTEM_SURFACE,
+        LATENT_PREFERENCE_FILESYSTEM_SURFACE,
+        INTENT_CLARIFICATION_FILESYSTEM_SURFACE,
+        SELECTIVE_MEMORY_USE_FILESYSTEM_SURFACE,
     }
 )
 QUERY_TOP1_REQUIRED_FRAGMENTS = (
@@ -116,6 +132,17 @@ FILESYSTEM_REQUIRED_FRAGMENTS = (
     "Later turn (complete reply):\n"
     "shell_command {\"command\":\"rg --hidden -n '^service port:' .\"",
 )
+FILESYSTEM_COMMON_REQUIRED_FRAGMENTS = (
+    'shell_command {"command":"rg -n pattern ."',
+    "apply_patch is followed on the next line",
+    "*** Begin Patch",
+    "*** End Patch",
+    "workspace persists across shopping sessions within this episode",
+    "Workspace actions have zero task reward",
+    "has no network",
+    "no host-path access",
+    "no dedicated memory API",
+)
 RECENCY_FILESYSTEM_REQUIRED_FRAGMENTS = (
     'shell_command {"command":"rg -n pattern ."',
     "apply_patch is followed on the next line",
@@ -156,6 +183,30 @@ RECENCY_FILESYSTEM_REQUIRED_FRAGMENTS = (
     "assume the workspace is unchanged and fix and retry the workspace action",
     "only `Done!` proves that the patch succeeded",
     "No concrete preference value or filename is demonstrated here",
+)
+DISTRACTOR_FILESYSTEM_REQUIRED_FRAGMENTS = (
+    'shell_command {"command":"rg -n pattern ."',
+    "apply_patch is followed on the next line",
+    "*** Begin Patch",
+    "*** End Patch",
+    "workspace persists across shopping sessions within this episode",
+    "Workspace actions have zero task reward",
+    "has no network",
+    "no host-path access",
+    "no dedicated memory API",
+    "workspace may start with harness-seeded ordinary profile notes",
+    "background records, not policy actions, hidden answers",
+    "beginning with `Current preference:`",
+    "copy that exact line verbatim",
+    "do not rewrite or delete the seeded notes",
+    "rg --hidden -n -i '(current|preference|profile)' .",
+    "Ignore superseded history, another customer's record",
+    "Do not rely on filenames, directory order, or the number of files",
+    "exact policy-authored `Current preference:` line",
+    "never infer the missing value from the current choice table",
+    "Create the current record with exactly five physical lines",
+    "Only `Done!` proves a patch succeeded",
+    "No concrete customer, axis, preference value, or filename",
 )
 COMPOSITIONAL_FILESYSTEM_REQUIRED_FRAGMENTS = (
     'shell_command {"command":"rg -n pattern ."',
@@ -204,10 +255,36 @@ NEGATIVE_FILESYSTEM_REQUIRED_FRAGMENTS = (
     "Only `Done!` proves the patch succeeded",
     "No concrete axis, forbidden value, or filename",
 )
+LATENT_PREFERENCE_FILESYSTEM_REQUIRED_FRAGMENTS = (
+    *FILESYSTEM_COMMON_REQUIRED_FRAGMENTS,
+    "confirmed choice as preference evidence",
+    "customer-profile memory",
+    "preference axis",
+    "inferred value",
+    "preserve confirmed preference evidence in an ordinary workspace file",
+    "apply the retrieved preference in later application sessions",
+)
+INTENT_FILESYSTEM_REQUIRED_FRAGMENTS = (
+    *FILESYSTEM_COMMON_REQUIRED_FRAGMENTS,
+    'ASK {"field":"..."}',
+    "ASK is available only in the first shopping session",
+    "CLARIFY observation",
+    "store the clarification in an ordinary workspace file",
+)
+SELECTIVE_FILESYSTEM_REQUIRED_FRAGMENTS = (
+    *FILESYSTEM_COMMON_REQUIRED_FRAGMENTS,
+    "workspace may start with one branch-conditioned ordinary profile file",
+    "first decide whether the current request already states every attribute needed",
+    "do not read the profile merely by habit",
+    "read the profile when the current request omits the preference",
+)
 FILESYSTEM_REQUIRED_FRAGMENTS_BY_SURFACE = {
     FILESYSTEM_SURFACE: FILESYSTEM_REQUIRED_FRAGMENTS,
     RECENCY_OVERRIDE_FILESYSTEM_SURFACE: (
         RECENCY_FILESYSTEM_REQUIRED_FRAGMENTS
+    ),
+    DISTRACTOR_ROBUSTNESS_FILESYSTEM_SURFACE: (
+        DISTRACTOR_FILESYSTEM_REQUIRED_FRAGMENTS
     ),
     COMPOSITIONAL_RECALL_FILESYSTEM_SURFACE: (
         COMPOSITIONAL_FILESYSTEM_REQUIRED_FRAGMENTS
@@ -215,6 +292,9 @@ FILESYSTEM_REQUIRED_FRAGMENTS_BY_SURFACE = {
     NEGATIVE_CONSTRAINT_FILESYSTEM_SURFACE: (
         NEGATIVE_FILESYSTEM_REQUIRED_FRAGMENTS
     ),
+    LATENT_PREFERENCE_FILESYSTEM_SURFACE: LATENT_PREFERENCE_FILESYSTEM_REQUIRED_FRAGMENTS,
+    INTENT_CLARIFICATION_FILESYSTEM_SURFACE: INTENT_FILESYSTEM_REQUIRED_FRAGMENTS,
+    SELECTIVE_MEMORY_USE_FILESYSTEM_SURFACE: SELECTIVE_FILESYSTEM_REQUIRED_FRAGMENTS,
 }
 FILESYSTEM_FORBIDDEN_FRAGMENTS = (
     'Read {"path"',
@@ -304,7 +384,10 @@ def build_attestation(
             "RETRIEVE contract: "
             f"missing={missing_query_top1} forbidden={forbidden_query_top1}"
         )
-    intent_clarification_required = surface == INTENT_CLARIFICATION_SURFACE
+    intent_clarification_required = surface in {
+        INTENT_CLARIFICATION_SURFACE,
+        INTENT_CLARIFICATION_FILESYSTEM_SURFACE,
+    }
     missing_intent_clarification = [
         fragment
         for fragment in INTENT_CLARIFICATION_FRAGMENTS
@@ -329,7 +412,10 @@ def build_attestation(
             "effective AgentMemory system prompt leaks the intent clarification "
             f"contract onto another surface: {unexpected_intent_clarification}"
         )
-    selective_memory_required = surface == SELECTIVE_MEMORY_USE_SURFACE
+    selective_memory_required = surface in {
+        SELECTIVE_MEMORY_USE_SURFACE,
+        SELECTIVE_MEMORY_USE_FILESYSTEM_SURFACE,
+    }
     missing_selective_memory = [
         fragment
         for fragment in SELECTIVE_MEMORY_SOP_FRAGMENTS

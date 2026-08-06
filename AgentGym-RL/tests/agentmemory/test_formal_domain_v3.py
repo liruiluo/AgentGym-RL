@@ -368,6 +368,7 @@ class FormalDomainV3Test(unittest.TestCase):
             MODULE.FORMAL_WEBSHOP_RECENCY_OVERRIDE_SURFACE_V2,
             MODULE.FORMAL_WEBSHOP_RECENCY_OVERRIDE_FILESYSTEM_SURFACE_V2,
             MODULE.FORMAL_WEBSHOP_DISTRACTOR_ROBUSTNESS_SURFACE_V2,
+            MODULE.FORMAL_WEBSHOP_DISTRACTOR_ROBUSTNESS_FILESYSTEM_SURFACE_V2,
             MODULE.FORMAL_WEBSHOP_COMPOSITIONAL_RECALL_SURFACE_V2,
             MODULE.FORMAL_WEBSHOP_INTENT_CLARIFICATION_SURFACE_V2,
             MODULE.FORMAL_WEBSHOP_SELECTIVE_MEMORY_USE_SURFACE_V2,
@@ -505,21 +506,24 @@ class FormalDomainV3Test(unittest.TestCase):
                 expected_prompt_mode="natural_filesystem",
             )
 
-    def test_recency_filesystem_surface_uses_shared_workspace_validator(self):
-        metadata = filesystem_contract_metadata(
-            surface=MODULE.FORMAL_WEBSHOP_RECENCY_OVERRIDE_FILESYSTEM_SURFACE_V2,
-        )
-        MODULE.validate_webshop_filesystem_surface(
-            metadata,
-            expected_prompt_mode="natural_filesystem",
-        )
-        tampered = deepcopy(metadata)
-        tampered["workspace_tool_ops"] = ["SHELL_COMMAND"]
-        with self.assertRaisesRegex(MODULE.FormalDomainV3Error, "exactly"):
-            MODULE.validate_webshop_filesystem_surface(
-                tampered,
-                expected_prompt_mode="natural_filesystem",
-            )
+    def test_task_specific_filesystem_surfaces_use_shared_workspace_validator(self):
+        for surface in (
+            MODULE.FORMAL_WEBSHOP_RECENCY_OVERRIDE_FILESYSTEM_SURFACE_V2,
+            MODULE.FORMAL_WEBSHOP_DISTRACTOR_ROBUSTNESS_FILESYSTEM_SURFACE_V2,
+        ):
+            with self.subTest(surface=surface):
+                metadata = filesystem_contract_metadata(surface=surface)
+                MODULE.validate_webshop_filesystem_surface(
+                    metadata,
+                    expected_prompt_mode="natural_filesystem",
+                )
+                tampered = deepcopy(metadata)
+                tampered["workspace_tool_ops"] = ["SHELL_COMMAND"]
+                with self.assertRaisesRegex(MODULE.FormalDomainV3Error, "exactly"):
+                    MODULE.validate_webshop_filesystem_surface(
+                        tampered,
+                        expected_prompt_mode="natural_filesystem",
+                    )
 
     def test_webshop_action_listing_mode_requires_server_rollout_parity(self):
         MODULE.validate_webshop_action_listing_mode(
