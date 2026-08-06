@@ -672,6 +672,7 @@ class FormalPromptTests(unittest.TestCase):
                 "apply the retrieved preference in later application sessions",
             ),
             module.INTENT_CLARIFICATION_FILESYSTEM_SURFACE: (
+                "ASK requires field:string",
                 'ASK {"field":"..."}',
                 "infer and fill the missing field",
                 "CLARIFY observation",
@@ -698,6 +699,43 @@ class FormalPromptTests(unittest.TestCase):
             prompts[module.INTENT_CLARIFICATION_FILESYSTEM_SURFACE],
         )
         self.assertEqual(len(set(prompts.values())), len(prompts))
+
+    def test_intent_filesystem_runtime_prompt_passes_attestation(self) -> None:
+        schemas = load_schemas_module()
+        attestation = load_standalone_module(
+            "agentmemory_intent_filesystem_attestation_for_integration_test",
+            PROMPT_ATTESTATION_PATH,
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "AGENTMEMORY_ENABLE_THINKING": "0",
+                "AGENTMEMORY_ALLOW_REASONING": "0",
+            },
+            clear=True,
+        ):
+            prompt = schemas.agentmemory_action_system_prompt(
+                ltm_inventory_mode="hidden",
+                memory_prompt_mode="natural_filesystem",
+                surface=schemas.INTENT_CLARIFICATION_FILESYSTEM_SURFACE,
+            )
+
+        result = attestation.build_attestation(
+            prompt=prompt,
+            memory_prompt_mode="natural_filesystem",
+            ltm_inventory_mode="hidden",
+            thinking_enabled=False,
+            reasoning_enabled=False,
+            require_lifecycle_sop=False,
+            surface=schemas.INTENT_CLARIFICATION_FILESYSTEM_SURFACE,
+        )
+
+        self.assertTrue(result["filesystem_present"])
+        self.assertTrue(result["intent_clarification_present"])
+        self.assertEqual(result["missing_filesystem_fragments"], [])
+        self.assertEqual(result["missing_intent_clarification_fragments"], [])
+        self.assertIn("ASK requires field:string", prompt)
+        self.assertNotIn('ASK {"field":"color"}', prompt)
 
     def test_surface_specific_top1_and_clarification_contracts(self) -> None:
         module = load_schemas_module()
