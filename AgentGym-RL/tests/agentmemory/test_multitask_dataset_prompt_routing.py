@@ -8,6 +8,7 @@ try:
         FILESYSTEM_MULTITASK_CYCLE_SIZE,
         PROVIDER_MODE_RESEEDED_STREAM,
         TaskBalancedMultitaskIndexSource,
+        UniformMultitaskIndexSource,
     )
     from verl.utils.agent_dataset.rl_dataset import RLHFDataset
 except ModuleNotFoundError as exc:  # pragma: no cover - exercised on minimal hosts
@@ -67,6 +68,37 @@ class MultitaskDatasetPromptRoutingTests(unittest.TestCase):
             observed_user_prompts.append(messages[0]["content"])
 
         self.assertEqual(len(set(observed_user_prompts)), 8)
+
+    def test_build_messages_routes_uniform_rows_by_seeded_surface_slot(self) -> None:
+        source = UniformMultitaskIndexSource(
+            task_count=64,
+            provider_mode=PROVIDER_MODE_RESEEDED_STREAM,
+            tasks_per_orbit=1,
+            sampling_seed=17,
+            local_task_count=12,
+        )
+        dataset = RLHFDataset.__new__(RLHFDataset)
+        dataset.procedural_index_source = source
+        dataset.env_client = SimpleNamespace(
+            conversation_start=[
+                {"value": "slot-0-user"},
+                {"value": "slot-0-assistant"},
+            ]
+        )
+        dataset.multitask_conversation_starts = [
+            [
+                {"value": f"slot-{slot}-user"},
+                {"value": f"slot-{slot}-assistant"},
+            ]
+            for slot in range(8)
+        ]
+
+        row = source.row_for_position(37)
+        messages, rendered = dataset._build_messages(row)
+        slot = row["agentmemory_surface_slot"]
+        self.assertEqual(messages[0]["content"], f"slot-{slot}-user")
+        self.assertEqual(messages[1]["content"], f"slot-{slot}-assistant")
+        self.assertIn(f"slot-{slot}-user", rendered)
 
 
 if __name__ == "__main__":

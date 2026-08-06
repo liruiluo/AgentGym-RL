@@ -14,11 +14,14 @@ data:
   # AgentMemoryGym indices and the environment generates/verifies tasks on reset.
   procedural_index:
     enabled: False
+    kind: null
     provider_mode: reseeded_stream
     task_count: null
     tasks_per_orbit: 2
     start_index: 0
     item_id_prefix: agentmemory
+    sampling_seed: 233
+    local_task_count: null
 
 actor_rollout_ref:
   hybrid_engine: True

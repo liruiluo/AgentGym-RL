@@ -4,6 +4,7 @@ import hashlib
 import json
 import operator
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Mapping, MutableMapping, Sequence
 
 
@@ -15,6 +16,9 @@ PROCEDURAL_STREAM_CHECKPOINT_SCHEMA = (
 ROLLOUT_REPLICA_INDEX_KEY = "agentmemory_replica_index"
 MULTITASK_SURFACE_SLOT_KEY = "agentmemory_surface_slot"
 MULTITASK_LOCAL_DATA_INDEX_KEY = "agentmemory_local_data_idx"
+MULTITASK_ROUTE_KIND_KEY = "agentmemory_multitask_route_kind"
+MULTITASK_SAMPLING_SEED_KEY = "agentmemory_multitask_sampling_seed"
+MULTITASK_LOCAL_TASK_COUNT_KEY = "agentmemory_multitask_local_task_count"
 PROVIDER_MODE_FIXED_WINDOW = "fixed_window"
 PROVIDER_MODE_RESEEDED_STREAM = "reseeded_stream"
 PROVIDER_MODES = (
@@ -61,6 +65,9 @@ FILESYSTEM_SURFACES = frozenset(
     }
 )
 FILESYSTEM_MULTITASK_KIND = "filesystem_task_balanced_v1"
+FILESYSTEM_MULTITASK_UNIFORM_KIND = "filesystem_surface_uniform_v2"
+FILESYSTEM_MULTITASK_FIXED_BATCH_SIZE = 64
+FILESYSTEM_MULTITASK_DEFAULT_SAMPLING_SEED = 233
 FILESYSTEM_MULTITASK_SURFACE_ORDER = (
     FILESYSTEM_SURFACE,
     LATENT_PREFERENCE_FILESYSTEM_SURFACE,
@@ -217,39 +224,144 @@ def generation_non_tensor_keys(
     keys = ["item_id", "raw_prompt"]
     if "data_idx" in non_tensor_batch:
         keys.append("data_idx")
-    for key in (MULTITASK_SURFACE_SLOT_KEY, MULTITASK_LOCAL_DATA_INDEX_KEY):
+    for key in (
+        MULTITASK_SURFACE_SLOT_KEY,
+        MULTITASK_LOCAL_DATA_INDEX_KEY,
+        MULTITASK_ROUTE_KIND_KEY,
+        MULTITASK_SAMPLING_SEED_KEY,
+        MULTITASK_LOCAL_TASK_COUNT_KEY,
+    ):
         if key in non_tensor_batch:
             keys.append(key)
     return keys
+
+
+def _normalize_nonnegative_index(field: str, value: Any) -> int:
+    if isinstance(value, bool):
+        raise ProceduralIndexError(f"{field} must be an integer, got bool")
+    try:
+        normalized = operator.index(value)
+    except TypeError as exc:
+        raise ProceduralIndexError(
+            f"{field} must be an integer, got {value!r}"
+        ) from exc
+    if normalized < 0:
+        raise ProceduralIndexError(f"{field} must be non-negative")
+    return normalized
+
+
+@lru_cache(maxsize=16)
+def _uniform_multitask_pool_permutation(
+    sampling_seed: int,
+    pool_epoch: int,
+    pool_size: int,
+) -> tuple[int, ...]:
+    """Return a deterministic random-key permutation of one source-row pool."""
+
+    if pool_size <= 0:
+        raise ProceduralIndexError("multitask source-row pool must be non-empty")
+    prefix = (
+        f"{FILESYSTEM_MULTITASK_UNIFORM_KIND}:"
+        f"{sampling_seed}:{pool_epoch}:"
+    ).encode("ascii")
+    return tuple(
+        sorted(
+            range(pool_size),
+            key=lambda flat_index: (
+                hashlib.sha256(
+                    prefix + str(flat_index).encode("ascii")
+                ).digest(),
+                flat_index,
+            ),
+        )
+    )
+
+
+def uniform_multitask_route_for_position(
+    global_data_idx: Any,
+    *,
+    sampling_seed: Any,
+    local_task_count: Any,
+) -> tuple[int, int, int]:
+    """Map a stream position to one uniformly shuffled surface/source row."""
+
+    normalized_global = _normalize_nonnegative_index(
+        "global_data_idx",
+        global_data_idx,
+    )
+    normalized_seed = _normalize_nonnegative_index(
+        MULTITASK_SAMPLING_SEED_KEY,
+        sampling_seed,
+    )
+    normalized_local_count = _normalize_nonnegative_index(
+        MULTITASK_LOCAL_TASK_COUNT_KEY,
+        local_task_count,
+    )
+    if normalized_local_count == 0:
+        raise ProceduralIndexError(
+            f"{MULTITASK_LOCAL_TASK_COUNT_KEY} must be positive"
+        )
+    pool_size = (
+        len(FILESYSTEM_MULTITASK_SURFACE_ORDER) * normalized_local_count
+    )
+    pool_epoch, pool_offset = divmod(normalized_global, pool_size)
+    flat_index = _uniform_multitask_pool_permutation(
+        normalized_seed,
+        pool_epoch,
+        pool_size,
+    )[pool_offset]
+    surface_slot, local_data_idx = divmod(
+        flat_index,
+        normalized_local_count,
+    )
+    return normalized_global, surface_slot, local_data_idx
 
 
 def validate_multitask_route_triplet(
     global_data_idx: Any,
     surface_slot: Any,
     local_data_idx: Any,
+    *,
+    route_kind: Any = None,
+    sampling_seed: Any = None,
+    local_task_count: Any = None,
 ) -> tuple[int, int, int]:
-    """Validate and normalize one frozen task-balanced routing row."""
+    """Validate and normalize one frozen multitask routing row."""
 
-    normalized = []
-    for field, value in (
-        ("global_data_idx", global_data_idx),
-        (MULTITASK_SURFACE_SLOT_KEY, surface_slot),
-        (MULTITASK_LOCAL_DATA_INDEX_KEY, local_data_idx),
-    ):
-        if isinstance(value, bool):
-            raise ProceduralIndexError(f"{field} must be an integer, got bool")
-        try:
-            normalized.append(operator.index(value))
-        except TypeError as exc:
+    normalized_global = _normalize_nonnegative_index(
+        "global_data_idx",
+        global_data_idx,
+    )
+    normalized_slot = _normalize_nonnegative_index(
+        MULTITASK_SURFACE_SLOT_KEY,
+        surface_slot,
+    )
+    normalized_local = _normalize_nonnegative_index(
+        MULTITASK_LOCAL_DATA_INDEX_KEY,
+        local_data_idx,
+    )
+    if route_kind == FILESYSTEM_MULTITASK_UNIFORM_KIND:
+        expected = uniform_multitask_route_for_position(
+            normalized_global,
+            sampling_seed=sampling_seed,
+            local_task_count=local_task_count,
+        )
+        if (normalized_slot, normalized_local) != expected[1:]:
             raise ProceduralIndexError(
-                f"{field} must be an integer, got {value!r}"
-            ) from exc
-
-    normalized_global, normalized_slot, normalized_local = normalized
-    if min(normalized) < 0:
+                "uniform multitask route identity disagrees with the seeded "
+                "global-index mapping: "
+                f"global={normalized_global} expected_slot={expected[1]} "
+                f"observed_slot={normalized_slot} expected_local={expected[2]} "
+                f"observed_local={normalized_local}"
+            )
+        return normalized_global, normalized_slot, normalized_local
+    if route_kind not in {None, FILESYSTEM_MULTITASK_KIND}:
         raise ProceduralIndexError(
-            "multitask global index, surface slot, and local index must be "
-            "non-negative"
+            f"unsupported multitask route kind: {route_kind!r}"
+        )
+    if sampling_seed is not None or local_task_count is not None:
+        raise ProceduralIndexError(
+            "legacy task-balanced routes must not carry uniform-sampler fields"
         )
     cycle_index, cycle_offset = divmod(
         normalized_global,
@@ -979,6 +1091,204 @@ class TaskBalancedMultitaskIndexSource(ProceduralIndexSource):
         }
 
 
+@dataclass(frozen=True)
+class UniformMultitaskIndexSource(ProceduralIndexSource):
+    """Sample independent certified rows with equal surface probability.
+
+    The underlying providers may organize rows into factual/counterfactual
+    semantic orbits for certification and held-out analysis.  Those semantic
+    relationships do not constrain this learner-side sampler: an orbit member
+    is just another independently sampled row.
+    """
+
+    kind: str = FILESYSTEM_MULTITASK_UNIFORM_KIND
+    sampling_seed: int = FILESYSTEM_MULTITASK_DEFAULT_SAMPLING_SEED
+    local_task_count: int = 0
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.kind != FILESYSTEM_MULTITASK_UNIFORM_KIND:
+            raise ProceduralIndexError(
+                f"unsupported uniform multitask procedural kind: {self.kind!r}"
+            )
+        if self.tasks_per_orbit != 1:
+            raise ProceduralIndexError(
+                "uniform multitask stream positions are independent rows; "
+                "tasks_per_orbit must be 1"
+            )
+        if (
+            isinstance(self.sampling_seed, bool)
+            or not isinstance(self.sampling_seed, int)
+            or self.sampling_seed < 0
+        ):
+            raise ProceduralIndexError(
+                "uniform multitask sampling_seed must be a non-negative integer"
+            )
+        if (
+            isinstance(self.local_task_count, bool)
+            or not isinstance(self.local_task_count, int)
+            or self.local_task_count <= 0
+        ):
+            raise ProceduralIndexError(
+                "uniform multitask local_task_count must be a positive integer"
+            )
+    def validate_training_batch_size(self, batch_size: int) -> None:
+        if batch_size != FILESYSTEM_MULTITASK_FIXED_BATCH_SIZE:
+            raise ProceduralIndexError(
+                "filesystem uniform multitask train_batch_size is frozen at "
+                f"{FILESYSTEM_MULTITASK_FIXED_BATCH_SIZE}, got {batch_size!r}"
+            )
+        super().validate_training_batch_size(batch_size)
+
+    def row_for_position(self, position: int) -> dict[str, Any]:
+        if (
+            isinstance(position, bool)
+            or not isinstance(position, int)
+            or position < 0
+        ):
+            raise IndexError(f"invalid procedural dataset position {position!r}")
+        if (
+            self.provider_mode == PROVIDER_MODE_FIXED_WINDOW
+            and position >= self.task_count
+        ):
+            raise IndexError(
+                f"procedural dataset position {position} is outside [0, "
+                f"{self.task_count})"
+            )
+        absolute_index = self.start_index + position
+        _, surface_slot, local_data_idx = uniform_multitask_route_for_position(
+            absolute_index,
+            sampling_seed=self.sampling_seed,
+            local_task_count=self.local_task_count,
+        )
+        return {
+            "item_id": f"{self.item_id_prefix}_u{surface_slot}_{absolute_index}",
+            "data_idx": absolute_index,
+            MULTITASK_SURFACE_SLOT_KEY: surface_slot,
+            MULTITASK_LOCAL_DATA_INDEX_KEY: local_data_idx,
+            MULTITASK_ROUTE_KIND_KEY: self.kind,
+            MULTITASK_SAMPLING_SEED_KEY: self.sampling_seed,
+            MULTITASK_LOCAL_TASK_COUNT_KEY: self.local_task_count,
+            "extra_info": {"index": absolute_index},
+        }
+
+    @property
+    def required_local_task_count(self) -> int:
+        return self.local_task_count
+
+    def metadata(self) -> dict[str, Any]:
+        metadata = super().metadata()
+        metadata.update(
+            {
+                "kind": self.kind,
+                "task_balanced_in_expectation": True,
+                "surface_order": list(FILESYSTEM_MULTITASK_SURFACE_ORDER),
+                "source_semantic_orbit_sizes": list(
+                    FILESYSTEM_MULTITASK_ROUTE_ORBIT_SIZES
+                ),
+                "sampling_contract": (
+                    "uniform_independent_source_rows_without_replacement_v2"
+                ),
+                "sampling_unit": "independent_certified_source_row",
+                "counterfactual_members_are_independent_rows": True,
+                "window_coverage_required": False,
+                "counterfactual_window_coverage_required": False,
+                "coverage_audit": "posthoc_distribution_only",
+                "sampling_seed": self.sampling_seed,
+                "local_task_count": self.local_task_count,
+                "source_pool_size": (
+                    len(FILESYSTEM_MULTITASK_SURFACE_ORDER)
+                    * self.local_task_count
+                ),
+                "orbit_members_coupled": False,
+                "fixed_train_batch_size": (
+                    FILESYSTEM_MULTITASK_FIXED_BATCH_SIZE
+                ),
+                "required_local_task_count": self.required_local_task_count,
+            }
+        )
+        return metadata
+
+    def validate_server_metadatas(
+        self,
+        server_metadatas: Sequence[Mapping[str, Any]],
+    ) -> None:
+        if len(server_metadatas) != len(FILESYSTEM_MULTITASK_SURFACE_ORDER):
+            raise ProceduralIndexError(
+                "filesystem multitask requires one server metadata record for "
+                f"each of {len(FILESYSTEM_MULTITASK_SURFACE_ORDER)} surfaces"
+            )
+        for slot, (metadata, expected_surface, route_orbit_size) in enumerate(
+            zip(
+                server_metadatas,
+                FILESYSTEM_MULTITASK_SURFACE_ORDER,
+                FILESYSTEM_MULTITASK_ROUTE_ORBIT_SIZES,
+            )
+        ):
+            if not isinstance(metadata, Mapping):
+                raise ProceduralIndexError(
+                    f"filesystem multitask route {slot} metadata must be a mapping"
+                )
+            if metadata.get("surface") != expected_surface:
+                raise ProceduralIndexError(
+                    "filesystem multitask route order drifted: "
+                    f"slot={slot} expected={expected_surface!r} "
+                    f"observed={metadata.get('surface')!r}"
+                )
+            provider = metadata.get("provider")
+            if not isinstance(provider, Mapping):
+                raise ProceduralIndexError(
+                    f"filesystem multitask route {slot} is missing provider metadata"
+                )
+            route_source = ProceduralIndexSource(
+                task_count=provider.get("task_count"),
+                provider_mode=self.provider_mode,
+                tasks_per_orbit=route_orbit_size,
+                start_index=0,
+                item_id_prefix=self.item_id_prefix,
+            )
+            route_source.validate_server_metadata(metadata)
+            if route_source.task_count < self.required_local_task_count:
+                raise ProceduralIndexError(
+                    "filesystem multitask route cannot cover the uniform source "
+                    "pool: "
+                    f"slot={slot} surface={expected_surface!r} "
+                    f"required_local_task_count={self.required_local_task_count} "
+                    f"server_task_count={route_source.task_count}"
+                )
+
+    def training_identity(
+        self,
+        *,
+        server_metadata: Sequence[Mapping[str, Any]],
+        train_batch_size: int,
+    ) -> dict[str, Any]:
+        self.validate_training_batch_size(train_batch_size)
+        self.validate_server_metadatas(server_metadata)
+        return {
+            "schema": PROCEDURAL_STREAM_IDENTITY_SCHEMA,
+            "index_source": self.metadata(),
+            "training_geometry": {
+                "train_batch_size": train_batch_size,
+                "shuffle": False,
+                "drop_last": True,
+                "tasks_per_orbit": 1,
+                "task_balanced_in_expectation": True,
+                "orbit_members_coupled": False,
+                "counterfactual_window_coverage_required": False,
+                "coverage_audit": "posthoc_distribution_only",
+                "fixed_compute_budget": True,
+            },
+            "server_metadata": [
+                _canonical_json_mapping(
+                    metadata,
+                    field=f"server metadata route {slot}",
+                )
+                for slot, metadata in enumerate(server_metadata)
+            ],
+        }
+
+
 class StatefulProceduralStreamSampler:
     """Yield disjoint contiguous windows and preserve the cursor in checkpoints."""
 
@@ -1049,11 +1359,11 @@ def procedural_index_source_from_config(
         return None
     if enabled is not True:
         raise ProceduralIndexError("procedural_index.enabled must be a boolean")
-    source_class = (
-        TaskBalancedMultitaskIndexSource
-        if raw.get("kind") == FILESYSTEM_MULTITASK_KIND
-        else ProceduralIndexSource
-    )
+    kind = raw.get("kind")
+    source_class = {
+        FILESYSTEM_MULTITASK_KIND: TaskBalancedMultitaskIndexSource,
+        FILESYSTEM_MULTITASK_UNIFORM_KIND: UniformMultitaskIndexSource,
+    }.get(kind, ProceduralIndexSource)
     return source_class(
         task_count=raw.get("task_count"),
         provider_mode=raw.get("provider_mode"),
@@ -1062,7 +1372,7 @@ def procedural_index_source_from_config(
             (
                 FILESYSTEM_MULTITASK_CYCLE_SIZE
                 if source_class is TaskBalancedMultitaskIndexSource
-                else 2
+                else 1 if source_class is UniformMultitaskIndexSource else 2
             ),
         ),
         start_index=raw.get("start_index", 0),
@@ -1070,6 +1380,18 @@ def procedural_index_source_from_config(
         **(
             {"kind": raw.get("kind")}
             if source_class is TaskBalancedMultitaskIndexSource
+            else {}
+        ),
+        **(
+            {
+                "kind": kind,
+                "sampling_seed": raw.get(
+                    "sampling_seed",
+                    FILESYSTEM_MULTITASK_DEFAULT_SAMPLING_SEED,
+                ),
+                "local_task_count": raw.get("local_task_count"),
+            }
+            if source_class is UniformMultitaskIndexSource
             else {}
         ),
     )

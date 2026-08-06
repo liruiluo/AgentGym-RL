@@ -28,10 +28,15 @@ PROVIDER_MODE_RESEEDED_STREAM = MODULE.PROVIDER_MODE_RESEEDED_STREAM
 ProceduralIndexError = MODULE.ProceduralIndexError
 ProceduralIndexSource = MODULE.ProceduralIndexSource
 TaskBalancedMultitaskIndexSource = MODULE.TaskBalancedMultitaskIndexSource
+UniformMultitaskIndexSource = MODULE.UniformMultitaskIndexSource
 StatefulProceduralStreamSampler = MODULE.StatefulProceduralStreamSampler
 FILESYSTEM_MULTITASK_CYCLE_SIZE = MODULE.FILESYSTEM_MULTITASK_CYCLE_SIZE
 FILESYSTEM_MULTITASK_KIND = MODULE.FILESYSTEM_MULTITASK_KIND
+FILESYSTEM_MULTITASK_UNIFORM_KIND = MODULE.FILESYSTEM_MULTITASK_UNIFORM_KIND
 MULTITASK_LOCAL_DATA_INDEX_KEY = MODULE.MULTITASK_LOCAL_DATA_INDEX_KEY
+MULTITASK_LOCAL_TASK_COUNT_KEY = MODULE.MULTITASK_LOCAL_TASK_COUNT_KEY
+MULTITASK_ROUTE_KIND_KEY = MODULE.MULTITASK_ROUTE_KIND_KEY
+MULTITASK_SAMPLING_SEED_KEY = MODULE.MULTITASK_SAMPLING_SEED_KEY
 MULTITASK_SURFACE_SLOT_KEY = MODULE.MULTITASK_SURFACE_SLOT_KEY
 build_stream_checkpoint = MODULE.build_stream_checkpoint
 generation_non_tensor_keys = MODULE.generation_non_tensor_keys
@@ -775,6 +780,210 @@ class ProceduralIndexSourceTests(unittest.TestCase):
             "cannot cover the frozen stream",
         ):
             source.validate_server_metadatas(undersized)
+
+    def test_uniform_multitask_config_freezes_batch64_without_orbit_coupling(
+        self,
+    ) -> None:
+        source = procedural_index_source_from_config(
+            {
+                "procedural_index": {
+                    "enabled": True,
+                    "kind": FILESYSTEM_MULTITASK_UNIFORM_KIND,
+                    "task_count": 6_400,
+                    "provider_mode": PROVIDER_MODE_RESEEDED_STREAM,
+                    "tasks_per_orbit": 1,
+                    "sampling_seed": 17,
+                    # Deliberately not divisible by the provider semantic
+                    # orbit sizes (2/3/4): learner sampling must not require
+                    # a complete counterfactual orbit in any window.
+                    "local_task_count": 11,
+                }
+            }
+        )
+        self.assertIsInstance(source, UniformMultitaskIndexSource)
+        source.validate_training_batch_size(64)
+        for invalid_batch_size in (32, 96):
+            with self.subTest(batch_size=invalid_batch_size), self.assertRaisesRegex(
+                ProceduralIndexError,
+                "frozen at 64",
+            ):
+                source.validate_training_batch_size(invalid_batch_size)
+        self.assertFalse(source.metadata()["orbit_members_coupled"])
+        self.assertEqual(source.metadata()["source_pool_size"], 88)
+        self.assertTrue(source.metadata()["task_balanced_in_expectation"])
+        self.assertEqual(
+            source.metadata()["sampling_unit"],
+            "independent_certified_source_row",
+        )
+        self.assertFalse(source.metadata()["window_coverage_required"])
+        self.assertFalse(
+            source.metadata()["counterfactual_window_coverage_required"]
+        )
+        self.assertEqual(
+            source.metadata()["coverage_audit"],
+            "posthoc_distribution_only",
+        )
+
+    def test_uniform_multitask_accepts_non_orbit_aligned_local_pool(self) -> None:
+        source = UniformMultitaskIndexSource(
+            task_count=6_400,
+            provider_mode=PROVIDER_MODE_RESEEDED_STREAM,
+            tasks_per_orbit=1,
+            sampling_seed=17,
+            local_task_count=11,
+        )
+        source.validate_server_metadatas(filesystem_multitask_server_metadatas())
+        observed = [
+            (
+                source.row_for_position(position)[MULTITASK_SURFACE_SLOT_KEY],
+                source.row_for_position(position)[MULTITASK_LOCAL_DATA_INDEX_KEY],
+            )
+            for position in range(88)
+        ]
+        self.assertEqual(len(set(observed)), 88)
+
+    def test_uniform_multitask_pool_is_a_seeded_permutation_of_independent_rows(
+        self,
+    ) -> None:
+        source = UniformMultitaskIndexSource(
+            task_count=64,
+            provider_mode=PROVIDER_MODE_RESEEDED_STREAM,
+            tasks_per_orbit=1,
+            sampling_seed=17,
+            local_task_count=12,
+        )
+        first_epoch = [source.row_for_position(position) for position in range(96)]
+        observed = {
+            (
+                row[MULTITASK_SURFACE_SLOT_KEY],
+                row[MULTITASK_LOCAL_DATA_INDEX_KEY],
+            )
+            for row in first_epoch
+        }
+        self.assertEqual(
+            observed,
+            {
+                (surface_slot, local_data_idx)
+                for surface_slot in range(8)
+                for local_data_idx in range(12)
+            },
+        )
+        self.assertEqual(len(observed), len(first_epoch))
+        second_epoch = [
+            (
+                source.row_for_position(position)[MULTITASK_SURFACE_SLOT_KEY],
+                source.row_for_position(position)[MULTITASK_LOCAL_DATA_INDEX_KEY],
+            )
+            for position in range(96, 192)
+        ]
+        self.assertNotEqual(
+            [
+                (
+                    row[MULTITASK_SURFACE_SLOT_KEY],
+                    row[MULTITASK_LOCAL_DATA_INDEX_KEY],
+                )
+                for row in first_epoch
+            ],
+            second_epoch,
+        )
+
+    def test_uniform_multitask_route_identity_is_exact_and_fail_closed(
+        self,
+    ) -> None:
+        source = UniformMultitaskIndexSource(
+            task_count=64,
+            provider_mode=PROVIDER_MODE_RESEEDED_STREAM,
+            tasks_per_orbit=1,
+            sampling_seed=17,
+            local_task_count=12,
+        )
+        row = source.row_for_position(37)
+        route_kwargs = {
+            "route_kind": row[MULTITASK_ROUTE_KIND_KEY],
+            "sampling_seed": row[MULTITASK_SAMPLING_SEED_KEY],
+            "local_task_count": row[MULTITASK_LOCAL_TASK_COUNT_KEY],
+        }
+        self.assertEqual(
+            validate_multitask_route_triplet(
+                row["data_idx"],
+                row[MULTITASK_SURFACE_SLOT_KEY],
+                row[MULTITASK_LOCAL_DATA_INDEX_KEY],
+                **route_kwargs,
+            ),
+            (
+                row["data_idx"],
+                row[MULTITASK_SURFACE_SLOT_KEY],
+                row[MULTITASK_LOCAL_DATA_INDEX_KEY],
+            ),
+        )
+        with self.assertRaisesRegex(ProceduralIndexError, "seeded global-index"):
+            validate_multitask_route_triplet(
+                row["data_idx"],
+                row[MULTITASK_SURFACE_SLOT_KEY],
+                (row[MULTITASK_LOCAL_DATA_INDEX_KEY] + 1) % 12,
+                **route_kwargs,
+            )
+        with self.assertRaises(ProceduralIndexError):
+            validate_multitask_route_triplet(
+                row["data_idx"],
+                row[MULTITASK_SURFACE_SLOT_KEY],
+                row[MULTITASK_LOCAL_DATA_INDEX_KEY],
+                route_kind=FILESYSTEM_MULTITASK_UNIFORM_KIND,
+            )
+        self.assertEqual(
+            generation_non_tensor_keys(
+                {
+                    "item_id": [row["item_id"]],
+                    "raw_prompt": [[]],
+                    "data_idx": [row["data_idx"]],
+                    MULTITASK_SURFACE_SLOT_KEY: [
+                        row[MULTITASK_SURFACE_SLOT_KEY]
+                    ],
+                    MULTITASK_LOCAL_DATA_INDEX_KEY: [
+                        row[MULTITASK_LOCAL_DATA_INDEX_KEY]
+                    ],
+                    MULTITASK_ROUTE_KIND_KEY: [row[MULTITASK_ROUTE_KIND_KEY]],
+                    MULTITASK_SAMPLING_SEED_KEY: [
+                        row[MULTITASK_SAMPLING_SEED_KEY]
+                    ],
+                    MULTITASK_LOCAL_TASK_COUNT_KEY: [
+                        row[MULTITASK_LOCAL_TASK_COUNT_KEY]
+                    ],
+                }
+            ),
+            [
+                "item_id",
+                "raw_prompt",
+                "data_idx",
+                MULTITASK_SURFACE_SLOT_KEY,
+                MULTITASK_LOCAL_DATA_INDEX_KEY,
+                MULTITASK_ROUTE_KIND_KEY,
+                MULTITASK_SAMPLING_SEED_KEY,
+                MULTITASK_LOCAL_TASK_COUNT_KEY,
+            ],
+        )
+
+    def test_uniform_multitask_attests_servers_and_fixed_compute_identity(
+        self,
+    ) -> None:
+        source = UniformMultitaskIndexSource(
+            task_count=6_400,
+            provider_mode=PROVIDER_MODE_RESEEDED_STREAM,
+            tasks_per_orbit=1,
+            sampling_seed=17,
+            local_task_count=12,
+        )
+        metadatas = filesystem_multitask_server_metadatas()
+        source.validate_server_metadatas(metadatas)
+        identity = source.training_identity(
+            server_metadata=metadatas,
+            train_batch_size=64,
+        )
+        geometry = identity["training_geometry"]
+        self.assertEqual(geometry["train_batch_size"], 64)
+        self.assertTrue(geometry["fixed_compute_budget"])
+        self.assertTrue(geometry["task_balanced_in_expectation"])
+        self.assertFalse(geometry["orbit_members_coupled"])
 
     def test_conflicting_explicit_rollout_indices_fail_closed(self) -> None:
         with self.assertRaisesRegex(ProceduralIndexError, "both data_idx"):

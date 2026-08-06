@@ -56,6 +56,9 @@ from verl.utils.agentgym.client import (
 )
 from verl.utils.agent_dataset.procedural_index import (
     MULTITASK_LOCAL_DATA_INDEX_KEY,
+    MULTITASK_LOCAL_TASK_COUNT_KEY,
+    MULTITASK_ROUTE_KIND_KEY,
+    MULTITASK_SAMPLING_SEED_KEY,
     MULTITASK_SURFACE_SLOT_KEY,
     ProceduralIndexError,
     validate_multitask_route_triplet,
@@ -950,6 +953,15 @@ class vLLMRollout(BaseRollout):
         multitask_local_data_indices = prompts.non_tensor_batch.get(
             MULTITASK_LOCAL_DATA_INDEX_KEY
         )
+        multitask_route_kinds = prompts.non_tensor_batch.get(
+            MULTITASK_ROUTE_KIND_KEY
+        )
+        multitask_sampling_seeds = prompts.non_tensor_batch.get(
+            MULTITASK_SAMPLING_SEED_KEY
+        )
+        multitask_local_task_counts = prompts.non_tensor_batch.get(
+            MULTITASK_LOCAL_TASK_COUNT_KEY
+        )
         source_parent_indices = prompts.non_tensor_batch.get(
             "rollout_source_parent_indices"
         )
@@ -968,9 +980,28 @@ class vLLMRollout(BaseRollout):
                 "multitask rollout rows must carry both surface slots and local "
                 "data indices"
             )
+        uniform_route_fields = (
+            multitask_route_kinds,
+            multitask_sampling_seeds,
+            multitask_local_task_counts,
+        )
+        if any(values is not None for values in uniform_route_fields) and not all(
+            values is not None for values in uniform_route_fields
+        ):
+            raise RuntimeError(
+                "uniform multitask rollout rows must carry route kind, sampling "
+                "seed, and local task count together"
+            )
+        if multitask_route_kinds is not None and multitask_surface_slots is None:
+            raise RuntimeError(
+                "uniform multitask route metadata requires surface/local indices"
+            )
         for field, values in (
             (MULTITASK_SURFACE_SLOT_KEY, multitask_surface_slots),
             (MULTITASK_LOCAL_DATA_INDEX_KEY, multitask_local_data_indices),
+            (MULTITASK_ROUTE_KIND_KEY, multitask_route_kinds),
+            (MULTITASK_SAMPLING_SEED_KEY, multitask_sampling_seeds),
+            (MULTITASK_LOCAL_TASK_COUNT_KEY, multitask_local_task_counts),
         ):
             if values is not None and len(values) != len(
                 prompts.non_tensor_batch["raw_prompt"]
@@ -1040,6 +1071,13 @@ class vLLMRollout(BaseRollout):
                 else:
                     handler.data_idx = int(handler.item_id)
                 if multitask_surface_slots is not None:
+                    route_kwargs = {}
+                    if multitask_route_kinds is not None:
+                        route_kwargs = {
+                            "route_kind": multitask_route_kinds[i],
+                            "sampling_seed": multitask_sampling_seeds[i],
+                            "local_task_count": multitask_local_task_counts[i],
+                        }
                     try:
                         (
                             handler.data_idx,
@@ -1049,6 +1087,7 @@ class vLLMRollout(BaseRollout):
                             handler.data_idx,
                             multitask_surface_slots[i],
                             multitask_local_data_indices[i],
+                            **route_kwargs,
                         )
                     except ProceduralIndexError as exc:
                         raise RuntimeError(

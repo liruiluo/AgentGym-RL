@@ -35,10 +35,15 @@ from verl.utils.agentgym.client import (
     init_env_client,
 )
 from verl.utils.agent_dataset.procedural_index import (
+    FILESYSTEM_MULTITASK_SURFACE_ORDER,
     MULTITASK_LOCAL_DATA_INDEX_KEY,
+    MULTITASK_LOCAL_TASK_COUNT_KEY,
+    MULTITASK_ROUTE_KIND_KEY,
+    MULTITASK_SAMPLING_SEED_KEY,
     MULTITASK_SURFACE_SLOT_KEY,
     ProceduralIndexSource,
     TaskBalancedMultitaskIndexSource,
+    UniformMultitaskIndexSource,
     procedural_index_source_from_config,
     validate_multitask_route_triplet,
 )
@@ -111,40 +116,49 @@ class RLHFDataset(Dataset):
         route_addrs = configured_multitask_env_addrs(self.agentgym_config)
         if isinstance(
             self.procedural_index_source,
-            TaskBalancedMultitaskIndexSource,
+            (
+                TaskBalancedMultitaskIndexSource,
+                UniformMultitaskIndexSource,
+            ),
         ):
-            if len(route_addrs) != 8:
+            expected_route_count = len(FILESYSTEM_MULTITASK_SURFACE_ORDER)
+            if len(route_addrs) != expected_route_count:
                 raise ValueError(
-                    "filesystem task-balanced training requires exactly eight "
-                    "multitask_env_addrs"
+                    "filesystem multitask training requires exactly "
+                    f"{expected_route_count} multitask_env_addrs"
                 )
             self.env_client = init_env_client(
                 self.agentgym_config,
                 env_addr=route_addrs[0],
             )
-            server_metadatas = [copy.deepcopy(self.env_client.metadata)]
-            conversation_starts = [
-                copy.deepcopy(self.env_client.conversation_start)
-            ]
-            for env_addr in route_addrs[1:]:
-                route_client = init_env_client(
-                    self.agentgym_config,
-                    env_addr=env_addr,
+            try:
+                server_metadatas = [copy.deepcopy(self.env_client.metadata)]
+                conversation_starts = [
+                    copy.deepcopy(self.env_client.conversation_start)
+                ]
+                for env_addr in route_addrs[1:]:
+                    route_client = init_env_client(
+                        self.agentgym_config,
+                        env_addr=env_addr,
+                    )
+                    try:
+                        server_metadatas.append(
+                            copy.deepcopy(route_client.metadata)
+                        )
+                        conversation_starts.append(
+                            copy.deepcopy(route_client.conversation_start)
+                        )
+                    finally:
+                        route_client.close()
+                self.procedural_index_source.validate_server_metadatas(
+                    server_metadatas
                 )
-                try:
-                    server_metadatas.append(
-                        copy.deepcopy(route_client.metadata)
-                    )
-                    conversation_starts.append(
-                        copy.deepcopy(route_client.conversation_start)
-                    )
-                finally:
-                    route_client.close()
-            self.procedural_index_source.validate_server_metadatas(
-                server_metadatas
-            )
-            self.procedural_server_metadata = server_metadatas
-            self.multitask_conversation_starts = conversation_starts
+                self.procedural_server_metadata = server_metadatas
+                self.multitask_conversation_starts = conversation_starts
+            finally:
+                # Dataset clients only provide immutable prompt/metadata
+                # bootstrap state. Rollout workers create their own sessions.
+                self.env_client.close()
         else:
             if route_addrs:
                 raise ValueError(
@@ -152,12 +166,16 @@ class RLHFDataset(Dataset):
                     "index kind"
                 )
             self.env_client = init_env_client(self.agentgym_config)
-            self.procedural_server_metadata = self.env_client.metadata
-            self.multitask_conversation_starts = None
-            if self.procedural_index_source is not None:
-                self.procedural_index_source.validate_server_metadata(
-                    self.env_client.metadata
-                )
+            try:
+                self.procedural_server_metadata = self.env_client.metadata
+                self.multitask_conversation_starts = None
+                if self.procedural_index_source is not None:
+                    self.procedural_index_source.validate_server_metadata(
+                        self.env_client.metadata
+                    )
+            finally:
+                if self.procedural_index_source is not None:
+                    self.env_client.close()
 
     def _read_files_and_tokenize(self):
         if getattr(self, "procedural_index_source", None) is not None:
@@ -194,12 +212,25 @@ class RLHFDataset(Dataset):
         conversation_start = self.env_client.conversation_start
         if isinstance(
             self.procedural_index_source,
-            TaskBalancedMultitaskIndexSource,
+            (
+                TaskBalancedMultitaskIndexSource,
+                UniformMultitaskIndexSource,
+            ),
         ):
+            route_kwargs = {}
+            if MULTITASK_ROUTE_KIND_KEY in example:
+                route_kwargs = {
+                    "route_kind": example[MULTITASK_ROUTE_KIND_KEY],
+                    "sampling_seed": example[MULTITASK_SAMPLING_SEED_KEY],
+                    "local_task_count": example[
+                        MULTITASK_LOCAL_TASK_COUNT_KEY
+                    ],
+                }
             _, surface_slot, _ = validate_multitask_route_triplet(
                 example["data_idx"],
                 example[MULTITASK_SURFACE_SLOT_KEY],
                 example[MULTITASK_LOCAL_DATA_INDEX_KEY],
+                **route_kwargs,
             )
             conversation_start = self.multitask_conversation_starts[
                 surface_slot
