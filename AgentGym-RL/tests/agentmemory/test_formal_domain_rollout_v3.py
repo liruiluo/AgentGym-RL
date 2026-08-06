@@ -302,6 +302,48 @@ def packed_webshop_v2_record(
     }
 
 
+def packed_intent_clarification_v2_record(
+    *,
+    surface: str = FORMAL_DOMAIN.FORMAL_WEBSHOP_INTENT_CLARIFICATION_FILESYSTEM_SURFACE_V2,
+):
+    record = packed_webshop_v2_record()
+    action = 'ASK {"field":"color"}'
+    record["action"] = action
+    record["action_submission"] = {
+        "raw_policy_output": action,
+        "submitted_action": action,
+        "parser_status": "adapter_parsed",
+    }
+    record["env_result"] = "CLARIFY: For color, I want gray."
+    record["env_info_before"]["surface"] = surface
+    record["env_info_after"].update(
+        {
+            "surface": surface,
+            "session_trace": [action],
+            "tool_ops": [
+                {
+                    "op": "CLARIFY",
+                    "request_op": "ASK",
+                    "field": "color",
+                    "clarification_received": True,
+                    "step": 1,
+                    "session_index": 0,
+                }
+            ],
+            "reward_components": [
+                {
+                    "name": "clarify_transition",
+                    "op": "CLARIFY",
+                    "step": 1,
+                    "value": 0.0,
+                }
+            ],
+        }
+    )
+    record["search_result_count"] = None
+    return record
+
+
 def invalid_webshop_v2_record(raw_output: str, submitted_action: str):
     record = packed_webshop_v2_record()
     record["action"] = raw_output
@@ -560,6 +602,46 @@ class FormalDomainRolloutV3Test(unittest.TestCase):
         record["search_result_count"] = None
         summary = validate_one_record(record)
         self.assertEqual(summary["valid_rows"], 1)
+
+    def test_webshop_v2_accepts_intent_ask_bound_to_clarify(self):
+        for surface in (
+            FORMAL_DOMAIN.FORMAL_WEBSHOP_INTENT_CLARIFICATION_SURFACE_V2,
+            FORMAL_DOMAIN.FORMAL_WEBSHOP_INTENT_CLARIFICATION_FILESYSTEM_SURFACE_V2,
+        ):
+            with self.subTest(surface=surface):
+                summary = validate_one_record(
+                    packed_intent_clarification_v2_record(surface=surface)
+                )
+                self.assertEqual(summary["valid_rows"], 1)
+
+    def test_webshop_v2_rejects_clarify_outside_intent_surface(self):
+        record = packed_intent_clarification_v2_record(
+            surface=FORMAL_DOMAIN.FORMAL_WEBSHOP_FILESYSTEM_SURFACE_V2
+        )
+        with self.assertRaisesRegex(ValueError, "unsupported tool operations"):
+            validate_one_record(record)
+
+    def test_webshop_v2_rejects_intent_surface_transition(self):
+        record = packed_intent_clarification_v2_record()
+        record["env_info_before"]["surface"] = (
+            FORMAL_DOMAIN.FORMAL_WEBSHOP_FILESYSTEM_SURFACE_V2
+        )
+        with self.assertRaisesRegex(ValueError, "surface changed"):
+            validate_one_record(record)
+
+    def test_webshop_v2_rejects_incomplete_clarify_binding(self):
+        mutations = {
+            "request_op": lambda event: event.update(request_op="RETRIEVE"),
+            "field": lambda event: event.update(field="size"),
+            "receipt": lambda event: event.update(clarification_received=False),
+            "session": lambda event: event.update(session_index=1),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                record = packed_intent_clarification_v2_record()
+                mutate(record["env_info_after"]["tool_ops"][0])
+                with self.assertRaisesRegex(ValueError, "Formal CLARIFY"):
+                    validate_one_record(record)
 
     def test_webshop_v2_rejects_shell_command_tool_misbinding(self):
         record = packed_webshop_v2_record()

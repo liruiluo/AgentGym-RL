@@ -15,6 +15,8 @@ from verl.utils.agentgym.formal_grpo_credit import (
 )
 from verl.utils.agentgym.formal_domain_v3 import (
     FORMAL_DOMAIN_SCHEMA_V3,
+    FORMAL_WEBSHOP_INTENT_CLARIFICATION_FILESYSTEM_SURFACE_V2,
+    FORMAL_WEBSHOP_INTENT_CLARIFICATION_SURFACE_V2,
     FORMAL_WEBSHOP_SCHEMA_V2,
     FormalDomainV3Error,
     canonical_unicode_contains,
@@ -562,11 +564,18 @@ _MEMORY_ACTION_RE = re.compile(
     r"\A(ADD|UPDATE|DELETE|RETRIEVE|SUMMARY|FILTER)\s+(\{.*\})\Z",
     re.DOTALL,
 )
+_ASK_ACTION_RE = re.compile(r"\AASK\s+(\{.*\})\Z", re.DOTALL)
 _SHELL_COMMAND_ACTION_RE = re.compile(
     r"\Ashell_command\s+(\{.*\})\Z",
     re.DOTALL,
 )
 _APPLY_PATCH_ACTION_PREFIX = "apply_patch\n"
+_INTENT_CLARIFICATION_SURFACES = frozenset(
+    {
+        FORMAL_WEBSHOP_INTENT_CLARIFICATION_SURFACE_V2,
+        FORMAL_WEBSHOP_INTENT_CLARIFICATION_FILESYSTEM_SURFACE_V2,
+    }
+)
 
 
 def _parse_formal_native_action(action: Any, *, row_index: int) -> tuple[str, str]:
@@ -591,6 +600,25 @@ def _parse_formal_native_action(action: Any, *, row_index: int) -> tuple[str, st
         if not isinstance(payload, dict):
             raise ValueError(f"Formal memory action payload is not an object at row {row_index}.")
         return memory_match.group(1), memory_match.group(2)
+
+    ask_match = _ASK_ACTION_RE.fullmatch(text)
+    if ask_match is not None:
+        try:
+            payload = json.loads(ask_match.group(1))
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Formal ASK action has invalid JSON at row {row_index}."
+            ) from exc
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"field"}
+            or not isinstance(payload["field"], str)
+            or not payload["field"].strip()
+        ):
+            raise ValueError(
+                f"Formal ASK action requires one nonempty field at row {row_index}."
+            )
+        return "ASK", payload["field"]
 
     shell_match = _SHELL_COMMAND_ACTION_RE.fullmatch(text)
     if shell_match is not None:
@@ -621,6 +649,7 @@ def _resolve_formal_native_action_op(
     tool_ops: Sequence[dict[str, Any]],
     *,
     row_index: int,
+    surface: Any,
 ) -> str:
     """Bind native syntax to the environment's one structured tool event.
 
@@ -636,6 +665,14 @@ def _resolve_formal_native_action_op(
         if tool_ops:
             raise ValueError(
                 f"Formal invalid action claims a tool operation at row {row_index}."
+            )
+        return "INVALID"
+
+    if syntax_op == "ASK" and surface not in _INTENT_CLARIFICATION_SURFACES:
+        if tool_ops:
+            raise ValueError(
+                "Formal ASK action produced a tool operation outside an intent-"
+                f"clarification surface at row {row_index}."
             )
         return "INVALID"
 
@@ -663,6 +700,28 @@ def _resolve_formal_native_action_op(
         ):
             raise ValueError(
                 f"Formal BUY lacks an exact committed click[Buy Now] at row {row_index}."
+            )
+    elif syntax_op == "ASK":
+        if tool_op != "CLARIFY":
+            raise ValueError(
+                f"Formal ASK action is bound to {tool_op} at row {row_index}."
+            )
+        clarification_event = tool_ops[0]
+        if clarification_event.get("request_op") != "ASK":
+            raise ValueError(
+                f"Formal CLARIFY event lacks request_op=ASK at row {row_index}."
+            )
+        if clarification_event.get("field") != native_argument:
+            raise ValueError(
+                f"Formal CLARIFY field differs from the ASK payload at row {row_index}."
+            )
+        if clarification_event.get("clarification_received") is not True:
+            raise ValueError(
+                f"Formal CLARIFY event lacks receipt evidence at row {row_index}."
+            )
+        if clarification_event.get("session_index") != 0:
+            raise ValueError(
+                f"Formal CLARIFY event occurred outside session zero at row {row_index}."
             )
     elif tool_op != syntax_op:
         raise ValueError(
@@ -1497,6 +1556,12 @@ def _validate_formal_step_record(
         raise ValueError(
             f"Formal post-step env_info lacks tool_ops at row {row_index}."
         )
+    surface = record["env_info_after"].get("surface")
+    before_surface = record["env_info_before"].get("surface")
+    if surface in _INTENT_CLARIFICATION_SURFACES and before_surface != surface:
+        raise ValueError(
+            f"Formal intent-clarification surface changed during row {row_index}."
+        )
     allowed_tool_ops = {
         "ADD",
         "UPDATE",
@@ -1512,6 +1577,8 @@ def _validate_formal_step_record(
         "BUY",
         "ANSWER",
     }
+    if surface in _INTENT_CLARIFICATION_SURFACES:
+        allowed_tool_ops.add("CLARIFY")
     malformed_tool_ops = [
         index
         for index, tool_op in enumerate(tool_ops)
@@ -1551,6 +1618,7 @@ def _validate_formal_step_record(
         submitted_action,
         tool_ops,
         row_index=row_index,
+        surface=surface,
     )
     if record["committed_purchase"] and expected_action_op != "BUY":
         raise ValueError(
