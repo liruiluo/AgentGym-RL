@@ -369,6 +369,16 @@ def invalid_webshop_v2_record(raw_output: str, submitted_action: str):
     return record
 
 
+def invalid_intent_action_record(action: str, *, attempted_op: str):
+    record = invalid_webshop_v2_record(action, action)
+    surface = FORMAL_DOMAIN.FORMAL_WEBSHOP_INTENT_CLARIFICATION_FILESYSTEM_SURFACE_V2
+    record["env_info_before"]["surface"] = surface
+    record["env_info_after"]["surface"] = surface
+    record["env_info_after"]["session_trace"] = [action]
+    record["env_info_after"]["reward_components"][0]["op"] = attempted_op
+    return record
+
+
 def validate_one_record(record: dict):
     return ROLLOUT_CONTEXT.validate_formal_runtime_evidence_rows(
         exact_state_uids=[record["exact_state_uid"]],
@@ -613,6 +623,51 @@ class FormalDomainRolloutV3Test(unittest.TestCase):
                     packed_intent_clarification_v2_record(surface=surface)
                 )
                 self.assertEqual(summary["valid_rows"], 1)
+
+    def test_webshop_v2_accepts_failed_intent_action_taxonomy(self):
+        cases = (
+            ("ASK not-json", "INVALID"),
+            ("ASK {bad json}", "INVALID"),
+            ("ASK [1]", "INVALID"),
+            ("ASK {}", "ASK"),
+            ('ASK {"field":""}', "ASK"),
+            ('ASK {"field":"wrong"}', "ASK"),
+            ('ASK {"field":"color","extra":true}', "ASK"),
+            ('shell_command {bad json}', "INVALID"),
+            ("apply_patch *** Begin Patch", "INVALID"),
+            ("click[Buy Now]", "CLICK"),
+        )
+        for action, attempted_op in cases:
+            with self.subTest(action=action, attempted_op=attempted_op):
+                summary = validate_one_record(
+                    invalid_intent_action_record(action, attempted_op=attempted_op)
+                )
+                self.assertEqual(summary["valid_rows"], 1)
+
+    def test_webshop_v2_requires_strict_ask_payload_for_clarify(self):
+        for action in (
+            "ASK {}",
+            'ASK {"field":""}',
+            'ASK {"field":"color","extra":true}',
+        ):
+            with self.subTest(action=action):
+                record = packed_intent_clarification_v2_record()
+                record["action"] = action
+                record["action_submission"]["raw_policy_output"] = action
+                record["action_submission"]["submitted_action"] = action
+                with self.assertRaisesRegex(ValueError, "Formal CLARIFY"):
+                    validate_one_record(record)
+
+    def test_webshop_v2_action_mismatch_reports_exact_evidence(self):
+        action = 'ASK {"field":"wrong"}'
+        record = invalid_intent_action_record(action, attempted_op="INVALID")
+        with self.assertRaises(ValueError) as caught:
+            validate_one_record(record)
+        message = str(caught.exception)
+        self.assertIn(f"submitted_action={action!r}", message)
+        self.assertIn("expected_action_op='ASK'", message)
+        self.assertIn("component_op='INVALID'", message)
+        self.assertIn("tool_ops=[]", message)
 
     def test_webshop_v2_rejects_clarify_outside_intent_surface(self):
         record = packed_intent_clarification_v2_record(

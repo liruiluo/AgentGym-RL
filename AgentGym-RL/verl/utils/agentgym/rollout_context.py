@@ -578,7 +578,7 @@ _INTENT_CLARIFICATION_SURFACES = frozenset(
 )
 
 
-def _parse_formal_native_action(action: Any, *, row_index: int) -> tuple[str, str]:
+def _parse_formal_native_action(action: Any, *, row_index: int) -> tuple[str, Any]:
     """Parse the policy-visible MemoryArena action without guessing BUY."""
 
     if not isinstance(action, str) or not action.strip():
@@ -609,16 +609,11 @@ def _parse_formal_native_action(action: Any, *, row_index: int) -> tuple[str, st
             raise ValueError(
                 f"Formal ASK action has invalid JSON at row {row_index}."
             ) from exc
-        if (
-            not isinstance(payload, dict)
-            or set(payload) != {"field"}
-            or not isinstance(payload["field"], str)
-            or not payload["field"].strip()
-        ):
+        if not isinstance(payload, dict):
             raise ValueError(
-                f"Formal ASK action requires one nonempty field at row {row_index}."
+                f"Formal ASK action payload is not an object at row {row_index}."
             )
-        return "ASK", payload["field"]
+        return "ASK", payload
 
     shell_match = _SHELL_COMMAND_ACTION_RE.fullmatch(text)
     if shell_match is not None:
@@ -706,12 +701,21 @@ def _resolve_formal_native_action_op(
             raise ValueError(
                 f"Formal ASK action is bound to {tool_op} at row {row_index}."
             )
+        ask_payload = native_argument
+        if (
+            set(ask_payload) != {"field"}
+            or not isinstance(ask_payload["field"], str)
+            or not ask_payload["field"].strip()
+        ):
+            raise ValueError(
+                f"Formal CLARIFY lacks one nonempty ASK field at row {row_index}."
+            )
         clarification_event = tool_ops[0]
         if clarification_event.get("request_op") != "ASK":
             raise ValueError(
                 f"Formal CLARIFY event lacks request_op=ASK at row {row_index}."
             )
-        if clarification_event.get("field") != native_argument:
+        if clarification_event.get("field") != ask_payload["field"]:
             raise ValueError(
                 f"Formal CLARIFY field differs from the ASK payload at row {row_index}."
             )
@@ -1644,7 +1648,10 @@ def _validate_formal_step_record(
         if component.get("op") != expected_action_op:
             raise ValueError(
                 "Formal reward component is bound to a different action: "
-                f"row={row_index} component={component_index}."
+                f"row={row_index} component={component_index} "
+                f"submitted_action={submitted_action!r} "
+                f"expected_action_op={expected_action_op!r} "
+                f"component_op={component.get('op')!r} tool_ops={tool_ops!r}."
             )
         if type(component.get("step")) is not int:
             raise ValueError(
