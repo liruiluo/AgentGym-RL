@@ -737,6 +737,44 @@ class FormalPromptTests(unittest.TestCase):
         self.assertIn("ASK requires field:string", prompt)
         self.assertNotIn('ASK {"field":"color"}', prompt)
 
+    def test_selective_filesystem_runtime_prompt_passes_attestation(self) -> None:
+        schemas = load_schemas_module()
+        attestation = load_standalone_module(
+            "agentmemory_selective_filesystem_attestation_for_integration_test",
+            PROMPT_ATTESTATION_PATH,
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "AGENTMEMORY_ENABLE_THINKING": "0",
+                "AGENTMEMORY_ALLOW_REASONING": "0",
+            },
+            clear=True,
+        ):
+            prompt = schemas.agentmemory_action_system_prompt(
+                ltm_inventory_mode="hidden",
+                memory_prompt_mode="natural_filesystem",
+                surface=schemas.SELECTIVE_MEMORY_USE_FILESYSTEM_SURFACE,
+            )
+
+        result = attestation.build_attestation(
+            prompt=prompt,
+            memory_prompt_mode="natural_filesystem",
+            ltm_inventory_mode="hidden",
+            thinking_enabled=False,
+            reasoning_enabled=False,
+            require_lifecycle_sop=False,
+            surface=schemas.SELECTIVE_MEMORY_USE_FILESYSTEM_SURFACE,
+        )
+
+        self.assertTrue(result["filesystem_present"])
+        self.assertTrue(result["selective_memory_present"])
+        self.assertEqual(result["missing_filesystem_fragments"], [])
+        self.assertEqual(result["missing_selective_memory_fragments"], [])
+        self.assertIn("do not read the profile merely by habit", prompt)
+        self.assertNotIn("ADD requires", prompt)
+        self.assertNotIn("RETRIEVE accepts", prompt)
+
     def test_surface_specific_top1_and_clarification_contracts(self) -> None:
         module = load_schemas_module()
         distractor_surface = (

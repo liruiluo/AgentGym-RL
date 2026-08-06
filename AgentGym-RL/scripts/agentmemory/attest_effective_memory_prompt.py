@@ -271,12 +271,15 @@ INTENT_FILESYSTEM_REQUIRED_FRAGMENTS = (
     "CLARIFY observation",
     "store the clarification in an ordinary workspace file",
 )
-SELECTIVE_FILESYSTEM_REQUIRED_FRAGMENTS = (
-    *FILESYSTEM_COMMON_REQUIRED_FRAGMENTS,
+SELECTIVE_FILESYSTEM_SOP_FRAGMENTS = (
     "workspace may start with one branch-conditioned ordinary profile file",
     "first decide whether the current request already states every attribute needed",
     "do not read the profile merely by habit",
     "read the profile when the current request omits the preference",
+)
+SELECTIVE_FILESYSTEM_REQUIRED_FRAGMENTS = (
+    *FILESYSTEM_COMMON_REQUIRED_FRAGMENTS,
+    *SELECTIVE_FILESYSTEM_SOP_FRAGMENTS,
 )
 FILESYSTEM_REQUIRED_FRAGMENTS_BY_SURFACE = {
     FILESYSTEM_SURFACE: FILESYSTEM_REQUIRED_FRAGMENTS,
@@ -416,9 +419,14 @@ def build_attestation(
         SELECTIVE_MEMORY_USE_SURFACE,
         SELECTIVE_MEMORY_USE_FILESYSTEM_SURFACE,
     }
+    required_selective_memory_fragments = (
+        SELECTIVE_FILESYSTEM_SOP_FRAGMENTS
+        if surface == SELECTIVE_MEMORY_USE_FILESYSTEM_SURFACE
+        else SELECTIVE_MEMORY_SOP_FRAGMENTS
+    )
     missing_selective_memory = [
         fragment
-        for fragment in SELECTIVE_MEMORY_SOP_FRAGMENTS
+        for fragment in required_selective_memory_fragments
         if fragment not in prompt
     ]
     unexpected_selective_memory = [

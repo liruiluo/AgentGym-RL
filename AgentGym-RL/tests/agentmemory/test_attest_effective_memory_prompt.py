@@ -65,6 +65,9 @@ class EffectiveMemoryPromptAttestationTests(unittest.TestCase):
         self.negative_filesystem_prompt = " ".join(
             self.module.NEGATIVE_FILESYSTEM_REQUIRED_FRAGMENTS
         )
+        self.selective_filesystem_prompt = " ".join(
+            self.module.SELECTIVE_FILESYSTEM_REQUIRED_FRAGMENTS
+        )
 
     def test_lifecycle_prompt_passes_and_records_hash(self) -> None:
         result = self.module.build_attestation(
@@ -267,6 +270,21 @@ class EffectiveMemoryPromptAttestationTests(unittest.TestCase):
             require_latent_preference_sop=True,
             surface=surface,
         )
+        self.assertTrue(result["selective_memory_required"])
+        self.assertTrue(result["selective_memory_present"])
+        self.assertEqual(result["missing_selective_memory_fragments"], [])
+
+    def test_selective_filesystem_surface_uses_its_filesystem_sop(self) -> None:
+        result = self.module.build_attestation(
+            prompt=self.selective_filesystem_prompt,
+            memory_prompt_mode="natural_filesystem",
+            ltm_inventory_mode="hidden",
+            thinking_enabled=False,
+            reasoning_enabled=True,
+            require_lifecycle_sop=False,
+            surface=self.module.SELECTIVE_MEMORY_USE_FILESYSTEM_SURFACE,
+        )
+        self.assertTrue(result["filesystem_present"])
         self.assertTrue(result["selective_memory_required"])
         self.assertTrue(result["selective_memory_present"])
         self.assertEqual(result["missing_selective_memory_fragments"], [])
