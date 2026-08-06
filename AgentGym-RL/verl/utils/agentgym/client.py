@@ -33,6 +33,7 @@ from agentenv.envs import (
     WebshopEnvClient,
     WordleEnvClient,
     SearchQAEnvClient,
+    SwesmithEnvClient,
 )
 
 def configured_multitask_env_addrs(args) -> tuple[str, ...]:
@@ -96,6 +97,7 @@ def init_env_client(args, *, env_addr: str | None = None):
         "sheet": SheetEnvClient,
         "academia": AcademiaEnvClient,
         "searchqa": SearchQAEnvClient,
+        "swesmith": SwesmithEnvClient,
     }
     # select task according to the name
     envclient_class = envclient_classes.get(args.task_name.lower(), None)
@@ -105,7 +107,7 @@ def init_env_client(args, *, env_addr: str | None = None):
     while True:
         try:
             data_len = getattr(args, "data_len", 1)
-            if args.task_name.lower() == "agentmemory" and not hasattr(args, "data_len"):
+            if args.task_name.lower() in {"agentmemory", "swesmith"} and not hasattr(args, "data_len"):
                 data_len = None
             resolved_env_addr = (
                 env_addr_for_surface_slot(args)

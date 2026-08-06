@@ -6,6 +6,7 @@ import pickle
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 try:
     from torch.utils.data import DataLoader
@@ -42,6 +43,7 @@ build_stream_checkpoint = MODULE.build_stream_checkpoint
 generation_non_tensor_keys = MODULE.generation_non_tensor_keys
 procedural_index_source_from_config = MODULE.procedural_index_source_from_config
 promote_data_idx_for_rollout = MODULE.promote_data_idx_for_rollout
+resolve_rollout_reset_index = MODULE.resolve_rollout_reset_index
 restore_stream_checkpoint = MODULE.restore_stream_checkpoint
 validate_paired_batch_indices = MODULE.validate_paired_batch_indices
 validate_orbit_batch_indices = MODULE.validate_orbit_batch_indices
@@ -639,6 +641,23 @@ class ProceduralIndexSourceTests(unittest.TestCase):
             ["item_id", "raw_prompt"],
         )
         self.assertFalse(promote_data_idx_for_rollout(non_tensor_batch))
+
+    def test_reset_uses_explicit_index_with_opaque_item_identity(self) -> None:
+        handler = SimpleNamespace(
+            item_id="pytest-dev__iniconfig.16793ead.combine_file__opaque",
+            data_idx=271,
+        )
+        self.assertEqual(resolve_rollout_reset_index(handler), 271)
+
+    def test_reset_index_never_falls_back_to_item_identity(self) -> None:
+        with self.assertRaisesRegex(ProceduralIndexError, "missing.*data_idx"):
+            resolve_rollout_reset_index(SimpleNamespace(item_id="task_7"))
+        for invalid in (True, -1, "7"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ProceduralIndexError):
+                    resolve_rollout_reset_index(
+                        SimpleNamespace(item_id="opaque", data_idx=invalid)
+                    )
 
     def test_task_balanced_multitask_cycle_routes_equal_complete_blocks(self) -> None:
         source = TaskBalancedMultitaskIndexSource(

@@ -401,6 +401,34 @@ def promote_data_idx_for_rollout(
     return True
 
 
+def resolve_rollout_reset_index(handler: Any) -> int:
+    """Return the explicit dataset index used for environment reset.
+
+    ``item_id`` is an opaque source identity for coding datasets.  Reset must
+    therefore fail closed when the rollout handler is missing its separately
+    routed integer ``data_idx`` instead of parsing or falling back to item_id.
+    """
+
+    if not hasattr(handler, "data_idx"):
+        raise ProceduralIndexError(
+            "rollout handler is missing the authoritative data_idx"
+        )
+    candidate = handler.data_idx
+    if isinstance(candidate, bool):
+        raise ProceduralIndexError("rollout handler data_idx must not be bool")
+    try:
+        resolved = operator.index(candidate)
+    except TypeError as exc:
+        raise ProceduralIndexError(
+            f"rollout handler data_idx is not an integer: {candidate!r}"
+        ) from exc
+    if resolved < 0:
+        raise ProceduralIndexError(
+            f"rollout handler data_idx must be non-negative: {resolved}"
+        )
+    return int(resolved)
+
+
 def validate_orbit_batch_indices(
     indices: Sequence[Any],
     *,

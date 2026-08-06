@@ -61,6 +61,7 @@ from verl.utils.agent_dataset.procedural_index import (
     MULTITASK_SAMPLING_SEED_KEY,
     MULTITASK_SURFACE_SLOT_KEY,
     ProceduralIndexError,
+    resolve_rollout_reset_index,
     validate_multitask_route_triplet,
 )
 from verl.utils.agentgym.context_policy import assert_rollout_context_supported, read_config, rollout_context_policy
@@ -2352,7 +2353,7 @@ class vLLMRollout(BaseRollout):
         all_done_flag = False
         for idx, rollout_handler in enumerate(rollout_handler_ls):
             try:
-                env_clients[idx].reset(rollout_handler.item_id)
+                env_clients[idx].reset(resolve_rollout_reset_index(rollout_handler))
                 task = env_clients[idx].observe()
                 rollout_handler.add_user_message(self.tokenizer, task)
             except TimeoutError:
