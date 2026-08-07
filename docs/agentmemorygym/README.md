@@ -79,9 +79,11 @@ Keep these three mechanisms separate in code, logs, and reports:
 | Policy handoff | An optional policy step at that reset boundary | Only model-authored file path/discovery text | A harness-written summary or old transcript |
 | Context compaction | A naturally continuous task reaches its context budget | Model-authored summary tokens plus the persistent workspace | A WebShop session transition |
 
-Any WebShop metric or launcher must label a handoff as `session_handoff` and
-must not count it as continuous-history reuse. SWE-smith, LiteResearcher, and
-MLE use the third mechanism only inside their native continuous episode.
+In runtime evidence, use `compaction_mode=webshop_session_handoff` for the
+second row and `compaction_mode=context_limit` for the third row. Any WebShop
+metric or launcher must label a handoff as `session_handoff` and must not count
+it as continuous-history reuse. SWE-smith, LiteResearcher, and MLE use the
+third mechanism only inside their native continuous episode.
 
 For this stream, `data.pt` contains only a versioned sampler cursor plus a
 canonical identity for the index source, complete server metadata, and training
