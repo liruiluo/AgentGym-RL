@@ -93,8 +93,8 @@ class WebShopSessionHandoffRuntimeTests(unittest.TestCase):
         self.rollout.config = SimpleNamespace(
             n=1,
             response_length=64,
-            prompt_length=512,
-            max_model_len=576,
+            prompt_length=1024,
+            max_model_len=1088,
             send_interval=0,
             rollout_log_dir=self.tempdir.name,
         )
