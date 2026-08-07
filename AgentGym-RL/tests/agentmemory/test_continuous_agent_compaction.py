@@ -42,6 +42,7 @@ validate_continuous_agent_trajectory_v1 = (
 validate_continuous_packed_rows_v1 = MODULE.validate_continuous_packed_rows_v1
 continuous_prompt_capacity = MODULE.continuous_prompt_capacity
 should_request_policy_compaction = MODULE.should_request_policy_compaction
+parse_webshop_session_handoff = MODULE.parse_webshop_session_handoff
 
 
 def generation_record(token_ids: list[int]) -> dict:
@@ -310,6 +311,7 @@ class ContinuousAgentCompactionTests(unittest.TestCase):
     def test_webshop_handoff_binds_session_reset_and_source_prompt(self) -> None:
         prompt = [10, 11, 12]
         response = [20, 2]
+        handoff_content = "notes/state.md"
         evidence = build_compaction_evidence_v1(
             pre_request_action_prompt_token_ids=[30, 31],
             pre_compaction_prompt_token_ids=prompt,
@@ -322,12 +324,13 @@ class ContinuousAgentCompactionTests(unittest.TestCase):
             session_index_after=1,
             handoff_source_prompt_token_ids=[50, 51, 52],
             raw_history_cleared=True,
+            handoff_parse_evidence=parse_webshop_session_handoff(handoff_content),
             request_text=POLICY_WEBSHOP_SESSION_HANDOFF_REQUEST,
         )
         row = build_continuous_agent_step_v1(
             row_kind=COMPACTION_ROW,
             task_name="agentmemory",
-            content="handoff",
+            content=handoff_content,
             score=0.0,
             item_id="webshop_4",
             data_idx=4,
@@ -357,6 +360,45 @@ class ContinuousAgentCompactionTests(unittest.TestCase):
         )
         self.assertEqual(row["compaction"]["session_index_after"], 1)
         self.assertTrue(row["compaction"]["raw_history_cleared"])
+        self.assertTrue(row["compaction"]["handoff_parse"]["valid"])
+        self.assertEqual(
+            row["compaction"]["handoff_parse"]["kind"],
+            MODULE.WEBSHOP_HANDOFF_KIND_PATH,
+        )
+
+    def test_webshop_handoff_parser_is_locator_only_and_fail_closed(self) -> None:
+        valid_cases = (
+            ("notes/state.md", MODULE.WEBSHOP_HANDOFF_KIND_PATH, "notes/state.md"),
+            (
+                "rg --hidden -n '^Confirmed' .",
+                MODULE.WEBSHOP_HANDOFF_KIND_READONLY_COMMAND,
+                "rg --hidden -n '^Confirmed' .",
+            ),
+            ("No locator available.", MODULE.WEBSHOP_HANDOFF_KIND_NO_LOCATOR, None),
+        )
+        for raw, kind, forwarded in valid_cases:
+            with self.subTest(raw=raw):
+                parsed = parse_webshop_session_handoff(raw)
+                self.assertTrue(parsed["valid"])
+                self.assertEqual(parsed["kind"], kind)
+                self.assertEqual(parsed["forwarded_content"], forwarded)
+        invalid_cases = (
+            "I remember the confirmed product is black.",
+            "file:///Users/luolirui/state.md",
+            "/home/user/state.md",
+            "../state.md",
+            "notes/state.md\nnext fact",
+            "cat notes/state.md > /tmp/out",
+            "sed -i s/a/b/ notes/state.md",
+            "find . -exec cat {} ;",
+        )
+        for raw in invalid_cases:
+            with self.subTest(raw=raw):
+                parsed = parse_webshop_session_handoff(raw)
+                self.assertFalse(parsed["valid"])
+                self.assertEqual(parsed["kind"], MODULE.WEBSHOP_HANDOFF_KIND_INVALID)
+                self.assertIsNone(parsed["forwarded_content"])
+                self.assertIsNone(parsed["forwarded_content_sha256"])
 
     def test_webshop_handoff_requires_native_reset_evidence(self) -> None:
         with self.assertRaisesRegex(ContinuousAgentV1Error, "raw-history clearing"):
@@ -373,6 +415,54 @@ class ContinuousAgentCompactionTests(unittest.TestCase):
                 handoff_source_prompt_token_ids=[50],
                 raw_history_cleared=False,
             )
+
+    def test_webshop_handoff_rejects_forged_parser_evidence(self) -> None:
+        row = build_continuous_agent_step_v1(
+            row_kind=COMPACTION_ROW,
+            task_name="agentmemory",
+            content="notes/state.md",
+            score=0.0,
+            item_id="webshop_4",
+            data_idx=4,
+            parent_index=0,
+            parent_group_uid="parent:0",
+            replica_index=0,
+            trajectory_uid="parent:0:replica:0",
+            exact_state_uid="0:turn1:statev1:" + token_digest([10, 11, 12]),
+            prompt_token_ids=[10, 11, 12],
+            response_token_ids=[20, 2],
+            sampled_token_logprobs=[-0.1, -0.2],
+            generation_record=generation_record([20, 2]),
+            environment_id=7,
+            environment_step_before=1,
+            environment_step_after=2,
+            native_environment_call_count_before=1,
+            native_environment_call_count_after=1,
+            context_epoch_before=0,
+            context_epoch_after=1,
+            done=False,
+            environment_result="",
+            compaction_evidence=build_compaction_evidence_v1(
+                pre_request_action_prompt_token_ids=[30, 31],
+                pre_compaction_prompt_token_ids=[10, 11, 12],
+                immutable_framing_token_ids=[1, 2, 3],
+                summary_token_ids=[20, 2],
+                post_compaction_prompt_token_ids=[40, 41],
+                workspace_continuity_id="7",
+                compaction_mode=COMPACTION_MODE_WEBSHOP_SESSION_HANDOFF,
+                session_index_before=0,
+                session_index_after=1,
+                handoff_source_prompt_token_ids=[50, 51, 52],
+                raw_history_cleared=True,
+                handoff_parse_evidence=parse_webshop_session_handoff(
+                    "notes/state.md"
+                ),
+                request_text=POLICY_WEBSHOP_SESSION_HANDOFF_REQUEST,
+            ),
+        )
+        row["compaction"]["handoff_parse"]["forwarded_content"] = "wrong.md"
+        with self.assertRaisesRegex(ContinuousAgentV1Error, "parser evidence drifted"):
+            MODULE.validate_continuous_agent_step_v1(row)
 
     def test_webshop_session_prompt_drops_old_transcript(self) -> None:
         messages = build_webshop_session_prompt_payload(

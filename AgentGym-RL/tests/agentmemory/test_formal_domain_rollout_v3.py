@@ -335,6 +335,9 @@ def packed_continuous_record(*, session_handoff: bool = False):
             session_index_after=1,
             handoff_source_prompt_token_ids=[71, 72],
             raw_history_cleared=True,
+            handoff_parse_evidence=CONTINUOUS_AGENT.parse_webshop_session_handoff(
+                action
+            ),
             request_text=CONTINUOUS_AGENT.POLICY_WEBSHOP_SESSION_HANDOFF_REQUEST,
         )
         environment_step_before = 1

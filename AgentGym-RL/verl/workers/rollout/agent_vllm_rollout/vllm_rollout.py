@@ -88,6 +88,7 @@ from verl.utils.agentgym.continuous_agent_v1 import (
     build_continuous_runtime_capacity_readback,
     continuous_prompt_capacity,
     extract_sampled_token_logprobs,
+    parse_webshop_session_handoff,
     should_request_policy_compaction,
     text_sha256,
     validate_continuous_agent_step_v1,
@@ -2149,6 +2150,7 @@ class vLLMRollout(BaseRollout):
                 )
 
                 compaction_evidence = None
+                handoff_parse_evidence = None
                 observation_evidence = None
                 horizon_evidence = None
                 environment_result = ""
@@ -2181,7 +2183,9 @@ class vLLMRollout(BaseRollout):
                         raise RuntimeError(
                             "WebShop compaction row has an invalid session transition"
                         )
-                    handoff_summaries[rollout_index] = content
+                    handoff_parse_evidence = parse_webshop_session_handoff(content)
+                    forwarded_handoff = handoff_parse_evidence["forwarded_content"]
+                    handoff_summaries[rollout_index] = forwarded_handoff
                     pending_handoff_sources[rollout_index] = None
                     pending_handoff_source_prompt_ids[rollout_index] = None
                     pending_session_before[rollout_index] = None
@@ -2198,7 +2202,7 @@ class vLLMRollout(BaseRollout):
                     post_messages = self._webshop_session_prompt_messages(
                         observation=str(latest_observations[rollout_index]),
                         system_prompt=str(system_prompts[rollout_index]),
-                        handoff_summary=content,
+                        handoff_summary=forwarded_handoff,
                     )
                     post_prompt_ids = self._continuous_prompt_from_messages(
                         post_messages
@@ -2225,6 +2229,7 @@ class vLLMRollout(BaseRollout):
                         session_index_after=session_after,
                         handoff_source_prompt_token_ids=source_prompt_ids,
                         raw_history_cleared=raw_history_cleared,
+                        handoff_parse_evidence=handoff_parse_evidence,
                         request_text=POLICY_WEBSHOP_SESSION_HANDOFF_REQUEST,
                     )
                     rollout_handler.messages = deepcopy(post_messages)

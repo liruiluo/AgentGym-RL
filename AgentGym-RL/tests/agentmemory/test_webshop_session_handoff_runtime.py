@@ -160,7 +160,10 @@ class WebShopSessionHandoffRuntimeTests(unittest.TestCase):
             update_sampling_params, self.rollout
         )
 
-    def test_native_reset_handoff_and_next_buy_are_packed_exactly(self) -> None:
+    def _run_rollout(self, contents=None):
+        if contents is not None:
+            self.generated_contents = iter(contents)
+        self.seen_prompt_texts.clear()
         client = FakeWebShopClient()
         handler = SimpleNamespace(
             item_id="webshop-0",
@@ -185,6 +188,10 @@ class WebShopSessionHandoffRuntimeTests(unittest.TestCase):
                 sampling_kwargs={"max_tokens": 64},
                 global_steps=None,
             )
+        return client, output
+
+    def test_native_reset_handoff_and_next_buy_are_packed_exactly(self) -> None:
+        client, output = self._run_rollout()
 
         self.assertEqual(client.native_calls, ["click[Buy Now]", "click[Buy Now]"])
         self.assertEqual(len(self.seen_prompt_texts), 3)
@@ -231,11 +238,47 @@ class WebShopSessionHandoffRuntimeTests(unittest.TestCase):
         self.assertEqual(records[1]["compaction"]["session_index_before"], 0)
         self.assertEqual(records[1]["compaction"]["session_index_after"], 1)
         self.assertTrue(records[1]["compaction"]["raw_history_cleared"])
+        self.assertTrue(records[1]["compaction"]["handoff_parse"]["valid"])
+        self.assertEqual(
+            records[1]["compaction"]["handoff_parse"]["kind"],
+            MODULE.WEBSHOP_HANDOFF_KIND_PATH,
+        )
+        self.assertEqual(
+            records[1]["compaction"]["handoff_parse"]["forwarded_content_sha256"],
+            MODULE.text_sha256("notes/state.md"),
+        )
         self.assertEqual(records[2]["buy_evidence"]["buy_record"]["step"], 2)
         self.assertEqual(
             list(output.batch[MODULE.AGENTMEMORY_TRAJECTORY_ROW_ORDER].cpu().tolist()),
             [0, 1, 2],
         )
+
+    def test_invalid_handoff_stays_in_ppo_but_is_not_forwarded(self) -> None:
+        invalid = "The confirmed product is black; read file:///Users/master/state.md"
+        client, output = self._run_rollout(
+            ["click[Buy Now]", invalid, "click[Buy Now]"]
+        )
+        self.assertEqual(client.native_calls, ["click[Buy Now]", "click[Buy Now]"])
+        self.assertEqual(len(self.seen_prompt_texts), 3)
+        self.assertNotIn(invalid, self.seen_prompt_texts[2])
+        self.assertIn("session-1 fresh observation", self.seen_prompt_texts[2])
+        records = [
+            json.loads(value)
+            for value in output.non_tensor_batch[MODULE.AGENTMEMORY_STEP_RECORD_JSON]
+        ]
+        self.assertEqual(records[1]["content"], invalid)
+        self.assertEqual(records[1]["action"], invalid)
+        self.assertFalse(records[1]["compaction"]["handoff_parse"]["valid"])
+        self.assertEqual(
+            records[1]["compaction"]["handoff_parse"]["kind"],
+            MODULE.WEBSHOP_HANDOFF_KIND_INVALID,
+        )
+        self.assertIsNone(
+            records[1]["compaction"]["handoff_parse"]["forwarded_content"]
+        )
+        self.assertEqual(len(records[1]["response_token_ids"]), len(
+            records[1]["sampled_token_logprobs"]
+        ))
 
 
 if __name__ == "__main__":

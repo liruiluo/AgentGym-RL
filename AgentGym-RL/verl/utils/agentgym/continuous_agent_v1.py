@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
+import shlex
 from copy import deepcopy
+from pathlib import PurePosixPath
 from typing import Any, Mapping, Sequence
 
 
@@ -16,6 +19,26 @@ ENVIRONMENT_ACTION_ROW = "environment_action"
 COMPACTION_ROW = "compaction"
 COMPACTION_MODE_CONTEXT_LIMIT = "context_limit"
 COMPACTION_MODE_WEBSHOP_SESSION_HANDOFF = "webshop_session_handoff"
+WEBSHOP_HANDOFF_PARSE_SCHEMA_V1 = "agentmemory_webshop_handoff_parse_v1"
+WEBSHOP_HANDOFF_KIND_PATH = "workspace_relative_path"
+WEBSHOP_HANDOFF_KIND_READONLY_COMMAND = "readonly_discovery_command"
+WEBSHOP_HANDOFF_KIND_NO_LOCATOR = "no_locator"
+WEBSHOP_HANDOFF_KIND_INVALID = "invalid"
+WEBSHOP_HANDOFF_KINDS = frozenset(
+    {
+        WEBSHOP_HANDOFF_KIND_PATH,
+        WEBSHOP_HANDOFF_KIND_READONLY_COMMAND,
+        WEBSHOP_HANDOFF_KIND_NO_LOCATOR,
+        WEBSHOP_HANDOFF_KIND_INVALID,
+    }
+)
+WEBSHOP_HANDOFF_READONLY_COMMANDS = frozenset(
+    {"cat", "rg", "grep", "find", "ls", "head", "tail", "sed"}
+)
+WEBSHOP_HANDOFF_NO_LOCATOR_RE = re.compile(
+    r"^(?:none|no[- ]locator(?: (?:is )?(?:available|needed))?)[.!。]?$",
+    re.IGNORECASE,
+)
 COMPACTION_MODES = frozenset(
     {COMPACTION_MODE_CONTEXT_LIMIT, COMPACTION_MODE_WEBSHOP_SESSION_HANDOFF}
 )
@@ -71,6 +94,137 @@ def build_webshop_session_prompt_payload(
             ]
         )
     return payload
+
+
+def _handoff_invalid_result(
+    raw_content: str,
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": WEBSHOP_HANDOFF_PARSE_SCHEMA_V1,
+        "raw_content_sha256": text_sha256(raw_content),
+        "valid": False,
+        "kind": WEBSHOP_HANDOFF_KIND_INVALID,
+        "forwarded_content": None,
+        "forwarded_content_sha256": None,
+        "rejection_reason": reason,
+    }
+
+
+def _handoff_token_has_forbidden_path(token: str) -> bool:
+    lowered = token.lower()
+    if (
+        lowered.startswith(("file://", "file:", "~", "/"))
+        or re.match(r"^[a-z]:[\\/]", lowered)
+        or "\\" in token
+    ):
+        return True
+    components = re.split(r"[/\\]", token)
+    return ".." in components
+
+
+def _parse_readonly_handoff_command(value: str) -> tuple[bool, str]:
+    if any(operator in value for operator in (";", "|", "&", ">", "<", chr(96))):
+        return False, "shell_operator"
+    if "$(" in value or ("$" + "{") in value:
+        return False, "shell_expansion"
+    try:
+        tokens = shlex.split(value, posix=True)
+    except ValueError:
+        return False, "invalid_shell_quoting"
+    if not tokens or tokens[0] not in WEBSHOP_HANDOFF_READONLY_COMMANDS:
+        return False, "not_readonly_command"
+    if any(_handoff_token_has_forbidden_path(token) for token in tokens[1:]):
+        return False, "non_workspace_path"
+    if tokens[0] == "sed" and any(
+        token in {"-i", "--in-place"} or token.startswith("-i")
+        for token in tokens[1:]
+    ):
+        return False, "write_command"
+    if tokens[0] == "find" and any(
+        token in {"-delete", "-exec", "-execdir", "-ok", "-okdir"}
+        for token in tokens[1:]
+    ):
+        return False, "write_or_child_process"
+    return True, ""
+
+
+def _parse_workspace_relative_path(value: str) -> tuple[bool, str]:
+    if not value or any(char.isspace() for char in value):
+        return False, "not_single_relative_path"
+    if any(operator in value for operator in (";", "|", "&", ">", "<", chr(96))):
+        return False, "shell_operator"
+    if _handoff_token_has_forbidden_path(value) or "://" in value:
+        return False, "non_workspace_path"
+    try:
+        path = PurePosixPath(value)
+    except (TypeError, ValueError):
+        return False, "invalid_relative_path"
+    if path.is_absolute() or not path.parts or path.parts == (".",):
+        return False, "invalid_relative_path"
+    if any(part in {"", ".", ".."} for part in path.parts[:-1]):
+        return False, "invalid_relative_path"
+    if path.name in {"", ".", ".."}:
+        return False, "invalid_relative_path"
+    return True, ""
+
+
+def parse_webshop_session_handoff(content: str) -> dict[str, Any]:
+    """Parse a model handoff without allowing semantic state to cross a reset.
+
+    The raw completion is retained by the caller as the sampled policy action.
+    Only the forwarded_content field may be inserted into the next-session
+    prompt.
+    """
+
+    if not isinstance(content, str):
+        return _handoff_invalid_result(str(content), reason="not_text")
+    raw = content
+    value = raw.strip()
+    if not value:
+        return _handoff_invalid_result(raw, reason="empty")
+    if "\n" in value or "\r" in value:
+        return _handoff_invalid_result(raw, reason="multiline")
+    if any(ord(char) < 32 and char not in "\t" for char in value):
+        return _handoff_invalid_result(raw, reason="control_character")
+    if WEBSHOP_HANDOFF_NO_LOCATOR_RE.fullmatch(value):
+        return {
+            "schema_version": WEBSHOP_HANDOFF_PARSE_SCHEMA_V1,
+            "raw_content_sha256": text_sha256(raw),
+            "valid": True,
+            "kind": WEBSHOP_HANDOFF_KIND_NO_LOCATOR,
+            "forwarded_content": None,
+            "forwarded_content_sha256": None,
+            "rejection_reason": None,
+        }
+
+    command_ok, command_reason = _parse_readonly_handoff_command(value)
+    if command_ok:
+        forwarded = value
+        return {
+            "schema_version": WEBSHOP_HANDOFF_PARSE_SCHEMA_V1,
+            "raw_content_sha256": text_sha256(raw),
+            "valid": True,
+            "kind": WEBSHOP_HANDOFF_KIND_READONLY_COMMAND,
+            "forwarded_content": forwarded,
+            "forwarded_content_sha256": text_sha256(forwarded),
+            "rejection_reason": None,
+        }
+    path_ok, path_reason = _parse_workspace_relative_path(value)
+    if path_ok:
+        forwarded = value
+        return {
+            "schema_version": WEBSHOP_HANDOFF_PARSE_SCHEMA_V1,
+            "raw_content_sha256": text_sha256(raw),
+            "valid": True,
+            "kind": WEBSHOP_HANDOFF_KIND_PATH,
+            "forwarded_content": forwarded,
+            "forwarded_content_sha256": text_sha256(forwarded),
+            "rejection_reason": None,
+        }
+    reason = command_reason if command_reason != "not_readonly_command" else path_reason
+    return _handoff_invalid_result(raw, reason=reason or "invalid_locator")
 
 
 def build_policy_generation_loss_masks(
@@ -260,6 +414,7 @@ def build_compaction_evidence_v1(
     session_index_after: int | None = None,
     handoff_source_prompt_token_ids: Sequence[int] | None = None,
     raw_history_cleared: bool | None = None,
+    handoff_parse_evidence: Mapping[str, Any] | None = None,
     request_text: str = POLICY_COMPACTION_REQUEST,
 ) -> dict[str, Any]:
     """Build self-verifying evidence from the exact prompts used by rollout."""
@@ -306,8 +461,18 @@ def build_compaction_evidence_v1(
             raise ContinuousAgentV1Error(
                 "WebShop handoff source prompt must not be empty"
             )
+        if not isinstance(handoff_parse_evidence, Mapping):
+            raise ContinuousAgentV1Error(
+                "WebShop session handoff requires parser evidence"
+            )
+        parse_evidence = deepcopy(dict(handoff_parse_evidence))
     else:
         handoff_source = []
+        if handoff_parse_evidence is not None:
+            raise ContinuousAgentV1Error(
+                "context-limit compaction must not carry handoff parser evidence"
+            )
+        parse_evidence = None
     return {
         "request_text_sha256": text_sha256(request_text),
         "continuation_marker_sha256": text_sha256(POLICY_CONTINUATION_MARKER),
@@ -340,6 +505,7 @@ def build_compaction_evidence_v1(
         if handoff_source
         else None,
         "raw_history_cleared": raw_history_cleared,
+        "handoff_parse": parse_evidence,
     }
 
 
@@ -1133,6 +1299,7 @@ def _validate_continuous_agent_step_v1(
                 "handoff_source_prompt_length",
                 "handoff_source_prompt_digest",
                 "raw_history_cleared",
+                "handoff_parse",
             ):
                 if field not in evidence:
                     raise ContinuousAgentV1Error(
@@ -1155,6 +1322,29 @@ def _validate_continuous_agent_step_v1(
                 raise ContinuousAgentV1Error(
                     "WebShop session handoff requires raw history to be cleared"
                 )
+            handoff_parse = evidence["handoff_parse"]
+            if not isinstance(handoff_parse, Mapping):
+                raise ContinuousAgentV1Error(
+                    "WebShop session handoff parser evidence must be a mapping"
+                )
+            expected_parse = parse_webshop_session_handoff(str(record["content"]))
+            for field in (
+                "schema_version",
+                "raw_content_sha256",
+                "valid",
+                "kind",
+                "forwarded_content",
+                "forwarded_content_sha256",
+                "rejection_reason",
+            ):
+                if handoff_parse.get(field) != expected_parse[field]:
+                    raise ContinuousAgentV1Error(
+                        f"WebShop handoff parser evidence drifted for {field}"
+                    )
+            if handoff_parse["kind"] not in WEBSHOP_HANDOFF_KINDS:
+                raise ContinuousAgentV1Error(
+                    "WebShop handoff parser returned an unsupported kind"
+                )
         else:
             if evidence.get("session_index_before") is not None or evidence.get(
                 "session_index_after"
@@ -1165,6 +1355,10 @@ def _validate_continuous_agent_step_v1(
             if evidence.get("raw_history_cleared") is not None:
                 raise ContinuousAgentV1Error(
                     "context-limit compaction must not claim native history clearing"
+                )
+            if evidence.get("handoff_parse") is not None:
+                raise ContinuousAgentV1Error(
+                    "context-limit compaction must not carry handoff parser evidence"
                 )
         if horizon_evidence is None and (
             bool(record["done"]) or float(record["score"]) != 0.0
