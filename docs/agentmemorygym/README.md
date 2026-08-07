@@ -92,6 +92,19 @@ the second mechanism `session_handoff`, never WebShop compaction, and must not
 count it as continuous-history reuse. SWE-smith, LiteResearcher, and MLE use
 context compaction only inside their native continuous episodes.
 
+The raw policy completion for `session_handoff` is untrusted. Runtime must parse
+it fail closed and may forward only one workspace-relative path, one read-only
+workspace discovery/read command (`cat`, `rg`, `grep`, `find`, `ls`, `head`,
+`tail`, or `sed`), or an explicit no-locator result. Absolute or `file://`
+paths, `..` traversal, host paths, prose summaries, multiline or multi-item
+outputs, write commands, and shell operators are invalid. An invalid completion
+remains the sampled policy row, token/logprob evidence, and RL action, but its
+content is not copied into the next session; that prompt receives only the
+fresh native observation. The runtime must record the raw digest, parse verdict,
+locator kind, and forwarded digest. A gate that merely packs the handoff row or
+observes a non-empty string proves PPO plumbing only, not locator-only semantic
+closure.
+
 For this stream, `data.pt` contains only a versioned sampler cursor plus a
 canonical identity for the index source, complete server metadata, and training
 geometry. Resume first builds and validates the current dataset and environment

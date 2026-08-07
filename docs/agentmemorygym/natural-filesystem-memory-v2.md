@@ -99,6 +99,18 @@ step, while `native_environment_call_count` remains unchanged. Every handoff
 record must bind `session_index_before/after`, a native empty `session_trace`,
 exact pre/post prompt digests, and the source prompt visible to the policy.
 
+The runtime treats the raw model completion as untrusted input. A fail-closed
+parser may forward exactly one of: a workspace-relative path, one read-only
+`cat`/`rg`/`grep`/`find`/`ls`/`head`/`tail`/`sed` discovery command,
+or an explicit no-locator result. It rejects absolute paths, `file://` URIs,
+`..` traversal, host paths, prose summaries, multiline or multi-item output,
+write commands, and shell operators. Rejection does not delete or mask the
+sampled action from PPO: the raw tokens and logprobs remain in the handoff row
+and receive downstream reward. It only prevents those bytes from entering the
+next session, which then sees the fresh native observation without a semantic
+fallback. Evidence must include raw-content digest, `valid`, normalized kind,
+and forwarded-content digest.
+
 The shared implementation currently stores this row with
 `compaction_mode=webshop_session_handoff`. That field name is retained only for
 schema compatibility. Specifications, launchers, metrics, and reports must call
@@ -114,6 +126,9 @@ one unified policy step for that row, a fresh next-session observation, inclusio
 of the model-authored locator, exclusion of the preceding observation and BUY,
 and exact PPO packing of all three sampled rows. A failure is a launch blocker;
 it must not be waived by relabeling the handoff as compaction.
+The gate must also exercise an invalid completion and prove that it remains in
+the PPO row but is absent from the next-session prompt. Checking only that a
+handoff row exists or that arbitrary model text was forwarded is insufficient.
 
 ## 4. Shell safety boundary
 
