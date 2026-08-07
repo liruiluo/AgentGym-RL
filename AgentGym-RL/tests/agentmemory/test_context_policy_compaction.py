@@ -62,6 +62,14 @@ class ContextPolicyCompactionTests(unittest.TestCase):
             method,
         )
 
+    def test_webshop_runtime_errors_use_session_handoff_terminology(self) -> None:
+        source = VLLM_SOURCE.read_text(encoding="utf-8")
+        start = source.index("def generate_agentmemory_webshop_session_handoff(")
+        end = source.index("def generate_continuous_agent_with_compaction(", start)
+        method = source[start:end]
+        self.assertIn("WebShop session_handoff row", method)
+        self.assertNotIn("WebShop compaction row", method)
+
 
 if __name__ == "__main__":
     unittest.main()

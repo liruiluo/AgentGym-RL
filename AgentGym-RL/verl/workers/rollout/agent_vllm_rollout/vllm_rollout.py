@@ -2177,11 +2177,11 @@ class vLLMRollout(BaseRollout):
                         or handoff_cleared is None
                     ):
                         raise RuntimeError(
-                            "WebShop compaction row has no pending session handoff"
+                            "WebShop session_handoff row has no pending session handoff"
                         )
                     if int(handoff_after) != int(handoff_before) + 1:
                         raise RuntimeError(
-                            "WebShop compaction row has an invalid session transition"
+                            "WebShop session_handoff row has an invalid session transition"
                         )
                     handoff_parse_evidence = parse_webshop_session_handoff(content)
                     forwarded_handoff = handoff_parse_evidence["forwarded_content"]
