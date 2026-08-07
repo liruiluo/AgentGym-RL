@@ -78,6 +78,7 @@ from verl.workers.ppo_token_normalization import (
     PPO_BATCH_CONTRACT_META_KEY,
     build_legacy_asymmetric_batch_contract,
     optimizer_step_readback,
+    requires_flattened_action_row_batch_contract,
     validate_dynamic_batch_token_caps,
 )
 from abc import ABC, abstractmethod
@@ -1353,7 +1354,7 @@ class RayPPOTrainer(object):
                 assert config.critic.model.use_remove_padding, \
                     "When using sequence parallelism for critic, you must enable `use_remove_padding`."
 
-        if task_name == 'agentmemory' and self.use_critic:
+        if requires_flattened_action_row_batch_contract(task_name) and self.use_critic:
             dynamic_roles = {
                 'actor': bool(config.actor_rollout_ref.actor.use_dynamic_bsz),
                 'critic': bool(config.critic.use_dynamic_bsz),
@@ -1407,8 +1408,9 @@ class RayPPOTrainer(object):
                         ) from exc
             else:
                 print(
-                    "AgentMemory PPO dynamic-batch contract: "
-                    f"roles={dynamic_roles} max_token_lens={dynamic_max_token_lens}"
+                    "Action-row PPO dynamic-batch contract: "
+                    f"task={task_name} roles={dynamic_roles} "
+                    f"max_token_lens={dynamic_max_token_lens}"
                 )
             self.ppo_batch_contract = build_legacy_asymmetric_batch_contract(
                 actor_mini_batch_size=config.actor_rollout_ref.actor.ppo_mini_batch_size,

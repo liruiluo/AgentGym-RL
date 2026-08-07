@@ -12,6 +12,7 @@ import torch.distributed as dist
 
 LEGACY_ASYMMETRIC_BATCH_MODE = "legacy_asymmetric_config_compensation_v1"
 PPO_BATCH_CONTRACT_META_KEY = "ppo_batch_contract"
+FLATTENED_ACTION_ROW_PPO_TASKS = frozenset({"agentmemory", "swesmith"})
 
 _PER_GPU_MICRO_BATCH_FIELDS = (
     "actor",
@@ -20,6 +21,12 @@ _PER_GPU_MICRO_BATCH_FIELDS = (
     "reference_logprob",
     "rollout_logprob",
 )
+
+
+def requires_flattened_action_row_batch_contract(task_name: str) -> bool:
+    """Return whether rollout expands each source episode into action rows."""
+
+    return str(task_name).strip().lower() in FLATTENED_ACTION_ROW_PPO_TASKS
 
 
 def _positive_int(value, name: str) -> int:

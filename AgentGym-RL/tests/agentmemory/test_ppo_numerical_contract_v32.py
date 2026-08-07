@@ -17,6 +17,7 @@ from verl.workers.ppo_token_normalization import (
     distributed_sum,
     mask_padding_rows,
     optimizer_step_readback,
+    requires_flattened_action_row_batch_contract,
     scale_token_mean_loss,
     summarize_dynamic_micro_batches,
     validate_dynamic_batch_token_caps,
@@ -225,6 +226,30 @@ class PaddingInvariantGroupCreditTest(unittest.TestCase):
 
 
 class BatchContractTest(unittest.TestCase):
+    def test_action_row_contract_is_enabled_for_agentmemory_and_swesmith(self):
+        self.assertTrue(requires_flattened_action_row_batch_contract("agentmemory"))
+        self.assertTrue(requires_flattened_action_row_batch_contract("SWEsmith"))
+        self.assertFalse(requires_flattened_action_row_batch_contract("webshop"))
+
+    def test_swesmith_variable_action_rows_keep_exact_optimizer_steps(self):
+        contract = _batch_contract(
+            actor_mini_batch_size=512,
+            critic_mini_batch_size=512,
+            rollout_n=1,
+            actor_ppo_epochs=1,
+            critic_ppo_epochs=1,
+        )
+        self.assertEqual(contract["actor_local_mini_batch_rows"], 64)
+        self.assertEqual(contract["critic_local_mini_batch_rows"], 64)
+        for global_rows in (8, 64, 200, 512):
+            with self.subTest(global_rows=global_rows):
+                readback = optimizer_step_readback(contract, global_rows)
+                self.assertEqual(readback["actor_optimizer_steps"], 1)
+                self.assertEqual(readback["critic_optimizer_steps"], 1)
+        readback = optimizer_step_readback(contract, 520)
+        self.assertEqual(readback["actor_optimizer_steps"], 2)
+        self.assertEqual(readback["critic_optimizer_steps"], 2)
+
     def test_v32_legacy_compensation_and_step_readback(self):
         contract = _batch_contract()
         self.assertEqual(contract["actor_local_mini_batch_rows"], 64)
