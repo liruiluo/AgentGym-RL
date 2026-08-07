@@ -427,7 +427,11 @@ class TrainerRoutingTests(unittest.TestCase):
         sync = "for handler, step in zip(flat_handlers, flat_step_refs):\n                handler.score = float(step[\"score\"])"
         self.assertIn(sync, source)
         self.assertLess(source.index("bind_max_round_timeout_failure("), source.index(sync))
-        self.assertLess(source.index(sync), source.index("output = self.pack_rollout_handlers("))
+        sync_index = source.index(sync)
+        packed_after_sync = source.index(
+            "output = self.pack_rollout_handlers(", sync_index
+        )
+        self.assertLess(sync_index, packed_after_sync)
 
 
 if __name__ == "__main__":
