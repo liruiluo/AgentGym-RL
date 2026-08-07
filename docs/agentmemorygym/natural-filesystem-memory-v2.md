@@ -84,18 +84,26 @@ full action/observation transcript. This is different from the continuous
 single-episode context lifecycle used by SWE-smith and other naturally long
 domains.
 
-The optional cross-session policy handoff is a separate, one-row diagnostic
-action. Its purpose is only to let the policy preserve a minimal continuation
-entry, primarily the path or discovery route of a persistent workspace note.
-The harness does not write the path or a semantic summary, and the handoff does
-not call the native WebShop server. After the handoff, the next action prompt is
-constructed from the fresh native observation plus the sampled handoff text;
-the old session transcript is discarded. The handoff consumes one ordinary
-policy step, while `native_environment_call_count` remains unchanged. Every
-handoff record must bind `session_index_before/after`, a native empty
-`session_trace`, exact pre/post prompt digests, and the source prompt visible to
-the policy. This diagnostic bridge must not be reported as continuous-history
-reuse or as a SWE-style long-horizon compaction result.
+The optional cross-session `session_handoff` is a separate, one-row diagnostic
+action. Its sole purpose is to re-anchor the policy to an external note that
+already exists in the persistent workspace. The policy may emit a
+workspace-relative file path or a generic file-discovery/read command. It must
+not emit shopping facts, selected products, progress, prior actions,
+observations, or any other semantic task summary. Content needed later belongs
+in the workspace file and must be recovered through ordinary filesystem tools.
+The harness does not write or repair the locator, and the handoff does not call
+the native WebShop server. After the handoff, the next action prompt is
+constructed from the fresh native observation plus that locator; the old
+session transcript is discarded. The handoff consumes one ordinary policy
+step, while `native_environment_call_count` remains unchanged. Every handoff
+record must bind `session_index_before/after`, a native empty `session_trace`,
+exact pre/post prompt digests, and the source prompt visible to the policy.
+
+The shared implementation currently stores this row with
+`compaction_mode=webshop_session_handoff`. That field name is retained only for
+schema compatibility. Specifications, launchers, metrics, and reports must call
+the mechanism `session_handoff`; they must not describe it as context
+compaction, continuous-history reuse, or a SWE-style long-horizon trajectory.
 
 ## 4. Shell safety boundary
 

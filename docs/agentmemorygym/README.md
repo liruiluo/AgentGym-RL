@@ -64,10 +64,14 @@ The v2 episode contains six **native, manually/sessionized WebShop sessions**;
 it is not a continuous full-history conversation. A successful `click[Buy Now]`
 advances the native task and clears the prior session's page, cart/budget,
 active context, and action/observation transcript. Only the policy workspace
-files persist. A policy-authored cross-session handoff may preserve a note path
-or discovery route as one ordinary policy step, but the harness never writes a
-summary or path, and the handoff never calls the native server. This must not be
-reported as SWE-smith-style context compaction or transcript reuse.
+files persist. An optional policy-authored `session_handoff` exists solely to
+re-anchor the policy to a file it created in that persistent workspace. Its
+output may identify a workspace-relative path or a generic command for finding
+and reading that file; it must not carry shopping facts, product choices,
+progress, prior actions/observations, or other semantic task state. The harness
+never writes the locator, and the handoff never calls the native server. Never
+report this WebShop mechanism as context compaction, continuous-history reuse,
+or a naturally long trajectory.
 
 #### Terminology invariant
 
@@ -76,14 +80,17 @@ Keep these three mechanisms separate in code, logs, and reports:
 | Mechanism | When it happens | What persists | What it is not |
 | --- | --- | --- | --- |
 | Native WebShop session reset | A correct `click[Buy Now]` advances the bundled task | Native server state is reset; policy workspace files remain | Continuous context compaction |
-| Policy handoff | An optional policy step at that reset boundary | Only model-authored file path/discovery text | A harness-written summary or old transcript |
+| Policy handoff | An optional policy step at that reset boundary | Only a model-authored locator for a persistent workspace file | A task-state summary, harness-written content, or old transcript |
 | Context compaction | A naturally continuous task reaches its context budget | Model-authored summary tokens plus the persistent workspace | A WebShop session transition |
 
-In runtime evidence, use `compaction_mode=webshop_session_handoff` for the
-second row and `compaction_mode=context_limit` for the third row. Any WebShop
-metric or launcher must label a handoff as `session_handoff` and must not count
-it as continuous-history reuse. SWE-smith, LiteResearcher, and MLE use the
-third mechanism only inside their native continuous episode.
+The shared serialized row schema currently uses
+`compaction_mode=webshop_session_handoff` for the second row and
+`compaction_mode=context_limit` for the third row. The `compaction_mode` field
+name is a compatibility detail, not a semantic classification. Human-facing
+WebShop code comments, metrics, launchers, TODO entries, and reports must call
+the second mechanism `session_handoff`, never WebShop compaction, and must not
+count it as continuous-history reuse. SWE-smith, LiteResearcher, and MLE use
+context compaction only inside their native continuous episodes.
 
 For this stream, `data.pt` contains only a versioned sampler cursor plus a
 canonical identity for the index source, complete server metadata, and training
