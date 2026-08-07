@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+from __future__ import annotations
+
 import ast
 import os
 import unittest
@@ -67,7 +69,8 @@ class FormalUpdateReadbackStepsTests(unittest.TestCase):
         for fragment in (
             "self.global_steps in formal_readback_target_steps",
             "formal_readback_observed_steps.add(self.global_steps)",
-            "formal_readback_observed_steps != set(formal_readback_target_steps)",
+            "_agentmemory_missing_formal_update_readback_steps(",
+            "readback target steps completed without",
         ):
             self.assertIn(fragment, source)
 

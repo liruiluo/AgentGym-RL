@@ -790,6 +790,75 @@ def _parameter_probe_from_update_metrics(metrics: dict, *, label: str) -> dict:
     return summary
 
 
+def _formal_update_readback_row_evidence(
+    *,
+    non_tensor_batch: dict,
+    valid_row_indices: list[int],
+    task_name: str,
+) -> dict:
+    """Return canonical row identities without imposing WebShop metadata on other tasks."""
+
+    normalized_task_name = str(task_name).strip().lower()
+    if not normalized_task_name:
+        raise RuntimeError("Formal PPO update readback requires a task name.")
+
+    step_record_arr = non_tensor_batch.get("agentmemory_step_record_json")
+    if step_record_arr is not None:
+        return {
+            "schema": "agentmemory_formal_step_records_v1",
+            "task_name": normalized_task_name,
+            "rows": [
+                json.loads(str(step_record_arr[row_index]))
+                for row_index in valid_row_indices
+            ],
+        }
+    if normalized_task_name == "agentmemory":
+        raise RuntimeError(
+            "Formal AgentMemory PPO update readback is missing canonical step records."
+        )
+
+    index_field = next(
+        (
+            field
+            for field in ("rollout_data_indices", "data_idx", "index")
+            if field in non_tensor_batch
+        ),
+        None,
+    )
+    if index_field is None:
+        raise RuntimeError(
+            "Formal non-AgentMemory PPO update readback is missing a canonical "
+            "dataset index field."
+        )
+    index_values = non_tensor_batch[index_field]
+    dataset_indices = []
+    for row_index in valid_row_indices:
+        value = index_values[row_index]
+        if isinstance(value, bool):
+            raise RuntimeError(
+                "Formal PPO update readback dataset indices must not be bool."
+            )
+        try:
+            normalized_index = int(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError(
+                "Formal PPO update readback found a non-integer dataset index: "
+                f"row={row_index} value={value!r}."
+            ) from exc
+        if normalized_index < 0:
+            raise RuntimeError(
+                "Formal PPO update readback dataset indices must be non-negative: "
+                f"row={row_index} value={normalized_index}."
+            )
+        dataset_indices.append(normalized_index)
+    return {
+        "schema": "generic_task_dataset_rows_v1",
+        "task_name": normalized_task_name,
+        "index_field": index_field,
+        "dataset_indices": dataset_indices,
+    }
+
+
 def _agentmemory_dump_formal_update_readback(
     *,
     batch: DataProto,
@@ -818,16 +887,19 @@ def _agentmemory_dump_formal_update_readback(
         valid_samples = valid_samples.to(
             dtype=torch.bool, device=response_mask.device
         )
-    step_record_arr = batch.non_tensor_batch.get("agentmemory_step_record_json")
-    if step_record_arr is None:
-        raise RuntimeError(
-            "Formal PPO update readback is missing canonical step records."
-        )
-    formal_step_records = [
-        json.loads(str(step_record_arr[row_index]))
+    valid_row_indices = [
+        row_index
         for row_index in range(len(batch))
         if bool(valid_samples[row_index].item())
     ]
+    task_name = str(
+        config.actor_rollout_ref.agentgym.get("task_name", "")
+    ).strip().lower()
+    row_evidence = _formal_update_readback_row_evidence(
+        non_tensor_batch=batch.non_tensor_batch,
+        valid_row_indices=valid_row_indices,
+        task_name=task_name,
+    )
     actor_before = _masked_row_values(
         batch.batch["old_log_probs"],
         response_mask,
@@ -872,7 +944,7 @@ def _agentmemory_dump_formal_update_readback(
         "global_step": int(global_steps),
         "role": "same_batch_post_optimizer_readback",
         "checkpoint_step_labels_are_not_used_as_update_evidence": True,
-        "formal_step_records": formal_step_records,
+        "row_evidence": row_evidence,
         "actor": {
             "summary": actor_summary,
             "parameter_delta_l2": actor_parameter_probe["parameter_delta_l2"],
@@ -888,6 +960,8 @@ def _agentmemory_dump_formal_update_readback(
             "after_response_value_mean": critic_after,
         },
     }
+    if row_evidence["schema"] == "agentmemory_formal_step_records_v1":
+        payload["formal_step_records"] = row_evidence["rows"]
     default_dir = str(config.trainer.default_local_dir)
     run_dir = os.path.dirname(default_dir.rstrip("/")) if default_dir else os.getcwd()
     out_dir = os.path.join(run_dir, "diagnostics")
