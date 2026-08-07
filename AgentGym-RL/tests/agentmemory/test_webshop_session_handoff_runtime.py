@@ -10,6 +10,10 @@ from unittest.mock import patch
 import torch
 
 from tests.agentmemory.test_formal_domain_v3 import filesystem_contract_metadata
+from verl.utils.agentgym.continuous_agent_v1 import (
+    WEBSHOP_HANDOFF_KIND_INVALID,
+    WEBSHOP_HANDOFF_KIND_PATH,
+)
 from verl.workers.rollout.agent_vllm_rollout import vllm_rollout as MODULE
 
 
@@ -241,7 +245,7 @@ class WebShopSessionHandoffRuntimeTests(unittest.TestCase):
         self.assertTrue(records[1]["compaction"]["handoff_parse"]["valid"])
         self.assertEqual(
             records[1]["compaction"]["handoff_parse"]["kind"],
-            MODULE.WEBSHOP_HANDOFF_KIND_PATH,
+            WEBSHOP_HANDOFF_KIND_PATH,
         )
         self.assertEqual(
             records[1]["compaction"]["handoff_parse"]["forwarded_content_sha256"],
@@ -254,7 +258,7 @@ class WebShopSessionHandoffRuntimeTests(unittest.TestCase):
         )
 
     def test_invalid_handoff_stays_in_ppo_but_is_not_forwarded(self) -> None:
-        invalid = "The confirmed product is black; read file:///Users/master/state.md"
+        invalid = "black; read file:///Users/master/state.md"
         client, output = self._run_rollout(
             ["click[Buy Now]", invalid, "click[Buy Now]"]
         )
@@ -271,7 +275,7 @@ class WebShopSessionHandoffRuntimeTests(unittest.TestCase):
         self.assertFalse(records[1]["compaction"]["handoff_parse"]["valid"])
         self.assertEqual(
             records[1]["compaction"]["handoff_parse"]["kind"],
-            MODULE.WEBSHOP_HANDOFF_KIND_INVALID,
+            WEBSHOP_HANDOFF_KIND_INVALID,
         )
         self.assertIsNone(
             records[1]["compaction"]["handoff_parse"]["forwarded_content"]
