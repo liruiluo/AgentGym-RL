@@ -69,6 +69,20 @@ or discovery route as one ordinary policy step, but the harness never writes a
 summary or path, and the handoff never calls the native server. This must not be
 reported as SWE-smith-style context compaction or transcript reuse.
 
+#### Terminology invariant
+
+Keep these three mechanisms separate in code, logs, and reports:
+
+| Mechanism | When it happens | What persists | What it is not |
+| --- | --- | --- | --- |
+| Native WebShop session reset | A correct `click[Buy Now]` advances the bundled task | Native server state is reset; policy workspace files remain | Continuous context compaction |
+| Policy handoff | An optional policy step at that reset boundary | Only model-authored file path/discovery text | A harness-written summary or old transcript |
+| Context compaction | A naturally continuous task reaches its context budget | Model-authored summary tokens plus the persistent workspace | A WebShop session transition |
+
+Any WebShop metric or launcher must label a handoff as `session_handoff` and
+must not count it as continuous-history reuse. SWE-smith, LiteResearcher, and
+MLE use the third mechanism only inside their native continuous episode.
+
 For this stream, `data.pt` contains only a versioned sampler cursor plus a
 canonical identity for the index source, complete server metadata, and training
 geometry. Resume first builds and validates the current dataset and environment
