@@ -32,6 +32,7 @@ validate_neutral_compaction_text = MODULE.validate_neutral_compaction_text
 validate_continuous_agent_trajectory_v1 = (
     MODULE.validate_continuous_agent_trajectory_v1
 )
+validate_continuous_packed_rows_v1 = MODULE.validate_continuous_packed_rows_v1
 continuous_prompt_capacity = MODULE.continuous_prompt_capacity
 should_request_policy_compaction = MODULE.should_request_policy_compaction
 
@@ -148,6 +149,20 @@ class ContinuousAgentCompactionTests(unittest.TestCase):
         self.assertEqual(prompt_mask, [0, 0, 0])
         self.assertEqual(response_mask, [1, 1])
         self.assertEqual(loss_mask, [0, 0, 0, 1, 1])
+
+    def test_packed_rows_must_preserve_sampled_prompt_and_response_tokens(self) -> None:
+        row = build_row(COMPACTION_ROW)
+        validate_continuous_packed_rows_v1(
+            [row],
+            packed_prompt_token_ids=[row["prompt_token_ids"]],
+            packed_response_token_ids=[row["response_token_ids"]],
+        )
+        with self.assertRaisesRegex(ContinuousAgentV1Error, "packed prompt drifted"):
+            validate_continuous_packed_rows_v1(
+                [row],
+                packed_prompt_token_ids=[[10, 99]],
+                packed_response_token_ids=[row["response_token_ids"]],
+            )
 
     def test_environment_action_advances_only_the_environment(self) -> None:
         row = build_row(ENVIRONMENT_ACTION_ROW)

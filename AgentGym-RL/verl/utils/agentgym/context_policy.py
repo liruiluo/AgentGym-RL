@@ -34,6 +34,13 @@ def assert_rollout_context_supported(agentgym_config: Any) -> None:
         raise RuntimeError(CONTINUOUS_AGENT_RAW_HISTORY_ERROR)
     if task_name != "agentmemory":
         return
+    if rollout_context_policy(agentgym_config) == CONTINUOUS_AGENT_CONTEXT_POLICY:
+        if allow_policy_authored_compaction_for_agentmemory(agentgym_config):
+            return
+        raise RuntimeError(
+            "AgentMemory policy-authored compaction is diagnostic-only until "
+            "allow_policy_authored_compaction_for_agentmemory=true is set."
+        )
     if rollout_context_policy(agentgym_config) == "latest_observation_only":
         return
     if allow_raw_history_for_agentmemory(agentgym_config):
@@ -58,6 +65,21 @@ def allow_raw_history_for_agentmemory(agentgym_config: Any) -> bool:
     if env_value is not None:
         return parse_bool(env_value)
     return parse_bool(read_config(agentgym_config, "allow_raw_history_for_agentmemory", False))
+
+
+def allow_policy_authored_compaction_for_agentmemory(agentgym_config: Any) -> bool:
+    """Gate WebShop compaction so it cannot silently become formal training."""
+
+    env_value = os.environ.get("AGENTMEMORY_ALLOW_POLICY_AUTHORED_COMPACTION")
+    if env_value is not None:
+        return parse_bool(env_value)
+    return parse_bool(
+        read_config(
+            agentgym_config,
+            "allow_policy_authored_compaction_for_agentmemory",
+            False,
+        )
+    )
 
 
 def read_config(config: Any, key: str, default: Any = None) -> Any:

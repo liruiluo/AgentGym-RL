@@ -829,6 +829,39 @@ def validate_continuous_agent_step_v1(record: Mapping[str, Any]) -> None:
             )
 
 
+def validate_continuous_packed_rows_v1(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    packed_prompt_token_ids: Sequence[Sequence[int]],
+    packed_response_token_ids: Sequence[Sequence[int]],
+) -> None:
+    """Prove that PPO receives the exact sampled continuous-agent tokens."""
+
+    lengths = {
+        "records": len(records),
+        "packed_prompt_token_ids": len(packed_prompt_token_ids),
+        "packed_response_token_ids": len(packed_response_token_ids),
+    }
+    if len(set(lengths.values())) != 1:
+        raise ContinuousAgentV1Error(
+            f"continuous packed-row length mismatch: {lengths}"
+        )
+    for index, record in enumerate(records):
+        validate_continuous_agent_step_v1(record)
+        packed_prompt = [int(value) for value in packed_prompt_token_ids[index]]
+        packed_response = [
+            int(value) for value in packed_response_token_ids[index]
+        ]
+        if packed_prompt != list(record["prompt_token_ids"]):
+            raise ContinuousAgentV1Error(
+                f"continuous packed prompt drifted at row {index}"
+            )
+        if packed_response != list(record["response_token_ids"]):
+            raise ContinuousAgentV1Error(
+                f"continuous packed response drifted at row {index}"
+            )
+
+
 def _validate_observation_evidence_v1(
     record: Mapping[str, Any], evidence: Mapping[str, Any]
 ) -> None:

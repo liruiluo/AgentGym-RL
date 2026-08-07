@@ -64,7 +64,12 @@ from verl.utils.agent_dataset.procedural_index import (
     resolve_rollout_reset_index,
     validate_multitask_route_triplet,
 )
-from verl.utils.agentgym.context_policy import assert_rollout_context_supported, read_config, rollout_context_policy
+from verl.utils.agentgym.context_policy import (
+    allow_policy_authored_compaction_for_agentmemory,
+    assert_rollout_context_supported,
+    read_config,
+    rollout_context_policy,
+)
 from verl.utils.agentgym.continuous_agent_v1 import (
     COMPACTION_ROW,
     CONTINUOUS_AGENT_CONTEXT_POLICY_V1,
@@ -83,6 +88,7 @@ from verl.utils.agentgym.continuous_agent_v1 import (
     should_request_policy_compaction,
     text_sha256,
     validate_continuous_agent_step_v1,
+    validate_continuous_packed_rows_v1,
     validate_continuous_agent_trajectory_v1,
 )
 from verl.utils.agentgym.formal_domain_v3 import (
@@ -1400,6 +1406,30 @@ class vLLMRollout(BaseRollout):
         packed_response_digests = [
             prompt_state_digest(tokens) for tokens in packed_response_tokens
         ]
+        continuous_schema_rows = bool(step_records) and all(
+            isinstance(record, dict)
+            and record.get("schema_version") == CONTINUOUS_AGENT_SCHEMA_V1
+            for record in step_records
+        )
+        if step_records and any(
+            isinstance(record, dict)
+            and record.get("schema_version") == CONTINUOUS_AGENT_SCHEMA_V1
+            for record in step_records
+        ) and not continuous_schema_rows:
+            raise RuntimeError(
+                "continuous-agent rows cannot be mixed with legacy formal rows"
+            )
+        if continuous_schema_rows:
+            try:
+                validate_continuous_packed_rows_v1(
+                    step_records,
+                    packed_prompt_token_ids=packed_prompt_tokens,
+                    packed_response_token_ids=packed_response_tokens,
+                )
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"continuous-agent packed-token evidence failed: {exc}"
+                ) from exc
 
         task_round_tensor = torch.tensor(
             task_rounds if task_rounds is not None else [1] * len(rollout_handler_ls),
@@ -1627,32 +1657,33 @@ class vLLMRollout(BaseRollout):
             non_tensor_batch[AGENTMEMORY_STEP_RECORD_JSON] = np.array(
                 canonical_step_records, dtype=object
             )
-            validate_formal_runtime_evidence_rows(
-                exact_state_uids=exact_state_uids,
-                trajectory_uids=trajectory_uids,
-                trajectory_row_uids=trajectory_row_uids,
-                trajectory_row_orders=trajectory_row_orders,
-                trajectory_terminals=trajectory_terminals,
-                task_rounds=task_rounds,
-                immediate_rewards=immediate_rewards,
-                trajectory_returns=trajectory_returns,
-                action_texts=action_texts,
-                done_flags=done_flags,
-                generation_prompt_lengths=generation_prompt_lengths,
-                generation_prompt_digests=generation_prompt_digests,
-                packed_prompt_lengths=packed_prompt_lengths,
-                packed_prompt_digests=packed_prompt_digests,
-                generation_response_lengths=generation_response_lengths,
-                generation_response_digests=generation_response_digests,
-                packed_response_lengths=packed_response_lengths,
-                packed_response_digests=packed_response_digests,
-                suffix_credit_applied=suffix_credit_flags,
-                suffix_returns=suffix_returns,
-                step_record_jsons=canonical_step_records,
-                valid_mask=[True] * len(rollout_handler_ls),
-                expected_suffix_credit=bool(suffix_credit_applied),
-                expected_prompt_width=int(self.config.prompt_length),
-            )
+            if not continuous_schema_rows:
+                validate_formal_runtime_evidence_rows(
+                    exact_state_uids=exact_state_uids,
+                    trajectory_uids=trajectory_uids,
+                    trajectory_row_uids=trajectory_row_uids,
+                    trajectory_row_orders=trajectory_row_orders,
+                    trajectory_terminals=trajectory_terminals,
+                    task_rounds=task_rounds,
+                    immediate_rewards=immediate_rewards,
+                    trajectory_returns=trajectory_returns,
+                    action_texts=action_texts,
+                    done_flags=done_flags,
+                    generation_prompt_lengths=generation_prompt_lengths,
+                    generation_prompt_digests=generation_prompt_digests,
+                    packed_prompt_lengths=packed_prompt_lengths,
+                    packed_prompt_digests=packed_prompt_digests,
+                    generation_response_lengths=generation_response_lengths,
+                    generation_response_digests=generation_response_digests,
+                    packed_response_lengths=packed_response_lengths,
+                    packed_response_digests=packed_response_digests,
+                    suffix_credit_applied=suffix_credit_flags,
+                    suffix_returns=suffix_returns,
+                    step_record_jsons=canonical_step_records,
+                    valid_mask=[True] * len(rollout_handler_ls),
+                    expected_suffix_credit=bool(suffix_credit_applied),
+                    expected_prompt_width=int(self.config.prompt_length),
+                )
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 
     def latest_observation_prompt_from_text(
@@ -1698,6 +1729,17 @@ class vLLMRollout(BaseRollout):
             int(token_id)
             for token_id in self.tokenizer.encode(text, add_special_tokens=False)
         ]
+
+    @staticmethod
+    def _continuous_observation_text(value) -> str:
+        """Normalize structured server observations without changing their content."""
+
+        if isinstance(value, str):
+            return value
+        try:
+            return json.dumps(value, ensure_ascii=True, sort_keys=True)
+        except (TypeError, ValueError):
+            return str(value)
 
     def _continuous_decode_plain_token_ids(self, token_ids: List[int]) -> str:
         try:
@@ -1803,12 +1845,25 @@ class vLLMRollout(BaseRollout):
         sampling_kwargs: dict,
         global_steps,
     ) -> DataProto:
-        """Roll out one native long-horizon task with policy-authored compaction."""
+        """Roll out one native long-horizon task with policy-authored compaction.
 
-        if str(read_config(self.agentgym_config, "task_name", "")).lower() != "swesmith":
+        SWE-smith is the formal path. AgentMemory/WebShop enters only through
+        an explicit diagnostic flag, so this protocol regression cannot be
+        mistaken for a formal WebShop result.
+        """
+
+        task_name = str(read_config(self.agentgym_config, "task_name", "")).lower()
+        if task_name not in {"swesmith", "agentmemory"}:
             raise RuntimeError(
-                "policy-authored continuous compaction is currently frozen only "
-                "for the SWE-smith native task"
+                "policy-authored continuous compaction is unsupported for "
+                f"task={task_name!r}"
+            )
+        if task_name == "agentmemory" and not allow_policy_authored_compaction_for_agentmemory(
+            self.agentgym_config
+        ):
+            raise RuntimeError(
+                "AgentMemory continuous compaction requires the explicit "
+                "diagnostic allow flag"
             )
         if rollout_context_policy(self.agentgym_config) != CONTINUOUS_AGENT_CONTEXT_POLICY_V1:
             raise RuntimeError("continuous-agent rollout context policy drifted")
@@ -1870,7 +1925,7 @@ class vLLMRollout(BaseRollout):
                 rollout_handler.item_id,
             )
             env_clients[idx].reset(int(reset_index))
-            task = env_clients[idx].observe()
+            task = self._continuous_observation_text(env_clients[idx].observe())
             rollout_handler.messages.append(Message(role="user", content=task))
             immutable_messages[idx] = deepcopy(rollout_handler.messages)
             immutable_prompt_ids[idx] = self._continuous_prompt_from_messages(
@@ -2033,7 +2088,7 @@ class vLLMRollout(BaseRollout):
                         )
                     if int(env_client.env_id) != environment_id_before:
                         raise RuntimeError(
-                            "SWE-smith workspace identity changed during compaction"
+                            f"{task_name} environment identity changed during compaction"
                         )
                     context_epochs[rollout_index] += 1
                     compaction_evidence = build_compaction_evidence_v1(
@@ -2052,7 +2107,9 @@ class vLLMRollout(BaseRollout):
                     )
                     step_output = env_client.step(content)
                     native_call_counts[rollout_index] += 1
-                    full_environment_result = str(step_output.state)
+                    full_environment_result = self._continuous_observation_text(
+                        step_output.state
+                    )
                     score = float(step_output.reward)
                     done = bool(step_output.done)
                     bounded_observation = self._bound_continuous_observation(
@@ -2114,15 +2171,38 @@ class vLLMRollout(BaseRollout):
                             )
                     if int(env_client.env_id) != environment_id_before:
                         raise RuntimeError(
-                            "SWE-smith workspace identity changed across an action"
+                            f"{task_name} environment identity changed across an action"
                         )
 
                 if not done and task_rounds[rollout_index] >= max_policy_turns:
                     policy_step_reward = score
-                    horizon_output = env_client.finalize_horizon()
-                    if not bool(horizon_output.done):
-                        raise RuntimeError(
-                            "SWE-smith horizon finalization did not terminate"
+                    finalize_horizon = getattr(env_client, "finalize_horizon", None)
+                    if callable(finalize_horizon):
+                        horizon_output = finalize_horizon()
+                        if not bool(horizon_output.done):
+                            raise RuntimeError(
+                                f"{task_name} horizon finalization did not terminate"
+                            )
+                        horizon_reward = float(horizon_output.reward)
+                        horizon_result = self._continuous_observation_text(
+                            horizon_output.state
+                        )
+                    else:
+                        # AgentMemory has no hidden horizon grader. Bind only a
+                        # neutral timeout penalty to the final sampled row and
+                        # terminate locally without another environment call.
+                        horizon_reward = float(
+                            read_config(
+                                self.agentgym_config,
+                                "continuous_timeout_penalty",
+                                -0.01,
+                            )
+                        )
+                        info = getattr(env_client, "info", None)
+                        horizon_result = self._continuous_observation_text(
+                            info.get("observation", "policy-turn ceiling")
+                            if isinstance(info, Mapping)
+                            else "policy-turn ceiling"
                         )
                     horizon_evidence = build_horizon_evidence_v1(
                         environment_id=environment_id_before,
@@ -2131,21 +2211,21 @@ class vLLMRollout(BaseRollout):
                             native_call_counts[rollout_index]
                         ),
                         policy_step_reward=policy_step_reward,
-                        horizon_reward=float(horizon_output.reward),
-                        environment_result=str(horizon_output.state),
+                        horizon_reward=horizon_reward,
+                        environment_result=horizon_result,
                     )
                     score = float(horizon_evidence["combined_reward"])
                     done = True
                     if int(env_client.env_id) != environment_id_before:
                         raise RuntimeError(
-                            "SWE-smith workspace identity changed during horizon grading"
+                            f"{task_name} environment identity changed during horizon grading"
                         )
 
                 rollout_handler.score = score
                 rollout_handler.done = done
                 step_record = build_continuous_agent_step_v1(
                     row_kind=row_kind,
-                    task_name="swesmith",
+                    task_name=task_name,
                     content=content,
                     score=score,
                     item_id=str(rollout_handler.item_id),
@@ -3039,11 +3119,17 @@ class vLLMRollout(BaseRollout):
             ]
         time.sleep(self.config.send_interval) # take a break before sendng request
         task_name = str(read_config(self.agentgym_config, "task_name", "")).lower()
-        if (
-            task_name == "swesmith"
-            and rollout_context_policy(self.agentgym_config)
+        continuous_policy = (
+            rollout_context_policy(self.agentgym_config)
             == CONTINUOUS_AGENT_CONTEXT_POLICY_V1
-        ):
+        )
+        continuous_diagnostic = (
+            task_name == "agentmemory"
+            and allow_policy_authored_compaction_for_agentmemory(
+                self.agentgym_config
+            )
+        )
+        if continuous_policy and (task_name == "swesmith" or continuous_diagnostic):
             try:
                 return self.generate_continuous_agent_with_compaction(
                     rollout_handler_ls=rollout_handler_ls,
