@@ -74,6 +74,29 @@ filename, note schema, write cadence, read cadence, or memory lifecycle.
 - The workspace begins empty. The environment never preloads task answers or a
   task-specific note template.
 
+### WebShop session boundary versus policy handoff
+
+WebShop is intentionally sessionized. A correct native `click[Buy Now]`
+advances the shopping task and the server clears the preceding session's page,
+cart/budget state, active context, and session trace. The next session receives
+fresh native observation context; it must not receive the preceding session's
+full action/observation transcript. This is different from the continuous
+single-episode context lifecycle used by SWE-smith and other naturally long
+domains.
+
+The optional cross-session policy handoff is a separate, one-row diagnostic
+action. Its purpose is only to let the policy preserve a minimal continuation
+entry, primarily the path or discovery route of a persistent workspace note.
+The harness does not write the path or a semantic summary, and the handoff does
+not call the native WebShop server. After the handoff, the next action prompt is
+constructed from the fresh native observation plus the sampled handoff text;
+the old session transcript is discarded. The handoff consumes one ordinary
+policy step, while `native_environment_call_count` remains unchanged. Every
+handoff record must bind `session_index_before/after`, a native empty
+`session_trace`, exact pre/post prompt digests, and the source prompt visible to
+the policy. This diagnostic bridge must not be reported as continuous-history
+reuse or as a SWE-style long-horizon compaction result.
+
 ## 4. Shell safety boundary
 
 Formal `shell_command` execution uses `linux_namespace_chroot_tmpfs_v1`:

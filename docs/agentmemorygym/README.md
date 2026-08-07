@@ -60,6 +60,15 @@ surface IDs remain separate so historical results are reproducible. The
 complete runtime, safety, evidence, and migration contract is in
 [`natural-filesystem-memory-v2.md`](natural-filesystem-memory-v2.md).
 
+The v2 episode contains six **native, manually/sessionized WebShop sessions**;
+it is not a continuous full-history conversation. A successful `click[Buy Now]`
+advances the native task and clears the prior session's page, cart/budget,
+active context, and action/observation transcript. Only the policy workspace
+files persist. A policy-authored cross-session handoff may preserve a note path
+or discovery route as one ordinary policy step, but the harness never writes a
+summary or path, and the handoff never calls the native server. This must not be
+reported as SWE-smith-style context compaction or transcript reuse.
+
 For this stream, `data.pt` contains only a versioned sampler cursor plus a
 canonical identity for the index source, complete server metadata, and training
 geometry. Resume first builds and validates the current dataset and environment
