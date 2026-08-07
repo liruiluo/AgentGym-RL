@@ -105,6 +105,16 @@ schema compatibility. Specifications, launchers, metrics, and reports must call
 the mechanism `session_handoff`; they must not describe it as context
 compaction, continuous-history reuse, or a SWE-style long-horizon trajectory.
 
+This boundary has an executable regression gate rather than relying on naming
+discipline alone. Every runtime or launcher change must run
+`test_webshop_session_handoff_runtime.py::WebShopSessionHandoffRuntimeTests::test_native_reset_handoff_and_next_buy_are_packed_exactly`
+and retain the exact model I/O audit. The gate must prove the native sequence
+`BUY -> session_handoff -> BUY`, unchanged native-call count on the handoff row,
+one unified policy step for that row, a fresh next-session observation, inclusion
+of the model-authored locator, exclusion of the preceding observation and BUY,
+and exact PPO packing of all three sampled rows. A failure is a launch blocker;
+it must not be waived by relabeling the handoff as compaction.
+
 ## 4. Shell safety boundary
 
 Formal `shell_command` execution uses `linux_namespace_chroot_tmpfs_v1`:
