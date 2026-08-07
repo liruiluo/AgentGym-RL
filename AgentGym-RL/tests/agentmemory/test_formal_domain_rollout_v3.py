@@ -16,6 +16,7 @@ _ROLLOUT_MODULE_NAMES = (
     "verl",
     "verl.utils",
     "verl.utils.agentgym",
+    "verl.utils.agentgym.continuous_agent_v1",
     "verl.utils.agentgym.formal_grpo_credit",
     "verl.utils.agentgym.formal_domain_v3",
     "formal_domain_rollout_context_for_test",
@@ -59,6 +60,11 @@ def load_rollout_context():
         sys.modules["verl"] = verl_module
         sys.modules["verl.utils"] = utils_module
         sys.modules["verl.utils.agentgym"] = agentgym_module
+        continuous_agent = load_module(
+            "verl.utils.agentgym.continuous_agent_v1",
+            "verl/utils/agentgym/continuous_agent_v1.py",
+            keep_registered=True,
+        )
         formal_grpo = load_module(
             "verl.utils.agentgym.formal_grpo_credit",
             "verl/utils/agentgym/formal_grpo_credit.py",
@@ -74,13 +80,15 @@ def load_rollout_context():
             "verl/utils/agentgym/rollout_context.py",
             keep_registered=True,
         )
-        return formal_grpo, formal_domain, rollout_context
+        return continuous_agent, formal_grpo, formal_domain, rollout_context
     finally:
         for name in reversed(_ROLLOUT_MODULE_NAMES):
             _restore_module(name, previous[name])
 
 
-FORMAL_GRPO, FORMAL_DOMAIN, ROLLOUT_CONTEXT = load_rollout_context()
+CONTINUOUS_AGENT, FORMAL_GRPO, FORMAL_DOMAIN, ROLLOUT_CONTEXT = (
+    load_rollout_context()
+)
 
 
 def env_info(*, phase: int, done: bool, episode_success: bool, reward: float):
@@ -302,6 +310,133 @@ def packed_webshop_v2_record(
     }
 
 
+def packed_continuous_record(*, session_handoff: bool = False):
+    prompt_token_ids = [101, 102, 103]
+    response_token_ids = [201, QWEN35_PRIMARY_EOS_TOKEN_ID]
+    prompt_digest = ROLLOUT_CONTEXT.prompt_token_digest(prompt_token_ids)
+    response_digest = ROLLOUT_CONTEXT.prompt_token_digest(response_token_ids)
+    trajectory_uid = "agentmemory:parentv1:0:replica0"
+    if session_handoff:
+        row_kind = CONTINUOUS_AGENT.COMPACTION_ROW
+        action = "notes/state.md"
+        environment_result = ""
+        observation = None
+        compaction = CONTINUOUS_AGENT.build_compaction_evidence_v1(
+            pre_request_action_prompt_token_ids=[91, 92],
+            pre_compaction_prompt_token_ids=prompt_token_ids,
+            immutable_framing_token_ids=[1, 2],
+            summary_token_ids=response_token_ids,
+            post_compaction_prompt_token_ids=[401, 402],
+            workspace_continuity_id="7",
+            compaction_mode=(
+                CONTINUOUS_AGENT.COMPACTION_MODE_WEBSHOP_SESSION_HANDOFF
+            ),
+            session_index_before=0,
+            session_index_after=1,
+            handoff_source_prompt_token_ids=[71, 72],
+            raw_history_cleared=True,
+            request_text=CONTINUOUS_AGENT.POLICY_WEBSHOP_SESSION_HANDOFF_REQUEST,
+        )
+        environment_step_before = 1
+        environment_step_after = 2
+        native_call_before = native_call_after = 1
+        context_epoch_before = 0
+        context_epoch_after = 1
+        row_order = 1
+    else:
+        row_kind = CONTINUOUS_AGENT.ENVIRONMENT_ACTION_ROW
+        action = 'search["displayed product"]'
+        environment_result = "fresh WebShop observation"
+        observation = CONTINUOUS_AGENT.build_observation_evidence_v1(
+            full_text=environment_result,
+            full_token_ids=[301],
+            policy_visible_text=environment_result,
+            policy_visible_token_ids=[301],
+            post_observation_prompt_token_ids=[401, 402],
+            max_observation_tokens=8,
+            truncated=False,
+            head_token_count=1,
+            tail_token_count=0,
+            truncation_marker=None,
+        )
+        compaction = None
+        environment_step_before = 0
+        environment_step_after = 1
+        native_call_before = 0
+        native_call_after = 1
+        context_epoch_before = context_epoch_after = 0
+        row_order = 0
+    record = CONTINUOUS_AGENT.build_continuous_agent_step_v1(
+        row_kind=row_kind,
+        task_name="agentmemory",
+        content=action,
+        score=0.0,
+        item_id="0",
+        data_idx=0,
+        parent_index=0,
+        parent_group_uid="agentmemory:parentv1:0",
+        replica_index=0,
+        trajectory_uid=trajectory_uid,
+        exact_state_uid=f"0:turn{row_order + 1}:statev1:{prompt_digest}",
+        prompt_token_ids=prompt_token_ids,
+        response_token_ids=response_token_ids,
+        sampled_token_logprobs=[-0.1, -0.2],
+        generation_record={
+            "response_token_count": len(response_token_ids),
+            "max_response_tokens": 8,
+            "finish_reason": "stop",
+            "finish_reason_source": "official_vllm:backend",
+            "stop_reason": None,
+            "backend_source": "official_vllm",
+            "configured_eos_token_ids": QWEN35_EOS_TOKEN_IDS,
+            "primary_eos_token_id": QWEN35_PRIMARY_EOS_TOKEN_ID,
+            "tokenizer_pad_token_id": 248044,
+            "token_ids_are_exact": True,
+            "backend_token_ids_are_exact": True,
+            "truncated": False,
+        },
+        environment_id=7,
+        environment_step_before=environment_step_before,
+        environment_step_after=environment_step_after,
+        native_environment_call_count_before=native_call_before,
+        native_environment_call_count_after=native_call_after,
+        context_epoch_before=context_epoch_before,
+        context_epoch_after=context_epoch_after,
+        done=False,
+        environment_result=environment_result,
+        compaction_evidence=compaction,
+        observation_evidence=observation,
+    )
+    record.pop("prompt_token_ids")
+    action = record.pop("content")
+    immediate_reward = record.pop("score")
+    record.update(
+        {
+            "trajectory_row_uid": FORMAL_GRPO.build_row_uid(
+                trajectory_uid, row_order
+            ),
+            "trajectory_row_order": row_order,
+            "trajectory_terminal": True,
+            "task_round": environment_step_after,
+            "action": action,
+            "immediate_reward": immediate_reward,
+            "suffix_return": immediate_reward,
+            "suffix_credit_applied": False,
+            "trajectory_return": immediate_reward,
+            "done": False,
+            "generation_prompt_length": len(prompt_token_ids),
+            "generation_prompt_digest": prompt_digest,
+            "packed_prompt_length": len(prompt_token_ids),
+            "packed_prompt_digest": prompt_digest,
+            "generation_response_length": len(response_token_ids),
+            "generation_response_digest": response_digest,
+            "packed_response_length": len(response_token_ids),
+            "packed_response_digest": response_digest,
+        }
+    )
+    return record
+
+
 def packed_intent_clarification_v2_record(
     *,
     surface: str = FORMAL_DOMAIN.FORMAL_WEBSHOP_INTENT_CLARIFICATION_FILESYSTEM_SURFACE_V2,
@@ -379,33 +514,59 @@ def invalid_intent_action_record(action: str, *, attempted_op: str):
     return record
 
 
-def validate_one_record(record: dict):
+def validate_records(records: list[dict]):
     return ROLLOUT_CONTEXT.validate_formal_runtime_evidence_rows(
-        exact_state_uids=[record["exact_state_uid"]],
-        trajectory_uids=[record["trajectory_uid"]],
-        trajectory_row_uids=[record["trajectory_row_uid"]],
-        trajectory_row_orders=[record["trajectory_row_order"]],
-        trajectory_terminals=[record["trajectory_terminal"]],
-        task_rounds=[record["task_round"]],
-        immediate_rewards=[record["immediate_reward"]],
-        trajectory_returns=[record["trajectory_return"]],
-        action_texts=[record["action"]],
-        done_flags=[record["done"]],
-        generation_prompt_lengths=[record["generation_prompt_length"]],
-        generation_prompt_digests=[record["generation_prompt_digest"]],
-        packed_prompt_lengths=[record["packed_prompt_length"]],
-        packed_prompt_digests=[record["packed_prompt_digest"]],
-        generation_response_lengths=[record["generation_response_length"]],
-        generation_response_digests=[record["generation_response_digest"]],
-        packed_response_lengths=[record["packed_response_length"]],
-        packed_response_digests=[record["packed_response_digest"]],
-        suffix_credit_applied=[record["suffix_credit_applied"]],
-        suffix_returns=[record["suffix_return"]],
-        step_record_jsons=[json.dumps(record)],
-        valid_mask=[True],
+        exact_state_uids=[record["exact_state_uid"] for record in records],
+        trajectory_uids=[record["trajectory_uid"] for record in records],
+        trajectory_row_uids=[record["trajectory_row_uid"] for record in records],
+        trajectory_row_orders=[
+            record["trajectory_row_order"] for record in records
+        ],
+        trajectory_terminals=[
+            record["trajectory_terminal"] for record in records
+        ],
+        task_rounds=[record["task_round"] for record in records],
+        immediate_rewards=[record["immediate_reward"] for record in records],
+        trajectory_returns=[record["trajectory_return"] for record in records],
+        action_texts=[record["action"] for record in records],
+        done_flags=[record["done"] for record in records],
+        generation_prompt_lengths=[
+            record["generation_prompt_length"] for record in records
+        ],
+        generation_prompt_digests=[
+            record["generation_prompt_digest"] for record in records
+        ],
+        packed_prompt_lengths=[
+            record["packed_prompt_length"] for record in records
+        ],
+        packed_prompt_digests=[
+            record["packed_prompt_digest"] for record in records
+        ],
+        generation_response_lengths=[
+            record["generation_response_length"] for record in records
+        ],
+        generation_response_digests=[
+            record["generation_response_digest"] for record in records
+        ],
+        packed_response_lengths=[
+            record["packed_response_length"] for record in records
+        ],
+        packed_response_digests=[
+            record["packed_response_digest"] for record in records
+        ],
+        suffix_credit_applied=[
+            record["suffix_credit_applied"] for record in records
+        ],
+        suffix_returns=[record["suffix_return"] for record in records],
+        step_record_jsons=[json.dumps(record) for record in records],
+        valid_mask=[True] * len(records),
         expected_suffix_credit=False,
         expected_prompt_width=16,
     )
+
+
+def validate_one_record(record: dict):
+    return validate_records([record])
 
 
 class FormalDomainRolloutV3Test(unittest.TestCase):
@@ -414,8 +575,11 @@ class FormalDomainRolloutV3Test(unittest.TestCase):
             name: (name in sys.modules, sys.modules.get(name))
             for name in _ROLLOUT_MODULE_NAMES
         }
-        formal_grpo, formal_domain, rollout_context = load_rollout_context()
+        continuous_agent, formal_grpo, formal_domain, rollout_context = (
+            load_rollout_context()
+        )
         self.assertTrue(callable(formal_grpo.build_row_uid))
+        self.assertTrue(callable(continuous_agent.validate_continuous_agent_step_v1))
         self.assertEqual(
             formal_domain.FORMAL_DOMAIN_SCHEMA_V3,
             "agentmemory_formal_step_v3",
@@ -443,6 +607,63 @@ class FormalDomainRolloutV3Test(unittest.TestCase):
         summary = validate_one_record(packed_v3_record())
         self.assertEqual(summary["valid_rows"], 1)
         self.assertEqual(summary["trajectory_count"], 1)
+
+    def test_runtime_validator_accepts_canonical_continuous_agent_row(self):
+        summary = validate_one_record(packed_continuous_record())
+        self.assertEqual(summary["valid_rows"], 1)
+        self.assertEqual(summary["trajectory_count"], 1)
+
+    def test_runtime_validator_accepts_canonical_webshop_handoff_row(self):
+        first = packed_continuous_record()
+        first["trajectory_terminal"] = False
+        record = packed_continuous_record(session_handoff=True)
+        summary = validate_records([first, record])
+        self.assertEqual(summary["valid_rows"], 2)
+        self.assertEqual(summary["trajectory_count"], 1)
+        self.assertEqual(
+            record["compaction"]["compaction_mode"],
+            CONTINUOUS_AGENT.COMPACTION_MODE_WEBSHOP_SESSION_HANDOFF,
+        )
+
+    def test_runtime_validator_rejects_continuous_agent_counter_drift(self):
+        record = packed_continuous_record()
+        record["native_environment_call_count_after"] = 0
+        with self.assertRaisesRegex(ValueError, "native environment call"):
+            validate_one_record(record)
+
+    def test_runtime_validator_rejects_noncanonical_continuous_field_types(self):
+        cases = (
+            ("generation_prompt_length", 3.0, "raw positive integer"),
+            ("generation_response_length", 2.0, "raw positive integer"),
+            ("environment_step_before", 0.0, "raw non-negative integer"),
+            ("data_idx", 0.0, "raw non-negative integer"),
+            ("task_round", 1.0, "raw positive integer"),
+            ("done", 0, "done must be boolean"),
+            ("trajectory_terminal", 1, "must be boolean"),
+            ("immediate_reward", False, "finite number"),
+            ("suffix_return", False, "finite number"),
+            ("sampled_token_logprobs", [True, -0.2], "raw numeric values"),
+        )
+        for field, value, message in cases:
+            with self.subTest(field=field):
+                record = packed_continuous_record()
+                record[field] = value
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_one_record(record)
+
+    def test_runtime_validator_rejects_webshop_handoff_reset_drift(self):
+        cases = (
+            ("raw_history_cleared", False, "raw history"),
+            ("session_index_after", 2, "session indices"),
+        )
+        for field, value, message in cases:
+            with self.subTest(field=field):
+                first = packed_continuous_record()
+                first["trajectory_terminal"] = False
+                record = packed_continuous_record(session_handoff=True)
+                record["compaction"][field] = value
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_records([first, record])
 
     def test_real_qwen35_primary_and_alternate_eos_pass_both_packed_schemas(self):
         cases = (

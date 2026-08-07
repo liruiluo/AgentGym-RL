@@ -558,15 +558,33 @@ def _raw_int_list(value: Any, *, name: str, allow_empty: bool = False) -> list[i
     return list(value)
 
 
+def _raw_nonnegative_int(
+    value: Any,
+    *,
+    name: str,
+    positive: bool = False,
+) -> int:
+    minimum = 1 if positive else 0
+    if type(value) is not int or value < minimum:
+        qualifier = "positive" if positive else "non-negative"
+        raise ContinuousAgentV1Error(f"{name} must be a raw {qualifier} integer")
+    return value
+
+
+def _finite_number(value: Any, *, name: str) -> float:
+    if type(value) not in (int, float) or not math.isfinite(float(value)):
+        raise ContinuousAgentV1Error(f"{name} must be a finite number")
+    return float(value)
+
+
 def _finite_float_list(value: Any, *, name: str, expected: int) -> list[float]:
     if not isinstance(value, list) or len(value) != expected:
         raise ContinuousAgentV1Error(
             f"{name} must contain exactly {expected} values"
         )
-    try:
-        values = [float(item) for item in value]
-    except (TypeError, ValueError) as exc:
-        raise ContinuousAgentV1Error(f"{name} must be numeric") from exc
+    if any(type(item) not in (int, float) for item in value):
+        raise ContinuousAgentV1Error(f"{name} must contain raw numeric values")
+    values = [float(item) for item in value]
     if not all(math.isfinite(item) for item in values):
         raise ContinuousAgentV1Error(f"{name} must be finite")
     return values
@@ -677,6 +695,132 @@ def build_continuous_agent_step_v1(
 
 
 def validate_continuous_agent_step_v1(record: Mapping[str, Any]) -> None:
+    _validate_continuous_agent_step_v1(record)
+
+
+def validate_packed_continuous_agent_step_v1(record: Mapping[str, Any]) -> None:
+    """Validate a canonical PPO row after raw prompt tokens are stripped."""
+
+    required = {
+        "action",
+        "immediate_reward",
+        "suffix_return",
+        "trajectory_return",
+        "trajectory_row_order",
+        "trajectory_terminal",
+        "task_round",
+        "suffix_credit_applied",
+        "generation_prompt_length",
+        "generation_prompt_digest",
+        "packed_prompt_length",
+        "packed_prompt_digest",
+        "generation_response_length",
+        "generation_response_digest",
+        "packed_response_length",
+        "packed_response_digest",
+    }
+    missing = sorted(required - set(record))
+    if missing:
+        raise ContinuousAgentV1Error(
+            "packed continuous-agent row is missing fields: " + ", ".join(missing)
+        )
+    generation_prompt_length = _raw_nonnegative_int(
+        record["generation_prompt_length"],
+        name="generation_prompt_length",
+        positive=True,
+    )
+    packed_prompt_length = _raw_nonnegative_int(
+        record["packed_prompt_length"],
+        name="packed_prompt_length",
+        positive=True,
+    )
+    generation_prompt_digest = record["generation_prompt_digest"]
+    packed_prompt_digest = record["packed_prompt_digest"]
+    for name, digest in (
+        ("generation_prompt_digest", generation_prompt_digest),
+        ("packed_prompt_digest", packed_prompt_digest),
+    ):
+        if type(digest) is not str:
+            raise ContinuousAgentV1Error(f"{name} must be a lowercase SHA256")
+    if generation_prompt_length != packed_prompt_length:
+        raise ContinuousAgentV1Error(
+            "packed continuous-agent prompt length drifted"
+        )
+    if generation_prompt_digest != packed_prompt_digest:
+        raise ContinuousAgentV1Error(
+            "packed continuous-agent prompt digest drifted"
+        )
+    _raw_nonnegative_int(
+        record["trajectory_row_order"], name="trajectory_row_order"
+    )
+    _raw_nonnegative_int(record["task_round"], name="task_round", positive=True)
+    generation_response_length = _raw_nonnegative_int(
+        record["generation_response_length"],
+        name="generation_response_length",
+        positive=True,
+    )
+    packed_response_length = _raw_nonnegative_int(
+        record["packed_response_length"],
+        name="packed_response_length",
+        positive=True,
+    )
+    if generation_response_length != packed_response_length:
+        raise ContinuousAgentV1Error(
+            "packed continuous-agent response length drifted"
+        )
+    generation_response_digest = record["generation_response_digest"]
+    packed_response_digest = record["packed_response_digest"]
+    for name, digest in (
+        ("generation_response_digest", generation_response_digest),
+        ("packed_response_digest", packed_response_digest),
+    ):
+        if type(digest) is not str:
+            raise ContinuousAgentV1Error(f"{name} must be a lowercase SHA256")
+    if generation_response_digest != packed_response_digest:
+        raise ContinuousAgentV1Error(
+            "packed continuous-agent response digest drifted"
+        )
+    for name in ("trajectory_terminal", "suffix_credit_applied"):
+        if type(record[name]) is not bool:
+            raise ContinuousAgentV1Error(f"{name} must be boolean")
+    if not isinstance(record["action"], str):
+        raise ContinuousAgentV1Error("action must be text")
+    normalized = deepcopy(dict(record))
+    if "content" in normalized and normalized["content"] != normalized["action"]:
+        raise ContinuousAgentV1Error(
+            "packed continuous-agent content/action drifted"
+        )
+    immediate_reward = _finite_number(
+        normalized["immediate_reward"], name="immediate_reward"
+    )
+    _finite_number(normalized["suffix_return"], name="suffix_return")
+    _finite_number(normalized["trajectory_return"], name="trajectory_return")
+    if "score" in normalized:
+        score = _finite_number(normalized["score"], name="score")
+        if not math.isclose(
+            score,
+            immediate_reward,
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        ):
+            raise ContinuousAgentV1Error(
+                "packed continuous-agent score/reward drifted"
+            )
+    normalized["content"] = normalized["action"]
+    normalized["score"] = normalized["immediate_reward"]
+    _validate_continuous_agent_step_v1(
+        normalized,
+        packed_prompt_length=generation_prompt_length,
+        packed_prompt_digest=generation_prompt_digest,
+    )
+
+
+def _validate_continuous_agent_step_v1(
+    record: Mapping[str, Any],
+    *,
+    packed_prompt_length: int | None = None,
+    packed_prompt_digest: str | None = None,
+) -> None:
     required = {
         "schema_version",
         "row_kind",
@@ -690,7 +834,6 @@ def validate_continuous_agent_step_v1(record: Mapping[str, Any]) -> None:
         "replica_index",
         "trajectory_uid",
         "exact_state_uid",
-        "prompt_token_ids",
         "response_token_ids",
         "sampled_token_logprobs",
         "response_token_count",
@@ -720,6 +863,8 @@ def validate_continuous_agent_step_v1(record: Mapping[str, Any]) -> None:
         "observation",
         "horizon_finalization",
     }
+    if packed_prompt_length is None or packed_prompt_digest is None:
+        required.add("prompt_token_ids")
     missing = sorted(required - set(record))
     if missing:
         raise ContinuousAgentV1Error(
@@ -734,7 +879,30 @@ def validate_continuous_agent_step_v1(record: Mapping[str, Any]) -> None:
         raise ContinuousAgentV1Error("continuous-agent context policy mismatch")
     if not isinstance(record["content"], str):
         raise ContinuousAgentV1Error("content must be text")
-    prompt_ids = _raw_int_list(record["prompt_token_ids"], name="prompt_token_ids")
+    if packed_prompt_length is None or packed_prompt_digest is None:
+        prompt_ids = _raw_int_list(
+            record["prompt_token_ids"], name="prompt_token_ids"
+        )
+        prompt_length = len(prompt_ids)
+        prompt_digest = token_digest(prompt_ids)
+    else:
+        prompt_length = _raw_nonnegative_int(
+            packed_prompt_length,
+            name="packed generation prompt length",
+            positive=True,
+        )
+        prompt_digest = packed_prompt_digest
+        if type(prompt_digest) is not str:
+            raise ContinuousAgentV1Error(
+                "packed generation prompt digest must be lowercase SHA256"
+            )
+        if len(prompt_digest) != 64 or any(
+            char not in "0123456789abcdef" for char in prompt_digest
+        ):
+            raise ContinuousAgentV1Error(
+                "packed generation prompt digest must be lowercase SHA256"
+            )
+        prompt_ids = None
     response_ids = _raw_int_list(
         record["response_token_ids"], name="response_token_ids"
     )
@@ -743,36 +911,52 @@ def validate_continuous_agent_step_v1(record: Mapping[str, Any]) -> None:
         name="sampled_token_logprobs",
         expected=len(response_ids),
     )
-    if len(response_ids) != int(record["response_token_count"]):
+    response_token_count = _raw_nonnegative_int(
+        record["response_token_count"],
+        name="response_token_count",
+        positive=True,
+    )
+    _raw_nonnegative_int(
+        record["max_response_tokens"],
+        name="max_response_tokens",
+        positive=True,
+    )
+    if len(response_ids) != response_token_count:
         raise ContinuousAgentV1Error("response token count mismatch")
     if response_ids != list(record["response_token_ids"]) or not logprobs:
         raise ContinuousAgentV1Error("sampled response evidence is empty")
-    if not prompt_ids:
+    if prompt_length <= 0:
         raise ContinuousAgentV1Error("generation prompt is empty")
-    if not math.isfinite(float(record["score"])):
-        raise ContinuousAgentV1Error("score must be finite")
+    _finite_number(record["score"], name="score")
     exact_state_uid = str(record["exact_state_uid"])
     if ":statev1:" not in exact_state_uid or exact_state_uid.rsplit(
         ":statev1:", 1
-    )[1] != token_digest(prompt_ids):
+    )[1] != prompt_digest:
         raise ContinuousAgentV1Error(
             "exact state identity must bind the generation prompt digest"
         )
-    before_step = int(record["environment_step_before"])
-    after_step = int(record["environment_step_after"])
-    before_native_call = int(record["native_environment_call_count_before"])
-    after_native_call = int(record["native_environment_call_count_after"])
-    before_epoch = int(record["context_epoch_before"])
-    after_epoch = int(record["context_epoch_after"])
-    if min(
-        before_step,
-        after_step,
-        before_native_call,
-        after_native_call,
-        before_epoch,
-        after_epoch,
-    ) < 0:
-        raise ContinuousAgentV1Error("step and context epoch must be non-negative")
+    for name in ("data_idx", "parent_index", "replica_index", "environment_id"):
+        _raw_nonnegative_int(record[name], name=name)
+    before_step = _raw_nonnegative_int(
+        record["environment_step_before"], name="environment_step_before"
+    )
+    after_step = _raw_nonnegative_int(
+        record["environment_step_after"], name="environment_step_after"
+    )
+    before_native_call = _raw_nonnegative_int(
+        record["native_environment_call_count_before"],
+        name="native_environment_call_count_before",
+    )
+    after_native_call = _raw_nonnegative_int(
+        record["native_environment_call_count_after"],
+        name="native_environment_call_count_after",
+    )
+    before_epoch = _raw_nonnegative_int(
+        record["context_epoch_before"], name="context_epoch_before"
+    )
+    after_epoch = _raw_nonnegative_int(
+        record["context_epoch_after"], name="context_epoch_after"
+    )
     if after_step != before_step + 1:
         raise ContinuousAgentV1Error(
             "every policy action, including compaction, must consume exactly one "
@@ -786,6 +970,10 @@ def validate_continuous_agent_step_v1(record: Mapping[str, Any]) -> None:
     dispatched = record["environment_action_dispatched"]
     if type(dispatched) is not bool:
         raise ContinuousAgentV1Error("environment_action_dispatched must be boolean")
+    if type(record["done"]) is not bool:
+        raise ContinuousAgentV1Error("done must be boolean")
+    if not isinstance(record["environment_result"], str):
+        raise ContinuousAgentV1Error("environment_result must be text")
     horizon_evidence = record["horizon_finalization"]
     if horizon_evidence is not None:
         _validate_horizon_evidence_v1(record, horizon_evidence)
@@ -890,14 +1078,14 @@ def validate_continuous_agent_step_v1(record: Mapping[str, Any]) -> None:
             )
         if (
             compaction_mode == COMPACTION_MODE_CONTEXT_LIMIT
-            and len(pre_request_action_ids) >= len(prompt_ids)
+            and len(pre_request_action_ids) >= prompt_length
         ):
             raise ContinuousAgentV1Error(
                 "compaction request must extend its action prompt"
             )
-        if int(evidence["pre_compaction_prompt_length"]) != len(prompt_ids):
+        if int(evidence["pre_compaction_prompt_length"]) != prompt_length:
             raise ContinuousAgentV1Error("pre-compaction prompt length mismatch")
-        if evidence["pre_compaction_prompt_digest"] != token_digest(prompt_ids):
+        if evidence["pre_compaction_prompt_digest"] != prompt_digest:
             raise ContinuousAgentV1Error("pre-compaction prompt digest mismatch")
         immutable_framing_ids = _raw_int_list(
             evidence["immutable_framing_token_ids"],

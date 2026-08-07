@@ -9,6 +9,11 @@ from typing import Any
 
 import numpy as np
 
+from verl.utils.agentgym.continuous_agent_v1 import (
+    CONTINUOUS_AGENT_SCHEMA_V1,
+    ContinuousAgentV1Error,
+    validate_packed_continuous_agent_step_v1,
+)
 from verl.utils.agentgym.formal_grpo_credit import (
     build_row_uid,
     compute_formal_grpo_credit,
@@ -1007,6 +1012,173 @@ def _validate_formal_domain_step_record_v3(
     return record
 
 
+def _validate_continuous_agent_step_record_v1(
+    record: dict[str, Any],
+    *,
+    row_index: int,
+    expected_exact_state_uid: str,
+    expected_trajectory_uid: str,
+    expected_trajectory_row_uid: str,
+    expected_trajectory_row_order: int,
+    expected_trajectory_terminal: bool,
+    expected_task_round: int,
+    expected_immediate_reward: float,
+    expected_suffix_return: float,
+    expected_trajectory_return: float,
+    expected_action_text: str,
+    expected_done: bool,
+    expected_generation_length: int,
+    expected_generation_digest: str,
+    expected_packed_length: int,
+    expected_packed_digest: str,
+    expected_generation_response_length: int,
+    expected_generation_response_digest: str,
+    expected_packed_response_length: int,
+    expected_packed_response_digest: str,
+    expected_suffix_credit_applied: bool,
+    tolerance: float,
+) -> dict[str, Any]:
+    try:
+        validate_packed_continuous_agent_step_v1(record)
+    except ContinuousAgentV1Error as exc:
+        raise ValueError(
+            f"Invalid packed continuous-agent step at row {row_index}: {exc}"
+        ) from exc
+
+    trajectory_row_order = _coerce_nonnegative_int(
+        record.get("trajectory_row_order"),
+        name="continuous trajectory row order",
+        row_index=row_index,
+    )
+    trajectory_row_uid = str(record.get("trajectory_row_uid"))
+    if (
+        trajectory_row_order != expected_trajectory_row_order
+        or trajectory_row_uid != expected_trajectory_row_uid
+        or trajectory_row_uid
+        != build_row_uid(expected_trajectory_uid, expected_trajectory_row_order)
+    ):
+        raise ValueError(
+            f"Continuous trajectory row identity mismatch at row {row_index}."
+        )
+    if type(record.get("trajectory_terminal")) is not bool or record[
+        "trajectory_terminal"
+    ] != bool(expected_trajectory_terminal):
+        raise ValueError(
+            f"Continuous trajectory terminal mismatch at row {row_index}."
+        )
+
+    response_token_ids = record.get("response_token_ids")
+    if not isinstance(response_token_ids, list) or any(
+        type(token_id) is not int for token_id in response_token_ids
+    ):
+        raise ValueError(
+            f"Continuous response_token_ids must contain raw integers at row {row_index}."
+        )
+    response_token_count = _coerce_nonnegative_int(
+        record.get("response_token_count"),
+        name="continuous response token count",
+        row_index=row_index,
+    )
+    response_digest = prompt_token_digest(response_token_ids)
+    if (
+        response_token_count != len(response_token_ids)
+        or response_token_count != expected_generation_response_length
+        or response_digest != expected_generation_response_digest
+    ):
+        raise ValueError(
+            f"Continuous generated-response metadata mismatch at row {row_index}."
+        )
+    generation_record = {
+        "token_ids": response_token_ids,
+        "response_token_count": response_token_count,
+        "max_response_tokens": record.get("max_response_tokens"),
+        "finish_reason": record.get("finish_reason"),
+        "finish_reason_source": record.get("finish_reason_source"),
+        "stop_reason": record.get("stop_reason"),
+        "truncated": record.get("truncated"),
+        "configured_eos_token_ids": record.get("generation_eos_token_ids"),
+        "primary_eos_token_id": record.get("tokenizer_primary_eos_token_id"),
+        "tokenizer_pad_token_id": record.get("tokenizer_pad_token_id"),
+        "backend_source": record.get("generation_backend_source"),
+        "backend_token_ids_are_exact": record.get(
+            "backend_token_ids_are_exact"
+        ),
+        "token_ids_are_exact": record.get("generation_token_ids_are_exact"),
+    }
+    try:
+        validate_official_vllm_generation_record(generation_record)
+    except RuntimeError as exc:
+        raise ValueError(
+            f"Continuous generation provenance is invalid at row {row_index}: {exc}"
+        ) from exc
+    tokenizer_pad_token_id = record.get("tokenizer_pad_token_id")
+    if tokenizer_pad_token_id is not None and (
+        type(tokenizer_pad_token_id) is not int or tokenizer_pad_token_id < 0
+    ):
+        raise ValueError(
+            "Continuous tokenizer pad readback must be a non-negative integer "
+            f"or None at row {row_index}."
+        )
+
+    exact_state_uid = str(record.get("exact_state_uid"))
+    if (
+        ":statev1:" not in exact_state_uid
+        or exact_state_uid.rsplit(":statev1:", 1)[1]
+        != expected_generation_digest
+    ):
+        raise ValueError(
+            f"Continuous exact-state UID digest mismatch at row {row_index}."
+        )
+
+    numeric_expectations = {
+        "immediate_reward": expected_immediate_reward,
+        "suffix_return": expected_suffix_return,
+        "trajectory_return": expected_trajectory_return,
+    }
+    for name, expected in numeric_expectations.items():
+        try:
+            actual = float(record[name])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid continuous step {name} at row {row_index}."
+            ) from exc
+        if not math.isfinite(actual) or not math.isclose(
+            actual, expected, rel_tol=tolerance, abs_tol=tolerance
+        ):
+            raise ValueError(
+                f"Continuous step {name} mismatch at row {row_index}: "
+                f"expected={expected} actual={actual}."
+            )
+
+    exact_expectations = {
+        "schema_version": CONTINUOUS_AGENT_SCHEMA_V1,
+        "exact_state_uid": expected_exact_state_uid,
+        "trajectory_uid": expected_trajectory_uid,
+        "trajectory_row_uid": expected_trajectory_row_uid,
+        "trajectory_row_order": expected_trajectory_row_order,
+        "trajectory_terminal": expected_trajectory_terminal,
+        "task_round": expected_task_round,
+        "action": expected_action_text,
+        "done": expected_done,
+        "generation_prompt_length": expected_generation_length,
+        "generation_prompt_digest": expected_generation_digest,
+        "packed_prompt_length": expected_packed_length,
+        "packed_prompt_digest": expected_packed_digest,
+        "generation_response_length": expected_generation_response_length,
+        "generation_response_digest": expected_generation_response_digest,
+        "packed_response_length": expected_packed_response_length,
+        "packed_response_digest": expected_packed_response_digest,
+        "suffix_credit_applied": expected_suffix_credit_applied,
+    }
+    for name, expected in exact_expectations.items():
+        if record.get(name) != expected:
+            raise ValueError(
+                f"Continuous step record {name} mismatch at row {row_index}: "
+                f"expected={expected!r} actual={record.get(name)!r}."
+            )
+    return record
+
+
 def _validate_formal_step_record(
     value: Any,
     *,
@@ -1040,6 +1212,36 @@ def _validate_formal_step_record(
             f"Invalid formal step record JSON at row {row_index}."
         ) from exc
     schema_version = record.get("schema_version")
+    if schema_version == CONTINUOUS_AGENT_SCHEMA_V1:
+        return _validate_continuous_agent_step_record_v1(
+            record,
+            row_index=row_index,
+            expected_exact_state_uid=expected_exact_state_uid,
+            expected_trajectory_uid=expected_trajectory_uid,
+            expected_trajectory_row_uid=expected_trajectory_row_uid,
+            expected_trajectory_row_order=expected_trajectory_row_order,
+            expected_trajectory_terminal=expected_trajectory_terminal,
+            expected_task_round=expected_task_round,
+            expected_immediate_reward=expected_immediate_reward,
+            expected_suffix_return=expected_suffix_return,
+            expected_trajectory_return=expected_trajectory_return,
+            expected_action_text=expected_action_text,
+            expected_done=expected_done,
+            expected_generation_length=expected_generation_length,
+            expected_generation_digest=expected_generation_digest,
+            expected_packed_length=expected_packed_length,
+            expected_packed_digest=expected_packed_digest,
+            expected_generation_response_length=(
+                expected_generation_response_length
+            ),
+            expected_generation_response_digest=(
+                expected_generation_response_digest
+            ),
+            expected_packed_response_length=expected_packed_response_length,
+            expected_packed_response_digest=expected_packed_response_digest,
+            expected_suffix_credit_applied=expected_suffix_credit_applied,
+            tolerance=tolerance,
+        )
     if schema_version == FORMAL_DOMAIN_SCHEMA_V3:
         return _validate_formal_domain_step_record_v3(
             record,
