@@ -65,6 +65,25 @@ from verl.utils.agent_dataset.procedural_index import (
     validate_multitask_route_triplet,
 )
 from verl.utils.agentgym.context_policy import assert_rollout_context_supported, read_config, rollout_context_policy
+from verl.utils.agentgym.continuous_agent_v1 import (
+    COMPACTION_ROW,
+    CONTINUOUS_AGENT_CONTEXT_POLICY_V1,
+    CONTINUOUS_AGENT_SCHEMA_V1,
+    ENVIRONMENT_ACTION_ROW,
+    POLICY_COMPACTION_REQUEST,
+    POLICY_CONTINUATION_MARKER,
+    build_compaction_evidence_v1,
+    build_continuous_agent_step_v1,
+    build_horizon_evidence_v1,
+    build_observation_evidence_v1,
+    build_policy_generation_loss_masks,
+    continuous_prompt_capacity,
+    extract_sampled_token_logprobs,
+    should_request_policy_compaction,
+    text_sha256,
+    validate_continuous_agent_step_v1,
+    validate_continuous_agent_trajectory_v1,
+)
 from verl.utils.agentgym.formal_domain_v3 import (
     FORMAL_DOMAIN_SCHEMA_V3,
     FORMAL_WEBSHOP_SCHEMA_V2,
@@ -134,6 +153,7 @@ from verl.workers.rollout.schemas import (
     agentmemory_action_system_prompt,
     agentmemory_ltm_inventory_mode,
     agentmemory_memory_prompt_mode,
+    apply_chat_template,
 )
 
 # TODO
@@ -779,6 +799,7 @@ class vLLMRollout(BaseRollout):
         sampling_params=None,
         *,
         require_exact_metadata: bool = False,
+        require_sampled_logprobs: bool = False,
     ):
         """Preserve actual generated tokens and backend termination metadata."""
 
@@ -822,7 +843,7 @@ class vLLMRollout(BaseRollout):
             )
 
         if isinstance(output, tuple):
-            if require_exact_metadata:
+            if require_exact_metadata or require_sampled_logprobs:
                 raise RuntimeError(
                     "Formal legacy/custom tuple generation lacks per-row token "
                     "length and finish metadata."
@@ -831,7 +852,7 @@ class vLLMRollout(BaseRollout):
             rows = ids.tolist() if hasattr(ids, 'tolist') else ids
             return [normalize_row(row, source="verl_vllm_wrapper") for row in rows]
         if hasattr(output, 'tolist'):
-            if require_exact_metadata:
+            if require_exact_metadata or require_sampled_logprobs:
                 raise RuntimeError(
                     "Formal tensor generation lacks per-row token length and "
                     "finish metadata."
@@ -841,14 +862,14 @@ class vLLMRollout(BaseRollout):
                 for row in output.tolist()
             ]
         if isinstance(output, list) and (not output or isinstance(output[0], (list, tuple))):
-            if require_exact_metadata:
+            if require_exact_metadata or require_sampled_logprobs:
                 raise RuntimeError(
                     "Formal list generation lacks per-row token length and "
                     "finish metadata."
                 )
             return [normalize_row(row, source="list_generation_output") for row in output]
         if isinstance(output, list) and output and isinstance(output[0], dict):
-            if require_exact_metadata:
+            if require_exact_metadata or require_sampled_logprobs:
                 raise RuntimeError(
                     "Formal official-vLLM generation rejects self-described "
                     "list/dict token metadata."
@@ -917,6 +938,18 @@ class vLLMRollout(BaseRollout):
                 )
                 if require_exact_metadata:
                     validate_official_vllm_generation_record(record)
+                raw_logprobs = getattr(candidate, "logprobs", None)
+                if raw_logprobs is not None:
+                    record["sampled_token_logprobs"] = (
+                        extract_sampled_token_logprobs(
+                            record["token_ids"], raw_logprobs
+                        )
+                    )
+                elif require_sampled_logprobs:
+                    raise RuntimeError(
+                        "Formal continuous-agent generation is missing official-vLLM "
+                        "sampled-token logprobs."
+                    )
                 records.append(record)
         return records
 
@@ -1115,7 +1148,14 @@ class vLLMRollout(BaseRollout):
         input_ids = prompt_token_ids + response_token_ids
         attention_mask = [1] * len(input_ids)
         position_ids = list(range(len(input_ids)))
-        loss_mask = [0] * len(prompt_token_ids) + [1] * len(response_token_ids)
+        (
+            loss_mask,
+            prompt_loss_mask,
+            response_loss_mask,
+        ) = build_policy_generation_loss_masks(
+            prompt_token_ids,
+            response_token_ids,
+        )
         return RolloutHandler(
             messages=[],
             task_name="agentmemory",
@@ -1132,8 +1172,8 @@ class vLLMRollout(BaseRollout):
             prompt_position_ids=list(range(len(prompt_token_ids))),
             response_position_ids=list(range(len(prompt_token_ids), len(input_ids))),
             loss_mask=loss_mask,
-            prompt_loss_mask=[0] * len(prompt_token_ids),
-            response_loss_mask=[1] * len(response_token_ids),
+            prompt_loss_mask=prompt_loss_mask,
+            response_loss_mask=response_loss_mask,
             max_response_len=self.config.response_length,
             max_model_len=min(self.config.max_model_len, self.config.prompt_length + self.config.response_length),
         )
@@ -1474,11 +1514,14 @@ class vLLMRollout(BaseRollout):
                 if schema_version not in (
                     FORMAL_WEBSHOP_SCHEMA_V2,
                     FORMAL_DOMAIN_SCHEMA_V3,
+                    CONTINUOUS_AGENT_SCHEMA_V1,
                 ):
                     raise RuntimeError(
                         "Unsupported formal step schema before packing: "
                         f"row={index} schema={schema_version!r}."
                     )
+                if schema_version == CONTINUOUS_AGENT_SCHEMA_V1:
+                    validate_continuous_agent_step_v1(record)
                 internal_fields = (
                     ("prompt_token_ids",)
                     if schema_version == FORMAL_DOMAIN_SCHEMA_V3
@@ -1593,6 +1636,623 @@ class vLLMRollout(BaseRollout):
             self.tokenizer,
             system_prompt=system_prompt,
         )
+
+    def _continuous_prompt_from_messages(self, messages: List[Message]) -> List[int]:
+        return apply_chat_template(
+            self.tokenizer,
+            [message.to_dict() for message in messages],
+        )
+
+    def _continuous_plain_token_ids(self, text: str) -> List[int]:
+        return [
+            int(token_id)
+            for token_id in self.tokenizer.encode(text, add_special_tokens=False)
+        ]
+
+    def _continuous_decode_plain_token_ids(self, token_ids: List[int]) -> str:
+        try:
+            return self.tokenizer.decode(
+                token_ids,
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+        except TypeError:
+            return self.tokenizer.decode(token_ids, skip_special_tokens=False)
+
+    def _bound_continuous_observation(
+        self, text: str, *, max_observation_tokens: int
+    ) -> dict:
+        """Keep deterministic head/tail context and expose explicit truncation."""
+
+        full_text = str(text)
+        full_ids = self._continuous_plain_token_ids(full_text)
+        if not full_ids:
+            raise RuntimeError("continuous-agent environment returned an empty token stream")
+        maximum = int(max_observation_tokens)
+        if maximum <= 0:
+            raise RuntimeError("max_observation_tokens must be positive")
+        if len(full_ids) <= maximum:
+            return {
+                "full_text": full_text,
+                "full_token_ids": full_ids,
+                "policy_visible_text": full_text,
+                "policy_visible_token_ids": full_ids,
+                "truncated": False,
+                "head_token_count": len(full_ids),
+                "tail_token_count": 0,
+                "truncation_marker": None,
+            }
+
+        kept = maximum
+        full_digest = text_sha256(full_text)
+        for _ in range(64):
+            omitted = len(full_ids) - kept
+            marker = (
+                "\n[OBSERVATION TRUNCATED: "
+                f"original_tokens={len(full_ids)} omitted_tokens={omitted} "
+                f"sha256={full_digest}]\n"
+            )
+            marker_ids = self._continuous_plain_token_ids(marker)
+            available = maximum - len(marker_ids)
+            if available < 2:
+                raise RuntimeError(
+                    "max_observation_tokens is too small for the truncation marker"
+                )
+            kept = min(kept, available)
+            head_count = (kept + 1) // 2
+            tail_count = kept // 2
+            head_text = self._continuous_decode_plain_token_ids(
+                full_ids[:head_count]
+            )
+            tail_text = self._continuous_decode_plain_token_ids(
+                full_ids[-tail_count:]
+            )
+            visible_text = head_text + marker + tail_text
+            visible_ids = self._continuous_plain_token_ids(visible_text)
+            if len(visible_ids) <= maximum:
+                return {
+                    "full_text": full_text,
+                    "full_token_ids": full_ids,
+                    "policy_visible_text": visible_text,
+                    "policy_visible_token_ids": visible_ids,
+                    "truncated": True,
+                    "head_token_count": head_count,
+                    "tail_token_count": tail_count,
+                    "truncation_marker": marker,
+                }
+            kept -= max(1, len(visible_ids) - maximum)
+            if kept < 2:
+                break
+        raise RuntimeError(
+            "failed to construct a tokenizer-bounded head/tail observation"
+        )
+
+    def _continuous_action_observation_envelope_tokens(
+        self, messages: List[Message], action_prompt_ids: List[int]
+    ) -> int:
+        empty_transition = list(messages) + [
+            Message(role="assistant", content=""),
+            Message(role="user", content=""),
+        ]
+        empty_transition_ids = self._continuous_prompt_from_messages(
+            empty_transition
+        )
+        envelope = len(empty_transition_ids) - len(action_prompt_ids)
+        if envelope < 0:
+            raise RuntimeError(
+                "chat template shortened after an empty action/observation transition"
+            )
+        return envelope
+
+    def generate_continuous_agent_with_compaction(
+        self,
+        rollout_handler_ls: List[RolloutHandler],
+        env_clients,
+        cur_device,
+        max_policy_turns: int,
+        sampling_kwargs: dict,
+        global_steps,
+    ) -> DataProto:
+        """Roll out one native long-horizon task with policy-authored compaction."""
+
+        if str(read_config(self.agentgym_config, "task_name", "")).lower() != "swesmith":
+            raise RuntimeError(
+                "policy-authored continuous compaction is currently frozen only "
+                "for the SWE-smith native task"
+            )
+        if rollout_context_policy(self.agentgym_config) != CONTINUOUS_AGENT_CONTEXT_POLICY_V1:
+            raise RuntimeError("continuous-agent rollout context policy drifted")
+        if isinstance(max_policy_turns, bool) or int(max_policy_turns) <= 0:
+            raise RuntimeError("max_policy_turns must be a positive integer")
+
+        effective_max_response_tokens = int(
+            sampling_kwargs.get(
+                "max_tokens",
+                getattr(self.sampling_params, "max_tokens", self.config.response_length),
+            )
+        )
+        max_prompt_tokens = int(self.config.prompt_length)
+        max_model_tokens = int(self.config.max_model_len)
+        raw_max_observation_tokens = read_config(
+            self.agentgym_config, "max_observation_tokens", None
+        )
+        if raw_max_observation_tokens is None:
+            raise RuntimeError(
+                "formal continuous-agent rollout requires explicit "
+                "agentgym.max_observation_tokens"
+            )
+        max_observation_tokens = int(raw_max_observation_tokens)
+        if max_observation_tokens <= 0:
+            raise RuntimeError("agentgym.max_observation_tokens must be positive")
+        prompt_capacity = continuous_prompt_capacity(
+            max_prompt_tokens=max_prompt_tokens,
+            max_model_tokens=max_model_tokens,
+            max_response_tokens=effective_max_response_tokens,
+        )
+        if effective_max_response_tokens != int(self.config.response_length):
+            raise RuntimeError(
+                "formal continuous-agent rollout requires sampling max_tokens to "
+                "match data.max_response_length exactly: "
+                f"sampling={effective_max_response_tokens} "
+                f"response_length={self.config.response_length}"
+            )
+
+        immutable_messages: list[List[Message] | None] = [
+            None for _ in rollout_handler_ls
+        ]
+        immutable_prompt_ids: list[List[int] | None] = [
+            None for _ in rollout_handler_ls
+        ]
+        task_rounds = [0] * len(rollout_handler_ls)
+        native_call_counts = [0] * len(rollout_handler_ls)
+        context_epochs = [0] * len(rollout_handler_ls)
+        trajectory_steps: list[list[dict]] = [
+            [] for _ in rollout_handler_ls
+        ]
+        flat_handlers: list[RolloutHandler] = []
+        flat_step_refs: list[dict] = []
+        flat_rollout_indices: list[int] = []
+
+        for idx, rollout_handler in enumerate(rollout_handler_ls):
+            reset_index = getattr(
+                rollout_handler,
+                "data_idx",
+                rollout_handler.item_id,
+            )
+            env_clients[idx].reset(int(reset_index))
+            task = env_clients[idx].observe()
+            rollout_handler.messages.append(Message(role="user", content=task))
+            immutable_messages[idx] = deepcopy(rollout_handler.messages)
+            immutable_prompt_ids[idx] = self._continuous_prompt_from_messages(
+                immutable_messages[idx]
+            )
+            if len(immutable_prompt_ids[idx]) > prompt_capacity:
+                raise RuntimeError(
+                    "SWE-smith immutable task framing exceeds continuous prompt "
+                    f"capacity: row={idx} tokens={len(immutable_prompt_ids[idx])} "
+                    f"capacity={prompt_capacity}"
+                )
+            environment_id = getattr(env_clients[idx], "env_id", None)
+            if isinstance(environment_id, bool) or not isinstance(environment_id, int):
+                raise RuntimeError(
+                    f"SWE-smith client {idx} has no stable integer env_id"
+                )
+
+        rollout_bar = tqdm(
+            total=max_policy_turns,
+            desc="Running continuous-agent policy steps",
+            disable=torch.distributed.get_rank() != 0,
+        )
+        while any(not handler.done for handler in rollout_handler_ls):
+            if all(round_count >= max_policy_turns for round_count in task_rounds):
+                break
+
+            generation_prompt_ids: list[List[int]] = []
+            action_prompt_ids_by_active: list[List[int]] = []
+            generation_row_kinds: list[str] = []
+            active_indices: list[int] = []
+            for idx, rollout_handler in enumerate(rollout_handler_ls):
+                if rollout_handler.done or task_rounds[idx] >= max_policy_turns:
+                    continue
+                action_prompt_ids = self._continuous_prompt_from_messages(
+                    rollout_handler.messages
+                )
+                compaction_messages = list(rollout_handler.messages) + [
+                    Message(role="user", content=POLICY_COMPACTION_REQUEST)
+                ]
+                compaction_prompt_ids = self._continuous_prompt_from_messages(
+                    compaction_messages
+                )
+                action_observation_envelope_tokens = (
+                    self._continuous_action_observation_envelope_tokens(
+                        rollout_handler.messages,
+                        action_prompt_ids,
+                    )
+                )
+                request_compaction = should_request_policy_compaction(
+                    action_prompt_token_count=len(action_prompt_ids),
+                    compaction_prompt_token_count=len(compaction_prompt_ids),
+                    max_prompt_tokens=max_prompt_tokens,
+                    max_model_tokens=max_model_tokens,
+                    max_response_tokens=effective_max_response_tokens,
+                    max_observation_tokens=max_observation_tokens,
+                    action_observation_envelope_tokens=(
+                        action_observation_envelope_tokens
+                    ),
+                )
+                action_prompt_ids_by_active.append(action_prompt_ids)
+                generation_prompt_ids.append(
+                    compaction_prompt_ids if request_compaction else action_prompt_ids
+                )
+                generation_row_kinds.append(
+                    COMPACTION_ROW if request_compaction else ENVIRONMENT_ACTION_ROW
+                )
+                active_indices.append(idx)
+
+            if not active_indices:
+                break
+            rollout_bar.set_description(
+                "Continuous-agent steps "
+                f"{max(task_rounds) + 1}/{max_policy_turns} | "
+                f"active={len(active_indices)} "
+                f"compactions={generation_row_kinds.count(COMPACTION_ROW)}"
+            )
+            with self.update_sampling_params(**sampling_kwargs):
+                output = self._generate_token_ids(
+                    generation_prompt_idxs=generation_prompt_ids,
+                    sampling_params=self.sampling_params,
+                )
+            generation_records = self._output_generation_records(
+                output,
+                self.sampling_params,
+                require_exact_metadata=True,
+                require_sampled_logprobs=True,
+            )
+            if len(generation_records) != len(active_indices):
+                raise RuntimeError(
+                    "continuous-agent generation result count mismatch: "
+                    f"active={len(active_indices)} outputs={len(generation_records)}"
+                )
+
+            time.sleep(self.config.send_interval)
+            for local_index, rollout_index in enumerate(active_indices):
+                rollout_handler = rollout_handler_ls[rollout_index]
+                env_client = env_clients[rollout_index]
+                prompt_token_ids = generation_prompt_ids[local_index]
+                action_prompt_token_ids = action_prompt_ids_by_active[local_index]
+                row_kind = generation_row_kinds[local_index]
+                generation_record = generation_records[local_index]
+                response_token_ids = [
+                    int(token_id) for token_id in generation_record["token_ids"]
+                ]
+                sampled_logprobs = generation_record.get(
+                    "sampled_token_logprobs"
+                )
+                if not isinstance(sampled_logprobs, list):
+                    raise RuntimeError(
+                        "continuous-agent generation lacks sampled-token logprobs"
+                    )
+                content = self.tokenizer.decode(
+                    response_token_ids,
+                    skip_special_tokens=True,
+                )
+                environment_id_before = int(env_client.env_id)
+                environment_step_before = task_rounds[rollout_index]
+                native_calls_before = native_call_counts[rollout_index]
+                context_epoch_before = context_epochs[rollout_index]
+                task_rounds[rollout_index] += 1
+                parent_index = int(
+                    getattr(rollout_handler, "parent_index", rollout_index // self.config.n)
+                )
+                replica_index = int(
+                    getattr(rollout_handler, "rollout_replica_index", 0)
+                )
+                parent_group_uid = build_parent_group_uid(parent_index)
+                trajectory_uid = build_trajectory_uid(
+                    parent_group_uid, replica_index
+                )
+                exact_state_uid = build_state_aware_rollout_uid(
+                    parent_index,
+                    task_rounds[rollout_index],
+                    prompt_token_ids,
+                )
+
+                compaction_evidence = None
+                observation_evidence = None
+                horizon_evidence = None
+                environment_result = ""
+                score = 0.0
+                done = False
+                if row_kind == COMPACTION_ROW:
+                    framing_messages = immutable_messages[rollout_index]
+                    framing_prompt_ids = immutable_prompt_ids[rollout_index]
+                    if framing_messages is None or framing_prompt_ids is None:
+                        raise RuntimeError("continuous-agent immutable framing is absent")
+                    rollout_handler.messages = deepcopy(framing_messages) + [
+                        Message(role="assistant", content=content),
+                        Message(role="user", content=POLICY_CONTINUATION_MARKER),
+                    ]
+                    post_prompt_ids = self._continuous_prompt_from_messages(
+                        rollout_handler.messages
+                    )
+                    if len(post_prompt_ids) > prompt_capacity:
+                        raise RuntimeError(
+                            "policy-authored compaction produced an overlong continuation "
+                            f"prompt: row={rollout_index} tokens={len(post_prompt_ids)} "
+                            f"limit={prompt_capacity}"
+                        )
+                    if int(env_client.env_id) != environment_id_before:
+                        raise RuntimeError(
+                            "SWE-smith workspace identity changed during compaction"
+                        )
+                    context_epochs[rollout_index] += 1
+                    compaction_evidence = build_compaction_evidence_v1(
+                        pre_request_action_prompt_token_ids=(
+                            action_prompt_token_ids
+                        ),
+                        pre_compaction_prompt_token_ids=prompt_token_ids,
+                        immutable_framing_token_ids=framing_prompt_ids,
+                        summary_token_ids=response_token_ids,
+                        post_compaction_prompt_token_ids=post_prompt_ids,
+                        workspace_continuity_id=environment_id_before,
+                    )
+                else:
+                    rollout_handler.messages.append(
+                        Message(role="assistant", content=content)
+                    )
+                    step_output = env_client.step(content)
+                    native_call_counts[rollout_index] += 1
+                    full_environment_result = str(step_output.state)
+                    score = float(step_output.reward)
+                    done = bool(step_output.done)
+                    bounded_observation = self._bound_continuous_observation(
+                        full_environment_result,
+                        max_observation_tokens=max_observation_tokens,
+                    )
+                    environment_result = bounded_observation[
+                        "policy_visible_text"
+                    ]
+                    rollout_handler.messages.append(
+                        Message(role="user", content=environment_result)
+                    )
+                    post_observation_prompt_ids = (
+                        self._continuous_prompt_from_messages(
+                            rollout_handler.messages
+                        )
+                    )
+                    observation_evidence = build_observation_evidence_v1(
+                        full_text=bounded_observation["full_text"],
+                        full_token_ids=bounded_observation["full_token_ids"],
+                        policy_visible_text=environment_result,
+                        policy_visible_token_ids=bounded_observation[
+                            "policy_visible_token_ids"
+                        ],
+                        post_observation_prompt_token_ids=(
+                            post_observation_prompt_ids
+                        ),
+                        max_observation_tokens=max_observation_tokens,
+                        truncated=bounded_observation["truncated"],
+                        head_token_count=bounded_observation[
+                            "head_token_count"
+                        ],
+                        tail_token_count=bounded_observation[
+                            "tail_token_count"
+                        ],
+                        truncation_marker=bounded_observation[
+                            "truncation_marker"
+                        ],
+                    )
+                    if not done:
+                        next_compaction_prompt_ids = (
+                            self._continuous_prompt_from_messages(
+                                list(rollout_handler.messages)
+                                + [
+                                    Message(
+                                        role="user",
+                                        content=POLICY_COMPACTION_REQUEST,
+                                    )
+                                ]
+                            )
+                        )
+                        if len(next_compaction_prompt_ids) > prompt_capacity:
+                            raise RuntimeError(
+                                "continuous observation reserve failed before the next "
+                                "trainable compaction: "
+                                f"row={rollout_index} "
+                                f"tokens={len(next_compaction_prompt_ids)} "
+                                f"capacity={prompt_capacity}"
+                            )
+                    if int(env_client.env_id) != environment_id_before:
+                        raise RuntimeError(
+                            "SWE-smith workspace identity changed across an action"
+                        )
+
+                if not done and task_rounds[rollout_index] >= max_policy_turns:
+                    policy_step_reward = score
+                    horizon_output = env_client.finalize_horizon()
+                    if not bool(horizon_output.done):
+                        raise RuntimeError(
+                            "SWE-smith horizon finalization did not terminate"
+                        )
+                    horizon_evidence = build_horizon_evidence_v1(
+                        environment_id=environment_id_before,
+                        environment_step=task_rounds[rollout_index],
+                        native_environment_call_count=(
+                            native_call_counts[rollout_index]
+                        ),
+                        policy_step_reward=policy_step_reward,
+                        horizon_reward=float(horizon_output.reward),
+                        environment_result=str(horizon_output.state),
+                    )
+                    score = float(horizon_evidence["combined_reward"])
+                    done = True
+                    if int(env_client.env_id) != environment_id_before:
+                        raise RuntimeError(
+                            "SWE-smith workspace identity changed during horizon grading"
+                        )
+
+                rollout_handler.score = score
+                rollout_handler.done = done
+                step_record = build_continuous_agent_step_v1(
+                    row_kind=row_kind,
+                    task_name="swesmith",
+                    content=content,
+                    score=score,
+                    item_id=str(rollout_handler.item_id),
+                    data_idx=int(getattr(rollout_handler, "data_idx", rollout_handler.item_id)),
+                    parent_index=parent_index,
+                    parent_group_uid=parent_group_uid,
+                    replica_index=replica_index,
+                    trajectory_uid=trajectory_uid,
+                    exact_state_uid=exact_state_uid,
+                    prompt_token_ids=prompt_token_ids,
+                    response_token_ids=response_token_ids,
+                    sampled_token_logprobs=sampled_logprobs,
+                    generation_record=generation_record,
+                    environment_id=environment_id_before,
+                    environment_step_before=environment_step_before,
+                    environment_step_after=task_rounds[rollout_index],
+                    native_environment_call_count_before=native_calls_before,
+                    native_environment_call_count_after=native_call_counts[rollout_index],
+                    context_epoch_before=context_epoch_before,
+                    context_epoch_after=context_epochs[rollout_index],
+                    done=done,
+                    environment_result=environment_result,
+                    compaction_evidence=compaction_evidence,
+                    observation_evidence=observation_evidence,
+                    horizon_evidence=horizon_evidence,
+                )
+                trajectory_steps[rollout_index].append(step_record)
+                flat_step_refs.append(step_record)
+                flat_rollout_indices.append(rollout_index)
+                flat_handlers.append(
+                    self.build_rollout_handler_from_prompt(
+                        prompt_token_ids=prompt_token_ids,
+                        content=content,
+                        score=score,
+                        parent_index=parent_index,
+                        sampled_response_token_ids=response_token_ids,
+                    )
+                )
+            rollout_bar.update(1)
+        rollout_bar.close()
+
+        if any(not steps for steps in trajectory_steps):
+            missing = [
+                index for index, steps in enumerate(trajectory_steps) if not steps
+            ]
+            raise RuntimeError(
+                "continuous-agent rollout produced no trainable steps for "
+                f"trajectories={missing[:8]}"
+            )
+        for steps in trajectory_steps:
+            validate_continuous_agent_trajectory_v1(
+                steps,
+                require_terminal=True,
+            )
+            trajectory_return = sum(float(step["score"]) for step in steps)
+            suffix_returns = compute_suffix_credit_scores(
+                [float(step["score"]) for step in steps],
+                list(range(1, len(steps) + 1)),
+            )
+            for row_order, (step, suffix_return) in enumerate(
+                zip(steps, suffix_returns)
+            ):
+                step["trajectory_row_uid"] = build_row_uid(
+                    step["trajectory_uid"], row_order
+                )
+                step["trajectory_row_order"] = row_order
+                step["trajectory_terminal"] = row_order == len(steps) - 1
+                step["suffix_return"] = float(suffix_return)
+                step["trajectory_return"] = float(trajectory_return)
+
+        parent_indices = [int(step["parent_index"]) for step in flat_step_refs]
+        parent_group_uids = [str(step["parent_group_uid"]) for step in flat_step_refs]
+        exact_state_uids = [str(step["exact_state_uid"]) for step in flat_step_refs]
+        replica_indices = [int(step["replica_index"]) for step in flat_step_refs]
+        trajectory_uids = [str(step["trajectory_uid"]) for step in flat_step_refs]
+        trajectory_returns = [float(step["trajectory_return"]) for step in flat_step_refs]
+        immediate_rewards = [float(step["score"]) for step in flat_step_refs]
+        trajectory_row_uids = [str(step["trajectory_row_uid"]) for step in flat_step_refs]
+        trajectory_row_orders = [int(step["trajectory_row_order"]) for step in flat_step_refs]
+        trajectory_terminals = [bool(step["trajectory_terminal"]) for step in flat_step_refs]
+        flat_task_rounds = [int(step["environment_step_after"]) for step in flat_step_refs]
+        flat_done_flags = [bool(step["done"]) for step in flat_step_refs]
+        action_texts = [str(step["content"]) for step in flat_step_refs]
+        suffix_returns = [float(step["suffix_return"]) for step in flat_step_refs]
+        uid_overrides = list(exact_state_uids)
+        validate_formal_trajectory_rows(
+            parent_group_uids=parent_group_uids,
+            exact_state_uids=exact_state_uids,
+            replica_indices=replica_indices,
+            trajectory_uids=trajectory_uids,
+            trajectory_returns=trajectory_returns,
+            immediate_rewards=immediate_rewards,
+            trajectory_row_uids=trajectory_row_uids,
+            trajectory_row_orders=trajectory_row_orders,
+            trajectory_terminals=trajectory_terminals,
+            parent_indices=parent_indices,
+            rollout_uids=uid_overrides,
+            valid_mask=[True] * len(flat_step_refs),
+            expected_replicas=int(self.config.n),
+        )
+        output = self.pack_rollout_handlers(
+            flat_handlers,
+            cur_device=cur_device,
+            parent_indices=parent_indices,
+            done_flags=flat_done_flags,
+            parent_group_uids=parent_group_uids,
+            exact_state_uids=exact_state_uids,
+            replica_indices=replica_indices,
+            trajectory_uids=trajectory_uids,
+            trajectory_returns=trajectory_returns,
+            immediate_rewards=immediate_rewards,
+            trajectory_row_uids=trajectory_row_uids,
+            trajectory_row_orders=trajectory_row_orders,
+            trajectory_terminals=trajectory_terminals,
+            task_rounds=flat_task_rounds,
+            action_texts=action_texts,
+            suffix_credit_applied=False,
+            suffix_returns=suffix_returns,
+            step_records=flat_step_refs,
+        )
+        output.non_tensor_batch["rollout_uid"] = np.array(
+            uid_overrides, dtype=object
+        )
+        if global_steps:
+            os.makedirs(
+                os.path.join(self.config.rollout_log_dir, f"step{global_steps}"),
+                exist_ok=True,
+            )
+            with open(
+                os.path.join(
+                    self.config.rollout_log_dir,
+                    f"step{global_steps}/{torch.distributed.get_rank()}.json",
+                ),
+                "w",
+            ) as handle:
+                json.dump(
+                    [
+                        {
+                            "item_id": handler.item_id,
+                            "data_idx": int(getattr(handler, "data_idx", handler.item_id)),
+                            "environment_id": int(env_clients[index].env_id),
+                            "task_rounds": task_rounds[index],
+                            "native_environment_call_count": native_call_counts[index],
+                            "context_epochs": context_epochs[index],
+                            "reward": handler.score,
+                            "conversations": [
+                                message.to_dict() for message in handler.messages
+                            ],
+                            "step_records": trajectory_steps[index],
+                        }
+                        for index, handler in enumerate(rollout_handler_ls)
+                    ],
+                    handle,
+                    ensure_ascii=True,
+                    indent=2,
+                )
+        return output
 
     def generate_agentmemory_latest_observation(
         self,
@@ -2329,6 +2989,38 @@ class vLLMRollout(BaseRollout):
             ]
         time.sleep(self.config.send_interval) # take a break before sendng request
         task_name = str(read_config(self.agentgym_config, "task_name", "")).lower()
+        if (
+            task_name == "swesmith"
+            and rollout_context_policy(self.agentgym_config)
+            == CONTINUOUS_AGENT_CONTEXT_POLICY_V1
+        ):
+            try:
+                return self.generate_continuous_agent_with_compaction(
+                    rollout_handler_ls=rollout_handler_ls,
+                    env_clients=env_clients,
+                    cur_device=cur_device,
+                    max_policy_turns=max_policy_turns,
+                    sampling_kwargs=kwargs,
+                    global_steps=global_steps,
+                )
+            finally:
+                for close_idx, client in enumerate(env_clients):
+                    try:
+                        _agentmemory_debug(
+                            f"continuous_close_start idx={close_idx}"
+                        )
+                        client.close()
+                        _agentmemory_debug(
+                            f"continuous_close_done idx={close_idx}"
+                        )
+                    except Exception as exc:
+                        print(
+                            "Error during continuous-agent environment close "
+                            f"idx={close_idx}: {exc}",
+                            flush=True,
+                        )
+                if self.config.free_cache_engine:
+                    self._maybe_release_engine()
         if task_name == "agentmemory" and rollout_context_policy(self.agentgym_config) == "latest_observation_only":
             output = self.generate_agentmemory_latest_observation(
                 rollout_handler_ls=rollout_handler_ls,

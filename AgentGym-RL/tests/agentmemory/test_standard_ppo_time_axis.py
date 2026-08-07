@@ -218,6 +218,30 @@ class StandardTrajectoryGaeTests(unittest.TestCase):
             rtol=0.0,
         )
 
+    def test_terminal_reward_credits_every_compaction_summary_token(self) -> None:
+        rewards = torch.tensor([[0.0, 0.0], [0.0, 0.0], [1.0, 0.0]])
+        response_mask = torch.tensor([[1.0, 0.0], [1.0, 1.0], [1.0, 0.0]])
+        advantages, returns = core_algos.compute_trajectory_gae_advantage_return(
+            token_level_rewards=rewards,
+            values=torch.zeros_like(rewards),
+            eos_mask=response_mask,
+            trajectory_uids=np.array(["a", "a", "a"], dtype=object),
+            trajectory_row_uids=np.array(["a-0", "a-1", "a-2"], dtype=object),
+            trajectory_row_orders=torch.tensor([0, 1, 2]),
+            trajectory_terminals=torch.tensor([False, False, True]),
+            done_flags=np.array([False, False, True], dtype=object),
+            sample_mask=torch.ones(3, dtype=torch.bool),
+            gamma=1.0,
+            lam=1.0,
+            immediate_rewards=torch.tensor([0.0, 0.0, 1.0]),
+            advantage_normalization="none",
+        )
+
+        expected = response_mask
+        torch.testing.assert_close(advantages, expected)
+        torch.testing.assert_close(returns, expected)
+        self.assertTrue(torch.all(advantages[1, :2] > 0))
+
     def test_interleaved_trajectories_do_not_leak_value_or_reward(self) -> None:
         advantages, _ = trajectory_gae(
             [0.0, -0.5, 1.0],

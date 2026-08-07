@@ -1,6 +1,6 @@
 # SWE-smith Episode Contract
 
-Status: frozen for the first AgentMemoryGym SWE-smith PPO update.
+Status: compaction revision required before the first AgentMemoryGym SWE-smith PPO update.
 
 ## Policy surface
 
@@ -12,6 +12,46 @@ Status: frozen for the first AgentMemoryGym SWE-smith PPO update.
   outcome receives `0`.
 - Conversation history is continuous. The harness does not insert artificial
   sessions or a dedicated memory API.
+
+## Context lifecycle
+
+- The persistent repository workspace is the policy's external long-term
+  state. The policy maintains any durable notes with the same ordinary
+  `shell_command` and `apply_patch` tools used for coding.
+- Near the configured context limit, the harness may count tokens and issue a
+  neutral compaction request with a bounded response budget. The current actor
+  policy itself writes the compact continuation summary. No separate model,
+  hidden state, gold patch, verifier evidence, harness-authored summary, or
+  harness-generated memory-file inventory may supply its semantic content.
+- Sampled compaction-summary tokens are retained as trainable policy actions
+  under the exact prompt that generated them and receive downstream terminal
+  task credit. They are not free observations or detached labels.
+- The neutral compaction request, prior dialogue, and environment observations
+  are prompt tokens with loss mask `0`. The policy-authored summary is the
+  response of its own trajectory row with response mask `1`; action-time GAE
+  propagates later terminal task reward to that row. When the same summary is
+  carried into the next prompt, that later copy is masked as context without
+  detaching the original sampled row.
+- The hard-capacity trigger is deterministic harness control, so this version
+  does not learn *when* to compact. It learns *what continuation state to
+  write*. Learning the trigger would require a separately sampled policy tool
+  call and is outside the first native SWE-smith contract.
+- A compaction consumes one ordinary episode step, exactly like a
+  `shell_command`, `apply_patch`, or final response. The existing
+  `max_policy_turns` budget applies uniformly; there is no task-specific
+  compaction-count limit. Evidence separately records whether the step called
+  the native environment, but that distinction does not make compaction free.
+- After compaction, the harness preserves only immutable system/tool/task
+  framing, the model-authored continuation summary, and a neutral continuation
+  marker. The repository workspace is unchanged. The policy must put any
+  external-note paths, current state, or next actions that it needs into its
+  own summary and recover details with normal tools. Omitted facts receive no
+  semantic fallback.
+- Silent token truncation and terminating an otherwise valid episode merely
+  because raw history reached the context limit are forbidden in formal
+  training. Every compaction boundary records exact pre/post prompt digests,
+  sampled summary token IDs and logprobs, token counts, and subsequent file
+  reads for audit.
 
 ## Data boundary
 
@@ -62,6 +102,10 @@ Status: frozen for the first AgentMemoryGym SWE-smith PPO update.
   hidden values to the policy.
 
 ## First PPO gate
+
+- The gate must first prove one real model-authored compaction and continued
+  workspace use without silent truncation. A 32K no-compaction run is only an
+  integration diagnostic and cannot satisfy the long-horizon training contract.
 
 - The learner runs on all eight B200s in `6.5.167.119` from the first real
   optimizer update. A single-GPU process may preheat independent environment
