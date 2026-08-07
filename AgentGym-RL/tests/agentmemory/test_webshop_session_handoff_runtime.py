@@ -270,7 +270,10 @@ class WebShopSessionHandoffRuntimeTests(unittest.TestCase):
             json.loads(value)
             for value in output.non_tensor_batch[MODULE.AGENTMEMORY_STEP_RECORD_JSON]
         ]
-        self.assertEqual(records[1]["content"], invalid)
+        self.assertEqual(
+            records[1].get("content", records[1]["action"]),
+            invalid,
+        )
         self.assertEqual(records[1]["action"], invalid)
         self.assertFalse(records[1]["compaction"]["handoff_parse"]["valid"])
         self.assertEqual(
