@@ -13,9 +13,15 @@ assert SPEC.loader is not None
 SPEC.loader.exec_module(MODULE)
 
 COMPACTION_ROW = MODULE.COMPACTION_ROW
+COMPACTION_MODE_WEBSHOP_SESSION_HANDOFF = (
+    MODULE.COMPACTION_MODE_WEBSHOP_SESSION_HANDOFF
+)
 CONTINUOUS_AGENT_CONTEXT_POLICY_V1 = MODULE.CONTINUOUS_AGENT_CONTEXT_POLICY_V1
 ENVIRONMENT_ACTION_ROW = MODULE.ENVIRONMENT_ACTION_ROW
 POLICY_COMPACTION_REQUEST = MODULE.POLICY_COMPACTION_REQUEST
+POLICY_WEBSHOP_SESSION_HANDOFF_REQUEST = (
+    MODULE.POLICY_WEBSHOP_SESSION_HANDOFF_REQUEST
+)
 POLICY_CONTINUATION_MARKER = MODULE.POLICY_CONTINUATION_MARKER
 ContinuousAgentV1Error = MODULE.ContinuousAgentV1Error
 build_continuous_agent_step_v1 = MODULE.build_continuous_agent_step_v1
@@ -23,6 +29,7 @@ build_compaction_evidence_v1 = MODULE.build_compaction_evidence_v1
 build_horizon_evidence_v1 = MODULE.build_horizon_evidence_v1
 build_observation_evidence_v1 = MODULE.build_observation_evidence_v1
 build_policy_generation_loss_masks = MODULE.build_policy_generation_loss_masks
+build_webshop_session_prompt_payload = MODULE.build_webshop_session_prompt_payload
 build_continuous_runtime_capacity_readback = (
     MODULE.build_continuous_runtime_capacity_readback
 )
@@ -299,6 +306,93 @@ class ContinuousAgentCompactionTests(unittest.TestCase):
         row["compaction"]["post_compaction_prompt_token_ids"] = [30, 32]
         with self.assertRaisesRegex(ContinuousAgentV1Error, "post-compaction prompt"):
             MODULE.validate_continuous_agent_step_v1(row)
+
+    def test_webshop_handoff_binds_session_reset_and_source_prompt(self) -> None:
+        prompt = [10, 11, 12]
+        response = [20, 2]
+        evidence = build_compaction_evidence_v1(
+            pre_request_action_prompt_token_ids=[30, 31],
+            pre_compaction_prompt_token_ids=prompt,
+            immutable_framing_token_ids=[1, 2, 3],
+            summary_token_ids=response,
+            post_compaction_prompt_token_ids=[40, 41],
+            workspace_continuity_id="7",
+            compaction_mode=COMPACTION_MODE_WEBSHOP_SESSION_HANDOFF,
+            session_index_before=0,
+            session_index_after=1,
+            handoff_source_prompt_token_ids=[50, 51, 52],
+            raw_history_cleared=True,
+            request_text=POLICY_WEBSHOP_SESSION_HANDOFF_REQUEST,
+        )
+        row = build_continuous_agent_step_v1(
+            row_kind=COMPACTION_ROW,
+            task_name="agentmemory",
+            content="handoff",
+            score=0.0,
+            item_id="webshop_4",
+            data_idx=4,
+            parent_index=0,
+            parent_group_uid="parent:0",
+            replica_index=0,
+            trajectory_uid="parent:0:replica:0",
+            exact_state_uid="0:turn1:statev1:" + token_digest(prompt),
+            prompt_token_ids=prompt,
+            response_token_ids=response,
+            sampled_token_logprobs=[-0.1, -0.2],
+            generation_record=generation_record(response),
+            environment_id=7,
+            environment_step_before=1,
+            environment_step_after=2,
+            native_environment_call_count_before=1,
+            native_environment_call_count_after=1,
+            context_epoch_before=0,
+            context_epoch_after=1,
+            done=False,
+            environment_result="",
+            compaction_evidence=evidence,
+        )
+        self.assertEqual(
+            row["compaction"]["compaction_mode"],
+            COMPACTION_MODE_WEBSHOP_SESSION_HANDOFF,
+        )
+        self.assertEqual(row["compaction"]["session_index_after"], 1)
+        self.assertTrue(row["compaction"]["raw_history_cleared"])
+
+    def test_webshop_handoff_requires_native_reset_evidence(self) -> None:
+        with self.assertRaisesRegex(ContinuousAgentV1Error, "raw-history clearing"):
+            build_compaction_evidence_v1(
+                pre_request_action_prompt_token_ids=[30, 31],
+                pre_compaction_prompt_token_ids=[10, 11, 12],
+                immutable_framing_token_ids=[1, 2, 3],
+                summary_token_ids=[20, 2],
+                post_compaction_prompt_token_ids=[40, 41],
+                workspace_continuity_id="7",
+                compaction_mode=COMPACTION_MODE_WEBSHOP_SESSION_HANDOFF,
+                session_index_before=0,
+                session_index_after=1,
+                handoff_source_prompt_token_ids=[50],
+                raw_history_cleared=False,
+            )
+
+    def test_webshop_session_prompt_drops_old_transcript(self) -> None:
+        messages = build_webshop_session_prompt_payload(
+            observation="session=1 fresh observation",
+            system_prompt="webshop system",
+            handoff_summary="read ./notes/state.md",
+        )
+        rendered = "\n".join(message["content"] for message in messages)
+        self.assertIn("session=1 fresh observation", rendered)
+        self.assertIn("./notes/state.md", rendered)
+        self.assertNotIn("old BUY action", rendered)
+        self.assertNotIn("old session observation", rendered)
+
+    def test_webshop_handoff_request_is_locator_only(self) -> None:
+        request = POLICY_WEBSHOP_SESSION_HANDOFF_REQUEST.lower()
+        self.assertIn("workspace-relative path", request)
+        self.assertIn("generic command", request)
+        self.assertIn("do not include shopping facts", request)
+        self.assertIn("previous actions or observations", request)
+        self.assertNotIn("continuation state", request)
 
     def test_truncated_observation_binds_full_and_visible_evidence(self) -> None:
         marker = (

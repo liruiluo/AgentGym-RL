@@ -445,6 +445,35 @@ def validate_webshop_filesystem_surface(
     _validate_workspace_sandbox_metadata(metadata)
 
 
+def validate_webshop_session_handoff_surface(metadata: Mapping[str, Any]) -> None:
+    """Admit session handoff only on a formal filesystem WebShop surface."""
+
+    if not isinstance(metadata, Mapping):
+        raise FormalDomainV3Error(
+            "WebShop session handoff requires runtime metadata"
+        )
+    surface = metadata.get("surface")
+    if surface not in FORMAL_WEBSHOP_FILESYSTEM_SURFACES_V2:
+        raise FormalDomainV3Error(
+            "WebShop session handoff is only valid for the persistent-workspace "
+            "surfaces: "
+            + ", ".join(sorted(FORMAL_WEBSHOP_FILESYSTEM_SURFACES_V2))
+        )
+    schema_version = metadata.get("formal_schema_version")
+    if schema_version not in (None, FORMAL_WEBSHOP_SCHEMA_V2):
+        raise FormalDomainV3Error(
+            "WebShop session handoff requires the formal WebShop v2 schema"
+        )
+    validate_webshop_memory_prompt_mode(
+        metadata,
+        expected_mode="natural_filesystem",
+    )
+    validate_webshop_filesystem_surface(
+        metadata,
+        expected_prompt_mode="natural_filesystem",
+    )
+
+
 def validate_webshop_action_listing_mode(
     metadata: Mapping[str, Any],
     *,

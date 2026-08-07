@@ -14,6 +14,11 @@ CONTINUOUS_AGENT_OBSERVATION_SCHEMA_V1 = (
 CONTINUOUS_AGENT_HORIZON_SCHEMA_V1 = "agentmemory_continuous_horizon_v1"
 ENVIRONMENT_ACTION_ROW = "environment_action"
 COMPACTION_ROW = "compaction"
+COMPACTION_MODE_CONTEXT_LIMIT = "context_limit"
+COMPACTION_MODE_WEBSHOP_SESSION_HANDOFF = "webshop_session_handoff"
+COMPACTION_MODES = frozenset(
+    {COMPACTION_MODE_CONTEXT_LIMIT, COMPACTION_MODE_WEBSHOP_SESSION_HANDOFF}
+)
 CONTINUOUS_AGENT_ROW_KINDS = frozenset(
     {ENVIRONMENT_ACTION_ROW, COMPACTION_ROW}
 )
@@ -24,11 +29,48 @@ POLICY_COMPACTION_REQUEST = (
     "response will be preserved verbatim and will not be sent to the "
     "environment. Include only information you choose to carry forward."
 )
+POLICY_WEBSHOP_SESSION_HANDOFF_REQUEST = (
+    "The native shopping session has just reset. Write only a locator for an "
+    "external workspace note you already created: either its workspace-relative "
+    "path or a generic command for finding and reading it. Do not include "
+    "shopping facts, product choices, progress, previous actions or observations, "
+    "or any other task state. If no note locator is needed, state only that no "
+    "locator is available. "
+    "Your response will be preserved verbatim and will not be sent to the "
+    "environment."
+)
 POLICY_CONTINUATION_MARKER = "Continue the same task in the unchanged workspace."
 
 
 class ContinuousAgentV1Error(ValueError):
     pass
+
+
+def build_webshop_session_prompt_payload(
+    *,
+    observation: str,
+    system_prompt: str,
+    handoff_summary: str | None = None,
+) -> list[dict[str, str]]:
+    """Return fresh WebShop context plus the locator-only handoff, if any.
+
+    ``handoff_summary`` is a legacy internal name from the shared compaction
+    row schema. WebShop protocol permits a workspace-note locator, not a
+    semantic task summary.
+    """
+
+    payload = [
+        {"role": "system", "content": str(system_prompt)},
+        {"role": "user", "content": str(observation)},
+    ]
+    if handoff_summary is not None:
+        payload.extend(
+            [
+                {"role": "assistant", "content": str(handoff_summary)},
+                {"role": "user", "content": POLICY_CONTINUATION_MARKER},
+            ]
+        )
+    return payload
 
 
 def build_policy_generation_loss_masks(
@@ -213,6 +255,12 @@ def build_compaction_evidence_v1(
     summary_token_ids: Sequence[int],
     post_compaction_prompt_token_ids: Sequence[int],
     workspace_continuity_id: str | int,
+    compaction_mode: str = COMPACTION_MODE_CONTEXT_LIMIT,
+    session_index_before: int | None = None,
+    session_index_after: int | None = None,
+    handoff_source_prompt_token_ids: Sequence[int] | None = None,
+    raw_history_cleared: bool | None = None,
+    request_text: str = POLICY_COMPACTION_REQUEST,
 ) -> dict[str, Any]:
     """Build self-verifying evidence from the exact prompts used by rollout."""
 
@@ -232,9 +280,38 @@ def build_compaction_evidence_v1(
     ):
         if not values:
             raise ContinuousAgentV1Error(f"{name} must not be empty")
+    if compaction_mode not in COMPACTION_MODES:
+        raise ContinuousAgentV1Error(
+            f"unsupported compaction mode: {compaction_mode!r}"
+        )
+    if compaction_mode == COMPACTION_MODE_WEBSHOP_SESSION_HANDOFF:
+        if session_index_before is None or session_index_after is None:
+            raise ContinuousAgentV1Error(
+                "WebShop session handoff requires before/after session indices"
+            )
+        if int(session_index_after) != int(session_index_before) + 1:
+            raise ContinuousAgentV1Error(
+                "WebShop session handoff must advance exactly one session"
+            )
+        if raw_history_cleared is not True:
+            raise ContinuousAgentV1Error(
+                "WebShop session handoff requires native raw-history clearing"
+            )
+        if handoff_source_prompt_token_ids is None:
+            raise ContinuousAgentV1Error(
+                "WebShop session handoff requires source prompt evidence"
+            )
+        handoff_source = [int(token_id) for token_id in handoff_source_prompt_token_ids]
+        if not handoff_source:
+            raise ContinuousAgentV1Error(
+                "WebShop handoff source prompt must not be empty"
+            )
+    else:
+        handoff_source = []
     return {
-        "request_text_sha256": text_sha256(POLICY_COMPACTION_REQUEST),
+        "request_text_sha256": text_sha256(request_text),
         "continuation_marker_sha256": text_sha256(POLICY_CONTINUATION_MARKER),
+        "compaction_mode": compaction_mode,
         "pre_request_action_prompt_token_ids": pre_request_action_prompt,
         "pre_request_action_prompt_length": len(pre_request_action_prompt),
         "pre_request_action_prompt_digest": token_digest(
@@ -251,6 +328,18 @@ def build_compaction_evidence_v1(
         "post_compaction_prompt_length": len(post_prompt),
         "post_compaction_prompt_digest": token_digest(post_prompt),
         "workspace_continuity_id": str(workspace_continuity_id),
+        "session_index_before": (
+            None if session_index_before is None else int(session_index_before)
+        ),
+        "session_index_after": (
+            None if session_index_after is None else int(session_index_after)
+        ),
+        "handoff_source_prompt_token_ids": handoff_source,
+        "handoff_source_prompt_length": len(handoff_source),
+        "handoff_source_prompt_digest": token_digest(handoff_source)
+        if handoff_source
+        else None,
+        "raw_history_cleared": raw_history_cleared,
     }
 
 
@@ -753,9 +842,21 @@ def validate_continuous_agent_step_v1(record: Mapping[str, Any]) -> None:
                 "compaction evidence is missing fields: "
                 + ", ".join(evidence_missing)
             )
-        if evidence["request_text_sha256"] != text_sha256(
-            POLICY_COMPACTION_REQUEST
-        ):
+        # Pre-session-handoff v1 records predate the mode/evidence extensions;
+        # interpret those records as ordinary context-limit compactions.
+        compaction_mode = evidence.get(
+            "compaction_mode", COMPACTION_MODE_CONTEXT_LIMIT
+        )
+        if compaction_mode not in COMPACTION_MODES:
+            raise ContinuousAgentV1Error(
+                f"unsupported compaction mode: {compaction_mode!r}"
+            )
+        expected_request_text = (
+            POLICY_WEBSHOP_SESSION_HANDOFF_REQUEST
+            if compaction_mode == COMPACTION_MODE_WEBSHOP_SESSION_HANDOFF
+            else POLICY_COMPACTION_REQUEST
+        )
+        if evidence["request_text_sha256"] != text_sha256(expected_request_text):
             raise ContinuousAgentV1Error("compaction request text drifted")
         if evidence["continuation_marker_sha256"] != text_sha256(
             POLICY_CONTINUATION_MARKER
@@ -787,7 +888,10 @@ def validate_continuous_agent_step_v1(record: Mapping[str, Any]) -> None:
             raise ContinuousAgentV1Error(
                 "pre-request action prompt digest mismatch"
             )
-        if len(pre_request_action_ids) >= len(prompt_ids):
+        if (
+            compaction_mode == COMPACTION_MODE_CONTEXT_LIMIT
+            and len(pre_request_action_ids) >= len(prompt_ids)
+        ):
             raise ContinuousAgentV1Error(
                 "compaction request must extend its action prompt"
             )
@@ -821,6 +925,59 @@ def validate_continuous_agent_step_v1(record: Mapping[str, Any]) -> None:
             post_prompt_ids
         ):
             raise ContinuousAgentV1Error("post-compaction prompt digest mismatch")
+        handoff_source_ids = _raw_int_list(
+            evidence.get("handoff_source_prompt_token_ids", []),
+            name="handoff_source_prompt_token_ids",
+            allow_empty=compaction_mode == COMPACTION_MODE_CONTEXT_LIMIT,
+        )
+        if int(evidence.get("handoff_source_prompt_length", len(handoff_source_ids))) != len(handoff_source_ids):
+            raise ContinuousAgentV1Error("handoff source prompt length mismatch")
+        expected_handoff_digest = (
+            token_digest(handoff_source_ids) if handoff_source_ids else None
+        )
+        if evidence.get("handoff_source_prompt_digest") != expected_handoff_digest:
+            raise ContinuousAgentV1Error("handoff source prompt digest mismatch")
+        if compaction_mode == COMPACTION_MODE_WEBSHOP_SESSION_HANDOFF:
+            for field in (
+                "session_index_before",
+                "session_index_after",
+                "handoff_source_prompt_token_ids",
+                "handoff_source_prompt_length",
+                "handoff_source_prompt_digest",
+                "raw_history_cleared",
+            ):
+                if field not in evidence:
+                    raise ContinuousAgentV1Error(
+                        f"WebShop session handoff evidence is missing {field}"
+                    )
+            before_session = evidence["session_index_before"]
+            after_session = evidence["session_index_after"]
+            if (
+                isinstance(before_session, bool)
+                or isinstance(after_session, bool)
+                or not isinstance(before_session, int)
+                or not isinstance(after_session, int)
+                or before_session < 0
+                or after_session != before_session + 1
+            ):
+                raise ContinuousAgentV1Error(
+                    "WebShop session handoff session indices are invalid"
+                )
+            if evidence["raw_history_cleared"] is not True:
+                raise ContinuousAgentV1Error(
+                    "WebShop session handoff requires raw history to be cleared"
+                )
+        else:
+            if evidence.get("session_index_before") is not None or evidence.get(
+                "session_index_after"
+            ) is not None:
+                raise ContinuousAgentV1Error(
+                    "context-limit compaction must not carry session indices"
+                )
+            if evidence.get("raw_history_cleared") is not None:
+                raise ContinuousAgentV1Error(
+                    "context-limit compaction must not claim native history clearing"
+                )
         if horizon_evidence is None and (
             bool(record["done"]) or float(record["score"]) != 0.0
         ):

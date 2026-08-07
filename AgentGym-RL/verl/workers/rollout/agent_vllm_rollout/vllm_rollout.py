@@ -72,16 +72,19 @@ from verl.utils.agentgym.context_policy import (
 )
 from verl.utils.agentgym.continuous_agent_v1 import (
     COMPACTION_ROW,
+    COMPACTION_MODE_WEBSHOP_SESSION_HANDOFF,
     CONTINUOUS_AGENT_CONTEXT_POLICY_V1,
     CONTINUOUS_AGENT_SCHEMA_V1,
     ENVIRONMENT_ACTION_ROW,
     POLICY_COMPACTION_REQUEST,
     POLICY_CONTINUATION_MARKER,
+    POLICY_WEBSHOP_SESSION_HANDOFF_REQUEST,
     build_compaction_evidence_v1,
     build_continuous_agent_step_v1,
     build_horizon_evidence_v1,
     build_observation_evidence_v1,
     build_policy_generation_loss_masks,
+    build_webshop_session_prompt_payload,
     build_continuous_runtime_capacity_readback,
     continuous_prompt_capacity,
     extract_sampled_token_logprobs,
@@ -103,6 +106,7 @@ from verl.utils.agentgym.formal_domain_v3 import (
     validate_webshop_filesystem_surface,
     validate_webshop_ltm_inventory_mode,
     validate_webshop_memory_prompt_mode,
+    validate_webshop_session_handoff_surface,
 )
 from verl.utils.agentgym.rollout_context import (
     AGENTMEMORY_ACTION_TEXT,
@@ -1836,6 +1840,760 @@ class vLLMRollout(BaseRollout):
             )
         return envelope
 
+    def _webshop_session_prompt_messages(
+        self,
+        *,
+        observation: str,
+        system_prompt: str,
+        handoff_summary: str | None = None,
+    ) -> List[Message]:
+        """Build a fresh WebShop-session prompt plus an optional policy handoff.
+
+        WebShop resets the native session context after a successful BUY.  The
+        only state allowed to survive in the model prompt is the policy-authored
+        handoff text; no previous action/observation transcript is appended.
+        """
+
+        return [
+            Message(role=item["role"], content=item["content"])
+            for item in build_webshop_session_prompt_payload(
+                observation=observation,
+                system_prompt=system_prompt,
+                handoff_summary=handoff_summary,
+            )
+        ]
+
+    def generate_agentmemory_webshop_session_handoff(
+        self,
+        rollout_handler_ls: List[RolloutHandler],
+        env_clients,
+        cur_device,
+        max_policy_turns: int,
+        sampling_kwargs: dict,
+        global_steps,
+    ) -> DataProto:
+        """Run WebShop with native session resets and policy handoff rows.
+
+        This is deliberately separate from the SWE-smith continuous-history
+        path.  Ordinary WebShop actions use only the current native observation
+        plus the last policy-authored handoff.  A handoff is sampled only after
+        the native server reports a successful session advance; the old session
+        prompt is used once to let the policy name its persistent workspace
+        entry, then it is discarded before the next session action.
+        """
+
+        task_name = str(read_config(self.agentgym_config, "task_name", "")).lower()
+        if task_name != "agentmemory":
+            raise RuntimeError(
+                "WebShop session handoff requires task_name='agentmemory'"
+            )
+        if rollout_context_policy(self.agentgym_config) != CONTINUOUS_AGENT_CONTEXT_POLICY_V1:
+            raise RuntimeError("WebShop session handoff context policy drifted")
+        if not allow_policy_authored_compaction_for_agentmemory(
+            self.agentgym_config
+        ):
+            raise RuntimeError(
+                "WebShop session handoff requires the explicit diagnostic allow flag"
+            )
+        for index, env_client in enumerate(env_clients):
+            metadata = getattr(env_client, "metadata", None)
+            try:
+                validate_webshop_session_handoff_surface(metadata)
+            except FormalDomainV3Error as exc:
+                raise RuntimeError(
+                    "WebShop session handoff rejected its runtime surface before "
+                    f"reset: row={index}: {exc}"
+                ) from exc
+        if isinstance(max_policy_turns, bool) or int(max_policy_turns) <= 0:
+            raise RuntimeError("max_policy_turns must be a positive integer")
+
+        effective_max_response_tokens = int(
+            sampling_kwargs.get(
+                "max_tokens",
+                getattr(
+                    self.sampling_params,
+                    "max_tokens",
+                    self.config.response_length,
+                ),
+            )
+        )
+        max_prompt_tokens = int(self.config.prompt_length)
+        max_model_tokens = int(self.config.max_model_len)
+        raw_max_observation_tokens = read_config(
+            self.agentgym_config, "max_observation_tokens", None
+        )
+        if raw_max_observation_tokens is None:
+            raise RuntimeError(
+                "WebShop session handoff requires explicit max_observation_tokens"
+            )
+        max_observation_tokens = int(raw_max_observation_tokens)
+        if max_observation_tokens <= 0:
+            raise RuntimeError("max_observation_tokens must be positive")
+        prompt_capacity = continuous_prompt_capacity(
+            max_prompt_tokens=max_prompt_tokens,
+            max_model_tokens=max_model_tokens,
+            max_response_tokens=effective_max_response_tokens,
+        )
+        if effective_max_response_tokens != int(self.config.response_length):
+            raise RuntimeError(
+                "WebShop session handoff sampling max_tokens must match "
+                "data.max_response_length: "
+                f"sampling={effective_max_response_tokens} "
+                f"response_length={self.config.response_length}"
+            )
+
+        row_count = len(rollout_handler_ls)
+        latest_observations: list[str | None] = [None] * row_count
+        system_prompts: list[str | None] = [None] * row_count
+        immutable_framing_prompt_ids: list[list[int] | None] = [None] * row_count
+        handoff_summaries: list[str | None] = [None] * row_count
+        pending_handoff_sources: list[list[Message] | None] = [None] * row_count
+        pending_handoff_source_prompt_ids: list[list[int] | None] = [None] * row_count
+        pending_session_before: list[int | None] = [None] * row_count
+        pending_session_after: list[int | None] = [None] * row_count
+        pending_raw_history_cleared: list[bool | None] = [None] * row_count
+        task_rounds = [0] * row_count
+        native_call_counts = [0] * row_count
+        context_epochs = [0] * row_count
+        trajectory_steps: list[list[dict]] = [[] for _ in rollout_handler_ls]
+        flat_handlers: list[RolloutHandler] = []
+        flat_step_refs: list[dict] = []
+        session_indices = [0] * row_count
+
+        for idx, rollout_handler in enumerate(rollout_handler_ls):
+            reset_index = getattr(
+                rollout_handler,
+                "agentmemory_local_data_idx",
+                getattr(rollout_handler, "data_idx", rollout_handler.item_id),
+            )
+            env_clients[idx].reset(int(reset_index))
+            if getattr(env_clients[idx], "sample_excluded", False):
+                raise RuntimeError(
+                    f"WebShop reset returned an infra-excluded row: {idx}"
+                )
+            task = self._continuous_observation_text(env_clients[idx].observe())
+            (
+                schema_version,
+                system_prompt,
+                system_prompt_source,
+            ) = _formal_runtime_contract_for_client(env_clients[idx])
+            if schema_version != FORMAL_WEBSHOP_SCHEMA_V2:
+                raise RuntimeError(
+                    "WebShop session handoff requires formal WebShop schema v2; "
+                    f"row={idx} schema={schema_version!r}"
+                )
+            env_info = getattr(env_clients[idx], "info", {}).get("env_info", {})
+            _validate_runtime_env_schema(
+                schema_version,
+                env_info,
+                boundary="reset",
+            )
+            if "current_subtask_index" not in env_info:
+                raise RuntimeError(
+                    "WebShop reset is missing current_subtask_index"
+                )
+            session_indices[idx] = int(env_info["current_subtask_index"])
+            latest_observations[idx] = task
+            system_prompts[idx] = str(system_prompt)
+            rollout_handler.formal_schema_version = schema_version
+            rollout_handler.formal_system_prompt = str(system_prompt)
+            rollout_handler.formal_system_prompt_source = str(system_prompt_source)
+            initial_messages = self._webshop_session_prompt_messages(
+                observation=task,
+                system_prompt=str(system_prompt),
+            )
+            rollout_handler.messages = deepcopy(initial_messages)
+            immutable_framing_prompt_ids[idx] = self._continuous_prompt_from_messages(
+                initial_messages
+            )
+            if len(immutable_framing_prompt_ids[idx]) > prompt_capacity:
+                raise RuntimeError(
+                    "WebShop immutable task framing exceeds prompt capacity: "
+                    f"row={idx} tokens={len(immutable_framing_prompt_ids[idx])} "
+                    f"capacity={prompt_capacity}"
+                )
+            environment_id = getattr(env_clients[idx], "env_id", None)
+            if isinstance(environment_id, bool) or not isinstance(environment_id, int):
+                raise RuntimeError(
+                    f"WebShop client {idx} has no stable integer env_id"
+                )
+
+        rollout_bar = tqdm(
+            total=max_policy_turns,
+            desc="Running WebShop session-handoff policy steps",
+            disable=torch.distributed.get_rank() != 0,
+        )
+        while any(not handler.done for handler in rollout_handler_ls):
+            if all(round_count >= max_policy_turns for round_count in task_rounds):
+                break
+
+            generation_prompt_ids: list[List[int]] = []
+            action_prompt_ids_by_active: list[List[int]] = []
+            generation_row_kinds: list[str] = []
+            action_messages_by_active: list[list[Message]] = []
+            active_indices: list[int] = []
+            for idx, rollout_handler in enumerate(rollout_handler_ls):
+                if rollout_handler.done or task_rounds[idx] >= max_policy_turns:
+                    continue
+                observation = latest_observations[idx]
+                system_prompt = system_prompts[idx]
+                if observation is None or system_prompt is None:
+                    raise RuntimeError(
+                        f"WebShop row {idx} lost its fresh session context"
+                    )
+                action_messages = self._webshop_session_prompt_messages(
+                    observation=observation,
+                    system_prompt=system_prompt,
+                    handoff_summary=handoff_summaries[idx],
+                )
+                action_prompt_ids = self._continuous_prompt_from_messages(
+                    action_messages
+                )
+                pending_source = pending_handoff_sources[idx]
+                if pending_source is not None:
+                    compaction_messages = deepcopy(pending_source) + [
+                        Message(
+                            role="user",
+                            content=POLICY_WEBSHOP_SESSION_HANDOFF_REQUEST,
+                        )
+                    ]
+                    prompt_ids = self._continuous_prompt_from_messages(
+                        compaction_messages
+                    )
+                    row_kind = COMPACTION_ROW
+                else:
+                    prompt_ids = action_prompt_ids
+                    row_kind = ENVIRONMENT_ACTION_ROW
+                if len(prompt_ids) > prompt_capacity:
+                    raise RuntimeError(
+                        "WebShop session-handoff generation prompt exceeds capacity: "
+                        f"row={idx} tokens={len(prompt_ids)} capacity={prompt_capacity}"
+                    )
+                generation_prompt_ids.append(prompt_ids)
+                action_prompt_ids_by_active.append(action_prompt_ids)
+                generation_row_kinds.append(row_kind)
+                action_messages_by_active.append(action_messages)
+                active_indices.append(idx)
+
+            if not active_indices:
+                break
+            rollout_bar.set_description(
+                "WebShop session-handoff steps "
+                f"{max(task_rounds) + 1}/{max_policy_turns} | "
+                f"active={len(active_indices)} "
+                f"handoffs={generation_row_kinds.count(COMPACTION_ROW)}"
+            )
+            with self.update_sampling_params(**sampling_kwargs):
+                output = self._generate_token_ids(
+                    generation_prompt_idxs=generation_prompt_ids,
+                    sampling_params=self.sampling_params,
+                )
+            generation_records = self._output_generation_records(
+                output,
+                self.sampling_params,
+                require_exact_metadata=True,
+                require_sampled_logprobs=True,
+            )
+            if len(generation_records) != len(active_indices):
+                raise RuntimeError(
+                    "WebShop session-handoff generation count mismatch: "
+                    f"active={len(active_indices)} outputs={len(generation_records)}"
+                )
+
+            time.sleep(self.config.send_interval)
+            for local_index, rollout_index in enumerate(active_indices):
+                rollout_handler = rollout_handler_ls[rollout_index]
+                env_client = env_clients[rollout_index]
+                prompt_token_ids = generation_prompt_ids[local_index]
+                action_prompt_token_ids = action_prompt_ids_by_active[local_index]
+                action_messages = action_messages_by_active[local_index]
+                row_kind = generation_row_kinds[local_index]
+                generation_record = generation_records[local_index]
+                response_token_ids = [
+                    int(token_id) for token_id in generation_record["token_ids"]
+                ]
+                sampled_logprobs = generation_record.get(
+                    "sampled_token_logprobs"
+                )
+                if not isinstance(sampled_logprobs, list):
+                    raise RuntimeError(
+                        "WebShop session-handoff generation lacks sampled logprobs"
+                    )
+                content = self.tokenizer.decode(
+                    response_token_ids,
+                    skip_special_tokens=True,
+                )
+                environment_id_before = int(env_client.env_id)
+                environment_step_before = task_rounds[rollout_index]
+                native_calls_before = native_call_counts[rollout_index]
+                context_epoch_before = context_epochs[rollout_index]
+                task_rounds[rollout_index] += 1
+                parent_index = int(
+                    getattr(
+                        rollout_handler,
+                        "parent_index",
+                        rollout_index // self.config.n,
+                    )
+                )
+                replica_index = int(
+                    getattr(rollout_handler, "rollout_replica_index", 0)
+                )
+                parent_group_uid = build_parent_group_uid(parent_index)
+                trajectory_uid = build_trajectory_uid(
+                    parent_group_uid, replica_index
+                )
+                exact_state_uid = build_state_aware_rollout_uid(
+                    parent_index,
+                    task_rounds[rollout_index],
+                    prompt_token_ids,
+                )
+
+                compaction_evidence = None
+                observation_evidence = None
+                horizon_evidence = None
+                environment_result = ""
+                score = 0.0
+                done = False
+                session_before = session_indices[rollout_index]
+                session_after = session_before
+                session_advanced = False
+                raw_history_cleared = False
+                buy_evidence_for_row = None
+                if row_kind == COMPACTION_ROW:
+                    source_prompt_ids = pending_handoff_source_prompt_ids[
+                        rollout_index
+                    ]
+                    source_messages = pending_handoff_sources[rollout_index]
+                    handoff_before = pending_session_before[rollout_index]
+                    handoff_after = pending_session_after[rollout_index]
+                    handoff_cleared = pending_raw_history_cleared[rollout_index]
+                    if (
+                        source_prompt_ids is None
+                        or source_messages is None
+                        or handoff_before is None
+                        or handoff_after is None
+                        or handoff_cleared is None
+                    ):
+                        raise RuntimeError(
+                            "WebShop compaction row has no pending session handoff"
+                        )
+                    if int(handoff_after) != int(handoff_before) + 1:
+                        raise RuntimeError(
+                            "WebShop compaction row has an invalid session transition"
+                        )
+                    handoff_summaries[rollout_index] = content
+                    pending_handoff_sources[rollout_index] = None
+                    pending_handoff_source_prompt_ids[rollout_index] = None
+                    pending_session_before[rollout_index] = None
+                    pending_session_after[rollout_index] = None
+                    pending_raw_history_cleared[rollout_index] = None
+                    context_epochs[rollout_index] += 1
+                    session_before = int(handoff_before)
+                    session_after = int(handoff_after)
+                    # The native reset happened on the preceding BUY row.  This
+                    # row only records the policy-authored handoff and must not
+                    # be counted as another native session transition.
+                    session_advanced = False
+                    raw_history_cleared = True
+                    post_messages = self._webshop_session_prompt_messages(
+                        observation=str(latest_observations[rollout_index]),
+                        system_prompt=str(system_prompts[rollout_index]),
+                        handoff_summary=content,
+                    )
+                    post_prompt_ids = self._continuous_prompt_from_messages(
+                        post_messages
+                    )
+                    if len(post_prompt_ids) > prompt_capacity:
+                        raise RuntimeError(
+                            "WebShop handoff continuation exceeds prompt capacity: "
+                            f"row={rollout_index} tokens={len(post_prompt_ids)}"
+                        )
+                    framing_prompt_ids = immutable_framing_prompt_ids[rollout_index]
+                    if framing_prompt_ids is None:
+                        raise RuntimeError(
+                            "WebShop immutable framing evidence is missing"
+                        )
+                    compaction_evidence = build_compaction_evidence_v1(
+                        pre_request_action_prompt_token_ids=action_prompt_token_ids,
+                        pre_compaction_prompt_token_ids=prompt_token_ids,
+                        immutable_framing_token_ids=framing_prompt_ids,
+                        summary_token_ids=response_token_ids,
+                        post_compaction_prompt_token_ids=post_prompt_ids,
+                        workspace_continuity_id=environment_id_before,
+                        compaction_mode=COMPACTION_MODE_WEBSHOP_SESSION_HANDOFF,
+                        session_index_before=session_before,
+                        session_index_after=session_after,
+                        handoff_source_prompt_token_ids=source_prompt_ids,
+                        raw_history_cleared=raw_history_cleared,
+                        request_text=POLICY_WEBSHOP_SESSION_HANDOFF_REQUEST,
+                    )
+                    rollout_handler.messages = deepcopy(post_messages)
+                else:
+                    env_info_payload = getattr(env_client, "info", None)
+                    env_info_before = (
+                        deepcopy(env_info_payload.get("env_info", {}))
+                        if isinstance(env_info_payload, dict)
+                        else {}
+                    )
+                    _validate_runtime_env_schema(
+                        FORMAL_WEBSHOP_SCHEMA_V2,
+                        env_info_before,
+                        boundary="pre-action",
+                    )
+                    if "current_subtask_index" not in env_info_before:
+                        raise RuntimeError(
+                            "WebShop action is missing pre-action session index"
+                        )
+                    session_before = int(
+                        env_info_before["current_subtask_index"]
+                    )
+                    if session_before != session_indices[rollout_index]:
+                        raise RuntimeError(
+                            "WebShop session index drifted before action"
+                        )
+                    step_output = env_client.step(content)
+                    native_call_counts[rollout_index] += 1
+                    if getattr(env_client, "sample_excluded", False):
+                        raise RuntimeError(
+                            "WebShop environment excluded the row during a native step: "
+                            f"row={rollout_index}"
+                        )
+                    score = float(step_output.reward)
+                    done = bool(step_output.done)
+                    environment_result_full = self._continuous_observation_text(
+                        step_output.state
+                    )
+                    bounded_observation = self._bound_continuous_observation(
+                        environment_result_full,
+                        max_observation_tokens=max_observation_tokens,
+                    )
+                    environment_result = bounded_observation["policy_visible_text"]
+                    latest_observations[rollout_index] = environment_result
+                    env_info_payload = getattr(env_client, "info", None)
+                    env_info_after = (
+                        deepcopy(env_info_payload.get("env_info", {}))
+                        if isinstance(env_info_payload, dict)
+                        else {}
+                    )
+                    _validate_runtime_env_schema(
+                        FORMAL_WEBSHOP_SCHEMA_V2,
+                        env_info_after,
+                        boundary="post-action",
+                    )
+                    if "current_subtask_index" not in env_info_after:
+                        raise RuntimeError(
+                            "WebShop action is missing post-action session index"
+                        )
+                    session_after = int(
+                        env_info_after["current_subtask_index"]
+                    )
+                    if session_after < session_before or session_after > session_before + 1:
+                        raise RuntimeError(
+                            "WebShop session index made an invalid transition"
+                        )
+                    session_advanced = session_after > session_before
+                    tool_ops = env_info_after.get("tool_ops", [])
+                    try:
+                        buy_evidence = validate_formal_buy_transition(
+                            tool_ops=tool_ops,
+                            # The server increments tool-op steps only for
+                            # dispatched native actions. Policy handoff rows
+                            # consume a unified task round without reaching the
+                            # server, so task_rounds diverges after the first
+                            # session boundary.
+                            env_step=native_call_counts[rollout_index],
+                            subtask_index_before=session_before,
+                            subtask_index_after=session_after,
+                            done=done,
+                        )
+                    except FormalBuyTransitionError as exc:
+                        raise RuntimeError(
+                            "WebShop BUY transition evidence is invalid: "
+                            f"row={rollout_index}: {exc}"
+                        ) from exc
+                    if session_advanced:
+                        session_trace_after = env_info_after.get("session_trace")
+                        if not isinstance(session_trace_after, list):
+                            raise RuntimeError(
+                                "WebShop session advance is missing session_trace evidence"
+                            )
+                        raw_history_cleared = not session_trace_after
+                        if not raw_history_cleared:
+                            raise RuntimeError(
+                                "WebShop native session advance did not clear raw history"
+                            )
+                        if not done:
+                            source_messages = deepcopy(action_messages) + [
+                                Message(role="assistant", content=content)
+                            ]
+                            pending_handoff_sources[rollout_index] = source_messages
+                            pending_handoff_source_prompt_ids[rollout_index] = list(
+                                prompt_token_ids
+                            )
+                            pending_session_before[rollout_index] = session_before
+                            pending_session_after[rollout_index] = session_after
+                            pending_raw_history_cleared[rollout_index] = True
+                    session_indices[rollout_index] = session_after
+                    post_messages = self._webshop_session_prompt_messages(
+                        observation=environment_result,
+                        system_prompt=str(system_prompts[rollout_index]),
+                        handoff_summary=handoff_summaries[rollout_index],
+                    )
+                    post_prompt_ids = self._continuous_prompt_from_messages(
+                        post_messages
+                    )
+                    if len(post_prompt_ids) > prompt_capacity:
+                        raise RuntimeError(
+                            "WebShop next-session prompt exceeds prompt capacity: "
+                            f"row={rollout_index} tokens={len(post_prompt_ids)}"
+                        )
+                    observation_evidence = build_observation_evidence_v1(
+                        full_text=bounded_observation["full_text"],
+                        full_token_ids=bounded_observation["full_token_ids"],
+                        policy_visible_text=environment_result,
+                        policy_visible_token_ids=bounded_observation[
+                            "policy_visible_token_ids"
+                        ],
+                        post_observation_prompt_token_ids=post_prompt_ids,
+                        max_observation_tokens=max_observation_tokens,
+                        truncated=bounded_observation["truncated"],
+                        head_token_count=bounded_observation["head_token_count"],
+                        tail_token_count=bounded_observation["tail_token_count"],
+                        truncation_marker=bounded_observation["truncation_marker"],
+                    )
+                    rollout_handler.messages = deepcopy(post_messages)
+                    # Keep the authoritative BUY evidence in the row for the
+                    # diagnostic ledger without changing the continuous schema.
+                    buy_evidence_for_row = buy_evidence
+
+                if not done and task_rounds[rollout_index] >= max_policy_turns:
+                    pending_handoff_sources[rollout_index] = None
+                    pending_handoff_source_prompt_ids[rollout_index] = None
+                    pending_session_before[rollout_index] = None
+                    pending_session_after[rollout_index] = None
+                    pending_raw_history_cleared[rollout_index] = None
+                    finalize_horizon = getattr(env_client, "finalize_horizon", None)
+                    if callable(finalize_horizon):
+                        horizon_output = finalize_horizon()
+                        if not bool(horizon_output.done):
+                            raise RuntimeError(
+                                "WebShop horizon finalization did not terminate"
+                            )
+                        horizon_reward = float(horizon_output.reward)
+                        horizon_result = self._continuous_observation_text(
+                            horizon_output.state
+                        )
+                    else:
+                        horizon_reward = float(
+                            read_config(
+                                self.agentgym_config,
+                                "continuous_timeout_penalty",
+                                -0.01,
+                            )
+                        )
+                        horizon_result = "policy-turn ceiling"
+                    horizon_evidence = build_horizon_evidence_v1(
+                        environment_id=environment_id_before,
+                        environment_step=task_rounds[rollout_index],
+                        native_environment_call_count=native_call_counts[
+                            rollout_index
+                        ],
+                        policy_step_reward=score,
+                        horizon_reward=horizon_reward,
+                        environment_result=horizon_result,
+                    )
+                    score = float(horizon_evidence["combined_reward"])
+                    done = True
+
+                rollout_handler.score = score
+                rollout_handler.done = done
+                step_record = build_continuous_agent_step_v1(
+                    row_kind=row_kind,
+                    task_name=task_name,
+                    content=content,
+                    score=score,
+                    item_id=str(rollout_handler.item_id),
+                    data_idx=int(
+                        getattr(
+                            rollout_handler,
+                            "data_idx",
+                            rollout_handler.item_id,
+                        )
+                    ),
+                    parent_index=parent_index,
+                    parent_group_uid=parent_group_uid,
+                    replica_index=replica_index,
+                    trajectory_uid=trajectory_uid,
+                    exact_state_uid=exact_state_uid,
+                    prompt_token_ids=prompt_token_ids,
+                    response_token_ids=response_token_ids,
+                    sampled_token_logprobs=sampled_logprobs,
+                    generation_record=generation_record,
+                    environment_id=environment_id_before,
+                    environment_step_before=environment_step_before,
+                    environment_step_after=task_rounds[rollout_index],
+                    native_environment_call_count_before=native_calls_before,
+                    native_environment_call_count_after=native_call_counts[
+                        rollout_index
+                    ],
+                    context_epoch_before=context_epoch_before,
+                    context_epoch_after=context_epochs[rollout_index],
+                    done=done,
+                    environment_result=environment_result,
+                    compaction_evidence=compaction_evidence,
+                    observation_evidence=observation_evidence,
+                    horizon_evidence=horizon_evidence,
+                )
+                step_record.update(
+                    {
+                        "protocol_mode": "webshop_session_boundary_handoff",
+                        "session_index_before": int(session_before),
+                        "session_index_after": int(session_after),
+                        "session_boundary": bool(
+                            row_kind == ENVIRONMENT_ACTION_ROW and session_advanced
+                        ),
+                        "handoff_boundary": bool(row_kind == COMPACTION_ROW),
+                        "raw_history_cleared": bool(raw_history_cleared),
+                    }
+                )
+                if row_kind == ENVIRONMENT_ACTION_ROW:
+                    step_record["buy_evidence"] = deepcopy(buy_evidence_for_row)
+                else:
+                    step_record["buy_evidence"] = None
+                trajectory_steps[rollout_index].append(step_record)
+                flat_step_refs.append(step_record)
+                flat_handlers.append(
+                    self.build_rollout_handler_from_prompt(
+                        prompt_token_ids=prompt_token_ids,
+                        content=content,
+                        score=score,
+                        parent_index=parent_index,
+                        sampled_response_token_ids=response_token_ids,
+                    )
+                )
+            rollout_bar.update(1)
+        rollout_bar.close()
+
+        if any(not steps for steps in trajectory_steps):
+            missing = [
+                index for index, steps in enumerate(trajectory_steps) if not steps
+            ]
+            raise RuntimeError(
+                "WebShop session-handoff rollout produced no trainable steps for "
+                f"trajectories={missing[:8]}"
+            )
+        for steps in trajectory_steps:
+            validate_continuous_agent_trajectory_v1(
+                steps,
+                require_terminal=True,
+            )
+            trajectory_return = sum(float(step["score"]) for step in steps)
+            suffix_returns = compute_suffix_credit_scores(
+                [float(step["score"]) for step in steps],
+                list(range(1, len(steps) + 1)),
+            )
+            for row_order, (step, suffix_return) in enumerate(
+                zip(steps, suffix_returns)
+            ):
+                step["trajectory_row_uid"] = build_row_uid(
+                    step["trajectory_uid"], row_order
+                )
+                step["trajectory_row_order"] = row_order
+                step["trajectory_terminal"] = row_order == len(steps) - 1
+                step["suffix_return"] = float(suffix_return)
+                step["trajectory_return"] = float(trajectory_return)
+
+        parent_indices = [int(step["parent_index"]) for step in flat_step_refs]
+        parent_group_uids = [str(step["parent_group_uid"]) for step in flat_step_refs]
+        exact_state_uids = [str(step["exact_state_uid"]) for step in flat_step_refs]
+        replica_indices = [int(step["replica_index"]) for step in flat_step_refs]
+        trajectory_uids = [str(step["trajectory_uid"]) for step in flat_step_refs]
+        trajectory_returns = [float(step["trajectory_return"]) for step in flat_step_refs]
+        immediate_rewards = [float(step["score"]) for step in flat_step_refs]
+        trajectory_row_uids = [str(step["trajectory_row_uid"]) for step in flat_step_refs]
+        trajectory_row_orders = [int(step["trajectory_row_order"]) for step in flat_step_refs]
+        trajectory_terminals = [bool(step["trajectory_terminal"]) for step in flat_step_refs]
+        flat_task_rounds = [int(step["environment_step_after"]) for step in flat_step_refs]
+        flat_done_flags = [bool(step["done"]) for step in flat_step_refs]
+        action_texts = [str(step["content"]) for step in flat_step_refs]
+        suffix_returns = [float(step["suffix_return"]) for step in flat_step_refs]
+        uid_overrides = list(exact_state_uids)
+        validate_formal_trajectory_rows(
+            parent_group_uids=parent_group_uids,
+            exact_state_uids=exact_state_uids,
+            replica_indices=replica_indices,
+            trajectory_uids=trajectory_uids,
+            trajectory_returns=trajectory_returns,
+            immediate_rewards=immediate_rewards,
+            trajectory_row_uids=trajectory_row_uids,
+            trajectory_row_orders=trajectory_row_orders,
+            trajectory_terminals=trajectory_terminals,
+            parent_indices=parent_indices,
+            rollout_uids=uid_overrides,
+            valid_mask=[True] * len(flat_step_refs),
+            expected_replicas=int(self.config.n),
+        )
+        output = self.pack_rollout_handlers(
+            flat_handlers,
+            cur_device=cur_device,
+            parent_indices=parent_indices,
+            done_flags=flat_done_flags,
+            parent_group_uids=parent_group_uids,
+            exact_state_uids=exact_state_uids,
+            replica_indices=replica_indices,
+            trajectory_uids=trajectory_uids,
+            trajectory_returns=trajectory_returns,
+            immediate_rewards=immediate_rewards,
+            trajectory_row_uids=trajectory_row_uids,
+            trajectory_row_orders=trajectory_row_orders,
+            trajectory_terminals=trajectory_terminals,
+            task_rounds=flat_task_rounds,
+            action_texts=action_texts,
+            suffix_credit_applied=False,
+            suffix_returns=suffix_returns,
+            step_records=flat_step_refs,
+        )
+        output.non_tensor_batch["rollout_uid"] = np.array(
+            uid_overrides, dtype=object
+        )
+        if global_steps:
+            os.makedirs(
+                os.path.join(self.config.rollout_log_dir, f"step{global_steps}"),
+                exist_ok=True,
+            )
+            with open(
+                os.path.join(
+                    self.config.rollout_log_dir,
+                    f"step{global_steps}/{torch.distributed.get_rank()}.json",
+                ),
+                "w",
+            ) as handle:
+                json.dump(
+                    [
+                        {
+                            "item_id": handler.item_id,
+                            "data_idx": int(
+                                getattr(handler, "data_idx", handler.item_id)
+                            ),
+                            "environment_id": int(env_clients[index].env_id),
+                            "task_rounds": task_rounds[index],
+                            "native_environment_call_count": native_call_counts[index],
+                            "context_epochs": context_epochs[index],
+                            "session_index": session_indices[index],
+                            "reward": handler.score,
+                            "conversations": [
+                                message.to_dict() for message in handler.messages
+                            ],
+                            "step_records": trajectory_steps[index],
+                        }
+                        for index, handler in enumerate(rollout_handler_ls)
+                    ],
+                    handle,
+                    ensure_ascii=True,
+                    indent=2,
+                )
+        return output
+
     def generate_continuous_agent_with_compaction(
         self,
         rollout_handler_ls: List[RolloutHandler],
@@ -1847,23 +2605,15 @@ class vLLMRollout(BaseRollout):
     ) -> DataProto:
         """Roll out one native long-horizon task with policy-authored compaction.
 
-        SWE-smith is the formal path. AgentMemory/WebShop enters only through
-        an explicit diagnostic flag, so this protocol regression cannot be
-        mistaken for a formal WebShop result.
+        SWE-smith is the only supported task here. WebShop uses the separate
+        native-session-reset plus locator-only session-handoff path above.
         """
 
         task_name = str(read_config(self.agentgym_config, "task_name", "")).lower()
-        if task_name not in {"swesmith", "agentmemory"}:
+        if task_name != "swesmith":
             raise RuntimeError(
                 "policy-authored continuous compaction is unsupported for "
                 f"task={task_name!r}"
-            )
-        if task_name == "agentmemory" and not allow_policy_authored_compaction_for_agentmemory(
-            self.agentgym_config
-        ):
-            raise RuntimeError(
-                "AgentMemory continuous compaction requires the explicit "
-                "diagnostic allow flag"
             )
         if rollout_context_policy(self.agentgym_config) != CONTINUOUS_AGENT_CONTEXT_POLICY_V1:
             raise RuntimeError("continuous-agent rollout context policy drifted")
@@ -3123,13 +3873,41 @@ class vLLMRollout(BaseRollout):
             rollout_context_policy(self.agentgym_config)
             == CONTINUOUS_AGENT_CONTEXT_POLICY_V1
         )
-        continuous_diagnostic = (
+        webshop_handoff_diagnostic = (
             task_name == "agentmemory"
             and allow_policy_authored_compaction_for_agentmemory(
                 self.agentgym_config
             )
         )
-        if continuous_policy and (task_name == "swesmith" or continuous_diagnostic):
+        if continuous_policy and webshop_handoff_diagnostic:
+            try:
+                return self.generate_agentmemory_webshop_session_handoff(
+                    rollout_handler_ls=rollout_handler_ls,
+                    env_clients=env_clients,
+                    cur_device=cur_device,
+                    max_policy_turns=max_policy_turns,
+                    sampling_kwargs=kwargs,
+                    global_steps=global_steps,
+                )
+            finally:
+                for close_idx, client in enumerate(env_clients):
+                    try:
+                        _agentmemory_debug(
+                            f"webshop_handoff_close_start idx={close_idx}"
+                        )
+                        client.close()
+                        _agentmemory_debug(
+                            f"webshop_handoff_close_done idx={close_idx}"
+                        )
+                    except Exception as exc:
+                        print(
+                            "Error during WebShop session-handoff environment close "
+                            f"idx={close_idx}: {exc}",
+                            flush=True,
+                        )
+                if self.config.free_cache_engine:
+                    self._maybe_release_engine()
+        if continuous_policy and task_name == "swesmith":
             try:
                 return self.generate_continuous_agent_with_compaction(
                     rollout_handler_ls=rollout_handler_ls,

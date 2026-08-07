@@ -38,7 +38,7 @@ def assert_rollout_context_supported(agentgym_config: Any) -> None:
         if allow_policy_authored_compaction_for_agentmemory(agentgym_config):
             return
         raise RuntimeError(
-            "AgentMemory policy-authored compaction is diagnostic-only until "
+            "AgentMemory WebShop session handoff is diagnostic-only until "
             "allow_policy_authored_compaction_for_agentmemory=true is set."
         )
     if rollout_context_policy(agentgym_config) == "latest_observation_only":
@@ -68,7 +68,7 @@ def allow_raw_history_for_agentmemory(agentgym_config: Any) -> bool:
 
 
 def allow_policy_authored_compaction_for_agentmemory(agentgym_config: Any) -> bool:
-    """Gate WebShop compaction so it cannot silently become formal training."""
+    """Read the compatibility flag that gates WebShop session handoff."""
 
     env_value = os.environ.get("AGENTMEMORY_ALLOW_POLICY_AUTHORED_COMPACTION")
     if env_value is not None:

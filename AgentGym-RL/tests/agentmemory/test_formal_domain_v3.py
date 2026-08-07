@@ -525,6 +525,36 @@ class FormalDomainV3Test(unittest.TestCase):
                         expected_prompt_mode="natural_filesystem",
                     )
 
+    def test_session_handoff_accepts_only_filesystem_webshop_v2_surfaces(self):
+        for surface in MODULE.FORMAL_WEBSHOP_FILESYSTEM_SURFACES_V2:
+            with self.subTest(surface=surface):
+                metadata = filesystem_contract_metadata(surface=surface)
+                MODULE.validate_webshop_session_handoff_surface(metadata)
+                metadata["formal_schema_version"] = MODULE.FORMAL_WEBSHOP_SCHEMA_V2
+                MODULE.validate_webshop_session_handoff_surface(metadata)
+
+        non_filesystem = filesystem_contract_metadata(
+            surface=MODULE.FORMAL_WEBSHOP_PROCEDURAL_SURFACE_V2
+        )
+        with self.assertRaisesRegex(
+            MODULE.FormalDomainV3Error,
+            "only valid for the persistent-workspace surfaces",
+        ):
+            MODULE.validate_webshop_session_handoff_surface(non_filesystem)
+
+        wrong_schema = filesystem_contract_metadata()
+        wrong_schema["formal_schema_version"] = MODULE.FORMAL_DOMAIN_SCHEMA_V3
+        with self.assertRaisesRegex(
+            MODULE.FormalDomainV3Error,
+            "requires the formal WebShop v2 schema",
+        ):
+            MODULE.validate_webshop_session_handoff_surface(wrong_schema)
+
+        wrong_prompt = filesystem_contract_metadata()
+        wrong_prompt["memory_prompt_mode"] = "legacy"
+        with self.assertRaisesRegex(MODULE.FormalDomainV3Error, "disagree"):
+            MODULE.validate_webshop_session_handoff_surface(wrong_prompt)
+
     def test_webshop_action_listing_mode_requires_server_rollout_parity(self):
         MODULE.validate_webshop_action_listing_mode(
             {"action_listing_mode": "unified"},
