@@ -77,6 +77,7 @@ from verl.utils.agentgym.continuous_agent_v1 import (
     build_horizon_evidence_v1,
     build_observation_evidence_v1,
     build_policy_generation_loss_masks,
+    build_continuous_runtime_capacity_readback,
     continuous_prompt_capacity,
     extract_sampled_token_logprobs,
     should_request_policy_compaction,
@@ -737,6 +738,55 @@ class vLLMRollout(BaseRollout):
 
         print(f"kwargs: {kwargs}")
         self.sampling_params = SamplingParams(**kwargs)
+        if (
+            str(read_config(agentgym_config, "task_name", "")).lower()
+            == "swesmith"
+            and rollout_context_policy(agentgym_config)
+            == CONTINUOUS_AGENT_CONTEXT_POLICY_V1
+        ):
+            llm_engine = getattr(self.inference_engine, "llm_engine", None)
+            model_config = getattr(llm_engine, "model_config", None)
+            engine_max_model_tokens = getattr(
+                model_config, "max_model_len", None
+            )
+            if engine_max_model_tokens is None:
+                raise RuntimeError(
+                    "formal continuous-agent rollout requires a real vLLM "
+                    "max_model_len readback"
+                )
+            max_observation_tokens = read_config(
+                agentgym_config, "max_observation_tokens", None
+            )
+            if max_observation_tokens is None:
+                raise RuntimeError(
+                    "formal continuous-agent rollout requires explicit "
+                    "agentgym.max_observation_tokens"
+                )
+            self.continuous_capacity_readback = (
+                build_continuous_runtime_capacity_readback(
+                    configured_max_prompt_tokens=int(
+                        rollout_config.prompt_length
+                    ),
+                    configured_max_model_tokens=int(
+                        rollout_config.max_model_len
+                    ),
+                    configured_max_response_tokens=int(
+                        rollout_config.response_length
+                    ),
+                    engine_max_model_tokens=int(engine_max_model_tokens),
+                    sampling_max_response_tokens=int(
+                        self.sampling_params.max_tokens
+                    ),
+                    max_observation_tokens=int(max_observation_tokens),
+                )
+            )
+            print(
+                "AgentMemoryGym continuous capacity readback: "
+                + json.dumps(
+                    self.continuous_capacity_readback, sort_keys=True
+                ),
+                flush=True,
+            )
         self.generation_stop_token_ids = _ordered_unique_token_ids(
             self.generation_eos_token_ids,
             getattr(self.sampling_params, "stop_token_ids", None),

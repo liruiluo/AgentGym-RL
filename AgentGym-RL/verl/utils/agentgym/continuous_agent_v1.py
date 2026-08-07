@@ -75,6 +75,63 @@ def continuous_prompt_capacity(
     return capacity
 
 
+def build_continuous_runtime_capacity_readback(
+    *,
+    configured_max_prompt_tokens: int,
+    configured_max_model_tokens: int,
+    configured_max_response_tokens: int,
+    engine_max_model_tokens: int,
+    sampling_max_response_tokens: int,
+    max_observation_tokens: int,
+) -> dict[str, int]:
+    """Bind continuous-context accounting to the effective runtime limits."""
+
+    configured_capacity = continuous_prompt_capacity(
+        max_prompt_tokens=configured_max_prompt_tokens,
+        max_model_tokens=configured_max_model_tokens,
+        max_response_tokens=configured_max_response_tokens,
+    )
+    effective_capacity = continuous_prompt_capacity(
+        max_prompt_tokens=configured_max_prompt_tokens,
+        max_model_tokens=engine_max_model_tokens,
+        max_response_tokens=sampling_max_response_tokens,
+    )
+    if int(engine_max_model_tokens) != int(configured_max_model_tokens):
+        raise ContinuousAgentV1Error(
+            "vLLM max_model_len readback drifted from the rollout config: "
+            f"engine={engine_max_model_tokens} "
+            f"configured={configured_max_model_tokens}"
+        )
+    if int(sampling_max_response_tokens) != int(configured_max_response_tokens):
+        raise ContinuousAgentV1Error(
+            "sampling max_tokens readback drifted from the packed response "
+            f"width: sampling={sampling_max_response_tokens} "
+            f"configured={configured_max_response_tokens}"
+        )
+    if configured_capacity != effective_capacity:
+        raise ContinuousAgentV1Error(
+            "continuous prompt capacity drifted across runtime layers: "
+            f"configured={configured_capacity} effective={effective_capacity}"
+        )
+    if (
+        isinstance(max_observation_tokens, bool)
+        or int(max_observation_tokens) != max_observation_tokens
+        or int(max_observation_tokens) <= 0
+    ):
+        raise ContinuousAgentV1Error(
+            "max_observation_tokens must be a positive integer"
+        )
+    return {
+        "configured_max_prompt_tokens": int(configured_max_prompt_tokens),
+        "configured_max_model_tokens": int(configured_max_model_tokens),
+        "configured_max_response_tokens": int(configured_max_response_tokens),
+        "engine_max_model_tokens": int(engine_max_model_tokens),
+        "sampling_max_response_tokens": int(sampling_max_response_tokens),
+        "max_observation_tokens": int(max_observation_tokens),
+        "effective_prompt_capacity": effective_capacity,
+    }
+
+
 def should_request_policy_compaction(
     *,
     action_prompt_token_count: int,

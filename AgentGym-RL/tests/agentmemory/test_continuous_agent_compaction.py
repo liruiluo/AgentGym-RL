@@ -23,6 +23,9 @@ build_compaction_evidence_v1 = MODULE.build_compaction_evidence_v1
 build_horizon_evidence_v1 = MODULE.build_horizon_evidence_v1
 build_observation_evidence_v1 = MODULE.build_observation_evidence_v1
 build_policy_generation_loss_masks = MODULE.build_policy_generation_loss_masks
+build_continuous_runtime_capacity_readback = (
+    MODULE.build_continuous_runtime_capacity_readback
+)
 text_sha256 = MODULE.text_sha256
 token_digest = MODULE.token_digest
 validate_neutral_compaction_text = MODULE.validate_neutral_compaction_text
@@ -211,6 +214,40 @@ class ContinuousAgentCompactionTests(unittest.TestCase):
             ),
             61440,
         )
+
+    def test_runtime_capacity_readback_recomputes_without_manual_reserve(self) -> None:
+        readback = build_continuous_runtime_capacity_readback(
+            configured_max_prompt_tokens=65536,
+            configured_max_model_tokens=65536,
+            configured_max_response_tokens=4096,
+            engine_max_model_tokens=65536,
+            sampling_max_response_tokens=4096,
+            max_observation_tokens=2048,
+        )
+        self.assertEqual(readback["effective_prompt_capacity"], 61440)
+        self.assertEqual(readback["max_observation_tokens"], 2048)
+
+    def test_runtime_capacity_readback_rejects_vllm_model_limit_drift(self) -> None:
+        with self.assertRaisesRegex(ContinuousAgentV1Error, "vLLM max_model_len"):
+            build_continuous_runtime_capacity_readback(
+                configured_max_prompt_tokens=30720,
+                configured_max_model_tokens=32768,
+                configured_max_response_tokens=2048,
+                engine_max_model_tokens=65536,
+                sampling_max_response_tokens=2048,
+                max_observation_tokens=1024,
+            )
+
+    def test_runtime_capacity_readback_rejects_sampling_limit_drift(self) -> None:
+        with self.assertRaisesRegex(ContinuousAgentV1Error, "sampling max_tokens"):
+            build_continuous_runtime_capacity_readback(
+                configured_max_prompt_tokens=30720,
+                configured_max_model_tokens=32768,
+                configured_max_response_tokens=2048,
+                engine_max_model_tokens=32768,
+                sampling_max_response_tokens=4096,
+                max_observation_tokens=1024,
+            )
 
     def test_capacity_trigger_fails_closed_if_compaction_was_requested_too_late(self) -> None:
         with self.assertRaisesRegex(ContinuousAgentV1Error, "prompt cap"):
