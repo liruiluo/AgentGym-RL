@@ -216,24 +216,28 @@ _AGENTMEMORY_SELECTIVE_MEMORY_SOP = (
 # memory API exists, which is exactly the scaffold this surface is meant to
 # remove.
 _AGENTMEMORY_FILESYSTEM_REPLY_RULE_NO_THINKING = (
-    "Reply with exactly one executable action and nothing else: either one native browser "
-    "action, one shell_command JSON action, or one multiline apply_patch action. Output "
-    "excludes markdown, explanations, Thought/Action labels, and <think> blocks. "
+    "Reply with exactly one executable action and nothing else. The first non-whitespace "
+    "text must be exactly one native browser action, one canonical shell_command action, "
+    "or one multiline apply_patch action. The canonical shell form is the literal prefix "
+    "shell_command, one space, then one JSON object. A bare JSON object, markdown code "
+    "fence, explanation, Thought/Action label, or <think> block is invalid. "
 )
 _AGENTMEMORY_FILESYSTEM_REPLY_RULE_THINKING = (
     "You may first reason inside a single <think>...</think> block. After the closing "
-    "</think>, reply with exactly one executable action and nothing else: either one native "
-    "browser action, one shell_command JSON action, or one multiline apply_patch action. "
-    "Apart from that optional <think> block, output excludes markdown, explanations, and "
-    "Thought/Action labels. "
+    "</think>, reply with exactly one executable action and nothing else. The action must "
+    "be one native browser action, one canonical shell_command action, or one multiline "
+    "apply_patch action. The canonical shell form is the literal prefix shell_command, one "
+    "space, then one JSON object. A bare JSON object, markdown code fence, explanation, or "
+    "Thought/Action label after </think> is invalid. "
 )
 _AGENTMEMORY_FILESYSTEM_REPLY_RULE_REASONING = (
     "Reply with exactly two labeled fields. Write `Thought:` followed by brief free-form "
-    "reasoning, then write `Action:` followed by exactly one executable action: either one "
-    "native browser action, one shell_command JSON action, or one multiline apply_patch "
-    "action. The environment executes only the complete action after the final `Action:` "
-    "label, while PPO trains the complete sampled Thought-and-Action response. Output "
-    "excludes markdown and <think> blocks. "
+    "reasoning, then write `Action:` followed by exactly one executable action: one native "
+    "browser action, one canonical shell_command action, or one multiline apply_patch "
+    "action. The canonical shell form is the literal prefix shell_command, one space, then "
+    "one JSON object. The environment executes only the complete action after the final "
+    "`Action:` label, while PPO trains the complete sampled Thought-and-Action response. "
+    "Do not put the action in a markdown code fence or emit a bare JSON object. "
 )
 _AGENTMEMORY_NO_WORKSPACE_REPLY_RULE_NO_THINKING = (
     "Reply with exactly one executable native browser action and nothing else. Output "
@@ -262,8 +266,10 @@ _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT = (
     "correct purchase advances to the next session; an incorrect purchase terminates the "
     "episode. A product page exposes its title, price, rating, sub-pages, options, and the "
     "Buy Now action. Two Codex-style workspace tools operate on a private episode workspace. "
-    'shell_command {"command":"rg -n pattern .","workdir":".","timeout_ms":10000} '
-    "runs one shell command; command is required and workdir and timeout_ms are optional. "
+    'The canonical shell form is exactly shell_command {"command":"rg -n pattern .",'
+    '"workdir":".","timeout_ms":10000}; the literal prefix and separating space are '
+    "required, and a bare JSON object is invalid. It runs one shell command; command is "
+    "required and workdir and timeout_ms are optional. "
     "The shell includes ordinary file utilities and pinned rg, has no network, and runs with "
     "bounded time, output, processes, storage, and privileges. apply_patch is followed on the "
     "next line by one Codex patch beginning with *** Begin Patch and ending with *** End Patch; "
