@@ -329,8 +329,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
 
     def test_swesmith_compaction_uses_same_entrypoint_without_native_call(self) -> None:
         client = FakeSwesmithClient()
-        initial = [
-            {"role": "system", "content": "Coding tool contract"},
+        initial = client.policy_framing() + [
             {"role": "user", "content": client.observe()},
         ]
         messages = bind_initial_policy_context(client, initial)
@@ -392,6 +391,25 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertIn(summary, str(messages))
         self.assertNotIn("native tool output 1", str(messages))
         self.assertNotIn(SWE_CONTEXT_COMPACTION_REQUEST, str(messages))
+
+    def test_swesmith_replaces_legacy_acknowledgement_with_system_framing(self) -> None:
+        client = FakeSwesmithClient()
+        messages = bind_initial_policy_context(
+            client,
+            [
+                {"role": "user", "content": "Legacy coding instructions"},
+                {"role": "assistant", "content": "Understood."},
+                {"role": "user", "content": client.observe()},
+            ],
+        )
+
+        self.assertEqual(
+            messages,
+            client.policy_framing()
+            + [{"role": "user", "content": client.observe()}],
+        )
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertNotIn("Understood.", str(messages))
 
 
 class RolloutFakeWebShopClient(FakeWebShopClient):
