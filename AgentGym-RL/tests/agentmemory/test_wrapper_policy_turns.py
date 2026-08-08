@@ -410,6 +410,14 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         )
         self.assertEqual(messages[0]["role"], "system")
         self.assertNotIn("Understood.", str(messages))
+        system_prompt = messages[0]["content"]
+        self.assertIn(
+            'shell_command {"command":"sed -n \'1,200p\' path/to/file.py",'
+            '"workdir":".","timeout_ms":120000}',
+            system_prompt,
+        )
+        self.assertIn("*** Update File: path/to/file.py", system_prompt)
+        self.assertIn("never print analysis", system_prompt)
 
 
 class RolloutFakeWebShopClient(FakeWebShopClient):
