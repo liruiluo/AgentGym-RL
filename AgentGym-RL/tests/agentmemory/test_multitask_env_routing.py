@@ -30,6 +30,7 @@ for class_name in (
     "WebshopEnvClient",
     "WordleEnvClient",
     "SearchQAEnvClient",
+    "SwesmithEnvClient",
 ):
     setattr(FAKE_ENVS, class_name, type(class_name, (), {}))
 
