@@ -26,7 +26,7 @@ When working with Megatron:
 """
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import List, Mapping
+from typing import Any, List, Mapping
 from omegaconf import DictConfig
 import numpy as np
 import torch
@@ -64,20 +64,7 @@ from verl.utils.agent_dataset.procedural_index import (
     resolve_rollout_reset_index,
     validate_multitask_route_triplet,
 )
-from verl.utils.agentgym.context_policy import assert_rollout_context_supported, read_config, rollout_context_policy
-from verl.utils.agentgym.formal_domain_v3 import (
-    FORMAL_DOMAIN_SCHEMA_V3,
-    FORMAL_WEBSHOP_SCHEMA_V2,
-    FormalDomainV3Error,
-    bind_generic_timeout_v3,
-    build_formal_domain_step_v3,
-    resolve_formal_runtime_contract,
-    validate_formal_env_schema,
-    validate_webshop_action_listing_mode,
-    validate_webshop_filesystem_surface,
-    validate_webshop_ltm_inventory_mode,
-    validate_webshop_memory_prompt_mode,
-)
+from verl.utils.agentgym.context_policy import read_config
 from verl.utils.agentgym.rollout_context import (
     AGENTMEMORY_ACTION_TEXT,
     AGENTMEMORY_GENERATION_PROMPT_DIGEST,
@@ -91,11 +78,23 @@ from verl.utils.agentgym.rollout_context import (
     AGENTMEMORY_SUFFIX_CREDIT_APPLIED,
     AGENTMEMORY_SUFFIX_RETURN,
     AGENTMEMORY_STEP_RECORD_JSON,
+    TASK_NEUTRAL_POLICY_STEP_SCHEMA,
     normalize_generation_record,
     validate_official_vllm_generation_record,
     validate_formal_runtime_evidence_rows,
     validate_formal_response_reward_placement,
-    validate_formal_sequence_limits,
+)
+from verl.utils.agentgym.task_neutral_rollout import (
+    build_task_neutral_step_record,
+    env_info_from_payload,
+    mapping_copy,
+    outcome_from_receipt,
+    receipt_parts,
+)
+from agentenv.controller import (
+    bind_initial_policy_context,
+    complete_policy_turn,
+    prepare_policy_turn,
 )
 from verl.workers.rollout.agent_vllm_rollout.agentmemory_grouping import (
     AGENTMEMORY_EXACT_STATE_UID,
@@ -118,10 +117,6 @@ from verl.workers.rollout.agent_vllm_rollout.agentmemory_grouping import (
     trainable_rollout_row_positions,
     validate_formal_trajectory_rows,
 )
-from verl.workers.rollout.agent_vllm_rollout.formal_buy_transition import (
-    FormalBuyTransitionError,
-    validate_formal_buy_transition,
-)
 from verl.workers.rollout.agent_vllm_rollout.vllm_runtime_config import (
     resolve_official_vllm_compilation_config,
     restore_training_triton_cache_after_vllm,
@@ -130,249 +125,13 @@ from verl.workers.rollout.schemas import (
     Message,
     RolloutHandler,
     _pre_process_inputs,
-    agentmemory_action_listing_mode,
-    agentmemory_action_system_prompt,
-    agentmemory_ltm_inventory_mode,
-    agentmemory_memory_prompt_mode,
+    apply_chat_template,
 )
+
 
 # TODO
 # 1. support pp in vllm
 # 2. passing tokenizer is not necessary? no encoding/decoding is happending here
-# 3. simplify init logics
-
-
-class FormalRuntimeEvidenceError(RuntimeError):
-    pass
-
-
-def _formal_runtime_contract_for_client(env_client) -> tuple[str, str, str]:
-    info = getattr(env_client, "info", None)
-    if not isinstance(info, Mapping):
-        raise FormalRuntimeEvidenceError(
-            "Formal AgentMemory client is missing its runtime info payload."
-        )
-    info_metadata = info.get("metadata")
-    client_metadata = getattr(env_client, "metadata", None)
-    if not isinstance(info_metadata, Mapping):
-        raise FormalRuntimeEvidenceError(
-            "Formal AgentMemory client info is missing server metadata."
-        )
-    if isinstance(client_metadata, Mapping):
-        contract_keys = (
-            "formal_schema_version",
-            "domain_id",
-            "surface",
-            "contract_id",
-            "contract_sha256",
-            "system_prompt",
-            "ltm_inventory_mode",
-            "memory_prompt_mode",
-            "action_listing_mode",
-        )
-        mismatches = [
-            key
-            for key in contract_keys
-            if key in info_metadata
-            and key in client_metadata
-            and info_metadata[key] != client_metadata[key]
-        ]
-        if mismatches:
-            raise FormalRuntimeEvidenceError(
-                "Formal AgentMemory client/server metadata mismatch: "
-                f"fields={mismatches}."
-            )
-    try:
-        validate_webshop_ltm_inventory_mode(
-            info_metadata,
-            expected_mode=agentmemory_ltm_inventory_mode(),
-        )
-        validate_webshop_memory_prompt_mode(
-            info_metadata,
-            expected_mode=agentmemory_memory_prompt_mode(),
-        )
-        validate_webshop_filesystem_surface(
-            info_metadata,
-            expected_prompt_mode=agentmemory_memory_prompt_mode(),
-        )
-        validate_webshop_action_listing_mode(
-            info_metadata,
-            expected_mode=agentmemory_action_listing_mode(),
-        )
-        return resolve_formal_runtime_contract(
-            info_metadata,
-            webshop_v2_system_prompt=agentmemory_action_system_prompt(
-                surface=info_metadata["surface"]
-            ),
-        )
-    except FormalDomainV3Error as exc:
-        raise FormalRuntimeEvidenceError(
-            f"Invalid formal AgentMemory runtime contract: {exc}"
-        ) from exc
-
-
-def _validate_runtime_env_schema(
-    schema_version: str,
-    env_info: Mapping,
-    *,
-    boundary: str,
-) -> None:
-    try:
-        validate_formal_env_schema(
-            schema_version,
-            env_info,
-            boundary=boundary,
-        )
-    except FormalDomainV3Error as exc:
-        raise FormalRuntimeEvidenceError(str(exc)) from exc
-
-
-def _build_formal_webshop_step_v2(
-    *,
-    content: str,
-    score: float,
-    task_round: int,
-    done: bool,
-    item_id: str,
-    parent_index: int,
-    parent_group_uid: str,
-    replica_index: int,
-    trajectory_uid: str,
-    exact_state_uid: str,
-    prompt_token_ids: list[int],
-    response_token_ids: list[int],
-    latest_observation: str,
-    visible_prompt: str,
-    single_observation_prompt_digest: str,
-    env_result: str,
-    generation_record: Mapping,
-    env_info_before: Mapping,
-    env_info_after: Mapping,
-    action_submission: Mapping | None,
-) -> dict:
-    if "current_subtask_index" not in env_info_before:
-        raise FormalRuntimeEvidenceError(
-            f"Formal WebShop v2 step is missing the pre-action session index for item {item_id}."
-        )
-    if "current_subtask_index" not in env_info_after:
-        raise FormalRuntimeEvidenceError(
-            f"Formal WebShop v2 step is missing the post-action session index for item {item_id}."
-        )
-    session_index = int(env_info_before["current_subtask_index"])
-    next_session_index = int(env_info_after["current_subtask_index"])
-    session_advanced = next_session_index > session_index
-    tool_ops = env_info_after.get("tool_ops", [])
-    try:
-        buy_evidence = validate_formal_buy_transition(
-            tool_ops=tool_ops,
-            env_step=task_round,
-            subtask_index_before=session_index,
-            subtask_index_after=next_session_index,
-            done=done,
-        )
-    except FormalBuyTransitionError as exc:
-        raise FormalRuntimeEvidenceError(
-            f"Formal BUY transition evidence is invalid for item={item_id}: {exc}"
-        ) from exc
-    committed_purchase = bool(buy_evidence["committed_purchase"])
-    purchase_correct = buy_evidence["purchase_correct"]
-    accepted_purchase = bool(buy_evidence["accepted_purchase"])
-    session_trace_after = env_info_after.get("session_trace")
-    if not isinstance(session_trace_after, list):
-        raise FormalRuntimeEvidenceError(
-            "Formal AgentMemory step is missing post-action session_trace."
-        )
-    raw_history_cleared = bool(session_advanced and not session_trace_after)
-    search_tool_ops = [
-        tool_op
-        for tool_op in tool_ops
-        if isinstance(tool_op, dict)
-        and str(tool_op.get("op", "")).upper() == "SEARCH"
-        and int(tool_op.get("step", -1)) == task_round
-    ]
-    search_result_count = None
-    if search_tool_ops:
-        if len(search_tool_ops) != 1 or "result_count" not in search_tool_ops[0]:
-            raise FormalRuntimeEvidenceError(
-                "Formal SEARCH tool record is missing result_count."
-            )
-        search_result_count = int(search_tool_ops[0]["result_count"])
-    if "episode_success" not in env_info_after:
-        raise FormalRuntimeEvidenceError(
-            "Formal WebShop v2 step is missing authoritative episode_success."
-        )
-    if type(env_info_after["episode_success"]) is not bool:
-        raise FormalRuntimeEvidenceError(
-            "Formal WebShop v2 episode_success must be a boolean."
-        )
-    episode_success = env_info_after["episode_success"]
-    outcome = (
-        "success"
-        if done and episode_success
-        else "terminal_failure" if done else "continue"
-    )
-    return {
-        "schema_version": FORMAL_WEBSHOP_SCHEMA_V2,
-        "prompt_token_ids": prompt_token_ids,
-        "content": content,
-        "score": float(score),
-        "parent_index": parent_index,
-        "parent_group_uid": parent_group_uid,
-        "replica_index": replica_index,
-        "trajectory_uid": trajectory_uid,
-        "exact_state_uid": exact_state_uid,
-        "task_round": task_round,
-        "done": done,
-        "item_id": item_id,
-        "session_index": session_index,
-        "subtask_index": session_index,
-        "next_session_index": next_session_index,
-        "subtask_index_before": session_index,
-        "subtask_index_after": next_session_index,
-        "visible_prompt": visible_prompt,
-        "latest_observation": latest_observation,
-        "prompt_history_policy": "latest_observation_only",
-        "raw_prior_messages_visible": False,
-        "single_observation_prompt_digest": single_observation_prompt_digest,
-        "response_token_ids": response_token_ids,
-        "response_token_count": int(generation_record["response_token_count"]),
-        "max_response_tokens": int(generation_record["max_response_tokens"]),
-        "finish_reason": str(generation_record["finish_reason"]),
-        "finish_reason_source": str(generation_record["finish_reason_source"]),
-        "stop_reason": generation_record.get("stop_reason"),
-        "generation_backend_source": str(generation_record["backend_source"]),
-        "generation_stop_reason": generation_record.get("stop_reason"),
-        "generation_eos_token_ids": list(
-            generation_record["configured_eos_token_ids"]
-        ),
-        "tokenizer_primary_eos_token_id": generation_record[
-            "primary_eos_token_id"
-        ],
-        "tokenizer_pad_token_id": generation_record["tokenizer_pad_token_id"],
-        "generation_token_ids_are_exact": bool(
-            generation_record["token_ids_are_exact"]
-        ),
-        "backend_token_ids_are_exact": bool(
-            generation_record["backend_token_ids_are_exact"]
-        ),
-        "truncated": bool(generation_record["truncated"]),
-        "env_result": env_result,
-        "env_info_before": deepcopy(dict(env_info_before)),
-        "env_info_after": deepcopy(dict(env_info_after)),
-        "action_submission": deepcopy(dict(action_submission or {})),
-        "committed_purchase": committed_purchase,
-        "purchase_correct": purchase_correct,
-        "accepted_purchase": accepted_purchase,
-        "session_advanced": session_advanced,
-        "buy_committed": committed_purchase,
-        "buy_accepted": accepted_purchase,
-        "subtask_advanced": session_advanced,
-        "raw_history_cleared": raw_history_cleared,
-        "search_result_count": search_result_count,
-        "outcome": outcome,
-    }
-
-
 def _ordered_unique_token_ids(*values) -> list[int]:
     ordered: list[int] = []
 
@@ -527,12 +286,6 @@ class vLLMRollout(BaseRollout):
         self.config = rollout_config
         self.agentgym_config = agentgym_config
         self.actor_module = actor_module
-        if str(read_config(agentgym_config, "task_name", "")).lower() == "agentmemory":
-            validate_formal_sequence_limits(
-                prompt_width=int(rollout_config.prompt_length),
-                response_width=int(rollout_config.response_length),
-                max_model_len=int(rollout_config.max_model_len),
-            )
         self.generation_eos_token_ids = _resolve_generation_eos_token_ids(
             actor_module=actor_module,
             tokenizer=tokenizer,
@@ -1118,7 +871,7 @@ class vLLMRollout(BaseRollout):
         loss_mask = [0] * len(prompt_token_ids) + [1] * len(response_token_ids)
         return RolloutHandler(
             messages=[],
-            task_name="agentmemory",
+            task_name="task_neutral",
             item_id=parent_index,
             score=score,
             done=False,
@@ -1468,23 +1221,13 @@ class vLLMRollout(BaseRollout):
                         f"Formal step record {index} must be a dictionary."
                     )
                 record = deepcopy(raw_record)
-                schema_version = record.get(
-                    "schema_version", FORMAL_WEBSHOP_SCHEMA_V2
-                )
-                if schema_version not in (
-                    FORMAL_WEBSHOP_SCHEMA_V2,
-                    FORMAL_DOMAIN_SCHEMA_V3,
-                ):
+                schema_version = record.get("schema_version")
+                if schema_version != TASK_NEUTRAL_POLICY_STEP_SCHEMA:
                     raise RuntimeError(
                         "Unsupported formal step schema before packing: "
                         f"row={index} schema={schema_version!r}."
                     )
-                internal_fields = (
-                    ("prompt_token_ids",)
-                    if schema_version == FORMAL_DOMAIN_SCHEMA_V3
-                    else ("prompt_token_ids", "content", "score")
-                )
-                for internal_field in internal_fields:
+                for internal_field in ("prompt_token_ids", "content", "score"):
                     record.pop(internal_field, None)
                 record.update(
                     {
@@ -1562,39 +1305,46 @@ class vLLMRollout(BaseRollout):
             )
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 
-    def latest_observation_prompt_from_text(
-        self,
-        observation: str,
-        *,
-        system_prompt: str | None = None,
+    def _task_neutral_prompt_from_messages(
+        self, messages: List[Mapping[str, str]]
     ) -> List[int]:
-        temp_handler = RolloutHandler(
-            messages=[Message(role="user", content=observation)],
-            task_name="agentmemory",
-            item_id=0,
-            score=0,
-            done=False,
-            input_ids=[],
-            prompt_ids=[],
-            response_ids=[],
-            attention_mask=[],
-            prompt_attention_mask=[],
-            response_attention_mask=[],
-            position_ids=[],
-            prompt_position_ids=[],
-            response_position_ids=[],
-            loss_mask=[],
-            prompt_loss_mask=[],
-            response_loss_mask=[],
-            max_response_len=self.config.response_length,
-            max_model_len=min(self.config.max_model_len, self.config.prompt_length + self.config.response_length),
-        )
-        return temp_handler.get_latest_observation_prompt(
+        """Render the exact prompt used by the one shared policy loop."""
+
+        return apply_chat_template(
             self.tokenizer,
-            system_prompt=system_prompt,
+            [
+                {"role": str(message["role"]), "content": str(message["content"])}
+                for message in messages
+            ],
         )
 
-    def generate_agentmemory_latest_observation(
+    def _task_neutral_action_observation_envelope_tokens(
+        self,
+        messages: List[Mapping[str, str]],
+        action_prompt_ids: List[int],
+    ) -> int:
+        empty_transition = list(messages) + [
+            {"role": "assistant", "content": ""},
+            {"role": "user", "content": ""},
+        ]
+        envelope = len(
+            self._task_neutral_prompt_from_messages(empty_transition)
+        ) - len(action_prompt_ids)
+        if envelope < 0:
+            raise RuntimeError(
+                "chat template shortened after an empty action/observation transition"
+            )
+        return envelope
+
+    def _task_neutral_bind_handler_messages(
+        self, handler: RolloutHandler, messages: List[Mapping[str, str]]
+    ) -> None:
+        handler.messages = [
+            Message(role=str(message["role"]), content=str(message["content"]))
+            for message in messages
+        ]
+
+    def generate_task_neutral_policy(
         self,
         rollout_handler_ls: List[RolloutHandler],
         env_clients,
@@ -1603,691 +1353,520 @@ class vLLMRollout(BaseRollout):
         sampling_kwargs: dict,
         global_steps,
     ) -> DataProto:
-        parent_indices = []
-        flat_task_rounds = []
-        flat_done_flags = []
-        flat_handlers = []
-        flat_rollout_indices = []
-        excluded_rollout_indices = set()
+        """Run one environment-independent sampled policy/PPO trajectory loop.
+
+        Wrappers decide when a context transition is needed. Every sampled
+        output, including a wrapper control turn, is sent through step and
+        becomes one trainable row. The runner only preserves the opaque receipt
+        and mechanically applies its context operation.
+        """
+
+        if isinstance(max_policy_turns, bool) or int(max_policy_turns) <= 0:
+            raise RuntimeError("max_policy_turns must be a positive integer")
+        max_policy_turns = int(max_policy_turns)
         suffix_credit = _agentmemory_latest_observation_suffix_credit_enabled()
         state_aware_group_uid = _agentmemory_state_aware_group_uid_enabled()
-        formal_trajectory_credit = True
-        trajectory_steps = [[] for _ in rollout_handler_ls]
-        flat_step_refs = []
-        uid_overrides = []
-        task_rounds = [0] * len(rollout_handler_ls)
-        messages = [[] for _ in rollout_handler_ls]
-        for idx, rollout_handler in enumerate(rollout_handler_ls):
-            try:
-                _agentmemory_debug(f"reset_start idx={idx} item_id={rollout_handler.item_id}")
-                reset_started = time.time()
-                env_clients[idx].reset(
-                    getattr(
-                        rollout_handler,
-                        "agentmemory_local_data_idx",
-                        getattr(
-                            rollout_handler,
-                            "data_idx",
-                            rollout_handler.item_id,
-                        ),
-                    )
-                )
-                task = env_clients[idx].observe()
-                rollout_handler.add_user_message(self.tokenizer, task)
-                (
-                    rollout_handler.formal_schema_version,
-                    rollout_handler.formal_system_prompt,
-                    rollout_handler.formal_system_prompt_source,
-                ) = _formal_runtime_contract_for_client(env_clients[idx])
-                _agentmemory_debug(f"reset_done idx={idx} item_id={rollout_handler.item_id} seconds={time.time() - reset_started:.2f}")
-            except FormalRuntimeEvidenceError:
-                raise
-            except Exception as e:
-                print(f"Reset Error: AgentMemory Env error={e} item id = {rollout_handler.item_id}", flush=True)
-                rollout_handler.done = True
-                rollout_handler.score = 0
-                excluded_rollout_indices.add(idx)
-
-        rounds = 0
-        all_done_flag = False
-        rollout_bar = tqdm(total=max_policy_turns, desc="Running AgentMemory policy turns", disable=torch.distributed.get_rank() != 0)
-        while rounds < max_policy_turns and not all_done_flag:
-            generation_prompt_idxs = []
-            not_done_idxs = []
-            for idx, rollout_handler in enumerate(rollout_handler_ls):
-                if not rollout_handler.done:
-                    generation_prompt_idxs.append(
-                        rollout_handler.get_latest_observation_prompt(
-                            self.tokenizer,
-                            system_prompt=rollout_handler.formal_system_prompt,
-                        )
-                    )
-                    not_done_idxs.append(idx)
-
-            overlong_generation_prompts = [
-                (not_done_idxs[index], len(prompt_token_ids))
-                for index, prompt_token_ids in enumerate(generation_prompt_idxs)
-                if len(prompt_token_ids) > int(self.config.prompt_length)
-            ]
-            if overlong_generation_prompts:
-                raise RuntimeError(
-                    "Generation prompt exceeds data.max_prompt_length before "
-                    "sampling; refusing a later packed-prompt mismatch: "
-                    f"prompt_width={self.config.prompt_length} "
-                    f"rows={overlong_generation_prompts[:8]}"
-                )
-
-            rollout_bar.set_description(f"AgentMemory policy turns {rounds + 1}/{max_policy_turns} | Active agents per gpu: {len(not_done_idxs)}")
-            _agentmemory_debug(f"round_start round={rounds + 1}/{max_policy_turns} active={len(not_done_idxs)}")
-            if len(not_done_idxs) == 0:
-                break
-            with self.update_sampling_params(**sampling_kwargs):
-                output = self._generate_token_ids(
-                    generation_prompt_idxs=generation_prompt_idxs,
-                    sampling_params=self.sampling_params,
-                )
-            generation_records = self._output_generation_records(
-                output,
-                self.sampling_params,
-                require_exact_metadata=bool(formal_trajectory_credit),
+        max_prompt_tokens = int(self.config.prompt_length)
+        max_model_tokens = int(self.config.max_model_len)
+        max_response_tokens = int(
+            sampling_kwargs.get(
+                "max_tokens",
+                getattr(
+                    self.sampling_params,
+                    "max_tokens",
+                    self.config.response_length,
+                ),
             )
-            if len(generation_records) != len(not_done_idxs):
-                raise RuntimeError(
-                    "Formal generation result count mismatch: "
-                    f"active={len(not_done_idxs)} outputs={len(generation_records)}."
-                )
-            response_ids = [record["token_ids"] for record in generation_records]
-            all_done_flag = True
-            time.sleep(self.config.send_interval)
-            for i, idx in enumerate(not_done_idxs):
-                prompt_token_ids = generation_prompt_idxs[i]
-                action_token_ids = response_ids[i]
-                generation_record = generation_records[i]
-                visible_prompt = self.tokenizer.decode(
-                    prompt_token_ids, skip_special_tokens=False
-                )
-                latest_observation = rollout_handler_ls[idx].messages[-1].content
-                formal_schema_version = str(
-                    rollout_handler_ls[idx].formal_schema_version
-                )
-                formal_system_prompt = str(
-                    rollout_handler_ls[idx].formal_system_prompt
-                )
-                single_observation_prompt_ids = (
-                    self.latest_observation_prompt_from_text(
-                        latest_observation,
-                        system_prompt=formal_system_prompt,
-                    )
-                )
-                if single_observation_prompt_ids != list(prompt_token_ids):
-                    raise FormalRuntimeEvidenceError(
-                        "Formal generation prompt contains context beyond the latest "
-                        f"observation for item {rollout_handler_ls[idx].item_id}."
-                    )
-                env_info_payload = getattr(env_clients[idx], "info", None)
-                env_info_before = (
-                    deepcopy(env_info_payload.get("env_info", {}))
-                    if isinstance(env_info_payload, dict)
-                    else {}
-                )
-                _validate_runtime_env_schema(
-                    formal_schema_version,
-                    env_info_before,
-                    boundary="pre-action",
-                )
-                if formal_schema_version == FORMAL_WEBSHOP_SCHEMA_V2:
-                    if "current_subtask_index" not in env_info_before:
-                        raise FormalRuntimeEvidenceError(
-                            "Formal AgentMemory step is missing the pre-action "
-                            f"session index for item {rollout_handler_ls[idx].item_id}."
-                        )
-                    session_index = int(env_info_before["current_subtask_index"])
-                else:
-                    if "phase_index" not in env_info_before:
-                        raise FormalRuntimeEvidenceError(
-                            "Formal v3 step is missing the pre-action phase_index "
-                            f"for item {rollout_handler_ls[idx].item_id}."
-                        )
-                    phase_index = int(env_info_before["phase_index"])
-                content = self.tokenizer.decode(action_token_ids, skip_special_tokens=True)
-                rollout_handler_ls[idx].add_assistant_message(self.tokenizer, content)
-                task_rounds[idx] += 1
-                parent_index = getattr(rollout_handler_ls[idx], "parent_index", idx // self.config.n)
-                replica_index = int(
-                    getattr(rollout_handler_ls[idx], "rollout_replica_index", 0)
-                )
-                exact_state_uid = build_state_aware_rollout_uid(
-                    parent_index,
-                    task_rounds[idx],
-                    prompt_token_ids,
-                )
-                parent_group_uid = build_parent_group_uid(parent_index)
-                trajectory_uid = build_trajectory_uid(
-                    parent_group_uid, replica_index
-                )
-                try:
-                    _agentmemory_debug(f"step_start round={rounds + 1} local_i={i} idx={idx} item_id={rollout_handler_ls[idx].item_id}")
-                    step_started = time.time()
-                    step_output = env_clients[idx].step(content)
-                    _agentmemory_debug(f"step_done round={rounds + 1} local_i={i} idx={idx} item_id={rollout_handler_ls[idx].item_id} seconds={time.time() - step_started:.2f} reward={step_output.reward} done={step_output.done}")
-                    state, rollout_handler_ls[idx].score, rollout_handler_ls[idx].done = (
-                        step_output.state,
-                        step_output.reward,
-                        step_output.done,
-                    )
-                    if getattr(env_clients[idx], "sample_excluded", False):
-                        excluded_rollout_indices.add(idx)
-                        rollout_handler_ls[idx].score = 0
-                        rollout_handler_ls[idx].done = True
-                        _agentmemory_debug(
-                            f"step_infra_excluded round={rounds + 1} idx={idx} "
-                            f"item_id={rollout_handler_ls[idx].item_id}"
-                        )
-                        continue
-                    env_info_payload = getattr(env_clients[idx], "info", None)
-                    env_info_after = (
-                        deepcopy(env_info_payload.get("env_info", {}))
-                        if isinstance(env_info_payload, dict)
-                        else {}
-                    )
-                    _validate_runtime_env_schema(
-                        formal_schema_version,
-                        env_info_after,
-                        boundary="post-action",
-                    )
-                    prompt_digest = prompt_state_digest(
-                        single_observation_prompt_ids
-                    )
-                    if formal_schema_version == FORMAL_DOMAIN_SCHEMA_V3:
-                        if "phase_index" not in env_info_after:
-                            raise FormalRuntimeEvidenceError(
-                                "Formal v3 step is missing the post-action phase_index "
-                                f"for item {rollout_handler_ls[idx].item_id}."
-                            )
-                        if int(env_info_after["phase_index"]) < phase_index:
-                            raise FormalRuntimeEvidenceError(
-                                "Formal v3 phase_index regressed across one action."
-                            )
-                        try:
-                            step_record = build_formal_domain_step_v3(
-                                content=content,
-                                score=float(rollout_handler_ls[idx].score),
-                                task_round=task_rounds[idx],
-                                done=bool(step_output.done),
-                                item_id=str(rollout_handler_ls[idx].item_id),
-                                parent_index=parent_index,
-                                parent_group_uid=parent_group_uid,
-                                replica_index=replica_index,
-                                trajectory_uid=trajectory_uid,
-                                exact_state_uid=exact_state_uid,
-                                prompt_token_ids=prompt_token_ids,
-                                response_token_ids=action_token_ids,
-                                latest_observation=latest_observation,
-                                visible_prompt=visible_prompt,
-                                system_prompt=formal_system_prompt,
-                                single_observation_prompt_digest=prompt_digest,
-                                env_result=str(step_output.state),
-                                generation_record=generation_record,
-                                env_info_before=env_info_before,
-                                env_info_after=env_info_after,
-                            )
-                        except FormalDomainV3Error as exc:
-                            raise FormalRuntimeEvidenceError(
-                                "Formal v3 step evidence is invalid for "
-                                f"item={rollout_handler_ls[idx].item_id}: {exc}"
-                            ) from exc
-                    else:
-                        step_record = _build_formal_webshop_step_v2(
-                            content=content,
-                            score=float(rollout_handler_ls[idx].score),
-                            task_round=task_rounds[idx],
-                            done=bool(step_output.done),
-                            item_id=str(rollout_handler_ls[idx].item_id),
-                            parent_index=parent_index,
-                            parent_group_uid=parent_group_uid,
-                            replica_index=replica_index,
-                            trajectory_uid=trajectory_uid,
-                            exact_state_uid=exact_state_uid,
-                            prompt_token_ids=prompt_token_ids,
-                            response_token_ids=list(action_token_ids),
-                            latest_observation=latest_observation,
-                            visible_prompt=visible_prompt,
-                            single_observation_prompt_digest=prompt_digest,
-                            env_result=str(step_output.state),
-                            generation_record=generation_record,
-                            env_info_before=env_info_before,
-                            env_info_after=env_info_after,
-                            action_submission=getattr(
-                                env_clients[idx], "last_action_submission", None
-                            ),
-                        )
-                    if suffix_credit or formal_trajectory_credit:
-                        step_record["trajectory_row_order"] = len(
-                            trajectory_steps[idx]
-                        )
-                        step_record["trajectory_row_uid"] = build_row_uid(
-                            trajectory_uid, step_record["trajectory_row_order"]
-                        )
-                        trajectory_steps[idx].append(step_record)
-                    if suffix_credit:
-                        pass
-                    else:
-                        flat_handlers.append(
-                            self.build_rollout_handler_from_prompt(
-                                prompt_token_ids=prompt_token_ids,
-                                content=content,
-                                score=rollout_handler_ls[idx].score,
-                                parent_index=parent_index,
-                                sampled_response_token_ids=action_token_ids,
-                            )
-                        )
-                        parent_indices.append(parent_index)
-                        flat_task_rounds.append(task_rounds[idx])
-                        flat_done_flags.append(bool(step_output.done))
-                        flat_rollout_indices.append(idx)
-                        if formal_trajectory_credit:
-                            flat_step_refs.append(step_record)
-                        if state_aware_group_uid:
-                            uid_overrides.append(exact_state_uid)
-                    rollout_handler_ls[idx].add_user_message(self.tokenizer, state)
-                    all_done_flag = all_done_flag and step_output.done
-                except FormalRuntimeEvidenceError:
-                    raise
-                except Exception as e:
-                    if getattr(env_clients[idx], "sample_excluded", False):
-                        rollout_handler_ls[idx].score = 0
-                        rollout_handler_ls[idx].done = True
-                        excluded_rollout_indices.add(idx)
-                        _agentmemory_debug(
-                            f"step_infra_exception_excluded round={rounds + 1} "
-                            f"idx={idx} item_id={rollout_handler_ls[idx].item_id} "
-                            f"error={type(e).__name__}: {e}"
-                        )
-                        continue
-                    if formal_trajectory_credit:
-                        raise FormalRuntimeEvidenceError(
-                            "Formal AgentMemory environment step failed before an "
-                            "auditable action/reward boundary: "
-                            f"item={rollout_handler_ls[idx].item_id} "
-                            f"task_round={task_rounds[idx]} action={content!r} "
-                            f"error={type(e).__name__}: {e}"
-                        ) from e
-                    _agentmemory_debug(f"step_error round={rounds + 1} local_i={i} idx={idx} item_id={rollout_handler_ls[idx].item_id} error={e}")
-                    rollout_handler_ls[idx].score = 0
-                    rollout_handler_ls[idx].done = True
-                    error_text = f"{type(e).__name__}: {e}"
-                    step_record = {
-                        "prompt_token_ids": prompt_token_ids,
-                        "content": content,
-                        "score": 0.0,
-                        "parent_index": parent_index,
-                        "parent_group_uid": parent_group_uid,
-                        "replica_index": replica_index,
-                        "trajectory_uid": trajectory_uid,
-                        "exact_state_uid": exact_state_uid,
-                        "task_round": task_rounds[idx],
-                        "done": True,
-                        "item_id": str(rollout_handler_ls[idx].item_id),
-                        "session_index": session_index,
-                        "subtask_index": session_index,
-                        "next_session_index": session_index,
-                        "subtask_index_before": session_index,
-                        "subtask_index_after": session_index,
-                        "visible_prompt": visible_prompt,
-                        "latest_observation": latest_observation,
-                        "prompt_history_policy": "latest_observation_only",
-                        "raw_prior_messages_visible": False,
-                        "single_observation_prompt_digest": prompt_state_digest(
-                            single_observation_prompt_ids
-                        ),
-                        "response_token_ids": list(action_token_ids),
-                        "response_token_count": int(
-                            generation_record["response_token_count"]
-                        ),
-                        "max_response_tokens": int(
-                            generation_record["max_response_tokens"]
-                        ),
-                        "finish_reason": str(
-                            generation_record["finish_reason"]
-                        ),
-                        "finish_reason_source": str(
-                            generation_record["finish_reason_source"]
-                        ),
-                        "stop_reason": generation_record.get("stop_reason"),
-                        "generation_backend_source": str(
-                            generation_record["backend_source"]
-                        ),
-                        "generation_stop_reason": generation_record.get(
-                            "stop_reason"
-                        ),
-                        "generation_eos_token_ids": list(
-                            generation_record["configured_eos_token_ids"]
-                        ),
-                        "tokenizer_primary_eos_token_id": generation_record[
-                            "primary_eos_token_id"
-                        ],
-                        "tokenizer_pad_token_id": generation_record[
-                            "tokenizer_pad_token_id"
-                        ],
-                        "generation_token_ids_are_exact": bool(
-                            generation_record["token_ids_are_exact"]
-                        ),
-                        "backend_token_ids_are_exact": bool(
-                            generation_record["backend_token_ids_are_exact"]
-                        ),
-                        "truncated": bool(generation_record["truncated"]),
-                        "env_result": error_text,
-                        "env_info_before": env_info_before,
-                        "env_info_after": deepcopy(env_info_before),
-                        "action_execution": None,
-                        "committed_purchase": False,
-                        "purchase_correct": None,
-                        "accepted_purchase": False,
-                        "session_advanced": False,
-                        "buy_committed": False,
-                        "buy_accepted": False,
-                        "subtask_advanced": False,
-                        "raw_history_cleared": False,
-                        "search_result_count": None,
-                        "outcome": "environment_error",
-                    }
-                    if suffix_credit or formal_trajectory_credit:
-                        step_record["trajectory_row_order"] = len(
-                            trajectory_steps[idx]
-                        )
-                        step_record["trajectory_row_uid"] = build_row_uid(
-                            trajectory_uid, step_record["trajectory_row_order"]
-                        )
-                        trajectory_steps[idx].append(step_record)
-                    if suffix_credit:
-                        pass
-                    else:
-                        flat_handlers.append(
-                            self.build_rollout_handler_from_prompt(
-                                prompt_token_ids=prompt_token_ids,
-                                content=content,
-                                score=0,
-                                parent_index=parent_index,
-                                sampled_response_token_ids=action_token_ids,
-                            )
-                        )
-                        parent_indices.append(parent_index)
-                        flat_task_rounds.append(task_rounds[idx])
-                        flat_done_flags.append(True)
-                        flat_rollout_indices.append(idx)
-                        if formal_trajectory_credit:
-                            flat_step_refs.append(step_record)
-                        if state_aware_group_uid:
-                            uid_overrides.append(exact_state_uid)
-                    print(f"AgentMemory rollout step error: {e} item id = {rollout_handler_ls[idx].item_id}")
-            rounds += 1
-            rollout_bar.update(1)
-        rollout_bar.close()
-
-        from agentenv_agentmemory.reward_hierarchy import (
-            bind_max_round_timeout_failure,
         )
+        if (
+            max_response_tokens <= 0
+            or max_response_tokens > int(self.config.response_length)
+        ):
+            raise RuntimeError(
+                "sampled response budget must fit the PPO response width: "
+                f"sampling={max_response_tokens} "
+                f"width={self.config.response_length}"
+            )
+        raw_max_observation_tokens = read_config(
+            self.agentgym_config, "max_observation_tokens", None
+        )
+        max_observation_tokens = (
+            None
+            if raw_max_observation_tokens is None
+            else int(raw_max_observation_tokens)
+        )
+        if max_observation_tokens is not None and max_observation_tokens <= 0:
+            raise RuntimeError("agentgym.max_observation_tokens must be positive")
+
+        policy_messages: list[list[dict[str, str]]] = [
+            [] for _ in rollout_handler_ls
+        ]
+        task_rounds = [0] * len(rollout_handler_ls)
+        trajectory_steps: list[list[dict[str, Any]]] = [
+            [] for _ in rollout_handler_ls
+        ]
+        excluded_rollout_indices: set[int] = set()
+
+        for index, handler in enumerate(rollout_handler_ls):
+            try:
+                env_clients[index].reset(resolve_rollout_reset_index(handler))
+                initial_messages = [
+                    message.to_dict() for message in handler.messages
+                ]
+                initial_messages.append(
+                    {
+                        "role": "user",
+                        "content": str(env_clients[index].observe()),
+                    }
+                )
+                policy_messages[index] = bind_initial_policy_context(
+                    env_clients[index], initial_messages
+                )
+                self._task_neutral_bind_handler_messages(
+                    handler, policy_messages[index]
+                )
+            except Exception as exc:
+                if getattr(env_clients[index], "sample_excluded", False):
+                    excluded_rollout_indices.add(index)
+                    handler.done = True
+                    continue
+                raise RuntimeError(
+                    "task-neutral environment reset failed: "
+                    f"row={index} item_id={handler.item_id} "
+                    f"error={type(exc).__name__}: {exc}"
+                ) from exc
+
+        rollout_bar = tqdm(
+            total=max_policy_turns,
+            desc="Running task-neutral policy turns",
+            disable=(
+                torch.distributed.is_initialized()
+                and torch.distributed.get_rank() != 0
+            ),
+        )
+        try:
+            while True:
+                active_indices = [
+                    index
+                    for index, handler in enumerate(rollout_handler_ls)
+                    if index not in excluded_rollout_indices
+                    and not handler.done
+                    and task_rounds[index] < max_policy_turns
+                ]
+                if not active_indices:
+                    break
+
+                prepared_turns = []
+                generation_prompt_ids = []
+                for index in active_indices:
+                    messages = policy_messages[index]
+                    action_prompt_ids = self._task_neutral_prompt_from_messages(
+                        messages
+                    )
+                    if len(action_prompt_ids) > max_prompt_tokens:
+                        raise RuntimeError(
+                            "task-neutral generation prompt exceeds the "
+                            "configured PPO prompt width before sampling: "
+                            f"row={index} tokens={len(action_prompt_ids)} "
+                            f"width={max_prompt_tokens}"
+                        )
+                    envelope_tokens = (
+                        self._task_neutral_action_observation_envelope_tokens(
+                            messages, action_prompt_ids
+                        )
+                    )
+                    prepared = prepare_policy_turn(
+                        env_clients[index],
+                        messages,
+                        count_prompt_tokens=lambda values: len(
+                            self._task_neutral_prompt_from_messages(
+                                [dict(value) for value in values]
+                            )
+                        ),
+                        max_prompt_tokens=max_prompt_tokens,
+                        max_model_tokens=max_model_tokens,
+                        max_response_tokens=max_response_tokens,
+                        max_observation_tokens=max_observation_tokens,
+                        action_observation_envelope_tokens=envelope_tokens,
+                    )
+                    prompt_ids = self._task_neutral_prompt_from_messages(
+                        list(prepared.messages)
+                    )
+                    if len(prompt_ids) != prepared.prompt_token_count:
+                        raise RuntimeError(
+                            "wrapper prompt-token count differs from the exact "
+                            "sampled prompt"
+                        )
+                    if len(prompt_ids) > max_prompt_tokens:
+                        raise RuntimeError(
+                            "wrapper control prompt exceeds the configured PPO "
+                            "prompt width: "
+                            f"row={index} tokens={len(prompt_ids)} "
+                            f"width={max_prompt_tokens}"
+                        )
+                    prepared_turns.append(prepared)
+                    generation_prompt_ids.append(prompt_ids)
+
+                rollout_bar.set_description(
+                    "Task-neutral policy turns "
+                    f"{max(task_rounds[index] for index in active_indices) + 1}/"
+                    f"{max_policy_turns} | active={len(active_indices)}"
+                )
+                with self.update_sampling_params(**sampling_kwargs):
+                    generated = self._generate_token_ids(
+                        generation_prompt_idxs=generation_prompt_ids,
+                        sampling_params=self.sampling_params,
+                    )
+                    generation_records = self._output_generation_records(
+                        generated,
+                        self.sampling_params,
+                        require_exact_metadata=True,
+                    )
+                if len(generation_records) != len(active_indices):
+                    raise RuntimeError(
+                        "task-neutral generation result count mismatch: "
+                        f"active={len(active_indices)} "
+                        f"outputs={len(generation_records)}"
+                    )
+
+                time.sleep(self.config.send_interval)
+                contents = [
+                    self.tokenizer.decode(
+                        record["token_ids"], skip_special_tokens=True
+                    )
+                    for record in generation_records
+                ]
+                env_info_before = [
+                    env_info_from_payload(
+                        getattr(env_clients[index], "info", {})
+                    )
+                    for index in active_indices
+                ]
+
+                def complete(index_and_action):
+                    local_index, action = index_and_action
+                    return complete_policy_turn(
+                        env_clients[active_indices[local_index]],
+                        prepared_turns[local_index],
+                        action,
+                    )
+
+                with ThreadPoolExecutor(
+                    max_workers=len(active_indices)
+                ) as executor:
+                    completed = list(
+                        executor.map(complete, enumerate(contents))
+                    )
+
+                for local_index, index in enumerate(active_indices):
+                    handler = rollout_handler_ls[index]
+                    generation_record = generation_records[local_index]
+                    prompt_token_ids = generation_prompt_ids[local_index]
+                    response_token_ids = [
+                        int(token_id)
+                        for token_id in generation_record["token_ids"]
+                    ]
+                    content = contents[local_index]
+                    step_output, next_messages = completed[local_index]
+                    task_rounds[index] += 1
+                    parent_index = int(
+                        getattr(
+                            handler,
+                            "parent_index",
+                            index // self.config.n,
+                        )
+                    )
+                    replica_index = int(
+                        getattr(handler, "rollout_replica_index", 0)
+                    )
+                    parent_group_uid = build_parent_group_uid(parent_index)
+                    trajectory_uid = build_trajectory_uid(
+                        parent_group_uid, replica_index
+                    )
+                    exact_state_uid = build_state_aware_rollout_uid(
+                        parent_index, task_rounds[index], prompt_token_ids
+                    )
+                    (
+                        env_info_after,
+                        action_submission,
+                        context_transition,
+                        wrapper_evidence,
+                    ) = receipt_parts(step_output, content)
+                    if getattr(env_clients[index], "sample_excluded", False):
+                        excluded_rollout_indices.add(index)
+                        handler.done = True
+                        trajectory_steps[index].clear()
+                        continue
+                    step_record = build_task_neutral_step_record(
+                        item_id=str(handler.item_id),
+                        parent_index=parent_index,
+                        parent_group_uid=parent_group_uid,
+                        replica_index=replica_index,
+                        trajectory_uid=trajectory_uid,
+                        exact_state_uid=exact_state_uid,
+                        task_round=task_rounds[index],
+                        prompt_token_ids=prompt_token_ids,
+                        content=content,
+                        response_token_ids=response_token_ids,
+                        score=float(step_output.reward),
+                        done=bool(step_output.done),
+                        generation_record=generation_record,
+                        env_result=str(step_output.state),
+                        env_info_before=env_info_before[local_index],
+                        env_info_after=env_info_after,
+                        action_submission=action_submission,
+                        context_transition=context_transition,
+                        wrapper_evidence=wrapper_evidence,
+                    )
+                    trajectory_steps[index].append(step_record)
+                    policy_messages[index] = next_messages
+                    self._task_neutral_bind_handler_messages(
+                        handler, next_messages
+                    )
+                    handler.score = float(step_output.reward)
+                    handler.done = bool(step_output.done)
+
+                rollout_bar.update(1)
+        finally:
+            rollout_bar.close()
+
+        for index, steps in enumerate(trajectory_steps):
+            if index in excluded_rollout_indices or not steps:
+                continue
+            if not steps[-1]["done"] and task_rounds[index] >= max_policy_turns:
+                finalizer = getattr(
+                    env_clients[index], "finalize_policy_horizon", None
+                )
+                horizon_output = finalizer() if callable(finalizer) else None
+                if horizon_output is None:
+                    steps[-1]["outcome"] = "max_rounds"
+                    steps[-1]["wrapper_evidence"]["horizon_finalization"] = {
+                        "status": "not_provided",
+                        "policy_turn": int(task_rounds[index]),
+                    }
+                else:
+                    if not bool(horizon_output.done):
+                        raise RuntimeError(
+                            "task-neutral horizon finalization must terminate "
+                            "the episode"
+                        )
+                    (
+                        horizon_env_info,
+                        _,
+                        _,
+                        horizon_wrapper_evidence,
+                    ) = receipt_parts(horizon_output, "")
+                    steps[-1]["score"] += float(horizon_output.reward)
+                    steps[-1]["immediate_reward"] = steps[-1]["score"]
+                    steps[-1]["done"] = True
+                    steps[-1]["outcome"] = outcome_from_receipt(
+                        done=True,
+                        reward=float(steps[-1]["score"]),
+                        env_info_after=horizon_env_info,
+                        wrapper_evidence=horizon_wrapper_evidence,
+                    )
+                    steps[-1]["horizon_finalization"] = {
+                        "state": str(horizon_output.state),
+                        "reward": float(horizon_output.reward),
+                        "done": bool(horizon_output.done),
+                        "info": mapping_copy(
+                            getattr(horizon_output, "info", {})
+                        ),
+                    }
+
+            trajectory_return = sum(float(step["score"]) for step in steps)
+            suffix_scores = compute_suffix_credit_scores(
+                [float(step["score"]) for step in steps],
+                [int(step["task_round"]) for step in steps],
+            )
+            for row_order, (step, suffix_score) in enumerate(
+                zip(steps, suffix_scores)
+            ):
+                step["trajectory_row_order"] = row_order
+                step["trajectory_row_uid"] = build_row_uid(
+                    str(step["trajectory_uid"]), row_order
+                )
+                step["trajectory_terminal"] = row_order == len(steps) - 1
+                step["suffix_return"] = float(suffix_score)
+                step["suffix_credit_applied"] = bool(suffix_credit)
+                step["trajectory_return"] = float(trajectory_return)
+
+        flat_handlers: list[RolloutHandler] = []
+        flat_rollout_indices: list[int] = []
+        flat_step_refs: list[dict[str, Any]] = []
+        for index, steps in enumerate(trajectory_steps):
+            if index in excluded_rollout_indices or not steps:
+                continue
+            for step in steps:
+                train_score = float(
+                    step["suffix_return"] if suffix_credit else step["score"]
+                )
+                flat_handlers.append(
+                    self.build_rollout_handler_from_prompt(
+                        prompt_token_ids=list(step["prompt_token_ids"]),
+                        content=str(step["content"]),
+                        score=train_score,
+                        parent_index=int(step["parent_index"]),
+                        sampled_response_token_ids=list(step["response_token_ids"]),
+                    )
+                )
+                flat_rollout_indices.append(index)
+                flat_step_refs.append(step)
 
         if excluded_rollout_indices:
             rollout_parent_indices = [
                 int(
-                    getattr(
-                        handler,
-                        "parent_index",
-                        index // self.config.n,
-                    )
+                    getattr(handler, "parent_index", index // self.config.n)
                 )
                 for index, handler in enumerate(rollout_handler_ls)
             ]
             excluded_rollout_indices = expand_excluded_rollout_parent_groups(
-                rollout_parent_indices,
-                excluded_rollout_indices,
+                rollout_parent_indices, excluded_rollout_indices
             )
-
-        for trajectory_index, steps in enumerate(trajectory_steps):
-            if trajectory_index in excluded_rollout_indices:
-                continue
-            if not steps:
-                continue
-            if not steps[-1]["done"] and rounds >= max_policy_turns:
-                if steps[-1].get("schema_version") == FORMAL_DOMAIN_SCHEMA_V3:
-                    bind_generic_timeout_v3(
-                        steps[-1],
-                        max_policy_turns=max_policy_turns,
-                    )
-                else:
-                    bind_max_round_timeout_failure(
-                        steps[-1],
-                        max_rounds=max_policy_turns,
-                    )
-                rollout_handler_ls[trajectory_index].score = steps[-1]["score"]
-            suffix_scores = compute_suffix_credit_scores(
-                [step["score"] for step in steps],
-                [step["task_round"] for step in steps],
-            )
-            trajectory_return = sum(float(step["score"]) for step in steps)
-            for step in steps:
-                step["trajectory_terminal"] = False
-            steps[-1]["trajectory_terminal"] = True
-            for step, suffix_score in zip(steps, suffix_scores):
-                step["suffix_return"] = float(suffix_score)
-                step["trajectory_return"] = float(trajectory_return)
-
-        if formal_trajectory_credit and not suffix_credit:
-            for handler, step in zip(flat_handlers, flat_step_refs):
-                handler.score = float(step["score"])
-                handler.done = bool(step["done"])
-            flat_done_flags = [bool(step["done"]) for step in flat_step_refs]
-
-        if suffix_credit:
-            for trajectory_index, steps in enumerate(trajectory_steps):
-                if trajectory_index in excluded_rollout_indices:
-                    continue
-                if not steps:
-                    continue
-                for step in steps:
-                    flat_handlers.append(
-                        self.build_rollout_handler_from_prompt(
-                            prompt_token_ids=step["prompt_token_ids"],
-                            content=step["content"],
-                            score=step["suffix_return"],
-                            parent_index=step["parent_index"],
-                            sampled_response_token_ids=step["response_token_ids"],
-                        )
-                    )
-                    parent_indices.append(step["parent_index"])
-                    flat_task_rounds.append(step["task_round"])
-                    flat_done_flags.append(bool(step["done"]))
-                    flat_rollout_indices.append(trajectory_index)
-                    if formal_trajectory_credit:
-                        flat_step_refs.append(step)
-                    if state_aware_group_uid:
-                        uid_overrides.append(step["exact_state_uid"])
-
-        if excluded_rollout_indices:
             keep_positions = trainable_rollout_row_positions(
-                flat_rollout_indices,
-                excluded_rollout_indices,
+                flat_rollout_indices, excluded_rollout_indices
             )
-            flat_handlers = [flat_handlers[position] for position in keep_positions]
-            parent_indices = [parent_indices[position] for position in keep_positions]
-            flat_task_rounds = [flat_task_rounds[position] for position in keep_positions]
-            flat_done_flags = [flat_done_flags[position] for position in keep_positions]
-            flat_rollout_indices = [
-                flat_rollout_indices[position] for position in keep_positions
+            flat_handlers = [
+                flat_handlers[position] for position in keep_positions
             ]
-            if formal_trajectory_credit:
-                flat_step_refs = [
-                    flat_step_refs[position] for position in keep_positions
-                ]
-            if state_aware_group_uid:
-                uid_overrides = [
-                    uid_overrides[position] for position in keep_positions
-                ]
-            print(
-                "AgentMemory excluded infrastructure-failed rollout parent "
-                "groups from PPO rows: "
-                f"indices={sorted(excluded_rollout_indices)}",
-                flush=True,
-            )
+            flat_step_refs = [
+                flat_step_refs[position] for position in keep_positions
+            ]
 
         if not flat_handlers:
-            raise RuntimeError("AgentMemory latest-observation rollout produced no trainable action samples.")
-
-        for idx, rollout_handler in enumerate(rollout_handler_ls):
-            messages[idx] = rollout_handler.messages
-        if global_steps:
-            try:
-                _agentmemory_debug(f"rollout_log_write_start step={global_steps}")
-                os.makedirs(os.path.join(self.config.rollout_log_dir, f"step{global_steps}"), exist_ok=True)
-                with open(os.path.join(self.config.rollout_log_dir, f"step{global_steps}/{torch.distributed.get_rank()}.json"), "w") as f:
-                    json_msg = []
-                    for idx, msgs in enumerate(messages):
-                        records = {
-                            "item_id": rollout_handler_ls[idx].item_id,
-                            "conversations": [msg.to_dict() for msg in msgs],
-                            "reward": rollout_handler_ls[idx].score,
-                            "task_rounds": task_rounds[idx],
-                            "sample_excluded": idx in excluded_rollout_indices,
-                        }
-                        json_msg.append(records)
-                    json.dump(json_msg, f, ensure_ascii=True, indent=4)
-                _agentmemory_debug(f"rollout_log_write_done step={global_steps} records={len(json_msg)}")
-            except Exception as e:
-                print(e, flush=True)
-        formal_pack_kwargs = {}
-        if formal_trajectory_credit:
-            empty_trajectory_indices = [
-                index
-                for index, steps in enumerate(trajectory_steps)
-                if index not in excluded_rollout_indices and not steps
-            ]
-            if empty_trajectory_indices:
-                raise RuntimeError(
-                    "Formal trajectory rollout is missing sampled action rows: "
-                    f"replica_rows={empty_trajectory_indices[:8]}"
-                )
-            if len(flat_step_refs) != len(flat_handlers):
-                raise RuntimeError(
-                    "Formal trajectory row reference count mismatch: "
-                    f"refs={len(flat_step_refs)} handlers={len(flat_handlers)}"
-                )
-            trajectory_return_by_uid = {}
-            for steps in trajectory_steps:
-                if not steps:
-                    continue
-                trajectory_uid = steps[0]["trajectory_uid"]
-                trajectory_return_by_uid[trajectory_uid] = sum(
-                    float(step["score"]) for step in steps
-                )
-            parent_group_uids = [
-                step["parent_group_uid"] for step in flat_step_refs
-            ]
-            exact_state_uids = [
-                step["exact_state_uid"] for step in flat_step_refs
-            ]
-            replica_indices = [step["replica_index"] for step in flat_step_refs]
-            trajectory_uids = [step["trajectory_uid"] for step in flat_step_refs]
-            trajectory_returns = [
-                trajectory_return_by_uid[step["trajectory_uid"]]
-                for step in flat_step_refs
-            ]
-            immediate_rewards = [float(step["score"]) for step in flat_step_refs]
-            trajectory_row_uids = [
-                str(step["trajectory_row_uid"]) for step in flat_step_refs
-            ]
-            trajectory_row_orders = [
-                int(step["trajectory_row_order"]) for step in flat_step_refs
-            ]
-            trajectory_terminals = [
-                bool(step["trajectory_terminal"]) for step in flat_step_refs
-            ]
-            suffix_returns = [
-                float(step["suffix_return"]) for step in flat_step_refs
-            ]
-            action_texts = [str(step["content"]) for step in flat_step_refs]
-            validate_formal_trajectory_rows(
-                parent_group_uids=parent_group_uids,
-                exact_state_uids=exact_state_uids,
-                replica_indices=replica_indices,
-                trajectory_uids=trajectory_uids,
-                trajectory_returns=trajectory_returns,
-                immediate_rewards=immediate_rewards,
-                trajectory_row_uids=trajectory_row_uids,
-                trajectory_row_orders=trajectory_row_orders,
-                trajectory_terminals=trajectory_terminals,
-                parent_indices=parent_indices,
-                rollout_uids=uid_overrides,
-                valid_mask=[True] * len(flat_step_refs),
-                expected_replicas=int(self.config.n),
+            raise RuntimeError(
+                "task-neutral rollout produced no trainable rows after exclusions"
             )
-            formal_pack_kwargs = {
-                "parent_group_uids": parent_group_uids,
-                "exact_state_uids": exact_state_uids,
-                "replica_indices": replica_indices,
-                "trajectory_uids": trajectory_uids,
-                "trajectory_returns": trajectory_returns,
-                "immediate_rewards": immediate_rewards,
-                "trajectory_row_uids": trajectory_row_uids,
-                "trajectory_row_orders": trajectory_row_orders,
-                "trajectory_terminals": trajectory_terminals,
-                "task_rounds": flat_task_rounds,
-                "action_texts": action_texts,
-                "suffix_credit_applied": bool(suffix_credit),
-                "suffix_returns": suffix_returns,
-                "step_records": flat_step_refs,
-            }
+        nonexcluded_empty = [
+            index
+            for index, steps in enumerate(trajectory_steps)
+            if index not in excluded_rollout_indices and not steps
+        ]
+        if nonexcluded_empty:
+            raise RuntimeError(
+                "task-neutral rollout is missing sampled rows for trajectories: "
+                f"{nonexcluded_empty[:8]}"
+            )
+
+        parent_indices = [int(step["parent_index"]) for step in flat_step_refs]
+        parent_group_uids = [str(step["parent_group_uid"]) for step in flat_step_refs]
+        exact_state_uids = [str(step["exact_state_uid"]) for step in flat_step_refs]
+        replica_indices = [int(step["replica_index"]) for step in flat_step_refs]
+        trajectory_uids = [str(step["trajectory_uid"]) for step in flat_step_refs]
+        trajectory_returns = [
+            float(step["trajectory_return"]) for step in flat_step_refs
+        ]
+        immediate_rewards = [float(step["score"]) for step in flat_step_refs]
+        trajectory_row_uids = [
+            str(step["trajectory_row_uid"]) for step in flat_step_refs
+        ]
+        trajectory_row_orders = [
+            int(step["trajectory_row_order"]) for step in flat_step_refs
+        ]
+        trajectory_terminals = [
+            bool(step["trajectory_terminal"]) for step in flat_step_refs
+        ]
+        flat_task_rounds = [int(step["task_round"]) for step in flat_step_refs]
+        flat_done_flags = [bool(step["done"]) for step in flat_step_refs]
+        suffix_returns = [float(step["suffix_return"]) for step in flat_step_refs]
+        action_texts = [str(step["content"]) for step in flat_step_refs]
+        uid_overrides = list(exact_state_uids) if state_aware_group_uid else None
+        validate_formal_trajectory_rows(
+            parent_group_uids=parent_group_uids,
+            exact_state_uids=exact_state_uids,
+            replica_indices=replica_indices,
+            trajectory_uids=trajectory_uids,
+            trajectory_returns=trajectory_returns,
+            immediate_rewards=immediate_rewards,
+            trajectory_row_uids=trajectory_row_uids,
+            trajectory_row_orders=trajectory_row_orders,
+            trajectory_terminals=trajectory_terminals,
+            parent_indices=parent_indices,
+            rollout_uids=uid_overrides or trajectory_uids,
+            valid_mask=[True] * len(flat_step_refs),
+            expected_replicas=int(self.config.n),
+        )
         output = self.pack_rollout_handlers(
             flat_handlers,
             cur_device=cur_device,
             parent_indices=parent_indices,
             done_flags=flat_done_flags,
-            **formal_pack_kwargs,
+            parent_group_uids=parent_group_uids,
+            exact_state_uids=exact_state_uids,
+            replica_indices=replica_indices,
+            trajectory_uids=trajectory_uids,
+            trajectory_returns=trajectory_returns,
+            immediate_rewards=immediate_rewards,
+            trajectory_row_uids=trajectory_row_uids,
+            trajectory_row_orders=trajectory_row_orders,
+            trajectory_terminals=trajectory_terminals,
+            task_rounds=flat_task_rounds,
+            action_texts=action_texts,
+            suffix_credit_applied=bool(suffix_credit),
+            suffix_returns=suffix_returns,
+            step_records=flat_step_refs,
         )
-        output.batch['task_rounds'] = torch.tensor(
-            flat_task_rounds,
-            dtype=torch.float32,
-            device=output.batch['input_ids'].device,
-        )
-        if state_aware_group_uid:
-            if len(uid_overrides) != len(output):
-                raise RuntimeError(
-                    "State-aware AgentMemory grouping produced a uid count mismatch: "
-                    f"uids={len(uid_overrides)} rollout_rows={len(output)}"
+        if uid_overrides is not None:
+            output.non_tensor_batch["rollout_uid"] = np.array(
+                uid_overrides, dtype=object
+            )
+        if global_steps is not None:
+            try:
+                log_dir = os.path.join(
+                    self.config.rollout_log_dir, f"step{global_steps}"
                 )
-            output.non_tensor_batch["rollout_uid"] = np.array(uid_overrides, dtype=object)
+                os.makedirs(log_dir, exist_ok=True)
+                rank = (
+                    torch.distributed.get_rank()
+                    if torch.distributed.is_initialized()
+                    else 0
+                )
+                with open(os.path.join(log_dir, f"{rank}.json"), "w") as handle:
+                    json.dump(
+                        [
+                            {
+                                "item_id": rollout_handler_ls[index].item_id,
+                                "conversations": policy_messages[index],
+                                "reward": float(
+                                    sum(float(step["score"]) for step in steps)
+                                ),
+                                "step_records": steps,
+                            }
+                            for index, steps in enumerate(trajectory_steps)
+                            if index not in excluded_rollout_indices and steps
+                        ],
+                        handle,
+                        ensure_ascii=True,
+                        indent=2,
+                    )
+            except Exception as exc:
+                print(f"Task-neutral rollout log write failed: {exc}", flush=True)
         return output
-
 
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
-        # rebuild vllm cache engine
         if self.config.free_cache_engine:
             self._maybe_resume_engine()
 
-        global_steps = prompts.meta_info.get('global_steps', None)
+        global_steps = prompts.meta_info.get("global_steps", None)
         max_policy_turns = prompts.meta_info.get(
-            'max_policy_turns',
-            prompts.meta_info.get('max_rounds', 10),
+            "max_policy_turns", prompts.meta_info.get("max_rounds", 10)
         )
         cur_device = prompts.batch["input_ids"].device
-
-        do_sample = prompts.meta_info.get('do_sample', True)
-        if not do_sample:
-            kwargs = {
-                'best_of': 1,
-                'top_p': 1.0,
-                'top_k': -1,
-                'min_p': 0.0,
-                'temperature': 0,
-                'n': 1  # if greedy, only 1 response
+        sampling_kwargs = dict(kwargs)
+        if not prompts.meta_info.get("do_sample", True):
+            sampling_kwargs = {
+                "best_of": 1,
+                "top_p": 1.0,
+                "top_k": -1,
+                "min_p": 0.0,
+                "temperature": 0,
+                "n": 1,
             }
 
-        # repeat for self.config.n times to rollout
-        batch_size = prompts.batch['input_ids'].size(0)
-        batch_size *= self.config.n
-        rollout_handler_ls = self.preprocess_prompt_to_rollout_handler(prompts, n=self.config.n)
-        assert_rollout_context_supported(self.agentgym_config)
+        rollout_handler_ls = self.preprocess_prompt_to_rollout_handler(
+            prompts, n=self.config.n
+        )
         multitask_env_addrs = configured_multitask_env_addrs(
             self.agentgym_config
         )
@@ -2306,8 +1885,7 @@ class vLLMRollout(BaseRollout):
                 init_env_client(
                     self.agentgym_config,
                     env_addr=env_addr_for_surface_slot(
-                        self.agentgym_config,
-                        handler.agentmemory_surface_slot,
+                        self.agentgym_config, handler.agentmemory_surface_slot
                     ),
                 )
                 for handler in rollout_handler_ls
@@ -2325,183 +1903,29 @@ class vLLMRollout(BaseRollout):
                 )
             env_clients = [
                 init_env_client(self.agentgym_config)
-                for _ in range(batch_size)
+                for _ in rollout_handler_ls
             ]
-        time.sleep(self.config.send_interval) # take a break before sendng request
-        task_name = str(read_config(self.agentgym_config, "task_name", "")).lower()
-        if task_name == "agentmemory" and rollout_context_policy(self.agentgym_config) == "latest_observation_only":
-            output = self.generate_agentmemory_latest_observation(
+        try:
+            time.sleep(self.config.send_interval)
+            return self.generate_task_neutral_policy(
                 rollout_handler_ls=rollout_handler_ls,
                 env_clients=env_clients,
                 cur_device=cur_device,
                 max_policy_turns=max_policy_turns,
-                sampling_kwargs=kwargs,
+                sampling_kwargs=sampling_kwargs,
                 global_steps=global_steps,
             )
-            for close_idx, client in enumerate(env_clients):
+        finally:
+            for index, client in enumerate(env_clients):
+                close = getattr(client, "close", None)
+                if not callable(close):
+                    continue
                 try:
-                    _agentmemory_debug(f"close_start idx={close_idx}")
-                    close_started = time.time()
-                    client.close()
-                    _agentmemory_debug(f"close_done idx={close_idx} seconds={time.time() - close_started:.2f}")
-                except Exception as e:
-                    print(f"Error during closing env idx={close_idx}: {e}", flush=True)
+                    close()
+                except Exception as exc:
+                    print(
+                        f"Task-neutral env close failed index={index}: {exc}",
+                        flush=True,
+                    )
             if self.config.free_cache_engine:
                 self._maybe_release_engine()
-            return output
-
-        all_done_flag = False
-        for idx, rollout_handler in enumerate(rollout_handler_ls):
-            try:
-                env_clients[idx].reset(resolve_rollout_reset_index(rollout_handler))
-                task = env_clients[idx].observe()
-                rollout_handler.add_user_message(self.tokenizer, task)
-            except TimeoutError:
-                print(f"Reset Timeout: Webarena Env Timeout. item id = {rollout_handler.item_id}")
-                rollout_handler.done = True
-                rollout_handler.score = 0
-
-        rounds = 0
-        task_rounds = [0] * batch_size
-        rollout_bar = tqdm(total = max_policy_turns, desc="Running rounds", disable=torch.distributed.get_rank() != 0)
-        def agent_step(i, idx):
-            content = self.tokenizer.decode(response_ids[i], skip_special_tokens=True)
-            rollout_handler_ls[idx].add_assistant_message(self.tokenizer, content)
-            task_rounds[idx] += 1
-            try:
-                step_output = env_clients[idx].step(content)
-                state, rollout_handler_ls[idx].score, rollout_handler_ls[idx].done = (
-                    step_output.state,
-                    step_output.reward,
-                    step_output.done,
-                )
-                rollout_handler_ls[idx].add_user_message(self.tokenizer, state)
-                return step_output.done
-            except Exception as e:
-                rollout_handler_ls[idx].score = 0
-                rollout_handler_ls[idx].done = True
-                print(f"Rollou step Error: {e} item id = {rollout_handler_ls[idx].item_id}")
-                return True
-        while rounds < max_policy_turns and not all_done_flag:
-            # get generation prompt
-            generation_prompt_idxs = []
-            not_done_idxs = []
-            for idx, rollout_handler in enumerate(rollout_handler_ls):
-                if not rollout_handler.done:
-                    generation_prompt_idxs.append(rollout_handler.get_generation_prompt(self.tokenizer))
-                    not_done_idxs.append(idx)
-
-            rollout_bar.set_description(f"Rounds {rounds + 1}/{max_policy_turns} | Active agents per gpu: {len(not_done_idxs)}")
-            # users can customize different sampling_params at different run
-            with self.update_sampling_params(**kwargs):
-                output = self.inference_engine.generate(
-                    prompts=None,
-                    prompt_token_ids=generation_prompt_idxs,
-                    sampling_params=self.sampling_params,
-                    use_tqdm=False)
-            response_ids = self._output_token_id_lists(output)
-            all_done_flag = True
-            time.sleep(self.config.send_interval) # take a break before sendng request
-            if len(not_done_idxs) > 0:
-                with ThreadPoolExecutor(max_workers=len(not_done_idxs)) as executor:
-                    step_dones = list(executor.map(
-                        lambda args: agent_step(*args), [(i, idx) for i, idx in enumerate(not_done_idxs)]
-                    ))
-                    all_done_flag = all(step_dones)
-            rounds += 1
-            rollout_bar.update(1)
-
-        # process ids
-        rollout_bar.close()
-        response_ids, response_attention_mask, response_position_ids, response_loss_mask = [], [], [], []
-        scores, messages = [], []
-
-        for rollout_handler in rollout_handler_ls:
-            # check length
-            rollout_handler.truncate_output_ids()
-            assert len(rollout_handler.input_ids) == len(rollout_handler.attention_mask) == len(rollout_handler.position_ids) == len(rollout_handler.loss_mask), f"""Rollout Handler has different length of {len(rollout_handler.input_ids)=},
-            {len(rollout_handler.attention_mask)=}, {len(rollout_handler.position_ids)=}, {len(rollout_handler.loss_mask)=}"""
-            assert len(rollout_handler.input_ids) <= self.config.max_model_len, f"Rollout Handler has sequence length {len(rollout_handler.input_ids)} > max_sequence_length {self.config.max_model_len}"
-
-            response_ids.append(torch.tensor(rollout_handler.response_ids, dtype=torch.int, device=cur_device))
-            response_attention_mask.append(torch.tensor(rollout_handler.response_attention_mask, dtype=torch.int, device=cur_device))
-            response_position_ids.append(torch.tensor(rollout_handler.response_position_ids, dtype=torch.int, device=cur_device))
-            response_loss_mask.append(torch.tensor(rollout_handler.response_loss_mask, dtype=torch.int, device=cur_device))
-            scores.append(rollout_handler.score)
-            messages.append(rollout_handler.messages)
-
-        # pad to length
-        response_ids = pad_sequence(response_ids, batch_first=True, padding_value=self.pad_token_id)
-        if response_ids.shape[1] < self.config.response_length:
-            response_ids = pad_sequence_to_length(response_ids, self.config.response_length, self.pad_token_id)
-        response_attention_mask = pad_sequence(response_attention_mask, batch_first=True, padding_value=0)
-        if response_attention_mask.shape[1] < self.config.response_length:
-            response_attention_mask = pad_sequence_to_length(response_attention_mask, self.config.response_length, 0)
-        response_loss_mask = pad_sequence(response_loss_mask, batch_first=True, padding_value=0)
-        if response_loss_mask.shape[1] < self.config.response_length:
-            response_loss_mask = pad_sequence_to_length(response_loss_mask, self.config.response_length, 0)
-        response_length = response_ids.size(1)
-        delta_position_ids = torch.arange(1, response_length + 1, device=cur_device)
-        delta_position_ids = delta_position_ids.unsqueeze(0).repeat(batch_size, 1)
-        input_ids = prompts.batch['input_ids']  # (bs, prompt_length)
-        prompt_length = input_ids.size(-1)
-        # left-padded attention_mask
-        attention_mask = prompts.batch['attention_mask']
-        position_ids = prompts.batch['position_ids']
-        input_ids = input_ids.repeat_interleave(self.config.n, dim=0)
-        attention_mask = attention_mask.repeat_interleave(self.config.n, dim=0)
-        position_ids = position_ids.repeat_interleave(self.config.n, dim=0)
-        response_position_ids = position_ids[:, -1:] + delta_position_ids
-
-        seq = torch.cat((input_ids, response_ids), dim=-1)
-        attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
-        position_ids = torch.cat((position_ids, response_position_ids), dim=-1)
-        response_mask = response_loss_mask
-
-        reward_tensor = torch.zeros_like(response_ids, dtype=torch.float32) # (bs, response_length)
-        valid_response_length = attention_mask[:, prompt_length:].sum(dim=-1)
-        for i in range(len(scores)):
-            reward_tensor[i, valid_response_length[i].item() - 1] = scores[i]
-
-        if global_steps:
-            try:
-                os.makedirs(os.path.join(self.config.rollout_log_dir, f"step{global_steps}"), exist_ok=True)
-                with open(os.path.join(self.config.rollout_log_dir, f"step{global_steps}/{torch.distributed.get_rank()}.json"), "w") as f:
-                    json_msg = []
-                    for idx, msgs in enumerate(messages):
-                        records = {
-                            "item_id": rollout_handler_ls[idx].item_id,
-                            "conversations": [msg.to_dict() for msg in msgs],
-                            "reward": scores[idx]
-                        }
-                        json_msg.append(records)
-                    json.dump(json_msg, f, ensure_ascii=True, indent=4)
-            except Exception as e:
-                print(e)
-
-        # close clients
-        for client in env_clients:
-            try:
-                client.close()
-            except Exception as e:
-                print(f"Error during closing env: {e}")
-
-        batch = TensorDict(
-            {
-                'prompts': input_ids,
-                'responses': response_ids,
-                'input_ids': seq,
-                'attention_mask': attention_mask,
-                'position_ids': position_ids,
-                'response_mask': response_mask,
-                'scores': reward_tensor,
-                'task_rounds': torch.tensor(task_rounds, dtype=torch.float32).to(input_ids.device),
-                'task_scores': reward_tensor
-            },
-            batch_size=batch_size)
-
-        # free vllm cache engine
-        if self.config.free_cache_engine:
-            self._maybe_release_engine()
-
-        return DataProto(batch=batch)

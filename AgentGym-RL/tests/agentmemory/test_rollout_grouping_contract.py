@@ -83,7 +83,7 @@ class RolloutGroupingContractTest(unittest.TestCase):
             / "verl/workers/rollout/agent_vllm_rollout/vllm_rollout.py"
         )
         source = rollout_path.read_text()
-        function_start = source.index("def generate_agentmemory_latest_observation")
+        function_start = source.index("def generate_task_neutral_policy")
         function_end = source.index("@torch.no_grad()", function_start)
         function_source = source[function_start:function_end]
 
@@ -102,16 +102,19 @@ class RolloutGroupingContractTest(unittest.TestCase):
         ):
             self.assertIn(required, function_source)
         self.assertLess(
-            function_source.index('getattr(env_clients[idx], "sample_excluded"'),
-            function_source.index('env_info_after = ('),
+            function_source.index(
+                'getattr(env_clients[index], "sample_excluded"'
+            ),
+            function_source.index("step_record = build_task_neutral_step_record"),
         )
         pack_start = source.index("def pack_rollout_handlers")
-        pack_end = source.index("def latest_observation_prompt_from_text", pack_start)
+        pack_end = source.index("def _task_neutral_prompt_from_messages", pack_start)
         pack_source = source[pack_start:pack_end]
         self.assertIn("AGENTMEMORY_STEP_RECORD_JSON", pack_source)
         self.assertIn("validate_formal_runtime_evidence_rows", pack_source)
-        self.assertIn("FORMAL_WEBSHOP_SCHEMA_V2", pack_source)
-        self.assertIn("FORMAL_DOMAIN_SCHEMA_V3", pack_source)
+        self.assertIn("TASK_NEUTRAL_POLICY_STEP_SCHEMA", pack_source)
+        self.assertNotIn("FORMAL_WEBSHOP_SCHEMA_V2", pack_source)
+        self.assertNotIn("FORMAL_DOMAIN_SCHEMA_V3", pack_source)
 
     def test_infra_failure_removes_the_complete_parent_group(self):
         expanded = expand_excluded_rollout_parent_groups(

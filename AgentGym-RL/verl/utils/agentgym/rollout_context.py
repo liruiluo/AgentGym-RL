@@ -24,6 +24,9 @@ from verl.utils.agentgym.formal_domain_v3 import (
 )
 
 
+TASK_NEUTRAL_POLICY_STEP_SCHEMA = "task_neutral_policy_step_v1"
+
+
 AGENTMEMORY_PARENT_GROUP_UID = "agentmemory_parent_group_uid"
 AGENTMEMORY_EXACT_STATE_UID = "agentmemory_exact_state_uid"
 AGENTMEMORY_REPLICA_INDEX = "agentmemory_replica_index"
@@ -1040,6 +1043,32 @@ def _validate_formal_step_record(
             f"Invalid formal step record JSON at row {row_index}."
         ) from exc
     schema_version = record.get("schema_version")
+    if schema_version == TASK_NEUTRAL_POLICY_STEP_SCHEMA:
+        return _validate_task_neutral_policy_step_record(
+            record,
+            row_index=row_index,
+            expected_exact_state_uid=expected_exact_state_uid,
+            expected_trajectory_uid=expected_trajectory_uid,
+            expected_trajectory_row_uid=expected_trajectory_row_uid,
+            expected_trajectory_row_order=expected_trajectory_row_order,
+            expected_trajectory_terminal=expected_trajectory_terminal,
+            expected_task_round=expected_task_round,
+            expected_immediate_reward=expected_immediate_reward,
+            expected_suffix_return=expected_suffix_return,
+            expected_trajectory_return=expected_trajectory_return,
+            expected_action_text=expected_action_text,
+            expected_done=expected_done,
+            expected_generation_length=expected_generation_length,
+            expected_generation_digest=expected_generation_digest,
+            expected_packed_length=expected_packed_length,
+            expected_packed_digest=expected_packed_digest,
+            expected_generation_response_length=expected_generation_response_length,
+            expected_generation_response_digest=expected_generation_response_digest,
+            expected_packed_response_length=expected_packed_response_length,
+            expected_packed_response_digest=expected_packed_response_digest,
+            expected_suffix_credit_applied=expected_suffix_credit_applied,
+            tolerance=tolerance,
+        )
     if schema_version == FORMAL_DOMAIN_SCHEMA_V3:
         return _validate_formal_domain_step_record_v3(
             record,
@@ -1830,6 +1859,176 @@ def _validate_formal_step_record(
         raise ValueError(f"Formal success row is not done at row {row_index}.")
     if record["outcome"] == "max_rounds" and record["done"]:
         raise ValueError(f"Formal max-round row is unexpectedly done at row {row_index}.")
+    return record
+
+
+def _validate_task_neutral_policy_step_record(
+    record: dict[str, Any],
+    *,
+    row_index: int,
+    expected_exact_state_uid: str,
+    expected_trajectory_uid: str,
+    expected_trajectory_row_uid: str,
+    expected_trajectory_row_order: int,
+    expected_trajectory_terminal: bool,
+    expected_task_round: int,
+    expected_immediate_reward: float,
+    expected_suffix_return: float,
+    expected_trajectory_return: float,
+    expected_action_text: str,
+    expected_done: bool,
+    expected_generation_length: int,
+    expected_generation_digest: str,
+    expected_packed_length: int,
+    expected_packed_digest: str,
+    expected_generation_response_length: int,
+    expected_generation_response_digest: str,
+    expected_packed_response_length: int,
+    expected_packed_response_digest: str,
+    expected_suffix_credit_applied: bool,
+    tolerance: float,
+) -> dict[str, Any]:
+    """Validate lifecycle-neutral rows, including policy control turns."""
+
+    required = {
+        "schema_version",
+        "item_id",
+        "exact_state_uid",
+        "trajectory_uid",
+        "trajectory_row_uid",
+        "trajectory_row_order",
+        "trajectory_terminal",
+        "task_round",
+        "action",
+        "response_token_ids",
+        "response_token_count",
+        "max_response_tokens",
+        "finish_reason",
+        "finish_reason_source",
+        "stop_reason",
+        "generation_backend_source",
+        "generation_stop_reason",
+        "generation_eos_token_ids",
+        "tokenizer_primary_eos_token_id",
+        "tokenizer_pad_token_id",
+        "generation_token_ids_are_exact",
+        "backend_token_ids_are_exact",
+        "truncated",
+        "env_result",
+        "env_info_before",
+        "env_info_after",
+        "action_submission",
+        "context_transition",
+        "wrapper_evidence",
+        "immediate_reward",
+        "suffix_return",
+        "suffix_credit_applied",
+        "trajectory_return",
+        "done",
+        "outcome",
+        "generation_prompt_length",
+        "generation_prompt_digest",
+        "packed_prompt_length",
+        "packed_prompt_digest",
+        "generation_response_length",
+        "generation_response_digest",
+        "packed_response_length",
+        "packed_response_digest",
+    }
+    missing = sorted(required - set(record))
+    if missing:
+        raise ValueError(
+            f"Task-neutral step record is missing fields at row {row_index}: {missing}"
+        )
+    if record["schema_version"] != TASK_NEUTRAL_POLICY_STEP_SCHEMA:
+        raise ValueError(f"Task-neutral schema drift at row {row_index}.")
+    for name in ("action", "env_result", "outcome"):
+        if not isinstance(record[name], str):
+            raise ValueError(
+                f"Task-neutral step record {name} must be text at row {row_index}."
+            )
+    for name in ("env_info_before", "env_info_after", "action_submission", "context_transition", "wrapper_evidence"):
+        if not isinstance(record[name], dict):
+            raise ValueError(
+                f"Task-neutral step record {name} must be an object at row {row_index}."
+            )
+    response_ids = record["response_token_ids"]
+    if not isinstance(response_ids, list) or not response_ids:
+        raise ValueError(
+            f"Task-neutral response tokens must be a non-empty list at row {row_index}."
+        )
+    bool_fields = (
+        "trajectory_terminal",
+        "generation_token_ids_are_exact",
+        "backend_token_ids_are_exact",
+        "truncated",
+        "suffix_credit_applied",
+        "done",
+    )
+    for field in bool_fields:
+        if not isinstance(record[field], (bool, np.bool_)):
+            raise ValueError(
+                f"Task-neutral field {field} must be boolean at row {row_index}."
+            )
+    if not record["generation_token_ids_are_exact"] or not record[
+        "backend_token_ids_are_exact"
+    ]:
+        raise ValueError(f"Task-neutral token IDs are not exact at row {row_index}.")
+    if record["outcome"] not in {
+        "continue",
+        "success",
+        "terminal_failure",
+        "environment_error",
+        "max_rounds",
+    }:
+        raise ValueError(
+            f"Invalid task-neutral step outcome at row {row_index}: {record['outcome']!r}"
+        )
+    if record["outcome"] == "success" and not record["done"]:
+        raise ValueError(f"Task-neutral success row is not done at row {row_index}.")
+
+    exact_expectations = {
+        "exact_state_uid": expected_exact_state_uid,
+        "trajectory_uid": expected_trajectory_uid,
+        "trajectory_row_uid": expected_trajectory_row_uid,
+        "trajectory_row_order": expected_trajectory_row_order,
+        "trajectory_terminal": expected_trajectory_terminal,
+        "task_round": expected_task_round,
+        "action": expected_action_text,
+        "done": expected_done,
+        "generation_prompt_length": expected_generation_length,
+        "generation_prompt_digest": expected_generation_digest,
+        "packed_prompt_length": expected_packed_length,
+        "packed_prompt_digest": expected_packed_digest,
+        "generation_response_length": expected_generation_response_length,
+        "generation_response_digest": expected_generation_response_digest,
+        "packed_response_length": expected_packed_response_length,
+        "packed_response_digest": expected_packed_response_digest,
+        "suffix_credit_applied": expected_suffix_credit_applied,
+    }
+    for name, expected in exact_expectations.items():
+        if record[name] != expected:
+            raise ValueError(
+                f"Task-neutral step record {name} mismatch at row {row_index}: "
+                f"expected={expected!r} actual={record[name]!r}."
+            )
+    for name, expected in {
+        "immediate_reward": expected_immediate_reward,
+        "suffix_return": expected_suffix_return,
+        "trajectory_return": expected_trajectory_return,
+    }.items():
+        try:
+            actual = float(record[name])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid task-neutral reward field {name} at row {row_index}."
+            ) from exc
+        if not math.isfinite(actual) or not math.isclose(
+            actual, float(expected), rel_tol=tolerance, abs_tol=tolerance
+        ):
+            raise ValueError(
+                f"Task-neutral reward field {name} mismatch at row {row_index}."
+            )
     return record
 
 

@@ -834,38 +834,31 @@ class FormalDomainRolloutV3Test(unittest.TestCase):
             ],
         )
 
-    def test_rollout_source_keeps_v3_schema_and_skips_buy_validator(self):
+    def test_shared_rollout_uses_task_neutral_schema_and_no_buy_validator(self):
         source_path = (
             ROOT
             / "verl/workers/rollout/agent_vllm_rollout/vllm_rollout.py"
         )
         source = source_path.read_text(encoding="utf-8")
         pack_start = source.index("def pack_rollout_handlers")
-        pack_end = source.index("def latest_observation_prompt_from_text", pack_start)
+        pack_end = source.index("def _task_neutral_prompt_from_messages", pack_start)
         pack_source = source[pack_start:pack_end]
         self.assertIn('schema_version = record.get(', pack_source)
         self.assertIn('"schema_version": schema_version', pack_source)
-        self.assertNotIn(
-            '"schema_version": "agentmemory_formal_step_v2"',
-            pack_source,
-        )
+        self.assertIn("TASK_NEUTRAL_POLICY_STEP_SCHEMA", pack_source)
+        self.assertNotIn("FORMAL_WEBSHOP_SCHEMA_V2", pack_source)
+        self.assertNotIn("FORMAL_DOMAIN_SCHEMA_V3", pack_source)
 
-        rollout_start = source.index("def generate_agentmemory_latest_observation")
+        rollout_start = source.index("def generate_task_neutral_policy")
         rollout_end = source.index("@torch.no_grad()", rollout_start)
         rollout_source = source[rollout_start:rollout_end]
-        v3_start = rollout_source.index(
-            "if formal_schema_version == FORMAL_DOMAIN_SCHEMA_V3:"
-        )
-        v3_end = rollout_source.index("else:", v3_start)
-        v3_source = rollout_source[v3_start:v3_end]
-        self.assertIn("build_formal_domain_step_v3", v3_source)
-        self.assertNotIn("validate_formal_buy_transition", v3_source)
-        self.assertIn(
-            "system_prompt=rollout_handler.formal_system_prompt",
-            rollout_source,
-        )
-        self.assertIn("system_prompt=formal_system_prompt", rollout_source)
-        self.assertIn("except FormalRuntimeEvidenceError:", rollout_source)
+        self.assertIn("prepare_policy_turn", rollout_source)
+        self.assertIn("complete_policy_turn", rollout_source)
+        self.assertIn("build_task_neutral_step_record", rollout_source)
+        self.assertIn("receipt_parts", rollout_source)
+        self.assertNotIn("validate_formal_buy_transition", rollout_source)
+        self.assertNotIn("build_formal_domain_step_v3", rollout_source)
+        self.assertNotIn("_build_formal_webshop_step_v2", rollout_source)
 
 
 if __name__ == "__main__":

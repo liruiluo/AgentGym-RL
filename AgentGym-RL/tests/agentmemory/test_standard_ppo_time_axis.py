@@ -396,18 +396,18 @@ class TrainerRoutingTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "SUFFIX_CREDIT=0"):
                 functions["_validate_formal_actor_advantage_config"](config)
 
-    def test_no_suffix_timeout_penalty_is_copied_to_packed_handler(self) -> None:
+    def test_task_neutral_score_is_bound_before_packing(self) -> None:
         source = (
             ROOT / "verl/workers/rollout/agent_vllm_rollout/vllm_rollout.py"
         ).read_text(encoding="utf-8")
-        sync = "for handler, step in zip(flat_handlers, flat_step_refs):\n                handler.score = float(step[\"score\"])"
-        self.assertIn(sync, source)
-        self.assertLess(source.index("bind_max_round_timeout_failure("), source.index(sync))
-        sync_index = source.index(sync)
+        score_index = source.index("train_score = float(")
+        self.assertIn("step[\"suffix_return\"] if suffix_credit else step[\"score\"]", source)
+        handler_index = source.index("score=train_score", score_index)
         packed_after_sync = source.index(
-            "output = self.pack_rollout_handlers(", sync_index
+            "output = self.pack_rollout_handlers(", handler_index
         )
-        self.assertLess(sync_index, packed_after_sync)
+        self.assertLess(score_index, handler_index)
+        self.assertLess(handler_index, packed_after_sync)
 
 
 if __name__ == "__main__":
