@@ -407,24 +407,35 @@ def resolve_rollout_reset_index(handler: Any) -> int:
     ``item_id`` is an opaque source identity for coding datasets.  Reset must
     therefore fail closed when the rollout handler is missing its separately
     routed integer ``data_idx`` instead of parsing or falling back to item_id.
+    A routed multitask row additionally carries the endpoint-local index.  The
+    stream ``data_idx`` identifies the global source position, while the
+    endpoint must reset using that row's local position within the selected
+    surface.
     """
 
     if not hasattr(handler, "data_idx"):
         raise ProceduralIndexError(
             "rollout handler is missing the authoritative data_idx"
         )
-    candidate = handler.data_idx
+    reset_field = (
+        MULTITASK_LOCAL_DATA_INDEX_KEY
+        if hasattr(handler, MULTITASK_LOCAL_DATA_INDEX_KEY)
+        else "data_idx"
+    )
+    candidate = getattr(handler, reset_field)
     if isinstance(candidate, bool):
-        raise ProceduralIndexError("rollout handler data_idx must not be bool")
+        raise ProceduralIndexError(
+            f"rollout handler {reset_field} must not be bool"
+        )
     try:
         resolved = operator.index(candidate)
     except TypeError as exc:
         raise ProceduralIndexError(
-            f"rollout handler data_idx is not an integer: {candidate!r}"
+            f"rollout handler {reset_field} is not an integer: {candidate!r}"
         ) from exc
     if resolved < 0:
         raise ProceduralIndexError(
-            f"rollout handler data_idx must be non-negative: {resolved}"
+            f"rollout handler {reset_field} must be non-negative: {resolved}"
         )
     return int(resolved)
 

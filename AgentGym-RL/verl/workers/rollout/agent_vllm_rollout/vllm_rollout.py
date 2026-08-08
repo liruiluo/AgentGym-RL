@@ -789,7 +789,10 @@ class vLLMRollout(BaseRollout):
                         Message(role=prompt["role"], content=prompt["content"]) for prompt in raw_prompt
                     ],
                     task_name=raw_item_id.split("_", 1)[0],
-                    item_id=parsed_item_id,
+                    # Preserve the opaque dataset identity in every task-neutral
+                    # receipt.  The parsed suffix is only a legacy reset fallback;
+                    # it must never replace the source identity used for audit.
+                    item_id=raw_item_id,
                     score=0,
                     done=False,
                     input_ids=list(input_ids),

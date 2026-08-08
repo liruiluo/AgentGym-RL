@@ -1148,7 +1148,7 @@ class RolloutHandler:
         self,
         messages: List[Message],
         task_name: str,
-        item_id: int,
+        item_id: str | int,
         score: float,
         done: bool,
         input_ids: List[int],

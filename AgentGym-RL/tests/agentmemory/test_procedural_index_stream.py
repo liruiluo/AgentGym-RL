@@ -649,6 +649,20 @@ class ProceduralIndexSourceTests(unittest.TestCase):
         )
         self.assertEqual(resolve_rollout_reset_index(handler), 271)
 
+    def test_routed_reset_uses_endpoint_local_index(self) -> None:
+        handler = SimpleNamespace(
+            item_id="agentmemory_u3_0",
+            data_idx=0,
+            agentmemory_local_data_idx=694,
+        )
+        self.assertEqual(resolve_rollout_reset_index(handler), 694)
+
+        for invalid in (True, -1, "694"):
+            with self.subTest(invalid=invalid):
+                handler.agentmemory_local_data_idx = invalid
+                with self.assertRaises(ProceduralIndexError):
+                    resolve_rollout_reset_index(handler)
+
     def test_reset_index_never_falls_back_to_item_identity(self) -> None:
         with self.assertRaisesRegex(ProceduralIndexError, "missing.*data_idx"):
             resolve_rollout_reset_index(SimpleNamespace(item_id="task_7"))

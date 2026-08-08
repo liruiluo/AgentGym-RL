@@ -27,6 +27,8 @@ class SharedRolloutActiveSourceTest(unittest.TestCase):
             "active shared rollout still contains domain-specific paths: "
             + ", ".join(hits),
         )
+        self.assertIn("item_id=raw_item_id", source)
+        self.assertNotIn("item_id=parsed_item_id", source)
 
 
 if __name__ == "__main__":
