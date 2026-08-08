@@ -344,6 +344,10 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         )
         self.assertEqual(len(client.native_calls), 1)
         self.assertEqual(
+            action_output.info["wrapper_evidence"]["workspace_continuity_id"],
+            client.env_id,
+        )
+        self.assertEqual(
             (action_output.info["policy_step_after"],
              action_output.info["native_call_count_after"]),
             (1, 1),
@@ -365,6 +369,10 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         )
 
         self.assertEqual(len(client.native_calls), 1)
+        self.assertEqual(
+            compaction_output.info["wrapper_evidence"]["workspace_continuity_id"],
+            client.env_id,
+        )
         self.assertEqual(
             (compaction_output.info["native_call_count_before"],
              compaction_output.info["native_call_count_after"]),

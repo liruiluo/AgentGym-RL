@@ -63,9 +63,10 @@ Status: frozen for the first AgentMemoryGym SWE-smith PPO update.
 
 ## First PPO gate
 
-- The learner runs on all eight B200s in `6.5.167.119` from the first real
-  optimizer update. A single-GPU process may preheat independent environment
-  dependencies, but it is not a learner gate.
+- The learner runs on all eight B200s in the lane recorded by the frozen
+  launcher and read-only inventory at launch time. Pod IPs are runtime
+  evidence, never a permanent role assignment. A single-GPU process may
+  preheat independent environment dependencies, but it is not a learner gate.
 - The first batch uses eight source episodes aligned with eight ranks to reduce
   environment concurrency variables while still exercising full eight-rank
   FSDP actor, critic, optimizer, checkpoint, and readback paths.
@@ -74,3 +75,15 @@ Status: frozen for the first AgentMemoryGym SWE-smith PPO update.
   auditable per-trajectory tool/final/verifier evidence, zero owned Ray/vLLM
   residue after a bounded gate, and restored GPU+CPU holders. Passing the gate
   continues into training rather than falling back to single-GPU PPO.
+
+## Resident endpoint
+
+- One resident HTTP process may serve all learner ranks. Each client obtains a
+  distinct slot from `/create`; reset binds that slot to exactly one dataset
+  index and one exclusive workspace/UID lease.
+- Before PPO launch, the eight-slot verifier must bind indices `0..7`, prove
+  unique slot, audit, workspace, and production UID identities, exercise
+  isolated write/read actions, close every slot, and attest zero active slots,
+  environments, workspaces, and workspace residue.
+- Endpoint reuse is allowed only when its source/data/image/runtime fingerprint
+  matches the frozen launcher and metadata reports zero active environments.
