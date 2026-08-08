@@ -78,6 +78,7 @@ class FakeWebShopClient(AgentMemoryEnvClient):
         self._responses = list(responses)
         self.native_calls: list[str] = []
         self._reset_policy_transition_state(self.info["env_info"])
+        self.configure_policy_system_prompt("Canonical WebShop tool contract")
 
     def __len__(self) -> int:
         return 1
@@ -167,13 +168,35 @@ def webshop_buy_response() -> dict:
 
 
 class SharedWrapperPolicyTurnTest(unittest.TestCase):
+    @staticmethod
+    def bind_webshop(client: FakeWebShopClient) -> list[dict[str, str]]:
+        return bind_initial_policy_context(
+            client,
+            [
+                {
+                    "role": "user",
+                    "content": "Legacy prompt requiring Thought and Action labels",
+                },
+                {"role": "assistant", "content": "Ok."},
+                {"role": "user", "content": client.observe()},
+            ],
+        )
+
     def test_webshop_uses_native_action_then_local_handoff(self) -> None:
         client = FakeWebShopClient(
             [webshop_search_response(), webshop_buy_response()]
         )
-        framing = [{"role": "system", "content": "WebShop tool contract"}]
-        messages = bind_initial_policy_context(client, framing)
-        messages.append({"role": "user", "content": client.observe()})
+        messages = self.bind_webshop(client)
+        self.assertEqual(
+            messages,
+            [
+                {
+                    "role": "system",
+                    "content": "Canonical WebShop tool contract",
+                },
+                {"role": "user", "content": "session-0 fresh observation"},
+            ],
+        )
 
         search = prepare(client, messages)
         self.assertIsNone(search.control_request)
@@ -183,10 +206,20 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertEqual(client.native_calls, ["search[black mug]"])
         self.assertEqual(
             search_output.info["context_transition"]["operation"],
-            "append_observation",
+            "replace_messages",
         )
-        self.assertIn("search[black mug]", str(messages))
-        self.assertIn("session-0 search result", str(messages))
+        self.assertEqual(
+            messages,
+            [
+                {
+                    "role": "system",
+                    "content": "Canonical WebShop tool contract",
+                },
+                {"role": "user", "content": "session-0 search result"},
+            ],
+        )
+        self.assertNotIn("search[black mug]", str(messages))
+        self.assertNotIn("session-0 fresh observation", str(messages))
 
         buy = prepare(client, messages)
         self.assertIsNone(buy.control_request)
@@ -252,9 +285,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
 
     def test_invalid_webshop_handoff_remains_evidence_but_not_context(self) -> None:
         client = FakeWebShopClient([webshop_buy_response()])
-        framing = [{"role": "system", "content": "WebShop tool contract"}]
-        messages = bind_initial_policy_context(client, framing)
-        messages.append({"role": "user", "content": client.observe()})
+        messages = self.bind_webshop(client)
         buy_output, messages = complete_policy_turn(
             client, prepare(client, messages), "click[Buy Now]"
         )
@@ -273,6 +304,28 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertNotIn(invalid, str(messages))
         self.assertIn("session-1 fresh observation", str(messages))
         self.assertEqual(client.native_calls, ["click[Buy Now]"])
+
+    def test_invalid_native_output_is_evidence_not_successor_context(self) -> None:
+        client = FakeWebShopClient([webshop_search_response()])
+        messages = self.bind_webshop(client)
+        invalid = '<ShellCommand {"command":"cat note.md"}>'
+
+        output, messages = complete_policy_turn(
+            client,
+            prepare(client, messages),
+            invalid,
+        )
+
+        self.assertEqual(
+            output.info["action_submission"]["raw_policy_output"], invalid
+        )
+        self.assertEqual(
+            output.info["context_transition"]["operation"],
+            "replace_messages",
+        )
+        self.assertNotIn(invalid, str(messages))
+        self.assertIn("session-0 search result", str(messages))
+        self.assertNotIn("session-0 fresh observation", str(messages))
 
     def test_swesmith_compaction_uses_same_entrypoint_without_native_call(self) -> None:
         client = FakeSwesmithClient()

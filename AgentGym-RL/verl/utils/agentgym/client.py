@@ -115,6 +115,8 @@ def init_env_client(args, *, env_addr: str | None = None):
                 else str(env_addr).rstrip("/")
             )
             env_client = envclient_class(env_server_base=resolved_env_addr, data_len=data_len, timeout=_client_timeout_seconds())
+            if args.task_name.lower() == "agentmemory":
+                _configure_agentmemory_policy_prompt(env_client)
             break
         except Exception as e:
             retry += 1
@@ -123,3 +125,54 @@ def init_env_client(args, *, env_addr: str | None = None):
                 raise e
             time.sleep(5)
     return env_client
+
+
+def _configure_agentmemory_policy_prompt(env_client) -> None:
+    """Resolve the formal AgentMemory prompt outside the shared rollout loop."""
+
+    from verl.utils.agentgym.formal_domain_v3 import (
+        FormalDomainV3Error,
+        resolve_formal_runtime_contract,
+        validate_webshop_action_listing_mode,
+        validate_webshop_filesystem_surface,
+        validate_webshop_ltm_inventory_mode,
+        validate_webshop_memory_prompt_mode,
+    )
+    from verl.workers.rollout.schemas import (
+        agentmemory_action_listing_mode,
+        agentmemory_action_system_prompt,
+        agentmemory_ltm_inventory_mode,
+        agentmemory_memory_prompt_mode,
+    )
+
+    metadata = getattr(env_client, "metadata", None)
+    if not isinstance(metadata, dict):
+        raise RuntimeError("AgentMemory client is missing formal runtime metadata")
+    try:
+        validate_webshop_ltm_inventory_mode(
+            metadata,
+            expected_mode=agentmemory_ltm_inventory_mode(),
+        )
+        validate_webshop_memory_prompt_mode(
+            metadata,
+            expected_mode=agentmemory_memory_prompt_mode(),
+        )
+        validate_webshop_filesystem_surface(
+            metadata,
+            expected_prompt_mode=agentmemory_memory_prompt_mode(),
+        )
+        validate_webshop_action_listing_mode(
+            metadata,
+            expected_mode=agentmemory_action_listing_mode(),
+        )
+        _, system_prompt, _ = resolve_formal_runtime_contract(
+            metadata,
+            webshop_v2_system_prompt=agentmemory_action_system_prompt(
+                surface=metadata.get("surface")
+            ),
+        )
+    except FormalDomainV3Error as exc:
+        raise RuntimeError(
+            f"Invalid formal AgentMemory runtime contract: {exc}"
+        ) from exc
+    env_client.configure_policy_system_prompt(system_prompt)

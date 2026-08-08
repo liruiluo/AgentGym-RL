@@ -100,6 +100,49 @@ class MultitaskDatasetPromptRoutingTests(unittest.TestCase):
         self.assertEqual(messages[1]["content"], f"slot-{slot}-assistant")
         self.assertIn(f"slot-{slot}-user", rendered)
 
+    def test_build_messages_prefers_canonical_policy_framing(self) -> None:
+        source = UniformMultitaskIndexSource(
+            task_count=64,
+            provider_mode=PROVIDER_MODE_RESEEDED_STREAM,
+            tasks_per_orbit=1,
+            sampling_seed=17,
+            local_task_count=12,
+        )
+        dataset = RLHFDataset.__new__(RLHFDataset)
+        dataset.procedural_index_source = source
+        dataset.env_client = SimpleNamespace(
+            conversation_start=[
+                {"value": "legacy-slot-0-user"},
+                {"value": "legacy-slot-0-assistant"},
+            ]
+        )
+        dataset.multitask_conversation_starts = [
+            [
+                {"value": f"legacy-slot-{slot}-user"},
+                {"value": f"legacy-slot-{slot}-assistant"},
+            ]
+            for slot in range(8)
+        ]
+        dataset.policy_framing = [
+            {"role": "system", "content": "canonical-slot-0"}
+        ]
+        dataset.multitask_policy_framings = [
+            [{"role": "system", "content": f"canonical-slot-{slot}"}]
+            for slot in range(8)
+        ]
+
+        row = source.row_for_position(37)
+        messages, rendered = dataset._build_messages(row)
+        slot = row["agentmemory_surface_slot"]
+
+        self.assertEqual(
+            messages,
+            [{"role": "system", "content": f"canonical-slot-{slot}"}],
+        )
+        self.assertIn(f"canonical-slot-{slot}", rendered)
+        self.assertNotIn("legacy-slot", rendered)
+        self.assertNotIn("Ok.", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()

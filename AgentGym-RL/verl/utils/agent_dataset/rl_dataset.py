@@ -136,6 +136,9 @@ class RLHFDataset(Dataset):
                 conversation_starts = [
                     copy.deepcopy(self.env_client.conversation_start)
                 ]
+                policy_framings = [
+                    copy.deepcopy(self.env_client.policy_framing())
+                ]
                 for env_addr in route_addrs[1:]:
                     route_client = init_env_client(
                         self.agentgym_config,
@@ -148,6 +151,9 @@ class RLHFDataset(Dataset):
                         conversation_starts.append(
                             copy.deepcopy(route_client.conversation_start)
                         )
+                        policy_framings.append(
+                            copy.deepcopy(route_client.policy_framing())
+                        )
                     finally:
                         route_client.close()
                 self.procedural_index_source.validate_server_metadatas(
@@ -155,6 +161,8 @@ class RLHFDataset(Dataset):
                 )
                 self.procedural_server_metadata = server_metadatas
                 self.multitask_conversation_starts = conversation_starts
+                self.multitask_policy_framings = policy_framings
+                self.policy_framing = policy_framings[0]
             finally:
                 # Dataset clients only provide immutable prompt/metadata
                 # bootstrap state. Rollout workers create their own sessions.
@@ -169,6 +177,11 @@ class RLHFDataset(Dataset):
             try:
                 self.procedural_server_metadata = self.env_client.metadata
                 self.multitask_conversation_starts = None
+                framing = self.env_client.policy_framing()
+                self.policy_framing = (
+                    None if framing is None else copy.deepcopy(framing)
+                )
+                self.multitask_policy_framings = None
                 if self.procedural_index_source is not None:
                     self.procedural_index_source.validate_server_metadata(
                         self.env_client.metadata
@@ -210,6 +223,7 @@ class RLHFDataset(Dataset):
         else:
             example["data_source"] = example[self.prompt_key].split("_")[0]
         conversation_start = self.env_client.conversation_start
+        policy_framing = getattr(self, "policy_framing", None)
         if isinstance(
             self.procedural_index_source,
             (
@@ -235,21 +249,34 @@ class RLHFDataset(Dataset):
             conversation_start = self.multitask_conversation_starts[
                 surface_slot
             ]
-        messages = [
-            {"role": "user", "content": conversation_start[0]["value"]},
-            {
-                "role": "assistant",
-                "content": conversation_start[1]["value"],
-            },
-        ]
-        prompt_with_chat_template = (
-            "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. "
-            "You are a helpful assistant.<|im_end|>\n<|im_start|>user\n"
-            + conversation_start[0]["value"]
-            + "<|im_end|>\n<|im_start|>assistant\n"
-            + conversation_start[1]["value"]
-            + "<|im_end|>"
-        )
+            routed_framings = getattr(
+                self, "multitask_policy_framings", None
+            )
+            if routed_framings is not None:
+                policy_framing = routed_framings[surface_slot]
+        if policy_framing is not None:
+            messages = copy.deepcopy(policy_framing)
+            prompt_with_chat_template = "\n".join(
+                f"<|im_start|>{message['role']}\n"
+                f"{message['content']}<|im_end|>"
+                for message in messages
+            )
+        else:
+            messages = [
+                {"role": "user", "content": conversation_start[0]["value"]},
+                {
+                    "role": "assistant",
+                    "content": conversation_start[1]["value"],
+                },
+            ]
+            prompt_with_chat_template = (
+                "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. "
+                "You are a helpful assistant.<|im_end|>\n<|im_start|>user\n"
+                + conversation_start[0]["value"]
+                + "<|im_end|>\n<|im_start|>assistant\n"
+                + conversation_start[1]["value"]
+                + "<|im_end|>"
+            )
         return messages, prompt_with_chat_template
 
     def __getitem__(self, item):
