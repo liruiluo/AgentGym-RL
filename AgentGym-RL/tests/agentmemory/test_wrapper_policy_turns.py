@@ -222,6 +222,28 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
              handoff_output.info["context_epoch_after"]),
             (0, 1),
         )
+        handoff_evidence = handoff_output.info["wrapper_evidence"]
+        self.assertEqual(
+            (
+                handoff_evidence["native_call_count_before"],
+                handoff_evidence["native_call_count_after"],
+            ),
+            (2, 2),
+        )
+        self.assertEqual(
+            (
+                handoff_evidence["policy_step_before"],
+                handoff_evidence["policy_step_after"],
+            ),
+            (2, 3),
+        )
+        self.assertEqual(
+            (
+                handoff_evidence["context_epoch_before"],
+                handoff_evidence["context_epoch_after"],
+            ),
+            (0, 1),
+        )
         self.assertIn("session-1 fresh observation", str(messages))
         self.assertIn("notes/state.md", str(messages))
         self.assertNotIn("session-0 search result", str(messages))
@@ -559,6 +581,14 @@ class SharedRolloutRuntimeTest(unittest.TestCase):
         self.assertEqual(
             handoff["wrapper_evidence"]["event"],
             "webshop_session_handoff",
+        )
+        self.assertEqual(
+            handoff["wrapper_evidence"]["native_call_count_before"],
+            handoff["wrapper_evidence"]["native_call_count_after"],
+        )
+        self.assertEqual(
+            handoff["wrapper_evidence"]["policy_step_after"],
+            handoff["wrapper_evidence"]["policy_step_before"] + 1,
         )
         self.assertEqual(handoff["context_transition"]["operation"], "replace_messages")
         self.assertEqual(handoff["immediate_reward"], 0.0)
