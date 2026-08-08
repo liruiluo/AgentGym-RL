@@ -204,7 +204,143 @@ def attach_workspace(
     return step
 
 
+def task_neutralize(step, *, before, after, event, session_advanced=None):
+    for key in (
+        "subtask_index_before",
+        "subtask_index_after",
+        "buy_accepted",
+        "buy_committed",
+        "session_advanced",
+    ):
+        step.pop(key, None)
+    step["schema_version"] = "task_neutral_policy_step_v1"
+    step["env_info_before"]["current_subtask_index"] = before
+    step["env_info_after"]["current_subtask_index"] = after
+    step["wrapper_evidence"] = {"event": event}
+    if session_advanced is not None:
+        step["wrapper_evidence"]["session_advanced"] = session_advanced
+    return step
+
+
 class FormalTrainingMetricsTests(unittest.TestCase):
+    def test_task_neutral_rows_bind_phases_and_do_not_recount_handoff_buy(self) -> None:
+        empty = workspace_snapshot()
+        shell = workspace_event(
+            "SHELL_COMMAND",
+            event_id=0,
+            phase_index=1,
+            before=empty,
+            after=empty,
+        )
+        native_buy = task_neutralize(
+            attach_workspace(
+                record(
+                    "click[Buy Now]",
+                    before=0,
+                    after=1,
+                    components=(("buy_committed_correct", 1.0),),
+                ),
+                before_snapshot=empty,
+                after_snapshot=empty,
+                before_audit_count=0,
+                after_audit_count=0,
+                other_tool_ops=({"op": "BUY"},),
+            ),
+            before=0,
+            after=1,
+            event="native_action",
+            session_advanced=True,
+        )
+        handoff = task_neutralize(
+            attach_workspace(
+                record(
+                    "no locator available",
+                    before=1,
+                    after=1,
+                    components=(("buy_committed_correct", 1.0),),
+                ),
+                before_snapshot=empty,
+                after_snapshot=empty,
+                before_audit_count=0,
+                after_audit_count=0,
+            ),
+            before=1,
+            after=1,
+            event="webshop_session_handoff",
+        )
+        later_shell = task_neutralize(
+            attach_workspace(
+                record(
+                    'shell_command {"command":"rg -n pattern ."}',
+                    before=1,
+                    after=1,
+                    components=(("shell_command_transition", 0.0),),
+                ),
+                before_snapshot=empty,
+                after_snapshot=empty,
+                before_audit_count=0,
+                after_audit_count=1,
+                workspace_event=shell,
+            ),
+            before=1,
+            after=1,
+            event="native_action",
+            session_advanced=False,
+        )
+        summary = summarize_formal_training_rows(
+            [
+                row("neutral", 0, 1.0, 1.0, 1.0, 0.5, native_buy),
+                row("neutral", 1, 0.0, 0.0, 1.0, 0.0, handoff),
+                row(
+                    "neutral",
+                    2,
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.0,
+                    later_shell,
+                    terminal=True,
+                ),
+            ]
+        )
+        self.assertEqual(summary["correct_buy_count"], 1.0)
+        self.assertEqual(summary["session_advance_count"], 1.0)
+        self.assertEqual(summary["progress_ge_1_count"], 1.0)
+        self.assertEqual(summary["workspace_shell_command_count"], 1.0)
+
+    def test_task_neutral_workspace_phase_mismatch_fails_closed(self) -> None:
+        empty = workspace_snapshot()
+        event = workspace_event(
+            "SHELL_COMMAND",
+            event_id=0,
+            phase_index=0,
+            before=empty,
+            after=empty,
+        )
+        step = task_neutralize(
+            attach_workspace(
+                record(
+                    'shell_command {"command":"rg -n pattern ."}',
+                    before=1,
+                    after=1,
+                    components=(("shell_command_transition", 0.0),),
+                ),
+                before_snapshot=empty,
+                after_snapshot=empty,
+                before_audit_count=0,
+                after_audit_count=1,
+                workspace_event=event,
+            ),
+            before=1,
+            after=1,
+            event="native_action",
+            session_advanced=False,
+        )
+        with self.assertRaisesRegex(ValueError, "different session"):
+            summarize_formal_training_rows(
+                [row("mismatch", 0, 0.0, 0.0, 0.0, 0.0, step, terminal=True)]
+            )
+
     def test_native_records_use_reward_ledger_for_invalid_count(self) -> None:
         valid_native = record(
             "search[widget]",

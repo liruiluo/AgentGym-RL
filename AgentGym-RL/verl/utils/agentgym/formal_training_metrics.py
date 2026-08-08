@@ -13,6 +13,7 @@ LEGACY_FILE_TOOL_OPS = frozenset({"READ", "WRITE", "EDIT", "GREP", "GLOB"})
 WORKSPACE_SURFACE = "codex_workspace_v2"
 WORKSPACE_TOOL_CONTRACT = "codex_shell_command_apply_patch_v1"
 WORKSPACE_SNAPSHOT_SCHEMA = "agentmemory_workspace_snapshot_v2"
+TASK_NEUTRAL_POLICY_STEP_SCHEMA = "task_neutral_policy_step_v1"
 _SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 _EMPTY_WORKSPACE_MANIFEST = {"directories": [], "files": []}
 _EMPTY_WORKSPACE_TREE_SHA256 = hashlib.sha256(
@@ -308,6 +309,88 @@ def _is_relevant_retrieve(record: dict[str, Any]) -> bool:
     return False
 
 
+def _record_phase_bounds(record: dict[str, Any]) -> tuple[int, int]:
+    """Read session bounds from either the legacy row or opaque env receipt."""
+
+    before_info = record.get("env_info_before")
+    after_info = record.get("env_info_after")
+    env_before = (
+        before_info.get("current_subtask_index")
+        if isinstance(before_info, dict)
+        else None
+    )
+    env_after = (
+        after_info.get("current_subtask_index")
+        if isinstance(after_info, dict)
+        else None
+    )
+    row_before = record.get("subtask_index_before")
+    row_after = record.get("subtask_index_after")
+
+    if (row_before is None) != (row_after is None):
+        raise ValueError("Formal row exposes only one legacy subtask boundary.")
+    if row_before is None:
+        if env_before is None and env_after is None:
+            return 0, 0
+        if env_before is None or env_after is None:
+            raise ValueError("Task-neutral row exposes only one environment phase boundary.")
+        before, after = env_before, env_after
+    else:
+        before, after = row_before, row_after
+        if env_before is not None and env_before != before:
+            raise ValueError("Legacy and environment pre-step phase boundaries disagree.")
+        if env_after is not None and env_after != after:
+            raise ValueError("Legacy and environment post-step phase boundaries disagree.")
+
+    if (
+        type(before) is not int
+        or type(after) is not int
+        or before < 0
+        or after < 0
+    ):
+        raise ValueError("Formal row has an invalid environment phase boundary.")
+    return before, after
+
+
+def _record_purchase_state(
+    record: dict[str, Any],
+    *,
+    component_names: set[str],
+    phase_before: int,
+    phase_after: int,
+) -> tuple[bool, bool, bool]:
+    """Return accepted, committed, and advanced without replaying stale receipts."""
+
+    if record.get("schema_version") != TASK_NEUTRAL_POLICY_STEP_SCHEMA:
+        return (
+            bool(record.get("buy_accepted")),
+            bool(record.get("buy_committed")),
+            bool(record.get("session_advanced")),
+        )
+
+    wrapper_evidence = record.get("wrapper_evidence")
+    if not isinstance(wrapper_evidence, dict):
+        raise ValueError("Task-neutral row lacks wrapper evidence.")
+    if wrapper_evidence.get("event") != "native_action":
+        return False, False, False
+
+    declared_advanced = wrapper_evidence.get("session_advanced")
+    inferred_advanced = phase_after > phase_before
+    if declared_advanced is not None:
+        if type(declared_advanced) is not bool:
+            raise ValueError("Task-neutral session advance evidence is not boolean.")
+        if declared_advanced != inferred_advanced:
+            raise ValueError("Task-neutral session advance evidence disagrees with phases.")
+
+    correct = "buy_committed_correct" in component_names
+    wrong = "buy_committed_incorrect" in component_names
+    if correct and wrong:
+        raise ValueError("Task-neutral row contains conflicting BUY outcomes.")
+    if correct != inferred_advanced:
+        raise ValueError("Task-neutral correct BUY evidence disagrees with session advance.")
+    return correct, correct or wrong, inferred_advanced
+
+
 def _mean(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
 
@@ -416,10 +499,13 @@ def summarize_formal_training_rows(rows: list[dict[str, Any]]) -> dict[str, floa
             record = row["record"]
             component_names = _component_names(record)
             memory_ops = _current_memory_ops(record)
-            session_index = int(record.get("subtask_index_before", 0))
-            max_progress = max(
-                max_progress,
-                int(record.get("subtask_index_after", record.get("next_session_index", 0))),
+            session_index, next_session_index = _record_phase_bounds(record)
+            max_progress = max(max_progress, next_session_index)
+            buy_accepted, buy_committed, session_advanced = _record_purchase_state(
+                record,
+                component_names=component_names,
+                phase_before=session_index,
+                phase_after=next_session_index,
             )
             workspace_ops = (
                 _current_workspace_ops(record) if workspace_enabled else []
@@ -598,20 +684,20 @@ def summarize_formal_training_rows(rows: list[dict[str, Any]]) -> dict[str, floa
                 relevant_retrieve_positions.append(position)
                 counts["relevant_retrieve_count"] += 1
 
-            if bool(record.get("buy_accepted")):
+            if buy_accepted:
                 counts["correct_buy_count"] += 1
                 correct_buy_events.append((position, session_index))
-                if int(record.get("subtask_index_before", 0)) >= 1:
+                if session_index >= 1:
                     dependent_buy_positions.append(position)
                 terminal_advantages["correct_buy"].append(
                     float(row["advantage_token_mean"])
                 )
-            elif bool(record.get("buy_committed")):
+            elif buy_committed:
                 counts["wrong_buy_count"] += 1
                 terminal_advantages["wrong_buy"].append(
                     float(row["advantage_token_mean"])
                 )
-            if bool(record.get("session_advanced")):
+            if session_advanced:
                 counts["session_advance_count"] += 1
             if "max_round_timeout_failure" in component_names:
                 counts["timeout_trajectory_count"] += 1
