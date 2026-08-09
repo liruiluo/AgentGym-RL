@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
 import urllib.error
 import urllib.request
 from typing import Any, Callable
@@ -84,6 +85,16 @@ def require_idle(metadata: dict[str, Any], *, label: str) -> None:
             raise AssertionError(f"{label} {key} is not zero: {metadata[key]!r}")
 
 
+def close_slots(endpoint: Endpoint, slot_ids: list[int]) -> list[str]:
+    errors: list[str] = []
+    for slot_id in slot_ids:
+        try:
+            endpoint.request("POST", "close", {"id": slot_id})
+        except Exception as exc:  # Preserve every cleanup failure for diagnosis.
+            errors.append(f"slot {slot_id}: {type(exc).__name__}: {exc}")
+    return errors
+
+
 def main() -> None:
     args = parse_args()
     indices = [int(value) for value in args.indices.split(",") if value != ""]
@@ -117,108 +128,116 @@ def main() -> None:
     if any(args.episodes_root.iterdir()):
         raise AssertionError("episodes root is not empty before the isolation probe")
 
-    created = parallel_map(lambda _: endpoint.request("POST", "create", {}), indices)
-    slot_ids = [int(value["id"]) for value in created]
-    assert len(set(slot_ids)) == len(indices)
+    slot_ids: list[int] = []
+    try:
+        for _ in indices:
+            created = endpoint.request("POST", "create", {})
+            slot_ids.append(int(created["id"]))
+        assert len(set(slot_ids)) == len(indices)
 
-    pairs = list(zip(slot_ids, indices, strict=True))
-    reset = parallel_map(
-        lambda pair: endpoint.request(
-            "POST", "reset", {"id": pair[0], "data_idx": pair[1]}
-        ),
-        pairs,
-    )
-    for value in reset:
-        assert value["done"] is False
-        assert float(value["reward"]) == 0.0
-        assert value["info"]["schema"] == EXPECTED_SCHEMA
+        pairs = list(zip(slot_ids, indices, strict=True))
+        reset = parallel_map(
+            lambda pair: endpoint.request(
+                "POST", "reset", {"id": pair[0], "data_idx": pair[1]}
+            ),
+            pairs,
+        )
+        for value in reset:
+            assert value["done"] is False
+            assert float(value["reward"]) == 0.0
+            assert value["info"]["schema"] == EXPECTED_SCHEMA
 
-    details = parallel_map(
-        lambda slot_id: endpoint.request(
-            "GET", f"detail?id={slot_id}", private=True
-        ),
-        slot_ids,
-    )
-    audit_ids = [value["audit_id"] for value in details]
-    episode_roots = [Path(value["workspace"]["episode_root"]) for value in details]
-    policy_roots = [Path(value["workspace"]["policy_root"]) for value in details]
-    model_uids = [int(value["workspace"]["model_uid"]) for value in details]
-    assert [int(value["data_idx"]) for value in details] == indices
-    assert [int(value["slot_id"]) for value in details] == slot_ids
-    assert len(set(audit_ids)) == len(indices)
-    assert len(set(episode_roots)) == len(indices)
-    assert len(set(policy_roots)) == len(indices)
-    assert len(set(model_uids)) == len(indices)
-    for episode_root, policy_root in zip(episode_roots, policy_roots, strict=True):
-        assert episode_root.parent == args.episodes_root
-        assert policy_root.parent == episode_root
+        details = parallel_map(
+            lambda slot_id: endpoint.request(
+                "GET", f"detail?id={slot_id}", private=True
+            ),
+            slot_ids,
+        )
+        audit_ids = [value["audit_id"] for value in details]
+        episode_roots = [Path(value["workspace"]["episode_root"]) for value in details]
+        policy_roots = [Path(value["workspace"]["policy_root"]) for value in details]
+        model_uids = [int(value["workspace"]["model_uid"]) for value in details]
+        assert [int(value["data_idx"]) for value in details] == indices
+        assert [int(value["slot_id"]) for value in details] == slot_ids
+        assert len(set(audit_ids)) == len(indices)
+        assert len(set(episode_roots)) == len(indices)
+        assert len(set(policy_roots)) == len(indices)
+        assert len(set(model_uids)) == len(indices)
+        for episode_root, policy_root in zip(episode_roots, policy_roots, strict=True):
+            assert episode_root.parent == args.episodes_root
+            assert policy_root.parent == episode_root
 
-    markers = [
-        hashlib.sha256(f"slot={slot}:index={index}".encode()).hexdigest()
-        for slot, index in pairs
-    ]
-    writes = parallel_map(
-        lambda item: endpoint.request(
-            "POST",
-            "step",
-            {
-                "id": item[0],
-                "action": "shell_command "
-                + json.dumps(
-                    {
-                        "command": (
-                            "mkdir -p .agent_memory && printf %s "
-                            + json.dumps(item[1])
-                            + " > .agent_memory/MEMORY.md"
-                        ),
-                        "workdir": ".",
-                        "timeout_ms": 120000,
-                    },
-                    separators=(",", ":"),
-                ),
-            },
-        ),
-        list(zip(slot_ids, markers, strict=True)),
-    )
-    for value in writes:
-        assert value["done"] is False
-        assert float(value["reward"]) == 0.0
-        assert value["info"]["action_kind"] == "shell_command"
+        markers = [
+            hashlib.sha256(f"slot={slot}:index={index}".encode()).hexdigest()
+            for slot, index in pairs
+        ]
+        writes = parallel_map(
+            lambda item: endpoint.request(
+                "POST",
+                "step",
+                {
+                    "id": item[0],
+                    "action": "shell_command "
+                    + json.dumps(
+                        {
+                            "command": (
+                                "mkdir -p .agent_memory && printf %s "
+                                + json.dumps(item[1])
+                                + " > .agent_memory/MEMORY.md"
+                            ),
+                            "workdir": ".",
+                            "timeout_ms": 120000,
+                        },
+                        separators=(",", ":"),
+                    ),
+                },
+            ),
+            list(zip(slot_ids, markers, strict=True)),
+        )
+        for value in writes:
+            assert value["done"] is False
+            assert float(value["reward"]) == 0.0
+            assert value["info"]["action_kind"] == "shell_command"
 
-    reads = parallel_map(
-        lambda slot_id: endpoint.request(
-            "POST",
-            "step",
-            {
-                "id": slot_id,
-                "action": "shell_command "
-                + json.dumps(
-                    {
-                        "command": "cat .agent_memory/MEMORY.md",
-                        "workdir": ".",
-                        "timeout_ms": 120000,
-                    },
-                    separators=(",", ":"),
-                ),
-            },
-        ),
-        slot_ids,
-    )
-    for marker, value in zip(markers, reads, strict=True):
-        assert value["done"] is False
-        assert float(value["reward"]) == 0.0
-        assert marker in value["observation"]
-        assert sum(other in value["observation"] for other in markers) == 1
+        reads = parallel_map(
+            lambda slot_id: endpoint.request(
+                "POST",
+                "step",
+                {
+                    "id": slot_id,
+                    "action": "shell_command "
+                    + json.dumps(
+                        {
+                            "command": "cat .agent_memory/MEMORY.md",
+                            "workdir": ".",
+                            "timeout_ms": 120000,
+                        },
+                        separators=(",", ":"),
+                    ),
+                },
+            ),
+            slot_ids,
+        )
+        for marker, value in zip(markers, reads, strict=True):
+            assert value["done"] is False
+            assert float(value["reward"]) == 0.0
+            assert marker in value["observation"]
+            assert sum(other in value["observation"] for other in markers) == 1
 
-    metadata_active = endpoint.request("GET", "metadata")
-    assert int(metadata_active["active_slot_count"]) == len(indices)
-    assert int(metadata_active["active_environment_count"]) == len(indices)
-    assert int(metadata_active["active_workspace_count"]) == len(indices)
+        metadata_active = endpoint.request("GET", "metadata")
+        assert int(metadata_active["active_slot_count"]) == len(indices)
+        assert int(metadata_active["active_environment_count"]) == len(indices)
+        assert int(metadata_active["active_workspace_count"]) == len(indices)
+    finally:
+        active_error = sys.exc_info()[1]
+        cleanup_errors = close_slots(endpoint, slot_ids)
+        if cleanup_errors:
+            message = "SWE-smith slot cleanup failed: " + "; ".join(cleanup_errors)
+            if active_error is not None:
+                active_error.add_note(message)
+            else:
+                raise RuntimeError(message)
 
-    parallel_map(
-        lambda slot_id: endpoint.request("POST", "close", {"id": slot_id}),
-        slot_ids,
-    )
     metadata_after = endpoint.request("GET", "metadata")
     require_idle(metadata_after, label="after")
     if any(args.episodes_root.iterdir()):
