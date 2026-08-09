@@ -418,6 +418,9 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         )
         self.assertIn("*** Update File: path/to/file.py", system_prompt)
         self.assertIn("never print analysis", system_prompt)
+        self.assertIn("shell_command may also edit files", system_prompt)
+        self.assertIn("workspace intentionally has no .git directory", system_prompt)
+        self.assertIn("If you diagnosed the bug but no path changed", system_prompt)
 
 
 class RolloutFakeWebShopClient(FakeWebShopClient):
