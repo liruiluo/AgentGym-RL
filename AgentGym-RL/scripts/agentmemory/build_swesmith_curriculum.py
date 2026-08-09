@@ -218,11 +218,12 @@ def _candidate_from_row(
     )
 
 
-def _atomic_write(path: Path, raw: bytes) -> None:
+def _atomic_write(path: Path, raw: bytes, mode: int = 0o644) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = Path(temporary_name)
     try:
+        os.fchmod(descriptor, mode)
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(raw)
             handle.flush()
