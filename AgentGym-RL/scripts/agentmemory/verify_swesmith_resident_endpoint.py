@@ -100,6 +100,9 @@ def main() -> None:
     metadata_before = endpoint.request("GET", "metadata")
     assert metadata_before["schema"] == EXPECTED_SCHEMA
     assert metadata_before["tool_contract"] == "codex_shell_command_apply_patch_v1"
+    assert metadata_before["tool_serialization"] == (
+        "qwen35_native_single_function_v1"
+    )
     assert metadata_before["reward_contract"] == "terminal_full_resolution_binary_v1"
     assert metadata_before["context_contract"] == "one_native_issue_continuous_episode_v1"
     assert metadata_before["private_audit_contract"] == AUDIT_SCHEMA
