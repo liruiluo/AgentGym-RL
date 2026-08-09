@@ -74,6 +74,24 @@ def parse_endpoint_probe_indices(raw: str) -> list[int]:
     return indices
 
 
+def parse_endpoint_probe_slots(endpoint_probe: dict[str, Any]) -> list[int]:
+    slots = [int(value) for value in endpoint_probe["slot_ids"]]
+    assert len(slots) == 8
+    assert all(slot >= 0 for slot in slots)
+    assert len(set(slots)) == len(slots)
+    return slots
+
+
+def expected_trainer_slot_counts(
+    endpoint_probe: dict[str, Any], train_batch_size: int, global_step: int
+) -> Counter[int]:
+    trainer_slot_start = max(parse_endpoint_probe_slots(endpoint_probe)) + 1
+    return Counter({
+        trainer_slot_start + slot: global_step
+        for slot in range(train_batch_size)
+    })
+
+
 def verify_endpoint_probe_indices(
     endpoint_probe: dict[str, Any],
     expected_probe_indices: list[int],
@@ -366,15 +384,18 @@ def main() -> None:
         index: args.global_step * args.train_batch_size // args.task_count
         for index in expected_data_indices
     })
-    expected_slot_counts = Counter({
-        slot: args.global_step for slot in range(args.train_batch_size)
-    })
     endpoint_probe = load_json(args.endpoint_probe)
     assert endpoint_probe["status"] == "pass"
     verify_endpoint_probe_indices(
         endpoint_probe,
         parse_endpoint_probe_indices(args.endpoint_probe_indices),
         expected_data_indices,
+    )
+    # The resident endpoint probe allocates slots before the trainer starts.
+    # Derive the training slot range from that probe instead of assuming that
+    # training begins at slot zero.
+    expected_slot_counts = expected_trainer_slot_counts(
+        endpoint_probe, args.train_batch_size, args.global_step
     )
 
     batch_path = (
