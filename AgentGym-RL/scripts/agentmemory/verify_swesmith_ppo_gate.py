@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict
+from datetime import datetime
 import json
 import math
 from pathlib import Path
@@ -30,6 +31,16 @@ def parse_args() -> argparse.Namespace:
 
 def load_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def parse_time(value: str, label: str) -> datetime:
+    try:
+        result = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise AssertionError(f"{label} is not an ISO-8601 timestamp: {value!r}") from exc
+    if result.tzinfo is None:
+        raise AssertionError(f"{label} must include a timezone: {value!r}")
+    return result
 
 
 def finite(value: Any, label: str) -> float:
@@ -113,12 +124,20 @@ def verify_audits(
     audit_root: Path,
     endpoint_probe: dict[str, Any],
     expected_indices: set[int],
+    run_started_at: datetime,
 ) -> dict[str, Any]:
     probe_audit_ids = set(str(value) for value in endpoint_probe["audit_ids"])
     trainer_audits: list[dict[str, Any]] = []
+    stale_audit_count = 0
     for path in sorted(audit_root.glob("episode-*.json")):
         payload = load_json(path)
         if str(payload["audit_id"]) in probe_audit_ids:
+            continue
+        audit_started_at = parse_time(
+            str(payload.get("started_at", "")), f"{path.name}.started_at"
+        )
+        if audit_started_at < run_started_at:
+            stale_audit_count += 1
             continue
         assert payload["schema"] == AUDIT_SCHEMA
         assert payload["close_reason"] == "client_close"
@@ -137,6 +156,9 @@ def verify_audits(
         "dataset_indices": sorted(indices),
         "resolved_count": sum(float(value["reward"]) == 1.0 for value in trainer_audits),
         "audit_ids": sorted(str(value["audit_id"]) for value in trainer_audits),
+        "selection": "run-start-time-minus-current-probe",
+        "run_started_at": run_started_at.isoformat(),
+        "stale_audit_count": stale_audit_count,
     }
 
 
@@ -280,7 +302,16 @@ def main() -> None:
         assert int(metadata_after[key]) == 0
 
     readback = verify_readback(args.run_dir, args.global_step, expected_indices)
-    audits = verify_audits(args.audit_root, endpoint_probe, expected_indices)
+    run_started_at = parse_time(
+        (args.run_dir / "started_at").read_text(encoding="utf-8"),
+        "run.started_at",
+    )
+    audits = verify_audits(
+        args.audit_root,
+        endpoint_probe,
+        expected_indices,
+        run_started_at,
+    )
     evidence = {
         "schema": "agentmemory_swesmith_ppo_gate_attestation_v1",
         "status": "pass",

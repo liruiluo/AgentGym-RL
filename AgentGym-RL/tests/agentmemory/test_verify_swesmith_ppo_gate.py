@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
 import importlib.util
+import json
 from pathlib import Path
+import tempfile
 import unittest
 
 
@@ -79,6 +81,75 @@ class SwesmithPpoGateRowEvidenceTests(unittest.TestCase):
                 },
                 set(range(8)),
             )
+
+
+class SwesmithPpoGateAuditSelectionTests(unittest.TestCase):
+    @staticmethod
+    def _audit(*, audit_id: str, index: int, slot: int, started_at: str) -> dict:
+        return {
+            "schema": "agentmemory_swesmith_private_episode_audit_v1",
+            "audit_id": audit_id,
+            "data_idx": index,
+            "slot_id": slot,
+            "started_at": started_at,
+            "close_reason": "client_close",
+            "done": True,
+            "reward": 1.0 if index == 0 else 0.0,
+            "grade": {"resolution_status": "RESOLVED_YES" if index == 0 else "RESOLVED_NO"},
+            "step_count": 3,
+        }
+
+    def test_excludes_stale_preflight_audits_from_reused_endpoint(self) -> None:
+        module = load_module()
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            current_probe_ids = []
+            for index in range(8):
+                stale_id = f"{index + 1:032x}"
+                probe_id = f"{index + 101:032x}"
+                trainer_id = f"{index + 201:032x}"
+                current_probe_ids.append(probe_id)
+                fixtures = (
+                    self._audit(
+                        audit_id=stale_id,
+                        index=index,
+                        slot=index,
+                        started_at="2026-08-09T00:00:00Z",
+                    ),
+                    self._audit(
+                        audit_id=probe_id,
+                        index=index,
+                        slot=index,
+                        started_at="2026-08-09T00:30:00Z",
+                    ),
+                    self._audit(
+                        audit_id=trainer_id,
+                        index=index,
+                        slot=index,
+                        started_at="2026-08-09T01:00:01Z",
+                    ),
+                )
+                for payload in fixtures:
+                    (root / f"episode-{payload['audit_id']}.json").write_text(
+                        json.dumps(payload), encoding="utf-8"
+                    )
+
+            result = module.verify_audits(
+                root,
+                {"audit_ids": current_probe_ids},
+                set(range(8)),
+                module.parse_time("2026-08-09T01:00:00Z", "test.started_at"),
+            )
+
+        self.assertEqual(result["audit_count"], 8)
+        self.assertEqual(result["dataset_indices"], list(range(8)))
+        self.assertEqual(result["stale_audit_count"], 8)
+        self.assertEqual(result["selection"], "run-start-time-minus-current-probe")
+
+    def test_rejects_naive_run_timestamp(self) -> None:
+        module = load_module()
+        with self.assertRaisesRegex(AssertionError, "must include a timezone"):
+            module.parse_time("2026-08-09T01:00:00", "test.started_at")
 
 
 if __name__ == "__main__":
