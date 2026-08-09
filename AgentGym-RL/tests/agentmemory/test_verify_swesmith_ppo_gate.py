@@ -168,6 +168,99 @@ class SwesmithPpoGateRowEvidenceTests(unittest.TestCase):
         result = module.verify_wrapper_transition(record, previous_native_step=29)
         self.assertEqual(result["action_kind"], "shell_command")
 
+    def test_accepts_horizon_grading_attached_to_last_native_row(self) -> None:
+        module = load_module()
+        record = {
+            "task_round": 30,
+            "wrapper_evidence": {
+                "event": module.NATIVE_EVENT,
+                "workspace_continuity_id": 9,
+            },
+            "env_info_before": {"step": 29},
+            "env_info_after": {
+                "step": 30,
+                "action_kind": "shell_command",
+                "episode_success": False,
+                "terminal": False,
+            },
+            "context_transition": {
+                "schema": "agentmemory_task_neutral_context_transition_v1",
+                "operation": "append_observation",
+                "messages": [],
+            },
+            "action_submission": {"submitted_action": "shell_command"},
+            "immediate_reward": 1.0,
+            "trajectory_terminal": True,
+            "done": True,
+            "outcome": "success",
+            "horizon_finalization": {
+                "state": "Submission accepted and graded. The issue is resolved.",
+                "reward": 1.0,
+                "done": True,
+                "info": {
+                    "env_info": {
+                        "schema": "agentmemory_swesmith_native_episode_v1",
+                        "step": 30,
+                        "action_kind": "policy_turn_horizon",
+                        "terminal": True,
+                        "episode_success": True,
+                    },
+                    "action_submission": {"control_action": "horizon"},
+                    "native_step_before": 30,
+                    "native_step_after": 30,
+                    "policy_step_after": 30,
+                    "wrapper_evidence": {"event": "horizon_finalization"},
+                },
+            },
+        }
+        result = module.verify_wrapper_transition(record, previous_native_step=29)
+        self.assertEqual(result["action_kind"], "shell_command")
+
+    def test_rejects_horizon_reward_mismatch(self) -> None:
+        module = load_module()
+        record = {
+            "task_round": 30,
+            "wrapper_evidence": {
+                "event": module.NATIVE_EVENT,
+                "workspace_continuity_id": 9,
+            },
+            "env_info_before": {"step": 29},
+            "env_info_after": {
+                "step": 30,
+                "action_kind": "shell_command",
+                "episode_success": False,
+                "terminal": False,
+            },
+            "context_transition": {
+                "schema": "agentmemory_task_neutral_context_transition_v1",
+                "operation": "append_observation",
+                "messages": [],
+            },
+            "action_submission": {"submitted_action": "shell_command"},
+            "immediate_reward": 1.0,
+            "trajectory_terminal": True,
+            "done": True,
+            "outcome": "success",
+            "horizon_finalization": {
+                "reward": 0.0,
+                "done": True,
+                "info": {
+                    "env_info": {
+                        "step": 30,
+                        "terminal": True,
+                        "episode_success": False,
+                    },
+                    "action_submission": {"control_action": "horizon"},
+                    "native_step_before": 30,
+                    "native_step_after": 30,
+                    "policy_step_after": 30,
+                    "wrapper_evidence": {"event": "horizon_finalization"},
+                },
+            },
+        }
+        with self.assertRaises(AssertionError):
+            module.verify_wrapper_transition(record, previous_native_step=29)
+
     def test_allows_natural_short_episode_without_compaction(self) -> None:
         module = load_module()
         module.verify_event_coverage(

@@ -175,11 +175,40 @@ def verify_wrapper_transition(
             assert record["outcome"] == (
                 "success" if immediate_reward == 1.0 else "terminal_failure"
             )
-            assert bool(record["env_info_after"]["episode_success"]) == (
-                immediate_reward == 1.0
-            )
-            if immediate_reward == 1.0:
-                assert record["env_info_after"]["terminal"] is True
+            horizon_finalization = record.get("horizon_finalization")
+            if horizon_finalization is None:
+                # A native final action is graded by env.step itself.
+                assert bool(record["env_info_after"]["episode_success"]) == (
+                    immediate_reward == 1.0
+                )
+                if immediate_reward == 1.0:
+                    assert record["env_info_after"]["terminal"] is True
+            else:
+                # At the policy-turn boundary the last sampled action is kept
+                # as the trainable terminal row, while the wrapper performs a
+                # separate hidden horizon grading call.  The native receipt
+                # therefore remains non-terminal; the hidden receipt is the
+                # authoritative terminal evidence and must agree with the
+                # reward attributed to that sampled row.
+                assert isinstance(horizon_finalization, dict)
+                assert float(horizon_finalization["reward"]) == immediate_reward
+                assert horizon_finalization["done"] is True
+                horizon_info = horizon_finalization["info"]
+                assert horizon_info["action_submission"]["control_action"] == "horizon"
+                assert horizon_info["wrapper_evidence"]["event"] == "horizon_finalization"
+                assert int(horizon_info["native_step_before"]) == native_after
+                assert int(horizon_info["native_step_after"]) == native_after
+                assert int(horizon_info["policy_step_after"]) == int(
+                    record["task_round"]
+                )
+                terminal_info = horizon_info["env_info"]
+                assert int(terminal_info["step"]) == native_after
+                assert terminal_info["terminal"] is True
+                assert bool(terminal_info["episode_success"]) == (
+                    immediate_reward == 1.0
+                )
+                assert record["env_info_after"]["terminal"] is False
+                assert bool(record["env_info_after"]["episode_success"]) is False
 
     return {
         "event": event,
