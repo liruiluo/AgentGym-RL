@@ -424,6 +424,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertIn('"./" is invalid', system_prompt)
         self.assertIn("delete those words", system_prompt)
         self.assertIn("begin at byte zero with apply_patch", system_prompt)
+        self.assertIn("non-terminal parser feedback", system_prompt)
 
 
 class RolloutFakeWebShopClient(FakeWebShopClient):
