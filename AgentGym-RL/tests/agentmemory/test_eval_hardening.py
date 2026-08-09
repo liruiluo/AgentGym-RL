@@ -98,6 +98,33 @@ class EvalHardeningTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "positive integer"):
             _MODULE._resolve_max_policy_turns({"max_policy_turns": 0})
 
+    def test_seed_prompt_client_is_closed_on_success_and_failure(self):
+        class FakeClient:
+            def __init__(self, conversation_start):
+                self.conversation_start = conversation_start
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        client = FakeClient([
+            {"from": "user", "value": "task"},
+            {"from": "assistant", "value": "ready"},
+        ])
+        with mock.patch.object(_MODULE, "init_env_client", return_value=client):
+            self.assertEqual(
+                _MODULE._read_conversation_start({}),
+                client.conversation_start,
+            )
+        self.assertTrue(client.closed)
+
+        invalid_client = FakeClient([])
+        with mock.patch.object(
+            _MODULE, "init_env_client", return_value=invalid_client
+        ), self.assertRaisesRegex(ValueError, "two turns"):
+            _MODULE._read_conversation_start({})
+        self.assertTrue(invalid_client.closed)
+
     def test_prompt_key_and_data_indices_use_row_positions_by_default(self):
         dataset = _MODULE.pd.DataFrame.from_records(
             [

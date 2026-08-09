@@ -240,6 +240,25 @@ def _resolve_max_policy_turns(agentgym_config):
     return parsed
 
 
+def _read_conversation_start(agentgym_config):
+    """Read the seed prompt without leaking the temporary environment slot."""
+
+    env_client = init_env_client(agentgym_config)
+    try:
+        conversation_start = env_client.conversation_start
+        if not isinstance(conversation_start, (list, tuple)) or len(conversation_start) < 2:
+            raise ValueError("environment conversation_start must contain two turns")
+        return [
+            {"from": str(turn["from"]), "value": str(turn["value"])}
+            for turn in conversation_start[:2]
+        ]
+    finally:
+        close = getattr(env_client, "close", None)
+        if not callable(close):
+            raise RuntimeError("environment client must expose close()")
+        close()
+
+
 def _resolve_eval_prompt_key(data_config, dataset):
     """Resolve the reporting id column across legacy and MemoryArena files."""
 
@@ -711,16 +730,16 @@ def main(config):
     progress_lst = [[] for _ in range(config.data.n_samples)]
     used_action_row_aggregation = False
     phase_progress_distribution = defaultdict(int)
-    env_client = init_env_client(config.agentgym)
+    conversation_start = _read_conversation_start(config.agentgym)
 
     for batch_idx in range(num_batch):
         print(f'[{batch_idx+1}/{num_batch}] Start to process.')
         start_idx = batch_idx * config_batch_size
         end_idx = min(total_samples, start_idx + config_batch_size)
         batch_item_ids = item_ids[start_idx: end_idx]
-        prompt_with_chat_template = ["<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\n" + env_client.conversation_start[0]["value"] + "<|im_end|>\n<|im_start|>assistant\n" + env_client.conversation_start[1]["value"] + "<|im_end|>" for _ in range(len(batch_item_ids))]
-        messages = [[{"role": "user", "content": env_client.conversation_start[0]["value"]},
-                     {"role": "assistant", "content": env_client.conversation_start[1]["value"]}] for _ in range(len(batch_item_ids))]
+        prompt_with_chat_template = ["<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\n" + conversation_start[0]["value"] + "<|im_end|>\n<|im_start|>assistant\n" + conversation_start[1]["value"] + "<|im_end|>" for _ in range(len(batch_item_ids))]
+        messages = [[{"role": "user", "content": conversation_start[0]["value"]},
+                     {"role": "assistant", "content": conversation_start[1]["value"]}] for _ in range(len(batch_item_ids))]
 
         input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(prompt=prompt_with_chat_template,
                                                                          tokenizer=tokenizer,
