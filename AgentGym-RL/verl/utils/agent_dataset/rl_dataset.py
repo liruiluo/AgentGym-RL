@@ -72,6 +72,12 @@ def collate_fn(data_list: list[dict]) -> dict:
     return {**tensors, **non_tensors}
 
 
+def _close_dataset_bootstrap_client(env_client) -> None:
+    close = getattr(env_client, "close", None)
+    if callable(close):
+        close()
+
+
 class RLHFDataset(Dataset):
     """
     We assume the dataset contains a column that contains prompts and other information
@@ -138,6 +144,9 @@ class RLHFDataset(Dataset):
                 env_addr=route_addrs[0],
             )
             try:
+                self.conversation_start = copy.deepcopy(
+                    self.env_client.conversation_start
+                )
                 server_metadatas = [copy.deepcopy(self.env_client.metadata)]
                 conversation_starts = [
                     copy.deepcopy(self.env_client.conversation_start)
@@ -172,7 +181,7 @@ class RLHFDataset(Dataset):
             finally:
                 # Dataset clients only provide immutable prompt/metadata
                 # bootstrap state. Rollout workers create their own sessions.
-                self.env_client.close()
+                _close_dataset_bootstrap_client(self.env_client)
         else:
             if route_addrs:
                 raise ValueError(
@@ -181,6 +190,9 @@ class RLHFDataset(Dataset):
                 )
             self.env_client = init_env_client(self.agentgym_config)
             try:
+                self.conversation_start = copy.deepcopy(
+                    self.env_client.conversation_start
+                )
                 self.procedural_server_metadata = self.env_client.metadata
                 self.multitask_conversation_starts = None
                 framing = self.env_client.policy_framing()
@@ -193,8 +205,9 @@ class RLHFDataset(Dataset):
                         self.env_client.metadata
                     )
             finally:
-                if self.procedural_index_source is not None:
-                    self.env_client.close()
+                # The dataset retains immutable prompt state only. Keeping this
+                # HTTP client open leaks one otherwise-idle server slot.
+                _close_dataset_bootstrap_client(self.env_client)
 
     def _read_files_and_tokenize(self):
         if getattr(self, "procedural_index_source", None) is not None:
@@ -236,7 +249,11 @@ class RLHFDataset(Dataset):
                 example["data_source"] = "agentmemory"
         else:
             example["data_source"] = example[self.prompt_key].split("_")[0]
-        conversation_start = self.env_client.conversation_start
+        conversation_start = getattr(
+            self,
+            "conversation_start",
+            self.env_client.conversation_start,
+        )
         policy_framing = getattr(self, "policy_framing", None)
         if isinstance(
             self.procedural_index_source,

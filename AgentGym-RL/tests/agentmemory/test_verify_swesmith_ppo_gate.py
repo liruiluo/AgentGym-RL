@@ -21,6 +21,153 @@ def load_module():
 
 
 class SwesmithPpoGateRowEvidenceTests(unittest.TestCase):
+    @staticmethod
+    def _response_cap_record() -> dict:
+        return {
+            "truncated": True,
+            "finish_reason": "length",
+            "finish_reason_source": "official_vllm:backend",
+            "generation_stop_reason": None,
+            "stop_reason": None,
+            "response_token_count": 2048,
+            "max_response_tokens": 2048,
+            "generation_response_length": 2048,
+            "packed_response_length": 2048,
+            "generation_token_ids_are_exact": True,
+            "backend_token_ids_are_exact": True,
+            "done": False,
+            "trajectory_terminal": False,
+            "outcome": "continue",
+            "immediate_reward": 0.0,
+            "task_round": 18,
+        }
+
+    def test_accepts_exact_backend_response_cap_as_negative_row(self) -> None:
+        module = load_module()
+        result = module.verify_response_cap_truncation(
+            self._response_cap_record(),
+            parent_index=43,
+        )
+        self.assertEqual(result["kind"], "exact_backend_response_cap")
+        self.assertEqual(result["parent_index"], 43)
+        self.assertEqual(result["response_token_count"], 2048)
+
+    def test_rejects_harness_or_context_truncation(self) -> None:
+        module = load_module()
+        record = self._response_cap_record()
+        record["finish_reason_source"] = "task_neutral_harness"
+        with self.assertRaises(AssertionError):
+            module.verify_response_cap_truncation(record, parent_index=43)
+
+    def test_rejects_inexact_or_short_response_cap(self) -> None:
+        module = load_module()
+        for key, value in (
+            ("backend_token_ids_are_exact", False),
+            ("response_token_count", 2047),
+        ):
+            with self.subTest(key=key):
+                record = self._response_cap_record()
+                record[key] = value
+                with self.assertRaises(AssertionError):
+                    module.verify_response_cap_truncation(record, parent_index=43)
+
+    def test_verifies_native_and_compaction_step_continuity(self) -> None:
+        module = load_module()
+        native = {
+            "wrapper_evidence": {
+                "event": module.NATIVE_EVENT,
+                "workspace_continuity_id": 9,
+            },
+            "env_info_before": {"step": 4},
+            "env_info_after": {"step": 5, "action_kind": "shell_command"},
+            "context_transition": {
+                "schema": "agentmemory_task_neutral_context_transition_v1",
+                "operation": "append_observation",
+                "messages": [],
+            },
+            "action_submission": {"submitted_action": "shell_command"},
+            "immediate_reward": 0.0,
+            "trajectory_terminal": False,
+            "done": False,
+            "outcome": "continue",
+        }
+        result = module.verify_wrapper_transition(native, previous_native_step=4)
+        self.assertEqual(result["native_step_after"], 5)
+        self.assertEqual(result["action_kind"], "shell_command")
+
+        compaction = {
+            "wrapper_evidence": {
+                "event": module.COMPACTION_EVENT,
+                "workspace_continuity_id": 9,
+            },
+            "env_info_before": {"step": 5},
+            "env_info_after": {"step": 5, "action_kind": "shell_command"},
+            "context_transition": {
+                "schema": "agentmemory_task_neutral_context_transition_v1",
+                "operation": "replace_messages",
+                "messages": [{"role": "system", "content": "summary"}],
+            },
+            "action_submission": {
+                "submitted_action": None,
+                "parser_status": "policy_context_compaction",
+            },
+            "immediate_reward": 0.0,
+        }
+        result = module.verify_wrapper_transition(compaction, previous_native_step=5)
+        self.assertEqual(result["native_step_after"], 5)
+        self.assertIsNone(result["action_kind"])
+
+    def test_rejects_native_step_gap(self) -> None:
+        module = load_module()
+        record = {
+            "wrapper_evidence": {
+                "event": module.NATIVE_EVENT,
+                "workspace_continuity_id": 9,
+            },
+            "env_info_before": {"step": 7},
+            "env_info_after": {"step": 8, "action_kind": "shell_command"},
+            "context_transition": {
+                "schema": "agentmemory_task_neutral_context_transition_v1",
+                "operation": "append_observation",
+                "messages": [],
+            },
+            "action_submission": {"submitted_action": "shell_command"},
+            "immediate_reward": 0.0,
+            "trajectory_terminal": False,
+            "done": False,
+            "outcome": "continue",
+        }
+        with self.assertRaises(AssertionError):
+            module.verify_wrapper_transition(record, previous_native_step=6)
+
+    def test_accepts_hidden_reward_on_horizon_tool_row(self) -> None:
+        module = load_module()
+        record = {
+            "wrapper_evidence": {
+                "event": module.NATIVE_EVENT,
+                "workspace_continuity_id": 9,
+            },
+            "env_info_before": {"step": 29},
+            "env_info_after": {
+                "step": 30,
+                "action_kind": "shell_command",
+                "episode_success": True,
+                "terminal": True,
+            },
+            "context_transition": {
+                "schema": "agentmemory_task_neutral_context_transition_v1",
+                "operation": "append_observation",
+                "messages": [],
+            },
+            "action_submission": {"submitted_action": "shell_command"},
+            "immediate_reward": 1.0,
+            "trajectory_terminal": True,
+            "done": True,
+            "outcome": "success",
+        }
+        result = module.verify_wrapper_transition(record, previous_native_step=29)
+        self.assertEqual(result["action_kind"], "shell_command")
+
     def test_allows_natural_short_episode_without_compaction(self) -> None:
         module = load_module()
         module.verify_event_coverage(

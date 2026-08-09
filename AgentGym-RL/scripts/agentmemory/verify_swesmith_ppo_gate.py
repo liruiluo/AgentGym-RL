@@ -99,6 +99,96 @@ def verify_event_coverage(
     )
 
 
+def verify_response_cap_truncation(
+    record: dict[str, Any], *, parent_index: int
+) -> dict[str, Any]:
+    """Accept only an exact backend length stop as a trainable negative row."""
+    response_token_count = int(record["response_token_count"])
+    max_response_tokens = int(record["max_response_tokens"])
+    assert record["truncated"] is True
+    assert record["finish_reason"] == "length"
+    assert str(record["finish_reason_source"]).endswith(":backend")
+    assert record.get("generation_stop_reason") is None
+    assert record.get("stop_reason") is None
+    assert max_response_tokens > 0
+    assert response_token_count == max_response_tokens
+    assert int(record["generation_response_length"]) == response_token_count
+    assert int(record["packed_response_length"]) == response_token_count
+    assert record["generation_token_ids_are_exact"] is True
+    assert record["backend_token_ids_are_exact"] is True
+    assert record["done"] is False
+    assert record["trajectory_terminal"] is False
+    assert record["outcome"] == "continue"
+    assert float(record["immediate_reward"]) == 0.0
+    return {
+        "kind": "exact_backend_response_cap",
+        "parent_index": parent_index,
+        "task_round": int(record["task_round"]),
+        "response_token_count": response_token_count,
+        "max_response_tokens": max_response_tokens,
+        "finish_reason": record["finish_reason"],
+        "finish_reason_source": record["finish_reason_source"],
+    }
+
+
+def verify_wrapper_transition(
+    record: dict[str, Any], *, previous_native_step: int | None
+) -> dict[str, Any]:
+    evidence = record["wrapper_evidence"]
+    event = str(evidence["event"])
+    assert event in {NATIVE_EVENT, COMPACTION_EVENT}
+    native_before = int(record["env_info_before"]["step"])
+    native_after = int(record["env_info_after"]["step"])
+    if previous_native_step is not None:
+        assert native_before == previous_native_step
+
+    transition = record["context_transition"]
+    assert transition["schema"] == "agentmemory_task_neutral_context_transition_v1"
+    action_kind: str | None = None
+    if event == COMPACTION_EVENT:
+        assert native_after == native_before
+        assert transition["operation"] == "replace_messages"
+        assert transition["messages"]
+        assert record["action_submission"]["submitted_action"] is None
+        assert record["action_submission"]["parser_status"] == (
+            "policy_context_compaction"
+        )
+    else:
+        assert native_after == native_before + 1
+        assert transition["operation"] == "append_observation"
+        action_kind = str(record["env_info_after"].get("action_kind", ""))
+        assert action_kind in {
+            "shell_command",
+            "apply_patch",
+            "final",
+            "parser_error",
+            "policy_turn_horizon",
+        }
+        trajectory_terminal = bool(record["trajectory_terminal"])
+        assert bool(record["done"]) == trajectory_terminal
+        immediate_reward = float(record["immediate_reward"])
+        if not trajectory_terminal:
+            assert record["outcome"] == "continue"
+            assert immediate_reward == 0.0
+        else:
+            assert immediate_reward in {0.0, 1.0}
+            assert record["outcome"] == (
+                "success" if immediate_reward == 1.0 else "terminal_failure"
+            )
+            assert bool(record["env_info_after"]["episode_success"]) == (
+                immediate_reward == 1.0
+            )
+            if immediate_reward == 1.0:
+                assert record["env_info_after"]["terminal"] is True
+
+    return {
+        "event": event,
+        "workspace_continuity_id": int(evidence["workspace_continuity_id"]),
+        "native_step_after": native_after,
+        "action_kind": action_kind,
+    }
+
+
 def verify_row_evidence(
     payload: dict[str, Any], expected_indices: set[int]
 ) -> dict[str, Any]:
@@ -294,16 +384,14 @@ def main() -> None:
         nonzero_return_rows += int(row.get("return_nonzero", 0) > 0)
         if record["truncated"]:
             truncated_rows.append(
-                {
-                    "parent_index": parent_index,
-                    "task_round": int(record["task_round"]),
-                    "response_token_count": int(record["response_token_count"]),
-                }
+                verify_response_cap_truncation(
+                    record,
+                    parent_index=parent_index,
+                )
             )
         rows_by_parent[parent_index].append(record)
 
     assert set(rows_by_parent) == expected_parent_indices
-    assert not truncated_rows
     assert nonzero_advantage_rows > 0
     assert nonzero_return_rows > 0
 
@@ -313,53 +401,19 @@ def main() -> None:
         assert [int(value["task_round"]) for value in records] == list(
             range(1, len(records) + 1)
         )
-        previous: dict[str, int] | None = None
+        previous_native_step: int | None = None
         for record in records:
-            evidence = record["wrapper_evidence"]
-            event = str(evidence["event"])
-            assert event in {NATIVE_EVENT, COMPACTION_EVENT}
-            event_counts[event] += 1
-            workspace_id = int(evidence["workspace_continuity_id"])
+            transition = verify_wrapper_transition(
+                record,
+                previous_native_step=previous_native_step,
+            )
+            event_counts[transition["event"]] += 1
+            workspace_id = int(transition["workspace_continuity_id"])
             workspace_ids.setdefault(parent_index, workspace_id)
             assert workspace_ids[parent_index] == workspace_id
-            counts = {
-                "native_before": int(evidence["native_call_count_before"]),
-                "native_after": int(evidence["native_call_count_after"]),
-                "policy_before": int(evidence["policy_step_before"]),
-                "policy_after": int(evidence["policy_step_after"]),
-                "context_before": int(evidence["context_epoch_before"]),
-                "context_after": int(evidence["context_epoch_after"]),
-            }
-            assert counts["policy_after"] == counts["policy_before"] + 1
-            assert counts["policy_after"] == int(record["task_round"])
-            if previous is not None:
-                assert counts["native_before"] == previous["native_after"]
-                assert counts["policy_before"] == previous["policy_after"]
-                assert counts["context_before"] == previous["context_after"]
-            previous = counts
-            if event == COMPACTION_EVENT:
-                assert counts["native_after"] == counts["native_before"]
-                assert counts["context_after"] == counts["context_before"] + 1
-                assert record["context_transition"]["operation"] == "replace_messages"
-                assert record["action_submission"]["submitted_action"] is None
-                assert record["action_submission"]["parser_status"] == (
-                    "policy_context_compaction"
-                )
-                continue
-
-            assert counts["native_after"] == counts["native_before"] + 1
-            assert counts["context_after"] == counts["context_before"]
-            action_kind = str(record["env_info_after"].get("action_kind", ""))
-            assert action_kind in {
-                "shell_command",
-                "apply_patch",
-                "final",
-                "parser_error",
-                "policy_turn_horizon",
-            }
-            action_kind_counts[action_kind] += 1
-            if action_kind in {"shell_command", "apply_patch", "parser_error"}:
-                assert float(record["immediate_reward"]) == 0.0
+            previous_native_step = int(transition["native_step_after"])
+            if transition["action_kind"] is not None:
+                action_kind_counts[str(transition["action_kind"])] += 1
 
     assert len(set(workspace_ids.values())) == args.train_batch_size
     verify_event_coverage(
@@ -405,6 +459,7 @@ def main() -> None:
         "action_kind_counts": dict(action_kind_counts),
         "compaction_required": args.require_compaction,
         "workspace_continuity_ids": workspace_ids,
+        "truncation_contract": "exact_backend_response_cap_is_trainable_negative_v1",
         "truncated_rows": truncated_rows,
         "readback": readback,
         "private_audits": audits,

@@ -11,10 +11,14 @@ try:
         UniformMultitaskIndexSource,
         WebshopSwesmithFamilyBalancedIndexSource,
     )
-    from verl.utils.agent_dataset.rl_dataset import RLHFDataset
+    from verl.utils.agent_dataset.rl_dataset import (
+        RLHFDataset,
+        _close_dataset_bootstrap_client,
+    )
 except ModuleNotFoundError as exc:  # pragma: no cover - exercised on minimal hosts
     IMPORT_ERROR = exc
     RLHFDataset = None
+    _close_dataset_bootstrap_client = None
 else:
     IMPORT_ERROR = None
 
@@ -24,6 +28,17 @@ else:
     f"full RL dataset runtime is unavailable: {IMPORT_ERROR}",
 )
 class MultitaskDatasetPromptRoutingTests(unittest.TestCase):
+    def test_closes_dataset_bootstrap_client(self) -> None:
+        class BootstrapClient:
+            closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        client = BootstrapClient()
+        _close_dataset_bootstrap_client(client)
+        self.assertTrue(client.closed)
+
     def test_build_messages_uses_each_rows_exact_surface_prompt(self) -> None:
         source = TaskBalancedMultitaskIndexSource(
             task_count=FILESYSTEM_MULTITASK_CYCLE_SIZE,
