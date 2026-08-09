@@ -21,6 +21,58 @@ def load_module():
 
 
 class SwesmithPpoGateRowEvidenceTests(unittest.TestCase):
+    def test_allows_natural_short_episode_without_compaction(self) -> None:
+        module = load_module()
+        module.verify_event_coverage(
+            module.Counter({module.NATIVE_EVENT: 10}),
+            module.Counter({"shell_command": 8, "final": 2}),
+            require_compaction=False,
+        )
+
+    def test_preserves_strict_compaction_gate_when_requested(self) -> None:
+        module = load_module()
+        with self.assertRaises(AssertionError):
+            module.verify_event_coverage(
+                module.Counter({module.NATIVE_EVENT: 10}),
+                module.Counter({"shell_command": 8, "final": 2}),
+                require_compaction=True,
+            )
+
+    def test_accepts_representative_endpoint_probe_for_train64(self) -> None:
+        module = load_module()
+        indices = module.parse_endpoint_probe_indices(
+            "0,1,13,14,30,31,47,48"
+        )
+        module.verify_endpoint_probe_indices(
+            {"indices": indices},
+            indices,
+            set(range(64)),
+        )
+
+    def test_rejects_endpoint_probe_outside_training_curriculum(self) -> None:
+        module = load_module()
+        indices = module.parse_endpoint_probe_indices(
+            "0,1,13,14,30,31,47,64"
+        )
+        with self.assertRaises(AssertionError):
+            module.verify_endpoint_probe_indices(
+                {"indices": indices},
+                indices,
+                set(range(64)),
+            )
+
+    def test_rejects_unpinned_endpoint_probe_order(self) -> None:
+        module = load_module()
+        expected = module.parse_endpoint_probe_indices(
+            "0,1,13,14,30,31,47,48"
+        )
+        with self.assertRaises(AssertionError):
+            module.verify_endpoint_probe_indices(
+                {"indices": list(reversed(expected))},
+                expected,
+                set(range(64)),
+            )
+
     def test_accepts_formal_step_records_and_binds_all_indices(self) -> None:
         module = load_module()
         rows = [

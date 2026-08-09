@@ -27,6 +27,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--global-step", type=int, default=1)
     parser.add_argument("--train-batch-size", type=int, default=8)
     parser.add_argument("--task-count", type=int, default=8)
+    parser.add_argument(
+        "--endpoint-probe-indices",
+        default="0,1,2,3,4,5,6,7",
+    )
+    parser.add_argument(
+        "--require-compaction",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     return parser.parse_args()
 
 
@@ -49,6 +58,45 @@ def finite(value: Any, label: str) -> float:
     if not math.isfinite(result):
         raise AssertionError(f"{label} is not finite: {value!r}")
     return result
+
+
+def parse_endpoint_probe_indices(raw: str) -> list[int]:
+    try:
+        indices = [int(value) for value in raw.split(",") if value != ""]
+    except ValueError as exc:
+        raise ValueError("endpoint probe indices must be comma-separated integers") from exc
+    if len(indices) != 8:
+        raise ValueError("the endpoint isolation probe requires exactly 8 indices")
+    if any(index < 0 for index in indices):
+        raise ValueError("endpoint probe indices must be nonnegative")
+    if len(set(indices)) != len(indices):
+        raise ValueError("endpoint probe indices must be distinct")
+    return indices
+
+
+def verify_endpoint_probe_indices(
+    endpoint_probe: dict[str, Any],
+    expected_probe_indices: list[int],
+    expected_training_indices: set[int],
+) -> None:
+    actual = [int(value) for value in endpoint_probe["indices"]]
+    assert actual == expected_probe_indices
+    assert set(actual).issubset(expected_training_indices)
+
+
+def verify_event_coverage(
+    event_counts: Counter[str],
+    action_kind_counts: Counter[str],
+    *,
+    require_compaction: bool,
+) -> None:
+    assert event_counts[NATIVE_EVENT] > 0
+    if require_compaction:
+        assert event_counts[COMPACTION_EVENT] > 0
+    assert (
+        action_kind_counts["shell_command"] + action_kind_counts["apply_patch"]
+        > 0
+    )
 
 
 def verify_row_evidence(
@@ -190,7 +238,11 @@ def main() -> None:
     })
     endpoint_probe = load_json(args.endpoint_probe)
     assert endpoint_probe["status"] == "pass"
-    assert set(int(value) for value in endpoint_probe["indices"]) == expected_data_indices
+    verify_endpoint_probe_indices(
+        endpoint_probe,
+        parse_endpoint_probe_indices(args.endpoint_probe_indices),
+        expected_data_indices,
+    )
 
     batch_path = (
         args.run_dir
@@ -310,9 +362,11 @@ def main() -> None:
                 assert float(record["immediate_reward"]) == 0.0
 
     assert len(set(workspace_ids.values())) == args.train_batch_size
-    assert event_counts[NATIVE_EVENT] > 0
-    assert event_counts[COMPACTION_EVENT] > 0
-    assert action_kind_counts["shell_command"] + action_kind_counts["apply_patch"] > 0
+    verify_event_coverage(
+        event_counts,
+        action_kind_counts,
+        require_compaction=args.require_compaction,
+    )
 
     metadata_after = load_json(args.metadata_after)
     for key in (
@@ -349,6 +403,7 @@ def main() -> None:
         },
         "event_counts": dict(event_counts),
         "action_kind_counts": dict(action_kind_counts),
+        "compaction_required": args.require_compaction,
         "workspace_continuity_ids": workspace_ids,
         "truncated_rows": truncated_rows,
         "readback": readback,

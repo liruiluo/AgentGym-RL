@@ -33,6 +33,20 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def parse_probe_indices(raw: str) -> list[int]:
+    try:
+        indices = [int(value) for value in raw.split(",") if value != ""]
+    except ValueError as exc:
+        raise ValueError("probe indices must be comma-separated integers") from exc
+    if len(indices) != 8:
+        raise ValueError("the eight-slot endpoint probe requires exactly 8 indices")
+    if any(index < 0 for index in indices):
+        raise ValueError("probe indices must be nonnegative")
+    if len(set(indices)) != len(indices):
+        raise ValueError("probe indices must be distinct")
+    return indices
+
+
 class Endpoint:
     def __init__(self, base_url: str, timeout: int, detail_token: str) -> None:
         self.base_url = base_url.rstrip("/")
@@ -97,9 +111,7 @@ def close_slots(endpoint: Endpoint, slot_ids: list[int]) -> list[str]:
 
 def main() -> None:
     args = parse_args()
-    indices = [int(value) for value in args.indices.split(",") if value != ""]
-    if indices != list(range(8)):
-        raise ValueError("the first formal gate must bind exact indices 0..7")
+    indices = parse_probe_indices(args.indices)
     detail_token = os.environ.get(args.detail_token_env, "")
     if not detail_token:
         raise RuntimeError(f"private detail token is unset: {args.detail_token_env}")
@@ -123,7 +135,7 @@ def main() -> None:
     assert runtime_source["source_id"] == (
         f"{args.expected_outer_commit}_{args.expected_inner_commit}"
     )
-    assert int(metadata_before["task_count"]) >= len(indices)
+    assert int(metadata_before["task_count"]) > max(indices)
     require_idle(metadata_before, label="before")
     if any(args.episodes_root.iterdir()):
         raise AssertionError("episodes root is not empty before the isolation probe")
