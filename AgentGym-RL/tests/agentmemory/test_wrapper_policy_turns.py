@@ -411,21 +411,23 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertEqual(messages[0]["role"], "system")
         self.assertNotIn("Understood.", str(messages))
         system_prompt = messages[0]["content"]
-        self.assertIn('"name":"shell_command"', system_prompt)
-        self.assertIn('"name":"apply_patch"', system_prompt)
         self.assertIn("Start at byte zero", system_prompt)
-        self.assertIn("one complete native <tool_call> block", system_prompt)
-        self.assertIn("shell_command is the preferred action", system_prompt)
+        self.assertIn(
+            'shell_command {"command":"find . -maxdepth 2 -type f | head -80",'
+            '"workdir":".","timeout_ms":120000}',
+            system_prompt,
+        )
+        self.assertIn("Start at byte zero with shell_command or apply_patch", system_prompt)
+        self.assertIn("no XML tags", system_prompt)
+        self.assertIn("*** Update File: relative/path.py", system_prompt)
         self.assertIn("apply_patch is optional", system_prompt)
-        self.assertIn("exactly one parameter=patch", system_prompt)
-        self.assertIn("never copy placeholder", system_prompt)
-        self.assertIn("Never use unified-diff headers", system_prompt)
+        self.assertIn("use shell_command when an exact patch is uncertain", system_prompt)
         self.assertIn("<think> tag", system_prompt)
         self.assertIn("Think privately", system_prompt)
         self.assertIn("A shell command can edit", system_prompt)
         self.assertIn("workspace intentionally has no .git directory", system_prompt)
         self.assertIn("Do not submit plain text until", system_prompt)
-        self.assertIn("Prose before or after a tool call is a parser error", system_prompt)
+        self.assertIn("Prose before or after a tool action is a parser error", system_prompt)
 
 
 class RolloutFakeWebShopClient(FakeWebShopClient):
