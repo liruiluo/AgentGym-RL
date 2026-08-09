@@ -30,10 +30,15 @@ ProceduralIndexError = MODULE.ProceduralIndexError
 ProceduralIndexSource = MODULE.ProceduralIndexSource
 TaskBalancedMultitaskIndexSource = MODULE.TaskBalancedMultitaskIndexSource
 UniformMultitaskIndexSource = MODULE.UniformMultitaskIndexSource
+WebshopSwesmithFamilyBalancedIndexSource = (
+    MODULE.WebshopSwesmithFamilyBalancedIndexSource
+)
 StatefulProceduralStreamSampler = MODULE.StatefulProceduralStreamSampler
 FILESYSTEM_MULTITASK_CYCLE_SIZE = MODULE.FILESYSTEM_MULTITASK_CYCLE_SIZE
 FILESYSTEM_MULTITASK_KIND = MODULE.FILESYSTEM_MULTITASK_KIND
 FILESYSTEM_MULTITASK_UNIFORM_KIND = MODULE.FILESYSTEM_MULTITASK_UNIFORM_KIND
+WEBSHOP_SWESMITH_MULTITASK_KIND = MODULE.WEBSHOP_SWESMITH_MULTITASK_KIND
+WEBSHOP_SWESMITH_SWESMITH_SLOT = MODULE.WEBSHOP_SWESMITH_SWESMITH_SLOT
 MULTITASK_LOCAL_DATA_INDEX_KEY = MODULE.MULTITASK_LOCAL_DATA_INDEX_KEY
 MULTITASK_LOCAL_TASK_COUNT_KEY = MODULE.MULTITASK_LOCAL_TASK_COUNT_KEY
 MULTITASK_ROUTE_KIND_KEY = MODULE.MULTITASK_ROUTE_KIND_KEY
@@ -618,6 +623,23 @@ def filesystem_multitask_server_metadatas() -> list[dict]:
     ]
 
 
+def swesmith_server_metadata(task_count: int = 8) -> dict:
+    return {
+        "schema": "agentmemory_swesmith_native_episode_v1",
+        "task_count": task_count,
+        "dataset_id": "swesmith_simple_native_train8_ea6d7173829c",
+        "upstream_repository": "SWE-bench/SWE-smith",
+        "dataset_manifest_sha256": "d" * 64,
+        "max_steps": 30,
+        "tool_contract": "codex_shell_command_apply_patch_v1",
+        "reward_contract": "terminal_full_resolution_binary_v1",
+        "context_contract": "one_native_issue_continuous_episode_v1",
+        "private_audit_contract": (
+            "agentmemory_swesmith_private_episode_audit_v1"
+        ),
+    }
+
+
 class ProceduralIndexSourceTests(unittest.TestCase):
     def test_explicit_data_index_is_promoted_for_environment_reset(self) -> None:
         indices = [200_000, 200_001]
@@ -1017,6 +1039,116 @@ class ProceduralIndexSourceTests(unittest.TestCase):
         self.assertTrue(geometry["fixed_compute_budget"])
         self.assertTrue(geometry["task_balanced_in_expectation"])
         self.assertFalse(geometry["orbit_members_coupled"])
+
+    def test_webshop_swesmith_batches_are_exactly_32_plus_32(self) -> None:
+        source = WebshopSwesmithFamilyBalancedIndexSource(
+            task_count=64 * 4,
+            provider_mode=PROVIDER_MODE_RESEEDED_STREAM,
+            tasks_per_orbit=1,
+            sampling_seed=17,
+            webshop_local_task_count=11,
+            swesmith_local_task_count=8,
+        )
+        source.validate_training_batch_size(64)
+        for batch_index in range(4):
+            rows = [
+                source.row_for_position(position)
+                for position in range(batch_index * 64, (batch_index + 1) * 64)
+            ]
+            webshop_rows = [
+                row
+                for row in rows
+                if row[MULTITASK_SURFACE_SLOT_KEY]
+                < WEBSHOP_SWESMITH_SWESMITH_SLOT
+            ]
+            swesmith_rows = [
+                row
+                for row in rows
+                if row[MULTITASK_SURFACE_SLOT_KEY]
+                == WEBSHOP_SWESMITH_SWESMITH_SLOT
+            ]
+            self.assertEqual(len(webshop_rows), 32)
+            self.assertEqual(len(swesmith_rows), 32)
+            self.assertTrue(
+                all(row["item_id"].startswith("agentmemory_") for row in webshop_rows)
+            )
+            self.assertTrue(
+                all(row["item_id"].startswith("swesmith_") for row in swesmith_rows)
+            )
+            for row in rows:
+                self.assertEqual(
+                    validate_multitask_route_triplet(
+                        row["data_idx"],
+                        row[MULTITASK_SURFACE_SLOT_KEY],
+                        row[MULTITASK_LOCAL_DATA_INDEX_KEY],
+                        route_kind=row[MULTITASK_ROUTE_KIND_KEY],
+                        sampling_seed=row[MULTITASK_SAMPLING_SEED_KEY],
+                        local_task_count=row[MULTITASK_LOCAL_TASK_COUNT_KEY],
+                    ),
+                    (
+                        row["data_idx"],
+                        row[MULTITASK_SURFACE_SLOT_KEY],
+                        row[MULTITASK_LOCAL_DATA_INDEX_KEY],
+                    ),
+                )
+
+    def test_webshop_swesmith_source_is_seeded_without_window_coupling(self) -> None:
+        source = procedural_index_source_from_config(
+            {
+                "procedural_index": {
+                    "enabled": True,
+                    "kind": WEBSHOP_SWESMITH_MULTITASK_KIND,
+                    "task_count": 6_400,
+                    "provider_mode": PROVIDER_MODE_RESEEDED_STREAM,
+                    "tasks_per_orbit": 1,
+                    "sampling_seed": 17,
+                    "webshop_local_task_count": 11,
+                    "swesmith_local_task_count": 8,
+                }
+            }
+        )
+        self.assertIsInstance(
+            source,
+            WebshopSwesmithFamilyBalancedIndexSource,
+        )
+        self.assertEqual(source.metadata()["rows_per_family_per_batch"], 32)
+        self.assertFalse(
+            source.metadata()["counterfactual_window_coverage_required"]
+        )
+        with self.assertRaisesRegex(ProceduralIndexError, "frozen at 64"):
+            source.validate_training_batch_size(96)
+
+    def test_webshop_swesmith_attests_both_environment_families(self) -> None:
+        source = WebshopSwesmithFamilyBalancedIndexSource(
+            task_count=64,
+            provider_mode=PROVIDER_MODE_RESEEDED_STREAM,
+            tasks_per_orbit=1,
+            sampling_seed=17,
+            webshop_local_task_count=11,
+            swesmith_local_task_count=8,
+        )
+        metadatas = filesystem_multitask_server_metadatas() + [
+            swesmith_server_metadata()
+        ]
+        source.validate_server_metadatas(metadatas)
+        identity = source.training_identity(
+            server_metadata=metadatas,
+            train_batch_size=64,
+        )
+        self.assertEqual(
+            identity["training_geometry"]["family_balance"],
+            {"webshop": 32, "swesmith": 32},
+        )
+
+        wrong_order = deepcopy(metadatas)
+        wrong_order[7], wrong_order[8] = wrong_order[8], wrong_order[7]
+        with self.assertRaises(ProceduralIndexError):
+            source.validate_server_metadatas(wrong_order)
+
+        undersized = deepcopy(metadatas)
+        undersized[-1]["task_count"] = 7
+        with self.assertRaisesRegex(ProceduralIndexError, "source panel"):
+            source.validate_server_metadatas(undersized)
 
     def test_conflicting_explicit_rollout_indices_fail_closed(self) -> None:
         with self.assertRaisesRegex(ProceduralIndexError, "both data_idx"):

@@ -44,6 +44,7 @@ from verl.utils.agent_dataset.procedural_index import (
     ProceduralIndexSource,
     TaskBalancedMultitaskIndexSource,
     UniformMultitaskIndexSource,
+    WebshopSwesmithFamilyBalancedIndexSource,
     procedural_index_source_from_config,
     validate_multitask_route_triplet,
 )
@@ -119,12 +120,17 @@ class RLHFDataset(Dataset):
             (
                 TaskBalancedMultitaskIndexSource,
                 UniformMultitaskIndexSource,
+                WebshopSwesmithFamilyBalancedIndexSource,
             ),
         ):
-            expected_route_count = len(FILESYSTEM_MULTITASK_SURFACE_ORDER)
+            expected_route_count = getattr(
+                self.procedural_index_source,
+                "expected_route_count",
+                len(FILESYSTEM_MULTITASK_SURFACE_ORDER),
+            )
             if len(route_addrs) != expected_route_count:
                 raise ValueError(
-                    "filesystem multitask training requires exactly "
+                    "multitask training requires exactly "
                     f"{expected_route_count} multitask_env_addrs"
                 )
             self.env_client = init_env_client(
@@ -219,7 +225,15 @@ class RLHFDataset(Dataset):
 
     def _build_messages(self, example: dict):
         if getattr(self, "procedural_index_source", None) is not None:
-            example["data_source"] = "agentmemory"
+            if isinstance(
+                self.procedural_index_source,
+                WebshopSwesmithFamilyBalancedIndexSource,
+            ):
+                example["data_source"] = str(example["item_id"]).split(
+                    "_", 1
+                )[0]
+            else:
+                example["data_source"] = "agentmemory"
         else:
             example["data_source"] = example[self.prompt_key].split("_")[0]
         conversation_start = self.env_client.conversation_start
@@ -229,6 +243,7 @@ class RLHFDataset(Dataset):
             (
                 TaskBalancedMultitaskIndexSource,
                 UniformMultitaskIndexSource,
+                WebshopSwesmithFamilyBalancedIndexSource,
             ),
         ):
             route_kwargs = {}

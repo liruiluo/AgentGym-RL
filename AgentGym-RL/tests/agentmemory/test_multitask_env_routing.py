@@ -57,7 +57,9 @@ finally:
         sys.modules["agentenv.envs"] = ORIGINAL_ENVS
 
 configured_multitask_env_addrs = MODULE.configured_multitask_env_addrs
+configured_multitask_task_names = MODULE.configured_multitask_task_names
 env_addr_for_surface_slot = MODULE.env_addr_for_surface_slot
+task_name_for_env_addr = MODULE.task_name_for_env_addr
 
 
 class MultitaskEnvRoutingTests(unittest.TestCase):
@@ -108,6 +110,53 @@ class MultitaskEnvRoutingTests(unittest.TestCase):
         for slot in (-1, 2, 1.0, "1", True):
             with self.subTest(slot=slot), self.assertRaises(ValueError):
                 env_addr_for_surface_slot(args, slot)
+
+    def test_cross_family_routes_select_the_existing_client_family(self) -> None:
+        endpoints = [f"http://127.0.0.1:{65000 + slot}" for slot in range(9)]
+        task_names = ["agentmemory"] * 8 + ["swesmith"]
+        args = SimpleNamespace(
+            task_name="agentmemory",
+            env_addr=endpoints[0],
+            multitask_env_addrs=endpoints,
+            multitask_task_names=task_names,
+        )
+        self.assertEqual(
+            configured_multitask_task_names(args),
+            tuple(task_names),
+        )
+        for slot, endpoint in enumerate(endpoints):
+            with self.subTest(slot=slot):
+                self.assertEqual(
+                    task_name_for_env_addr(args, endpoint),
+                    task_names[slot],
+                )
+        self.assertEqual(task_name_for_env_addr(args), "agentmemory")
+
+    def test_cross_family_task_name_contract_fails_closed(self) -> None:
+        endpoints = ["http://a:1", "http://b:2"]
+        invalid_task_names = (
+            "agentmemory",
+            [],
+            ["agentmemory"],
+            ["agentmemory", "unsupported"],
+        )
+        for task_names in invalid_task_names:
+            with self.subTest(task_names=task_names), self.assertRaises(ValueError):
+                configured_multitask_task_names(
+                    SimpleNamespace(
+                        multitask_env_addrs=endpoints,
+                        multitask_task_names=task_names,
+                    )
+                )
+
+        args = SimpleNamespace(
+            task_name="agentmemory",
+            env_addr=endpoints[0],
+            multitask_env_addrs=endpoints,
+            multitask_task_names=["agentmemory", "swesmith"],
+        )
+        with self.assertRaisesRegex(ValueError, "not present"):
+            task_name_for_env_addr(args, "http://missing:3")
 
 
 if __name__ == "__main__":

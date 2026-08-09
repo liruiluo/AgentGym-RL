@@ -79,6 +79,7 @@ actor_rollout_ref:
       task_name: textcraft # Training task name of AgentGym.
       env_addr: 'http://localhost:5000' # URL of the AgentGym environment server.
       multitask_env_addrs: null # Ordered per-surface endpoints for task-balanced AgentMemory training.
+      multitask_task_names: null # Optional client family for each multitask endpoint.
       max_retries: 10 # Maximum retry times.
       max_rounds: 10 # Maximum token length of a single response per turn.
       timeout: 300 # timeout seconds.

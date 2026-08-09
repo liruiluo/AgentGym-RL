@@ -36,6 +36,27 @@ from agentenv.envs import (
     SwesmithEnvClient,
 )
 
+
+ENVCLIENT_CLASSES = {
+    "agentmemory": AgentMemoryEnvClient,
+    "webshop": WebshopEnvClient,
+    "alfworld": AlfWorldEnvClient,
+    "babyai": BabyAIEnvClient,
+    "sciworld": SciworldEnvClient,
+    "textcraft": TextCraftEnvClient,
+    "webarena": WebarenaEnvClient,
+    "sqlgym": SqlGymEnvClient,
+    "maze": MazeEnvClient,
+    "wordle": WordleEnvClient,
+    "weather": WeatherEnvClient,
+    "todo": TodoEnvClient,
+    "movie": MovieEnvClient,
+    "sheet": SheetEnvClient,
+    "academia": AcademiaEnvClient,
+    "searchqa": SearchQAEnvClient,
+    "swesmith": SwesmithEnvClient,
+}
+
 def configured_multitask_env_addrs(args) -> tuple[str, ...]:
     raw = getattr(args, "multitask_env_addrs", None)
     if raw is None:
@@ -59,6 +80,30 @@ def configured_multitask_env_addrs(args) -> tuple[str, ...]:
     return values
 
 
+def configured_multitask_task_names(args) -> tuple[str, ...]:
+    raw = getattr(args, "multitask_task_names", None)
+    if raw is None:
+        return ()
+    if isinstance(raw, str):
+        raise ValueError("multitask_task_names must be a sequence, not a string")
+    try:
+        values = tuple(str(value).strip().lower() for value in raw)
+    except TypeError as exc:
+        raise ValueError("multitask_task_names must be a sequence") from exc
+    route_addrs = configured_multitask_env_addrs(args)
+    if len(values) != len(route_addrs):
+        raise ValueError(
+            "multitask_task_names must align one-to-one with "
+            "multitask_env_addrs"
+        )
+    for index, value in enumerate(values):
+        if value not in ENVCLIENT_CLASSES:
+            raise ValueError(
+                f"multitask_task_names[{index}] is unsupported: {value!r}"
+            )
+    return values
+
+
 def env_addr_for_surface_slot(args, surface_slot: int | None = None) -> str:
     route_addrs = configured_multitask_env_addrs(args)
     if not route_addrs:
@@ -78,44 +123,45 @@ def env_addr_for_surface_slot(args, surface_slot: int | None = None) -> str:
     return route_addrs[surface_slot]
 
 
+def task_name_for_env_addr(args, env_addr: str | None = None) -> str:
+    default_task_name = str(args.task_name).strip().lower()
+    route_task_names = configured_multitask_task_names(args)
+    if not route_task_names:
+        return default_task_name
+    route_addrs = configured_multitask_env_addrs(args)
+    resolved_env_addr = (
+        env_addr_for_surface_slot(args)
+        if env_addr is None
+        else str(env_addr).rstrip("/")
+    )
+    try:
+        route_index = route_addrs.index(resolved_env_addr)
+    except ValueError as exc:
+        raise ValueError(
+            "env_addr is not present in configured multitask_env_addrs: "
+            f"{resolved_env_addr!r}"
+        ) from exc
+    return route_task_names[route_index]
+
+
 def init_env_client(args, *, env_addr: str | None = None):
-    # task_name - task dict
-    envclient_classes = {
-        "agentmemory": AgentMemoryEnvClient,
-        "webshop": WebshopEnvClient,
-        "alfworld": AlfWorldEnvClient,
-        "babyai": BabyAIEnvClient,
-        "sciworld": SciworldEnvClient,
-        "textcraft": TextCraftEnvClient,
-        "webarena": WebarenaEnvClient,
-        "sqlgym": SqlGymEnvClient,
-        "maze": MazeEnvClient,
-        "wordle": WordleEnvClient,
-        "weather": WeatherEnvClient,
-        "todo": TodoEnvClient,
-        "movie": MovieEnvClient,
-        "sheet": SheetEnvClient,
-        "academia": AcademiaEnvClient,
-        "searchqa": SearchQAEnvClient,
-        "swesmith": SwesmithEnvClient,
-    }
-    # select task according to the name
-    envclient_class = envclient_classes.get(args.task_name.lower(), None)
+    resolved_env_addr = (
+        env_addr_for_surface_slot(args)
+        if env_addr is None
+        else str(env_addr).rstrip("/")
+    )
+    resolved_task_name = task_name_for_env_addr(args, resolved_env_addr)
+    envclient_class = ENVCLIENT_CLASSES.get(resolved_task_name)
     if envclient_class is None:
-        raise ValueError(f"Unsupported task name: {args.task_name}")
+        raise ValueError(f"Unsupported task name: {resolved_task_name}")
     retry = 0
     while True:
         try:
             data_len = getattr(args, "data_len", 1)
-            if args.task_name.lower() in {"agentmemory", "swesmith"} and not hasattr(args, "data_len"):
+            if resolved_task_name in {"agentmemory", "swesmith"} and not hasattr(args, "data_len"):
                 data_len = None
-            resolved_env_addr = (
-                env_addr_for_surface_slot(args)
-                if env_addr is None
-                else str(env_addr).rstrip("/")
-            )
             env_client = envclient_class(env_server_base=resolved_env_addr, data_len=data_len, timeout=_client_timeout_seconds())
-            if args.task_name.lower() == "agentmemory":
+            if resolved_task_name == "agentmemory":
                 _configure_agentmemory_policy_prompt(env_client)
             break
         except Exception as e:

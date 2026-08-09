@@ -9,6 +9,7 @@ try:
         PROVIDER_MODE_RESEEDED_STREAM,
         TaskBalancedMultitaskIndexSource,
         UniformMultitaskIndexSource,
+        WebshopSwesmithFamilyBalancedIndexSource,
     )
     from verl.utils.agent_dataset.rl_dataset import RLHFDataset
 except ModuleNotFoundError as exc:  # pragma: no cover - exercised on minimal hosts
@@ -142,6 +143,67 @@ class MultitaskDatasetPromptRoutingTests(unittest.TestCase):
         self.assertIn(f"canonical-slot-{slot}", rendered)
         self.assertNotIn("legacy-slot", rendered)
         self.assertNotIn("Ok.", rendered)
+
+    def test_build_messages_routes_webshop_and_swesmith_policy_framing(self) -> None:
+        source = WebshopSwesmithFamilyBalancedIndexSource(
+            task_count=64,
+            provider_mode=PROVIDER_MODE_RESEEDED_STREAM,
+            tasks_per_orbit=1,
+            sampling_seed=17,
+            webshop_local_task_count=11,
+            swesmith_local_task_count=8,
+        )
+        dataset = RLHFDataset.__new__(RLHFDataset)
+        dataset.procedural_index_source = source
+        dataset.env_client = SimpleNamespace(
+            conversation_start=[
+                {"value": "legacy-slot-0-user"},
+                {"value": "legacy-slot-0-assistant"},
+            ]
+        )
+        dataset.multitask_conversation_starts = [
+            [
+                {"value": f"legacy-slot-{slot}-user"},
+                {"value": f"legacy-slot-{slot}-assistant"},
+            ]
+            for slot in range(9)
+        ]
+        dataset.policy_framing = [
+            {"role": "system", "content": "webshop-slot-0"}
+        ]
+        dataset.multitask_policy_framings = [
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        f"webshop-slot-{slot}"
+                        if slot < 8
+                        else "swesmith-coding-policy"
+                    ),
+                }
+            ]
+            for slot in range(9)
+        ]
+
+        rows = [source.row_for_position(position) for position in range(64)]
+        webshop_row = next(
+            row for row in rows if row["agentmemory_surface_slot"] < 8
+        )
+        swesmith_row = next(
+            row for row in rows if row["agentmemory_surface_slot"] == 8
+        )
+        webshop_messages, _ = dataset._build_messages(webshop_row)
+        swesmith_messages, _ = dataset._build_messages(swesmith_row)
+
+        self.assertEqual(webshop_row["data_source"], "agentmemory")
+        self.assertEqual(swesmith_row["data_source"], "swesmith")
+        self.assertTrue(
+            webshop_messages[0]["content"].startswith("webshop-slot-")
+        )
+        self.assertEqual(
+            swesmith_messages,
+            [{"role": "system", "content": "swesmith-coding-policy"}],
+        )
 
 
 if __name__ == "__main__":
