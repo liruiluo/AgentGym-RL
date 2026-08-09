@@ -334,6 +334,25 @@ class EvalHardeningTest(unittest.TestCase):
         self.assertEqual(passes, [True])
         self.assertEqual(info["mode"], "formal_episode_rows")
 
+    def test_task_neutral_env_info_success_is_pass(self):
+        output = DataProto.from_dict(
+            tensors={"task_scores": torch.tensor([[1.0]])},
+            non_tensors={
+                "rollout_done_flags": np.array([True], dtype=object),
+                "agentmemory_step_record_json": np.array(
+                    [json.dumps({"env_info_after": {"episode_success": True}})],
+                    dtype=object,
+                ),
+            },
+        )
+
+        _, passes, _, info = _MODULE._aggregate_episode_scores(
+            output, real_batch_size=1
+        )
+
+        self.assertEqual(passes, [True])
+        self.assertEqual(info["pass_source"], "formal_episode_success")
+
     def test_phase_histogram_includes_zero_bins_and_unknown(self):
         records = [
             json.dumps(
