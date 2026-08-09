@@ -26,6 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metadata-after", type=Path, required=True)
     parser.add_argument("--global-step", type=int, default=1)
     parser.add_argument("--train-batch-size", type=int, default=8)
+    parser.add_argument("--task-count", type=int, default=8)
     return parser.parse_args()
 
 
@@ -125,6 +126,9 @@ def verify_audits(
     endpoint_probe: dict[str, Any],
     expected_indices: set[int],
     run_started_at: datetime,
+    *,
+    expected_audit_count: int | None = None,
+    expected_data_idx_counts: Counter[int] | None = None,
 ) -> dict[str, Any]:
     probe_audit_ids = set(str(value) for value in endpoint_probe["audit_ids"])
     trainer_audits: list[dict[str, Any]] = []
@@ -146,14 +150,24 @@ def verify_audits(
         assert payload["grade"] is not None
         assert int(payload["step_count"]) > 0
         trainer_audits.append(payload)
-    assert len(trainer_audits) == len(expected_indices)
+    if expected_audit_count is None:
+        expected_audit_count = len(expected_indices)
+    assert len(trainer_audits) == expected_audit_count
     indices = [int(value["data_idx"]) for value in trainer_audits]
     assert set(indices) == expected_indices
-    assert len(indices) == len(set(indices))
+    observed_data_idx_counts = Counter(indices)
+    if expected_data_idx_counts is None:
+        assert len(indices) == len(set(indices))
+    else:
+        assert observed_data_idx_counts == expected_data_idx_counts
     assert len({int(value["slot_id"]) for value in trainer_audits}) == len(indices)
     return {
         "audit_count": len(trainer_audits),
-        "dataset_indices": sorted(indices),
+        "dataset_indices": sorted(set(indices)),
+        "data_idx_counts": {
+            str(index): count
+            for index, count in sorted(observed_data_idx_counts.items())
+        },
         "resolved_count": sum(float(value["reward"]) == 1.0 for value in trainer_audits),
         "audit_ids": sorted(str(value["audit_id"]) for value in trainer_audits),
         "selection": "run-start-time-minus-current-probe",
@@ -165,11 +179,18 @@ def verify_audits(
 def main() -> None:
     args = parse_args()
     assert args.global_step == 1
-    assert args.train_batch_size == 8
-    expected_indices = set(range(args.train_batch_size))
+    assert args.train_batch_size > 0
+    assert args.task_count > 0
+    assert args.train_batch_size % args.task_count == 0
+    expected_parent_indices = set(range(args.train_batch_size))
+    expected_data_indices = set(range(args.task_count))
+    expected_data_idx_counts = Counter({
+        index: args.train_batch_size // args.task_count
+        for index in expected_data_indices
+    })
     endpoint_probe = load_json(args.endpoint_probe)
     assert endpoint_probe["status"] == "pass"
-    assert set(int(value) for value in endpoint_probe["indices"]) == expected_indices
+    assert set(int(value) for value in endpoint_probe["indices"]) == expected_data_indices
 
     batch_path = (
         args.run_dir
@@ -193,7 +214,7 @@ def main() -> None:
         if not row["ppo_valid_sample"]:
             continue
         parent_index = int(row["parent_index"])
-        assert parent_index in expected_indices
+        assert parent_index in expected_parent_indices
         record = row["formal_step_record"]
         assert record["schema_version"] == STEP_SCHEMA
         assert int(record["parent_index"]) == parent_index
@@ -229,7 +250,7 @@ def main() -> None:
             )
         rows_by_parent[parent_index].append(record)
 
-    assert set(rows_by_parent) == expected_indices
+    assert set(rows_by_parent) == expected_parent_indices
     assert not truncated_rows
     assert nonzero_advantage_rows > 0
     assert nonzero_return_rows > 0
@@ -301,7 +322,9 @@ def main() -> None:
     ):
         assert int(metadata_after[key]) == 0
 
-    readback = verify_readback(args.run_dir, args.global_step, expected_indices)
+    readback = verify_readback(
+        args.run_dir, args.global_step, expected_parent_indices
+    )
     run_started_at = parse_time(
         (args.run_dir / "started_at").read_text(encoding="utf-8"),
         "run.started_at",
@@ -309,14 +332,17 @@ def main() -> None:
     audits = verify_audits(
         args.audit_root,
         endpoint_probe,
-        expected_indices,
+        expected_data_indices,
         run_started_at,
+        expected_audit_count=args.train_batch_size,
+        expected_data_idx_counts=expected_data_idx_counts,
     )
     evidence = {
         "schema": "agentmemory_swesmith_ppo_gate_attestation_v1",
         "status": "pass",
         "global_step": args.global_step,
         "train_batch_size": args.train_batch_size,
+        "task_count": args.task_count,
         "valid_rows": int(payload["valid_rows"]),
         "parent_row_counts": {
             str(parent): len(records) for parent, records in sorted(rows_by_parent.items())

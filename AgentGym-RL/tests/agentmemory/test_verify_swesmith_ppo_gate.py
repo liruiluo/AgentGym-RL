@@ -151,6 +151,35 @@ class SwesmithPpoGateAuditSelectionTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "must include a timezone"):
             module.parse_time("2026-08-09T01:00:00", "test.started_at")
 
+    def test_accepts_repeated_task_indices_for_batch64(self) -> None:
+        module = load_module()
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            for parent_index in range(64):
+                task_index = parent_index % 8
+                audit_id = f"{parent_index + 1:032x}"
+                payload = self._audit(
+                    audit_id=audit_id,
+                    index=task_index,
+                    slot=parent_index,
+                    started_at="2026-08-09T01:00:01Z",
+                )
+                (root / f"episode-{audit_id}.json").write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+
+            result = module.verify_audits(
+                root,
+                {"audit_ids": []},
+                set(range(8)),
+                module.parse_time("2026-08-09T01:00:00Z", "test.started_at"),
+                expected_audit_count=64,
+                expected_data_idx_counts=module.Counter({index: 8 for index in range(8)}),
+            )
+
+        self.assertEqual(result["audit_count"], 64)
+        self.assertEqual(result["data_idx_counts"], {str(index): 8 for index in range(8)})
+
 
 if __name__ == "__main__":
     unittest.main()
