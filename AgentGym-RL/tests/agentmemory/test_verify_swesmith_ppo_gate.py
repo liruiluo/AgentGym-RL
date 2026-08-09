@@ -379,6 +379,42 @@ class SwesmithPpoGateAuditSelectionTests(unittest.TestCase):
         self.assertEqual(result["audit_count"], 64)
         self.assertEqual(result["data_idx_counts"], {str(index): 8 for index in range(8)})
 
+    def test_accepts_reused_slots_across_optimizer_updates(self) -> None:
+        module = load_module()
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            for update in range(2):
+                for slot in range(8):
+                    audit_id = f"{update * 8 + slot + 1:032x}"
+                    payload = self._audit(
+                        audit_id=audit_id,
+                        index=slot,
+                        slot=slot,
+                        started_at=f"2026-08-09T01:00:{update + 1:02d}Z",
+                    )
+                    (root / f"episode-{audit_id}.json").write_text(
+                        json.dumps(payload), encoding="utf-8"
+                    )
+
+            result = module.verify_audits(
+                root,
+                {"audit_ids": []},
+                set(range(8)),
+                module.parse_time("2026-08-09T01:00:00Z", "test.started_at"),
+                expected_audit_count=16,
+                expected_data_idx_counts=module.Counter(
+                    {index: 2 for index in range(8)}
+                ),
+                expected_slot_counts=module.Counter(
+                    {slot: 2 for slot in range(8)}
+                ),
+            )
+
+        self.assertEqual(result["audit_count"], 16)
+        self.assertEqual(
+            result["slot_counts"], {str(slot): 2 for slot in range(8)}
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

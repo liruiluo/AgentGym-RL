@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the first real eight-rank SWE-smith PPO update."""
+"""Verify a declared eight-rank SWE-smith PPO endpoint."""
 
 from __future__ import annotations
 
@@ -267,6 +267,7 @@ def verify_audits(
     *,
     expected_audit_count: int | None = None,
     expected_data_idx_counts: Counter[int] | None = None,
+    expected_slot_counts: Counter[int] | None = None,
 ) -> dict[str, Any]:
     probe_audit_ids = set(str(value) for value in endpoint_probe["audit_ids"])
     trainer_audits: list[dict[str, Any]] = []
@@ -298,13 +299,23 @@ def verify_audits(
         assert len(indices) == len(set(indices))
     else:
         assert observed_data_idx_counts == expected_data_idx_counts
-    assert len({int(value["slot_id"]) for value in trainer_audits}) == len(indices)
+    observed_slot_counts = Counter(
+        int(value["slot_id"]) for value in trainer_audits
+    )
+    if expected_slot_counts is None:
+        assert len(observed_slot_counts) == len(indices)
+    else:
+        assert observed_slot_counts == expected_slot_counts
     return {
         "audit_count": len(trainer_audits),
         "dataset_indices": sorted(set(indices)),
         "data_idx_counts": {
             str(index): count
             for index, count in sorted(observed_data_idx_counts.items())
+        },
+        "slot_counts": {
+            str(slot): count
+            for slot, count in sorted(observed_slot_counts.items())
         },
         "resolved_count": sum(float(value["reward"]) == 1.0 for value in trainer_audits),
         "audit_ids": sorted(str(value["audit_id"]) for value in trainer_audits),
@@ -316,15 +327,18 @@ def verify_audits(
 
 def main() -> None:
     args = parse_args()
-    assert args.global_step == 1
+    assert args.global_step > 0
     assert args.train_batch_size > 0
     assert args.task_count > 0
     assert args.train_batch_size % args.task_count == 0
     expected_parent_indices = set(range(args.train_batch_size))
     expected_data_indices = set(range(args.task_count))
     expected_data_idx_counts = Counter({
-        index: args.train_batch_size // args.task_count
+        index: args.global_step * args.train_batch_size // args.task_count
         for index in expected_data_indices
+    })
+    expected_slot_counts = Counter({
+        slot: args.global_step for slot in range(args.train_batch_size)
     })
     endpoint_probe = load_json(args.endpoint_probe)
     assert endpoint_probe["status"] == "pass"
@@ -442,13 +456,15 @@ def main() -> None:
         endpoint_probe,
         expected_data_indices,
         run_started_at,
-        expected_audit_count=args.train_batch_size,
+        expected_audit_count=args.global_step * args.train_batch_size,
         expected_data_idx_counts=expected_data_idx_counts,
+        expected_slot_counts=expected_slot_counts,
     )
     evidence = {
         "schema": "agentmemory_swesmith_ppo_gate_attestation_v1",
         "status": "pass",
         "global_step": args.global_step,
+        "optimizer_update_count": args.global_step,
         "train_batch_size": args.train_batch_size,
         "task_count": args.task_count,
         "valid_rows": int(payload["valid_rows"]),
