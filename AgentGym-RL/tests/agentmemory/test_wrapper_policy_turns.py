@@ -416,6 +416,15 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertIn("<function=shell_command>", system_prompt)
         self.assertIn("<parameter=command>", system_prompt)
         self.assertIn("function=apply_patch", system_prompt)
+        self.assertIn(
+            "<function=apply_patch>\n<parameter=patch>\n*** Begin Patch",
+            system_prompt,
+        )
+        self.assertIn("*** Update File: path/to/file.py", system_prompt)
+        self.assertIn("exactly one parameter named patch", system_prompt)
+        self.assertIn("Never add workdir, timeout_ms, command", system_prompt)
+        self.assertIn("never unified-diff headers --- a/path.py", system_prompt)
+        self.assertIn("bare </think> tag", system_prompt)
         self.assertIn("Think privately", system_prompt)
         self.assertIn("shell_command may also edit files", system_prompt)
         self.assertIn("workspace intentionally has no .git directory", system_prompt)
