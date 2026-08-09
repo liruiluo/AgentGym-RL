@@ -1,5 +1,23 @@
 # AgentMemoryGym Evidence Eval
 
+## SWE-smith curriculum and image preparation
+
+`build_swesmith_curriculum.py` constructs a deterministic curriculum from an
+existing frozen `train` or `heldout` manifest. It verifies every shard and the
+base selection, rejects a role mismatch, balances explicit repository quotas,
+and emits instance IDs, an indexed dataset manifest, routing JSONL, and a
+server-private selection report. The default filter keeps small patches to one
+existing non-test Python source file. Formal PPO must use a manifest derived
+from the native train split; the historical `oauthlib` `simple_train8` panel is
+held-out plumbing and is not a training distribution.
+
+`prepare_swesmith_oci_rootfs.py` resolves already-frozen image digests into the
+out-of-band rootfs cache consumed by the sandbox. It streams `crane export`
+through `tar`, verifies the manifest/config/rootfs contract, writes the
+completion marker last, and emits the corresponding profile image manifest.
+The formal endpoint performs no network fallback, so every required digest
+must pass this preparation step before launch.
+
 `attest_effective_memory_prompt.py` records the exact rollout system prompt,
 its SHA-256, and the effective memory/LTM modes. Formal MemoryChain launchers
 should pass `--require-lifecycle-sop` when their scientific contract requires
