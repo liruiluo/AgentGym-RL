@@ -411,18 +411,19 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertEqual(messages[0]["role"], "system")
         self.assertNotIn("Understood.", str(messages))
         system_prompt = messages[0]["content"]
-        self.assertIn('"name":"shell_command"', system_prompt)
-        self.assertIn('"name":"apply_patch"', system_prompt)
-        self.assertIn("<function=shell_command>", system_prompt)
-        self.assertIn("<parameter=command>", system_prompt)
-        self.assertIn("function=apply_patch", system_prompt)
-        self.assertIn("Think privately", system_prompt)
+        self.assertIn(
+            'shell_command {"command":"sed -n \'1,200p\' path/to/file.py",'
+            '"workdir":".","timeout_ms":120000}',
+            system_prompt,
+        )
+        self.assertIn("*** Update File: path/to/file.py", system_prompt)
+        self.assertIn("never print analysis", system_prompt)
         self.assertIn("shell_command may also edit files", system_prompt)
         self.assertIn("workspace intentionally has no .git directory", system_prompt)
         self.assertIn("If you diagnosed the bug but no path changed", system_prompt)
-        self.assertIn("./ is invalid", system_prompt)
+        self.assertIn('"./" is invalid', system_prompt)
         self.assertIn("delete those words", system_prompt)
-        self.assertIn("begin at byte zero with <tool_call>", system_prompt)
+        self.assertIn("begin at byte zero with apply_patch", system_prompt)
         self.assertIn("non-terminal parser feedback", system_prompt)
 
 
