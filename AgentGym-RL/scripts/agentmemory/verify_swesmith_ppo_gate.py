@@ -82,16 +82,6 @@ def parse_endpoint_probe_slots(endpoint_probe: dict[str, Any]) -> list[int]:
     return slots
 
 
-def expected_trainer_slot_counts(
-    endpoint_probe: dict[str, Any], train_batch_size: int, global_step: int
-) -> Counter[int]:
-    trainer_slot_start = max(parse_endpoint_probe_slots(endpoint_probe)) + 1
-    return Counter({
-        trainer_slot_start + slot: global_step
-        for slot in range(train_batch_size)
-    })
-
-
 def verify_endpoint_probe_indices(
     endpoint_probe: dict[str, Any],
     expected_probe_indices: list[int],
@@ -315,6 +305,7 @@ def verify_audits(
     expected_audit_count: int | None = None,
     expected_data_idx_counts: Counter[int] | None = None,
     expected_slot_counts: Counter[int] | None = None,
+    expected_slot_cardinality: int | None = None,
 ) -> dict[str, Any]:
     probe_audit_ids = set(str(value) for value in endpoint_probe["audit_ids"])
     trainer_audits: list[dict[str, Any]] = []
@@ -350,7 +341,12 @@ def verify_audits(
         int(value["slot_id"]) for value in trainer_audits
     )
     if expected_slot_counts is None:
-        assert len(observed_slot_counts) == len(indices)
+        if expected_slot_cardinality is None:
+            expected_slot_cardinality = len(expected_indices)
+        assert len(observed_slot_counts) == expected_slot_cardinality
+        assert expected_audit_count % expected_slot_cardinality == 0
+        expected_slot_frequency = expected_audit_count // expected_slot_cardinality
+        assert set(observed_slot_counts.values()) == {expected_slot_frequency}
     else:
         assert observed_slot_counts == expected_slot_counts
     return {
@@ -386,17 +382,16 @@ def main() -> None:
     })
     endpoint_probe = load_json(args.endpoint_probe)
     assert endpoint_probe["status"] == "pass"
+    parse_endpoint_probe_slots(endpoint_probe)
     verify_endpoint_probe_indices(
         endpoint_probe,
         parse_endpoint_probe_indices(args.endpoint_probe_indices),
         expected_data_indices,
     )
-    # The resident endpoint probe allocates slots before the trainer starts.
-    # Derive the training slot range from that probe instead of assuming that
-    # training begins at slot zero.
-    expected_slot_counts = expected_trainer_slot_counts(
-        endpoint_probe, args.train_batch_size, args.global_step
-    )
+    # Slot IDs are service-local and may include internal reservations between
+    # the endpoint probe and trainer allocation. Verify cardinality/frequency,
+    # while keeping dataset-index and audit-count checks exact.
+    expected_slot_counts = None
 
     batch_path = (
         args.run_dir
@@ -509,6 +504,7 @@ def main() -> None:
         expected_audit_count=args.global_step * args.train_batch_size,
         expected_data_idx_counts=expected_data_idx_counts,
         expected_slot_counts=expected_slot_counts,
+        expected_slot_cardinality=args.train_batch_size,
     )
     evidence = {
         "schema": "agentmemory_swesmith_ppo_gate_attestation_v1",

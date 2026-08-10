@@ -443,13 +443,11 @@ class SwesmithPpoGateAuditSelectionTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "must include a timezone"):
             module.parse_time("2026-08-09T01:00:00", "test.started_at")
 
-    def test_training_slots_start_after_endpoint_probe_slots(self) -> None:
+    def test_endpoint_probe_slots_are_validated_without_fixing_service_offsets(self) -> None:
         module = load_module()
         self.assertEqual(
-            module.expected_trainer_slot_counts(
-                {"slot_ids": list(range(8))}, train_batch_size=4, global_step=2
-            ),
-            module.Counter({8: 2, 9: 2, 10: 2, 11: 2}),
+            module.parse_endpoint_probe_slots({"slot_ids": list(range(8))}),
+            list(range(8)),
         )
 
     def test_accepts_repeated_task_indices_for_batch64(self) -> None:
@@ -462,7 +460,7 @@ class SwesmithPpoGateAuditSelectionTests(unittest.TestCase):
                 payload = self._audit(
                     audit_id=audit_id,
                     index=task_index,
-                    slot=parent_index,
+                    slot=parent_index + 9,
                     started_at="2026-08-09T01:00:01Z",
                 )
                 (root / f"episode-{audit_id}.json").write_text(
@@ -476,6 +474,7 @@ class SwesmithPpoGateAuditSelectionTests(unittest.TestCase):
                 module.parse_time("2026-08-09T01:00:00Z", "test.started_at"),
                 expected_audit_count=64,
                 expected_data_idx_counts=module.Counter({index: 8 for index in range(8)}),
+                expected_slot_cardinality=64,
             )
 
         self.assertEqual(result["audit_count"], 64)
