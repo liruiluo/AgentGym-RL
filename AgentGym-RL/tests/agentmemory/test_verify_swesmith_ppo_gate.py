@@ -589,6 +589,93 @@ class SwesmithPpoGateAuditSelectionTests(unittest.TestCase):
         self.assertEqual(len(result["slot_counts"]), 16)
         self.assertEqual(set(result["slot_counts"].values()), {1})
 
+    def test_accepts_ungraded_authoritative_executor_rejection(self) -> None:
+        module = load_module()
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            payload = self._audit(
+                audit_id="1" * 32,
+                index=3,
+                slot=17,
+                started_at="2026-08-09T01:00:01Z",
+            )
+            payload.update({
+                "reward": 0.0,
+                "grade": None,
+                "evidence": [{
+                    "event": "policy_step",
+                    "action": {"kind": "shell_command"},
+                    "actor_credit": {
+                        "schema": "task_neutral_actor_credit_v1",
+                        "positive_eligible": False,
+                        "basis": "executor_rejected",
+                    },
+                    "observation_after": (
+                        "shell_command failed: workspace contains an absolute symlink"
+                    ),
+                }],
+            })
+            (root / "episode-rejected.json").write_text(
+                json.dumps(payload), encoding="utf-8"
+            )
+            result = module.verify_audits(
+                root,
+                {"audit_ids": []},
+                {3},
+                module.parse_time("2026-08-09T01:00:00Z", "test.started_at"),
+            )
+
+        self.assertEqual(result["audit_count"], 1)
+        self.assertEqual(result["graded_audit_count"], 0)
+        self.assertEqual(
+            result["ungraded_terminal_rejections"],
+            [{
+                "audit_id": "1" * 32,
+                "data_idx": 3,
+                "slot_id": 17,
+                "step_count": 3,
+                "actor_credit_basis": "executor_rejected",
+                "action_kind": "shell_command",
+            }],
+        )
+
+    def test_rejects_ungraded_non_authoritative_client_close(self) -> None:
+        module = load_module()
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            payload = self._audit(
+                audit_id="2" * 32,
+                index=3,
+                slot=17,
+                started_at="2026-08-09T01:00:01Z",
+            )
+            payload.update({
+                "reward": 0.0,
+                "grade": None,
+                "evidence": [{
+                    "event": "policy_step",
+                    "action": {"kind": "shell_command"},
+                    "actor_credit": {
+                        "schema": "task_neutral_actor_credit_v1",
+                        "positive_eligible": True,
+                        "basis": "shell_executed",
+                    },
+                    "observation_after": "shell_command exit_code=0",
+                }],
+            })
+            (root / "episode-incomplete.json").write_text(
+                json.dumps(payload), encoding="utf-8"
+            )
+            with self.assertRaises(AssertionError):
+                module.verify_audits(
+                    root,
+                    {"audit_ids": []},
+                    {3},
+                    module.parse_time(
+                        "2026-08-09T01:00:00Z", "test.started_at"
+                    ),
+                )
+
     def test_rejects_reused_slots_when_service_contract_is_fresh_per_episode(self) -> None:
         module = load_module()
         with tempfile.TemporaryDirectory() as raw_root:

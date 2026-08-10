@@ -361,6 +361,7 @@ def verify_audits(
 ) -> dict[str, Any]:
     probe_audit_ids = set(str(value) for value in endpoint_probe["audit_ids"])
     trainer_audits: list[dict[str, Any]] = []
+    ungraded_terminal_rejections: list[dict[str, Any]] = []
     stale_audit_count = 0
     for path in sorted(audit_root.glob("episode-*.json")):
         payload = load_json(path)
@@ -376,8 +377,30 @@ def verify_audits(
         assert payload["close_reason"] == "client_close"
         assert payload["done"] is True
         assert float(payload["reward"]) in {0.0, 1.0}
-        assert payload["grade"] is not None
         assert int(payload["step_count"]) > 0
+        if payload["grade"] is None:
+            assert float(payload["reward"]) == 0.0
+            last_event = payload["evidence"][-1]
+            assert last_event["event"] == "policy_step"
+            actor_credit = last_event["actor_credit"]
+            assert actor_credit == {
+                "schema": "task_neutral_actor_credit_v1",
+                "positive_eligible": False,
+                "basis": "executor_rejected",
+            }
+            action_kind = str(last_event["action"]["kind"])
+            assert action_kind in {"shell_command", "apply_patch"}
+            assert str(last_event["observation_after"]).startswith(
+                f"{action_kind} failed:"
+            )
+            ungraded_terminal_rejections.append({
+                "audit_id": str(payload["audit_id"]),
+                "data_idx": int(payload["data_idx"]),
+                "slot_id": int(payload["slot_id"]),
+                "step_count": int(payload["step_count"]),
+                "actor_credit_basis": actor_credit["basis"],
+                "action_kind": action_kind,
+            })
         trainer_audits.append(payload)
     if expected_audit_count is None:
         expected_audit_count = len(expected_indices)
@@ -413,6 +436,8 @@ def verify_audits(
             for slot, count in sorted(observed_slot_counts.items())
         },
         "resolved_count": sum(float(value["reward"]) == 1.0 for value in trainer_audits),
+        "graded_audit_count": sum(value["grade"] is not None for value in trainer_audits),
+        "ungraded_terminal_rejections": ungraded_terminal_rejections,
         "audit_ids": sorted(str(value["audit_id"]) for value in trainer_audits),
         "selection": "run-start-time-minus-current-probe",
         "run_started_at": run_started_at.isoformat(),
