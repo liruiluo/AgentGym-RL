@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -31,6 +32,7 @@ from agentenv.envs.agentmemory import AgentMemoryEnvClient  # noqa: E402
 from agentenv.envs.swesmith import (  # noqa: E402
     SWE_CONTEXT_COMPACTION_REQUEST,
     SwesmithEnvClient,
+    _validate_action_progress_receipt,
     _validate_actor_credit_receipt,
 )
 from agentenv.envs.webshop_handoff import (  # noqa: E402
@@ -121,6 +123,7 @@ class FakeSwesmithClient(SwesmithEnvClient):
         action = str(kwargs["json"]["action"])
         self.native_calls.append(action)
         step = len(self.native_calls)
+        workspace_changed = "printf changed >" in action
         return {
             "observation": f"native tool output {step}",
             "reward": 0.0,
@@ -132,6 +135,16 @@ class FakeSwesmithClient(SwesmithEnvClient):
                     "schema": "task_neutral_actor_credit_v1",
                     "positive_eligible": True,
                     "basis": "shell_executed",
+                },
+                "action_progress": {
+                    "schema": "swesmith_action_progress_v1",
+                    "action_fingerprint": hashlib.sha256(
+                        action.encode("utf-8")
+                    ).hexdigest(),
+                    "result_fingerprint": hashlib.sha256(
+                        ("result:" + action).encode("utf-8")
+                    ).hexdigest(),
+                    "workspace_changed": workspace_changed,
                 },
             },
         }
@@ -435,6 +448,98 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             with self.subTest(receipt=receipt):
                 with self.assertRaises(RuntimeError):
                     _validate_actor_credit_receipt(receipt)
+
+    def test_swesmith_action_progress_receipt_fails_closed(self) -> None:
+        invalid_receipts = (
+            None,
+            {
+                "schema": "swesmith_action_progress_v1",
+                "action_fingerprint": "not-a-sha",
+                "result_fingerprint": "b" * 64,
+                "workspace_changed": False,
+            },
+            {
+                "schema": "swesmith_action_progress_v1",
+                "action_fingerprint": "a" * 64,
+                "result_fingerprint": "b" * 64,
+                "workspace_changed": 0,
+            },
+        )
+        for receipt in invalid_receipts:
+            with self.subTest(receipt=receipt):
+                with self.assertRaises(RuntimeError):
+                    _validate_action_progress_receipt(receipt)
+
+    def test_swesmith_zero_progress_repeat_resets_after_workspace_change(self) -> None:
+        client = FakeSwesmithClient()
+        inspect = 'shell_command {"command":"find . -maxdepth 2 -type f"}'
+
+        first = client.step(inspect)
+        repeated = client.step(inspect)
+        mutation = client.step(
+            'shell_command {"command":"printf changed > notes.txt"}'
+        )
+        after_mutation = client.step(inspect)
+
+        self.assertTrue(
+            first.info["wrapper_evidence"]["actor_credit"]["positive_eligible"]
+        )
+        self.assertEqual(
+            repeated.info["wrapper_evidence"]["actor_credit"],
+            {
+                "schema": "task_neutral_actor_credit_v1",
+                "positive_eligible": False,
+                "basis": "zero_progress_repeat",
+            },
+        )
+        self.assertTrue(
+            mutation.info["wrapper_evidence"]["action_progress"][
+                "workspace_changed"
+            ]
+        )
+        self.assertTrue(
+            after_mutation.info["wrapper_evidence"]["actor_credit"][
+                "positive_eligible"
+            ]
+        )
+
+    def test_swesmith_zero_progress_repeat_resets_after_compaction(self) -> None:
+        client = FakeSwesmithClient()
+        messages = bind_initial_policy_context(
+            client,
+            client.policy_framing()
+            + [{"role": "user", "content": client.observe()}],
+        )
+        inspect = 'shell_command {"command":"find . -maxdepth 2 -type f"}'
+
+        first, messages = complete_policy_turn(client, prepare(client, messages), inspect)
+        repeated, messages = complete_policy_turn(
+            client, prepare(client, messages), inspect
+        )
+        self.assertTrue(
+            first.info["wrapper_evidence"]["actor_credit"]["positive_eligible"]
+        )
+        self.assertFalse(
+            repeated.info["wrapper_evidence"]["actor_credit"]["positive_eligible"]
+        )
+
+        action_count = count_prompt_tokens(messages)
+        candidate_count = count_prompt_tokens(
+            messages + [{"role": "user", "content": SWE_CONTEXT_COMPACTION_REQUEST}]
+        )
+        self.assertGreater(candidate_count, action_count)
+        compaction = prepare(client, messages, capacity=candidate_count + 1)
+        self.assertEqual(compaction.control_request, SWE_CONTEXT_COMPACTION_REQUEST)
+        _, messages = complete_policy_turn(client, compaction, "Resume by inspecting files.")
+
+        after_compaction, _ = complete_policy_turn(
+            client, prepare(client, messages), inspect
+        )
+        self.assertTrue(
+            after_compaction.info["wrapper_evidence"]["actor_credit"][
+                "positive_eligible"
+            ]
+        )
 
     def test_swesmith_replaces_legacy_acknowledgement_with_system_framing(self) -> None:
         client = FakeSwesmithClient()
