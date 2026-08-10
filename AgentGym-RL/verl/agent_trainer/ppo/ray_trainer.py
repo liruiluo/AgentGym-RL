@@ -58,6 +58,7 @@ from verl.utils.agentgym.rollout_context import (
     AGENTMEMORY_PACKED_PROMPT_LENGTH,
     AGENTMEMORY_PARENT_GROUP_UID,
     AGENTMEMORY_REPLICA_INDEX,
+    AGENTMEMORY_STEP_RECORD_JSON,
     AGENTMEMORY_SUFFIX_CREDIT_APPLIED,
     AGENTMEMORY_SUFFIX_RETURN,
     AGENTMEMORY_TRAJECTORY_RETURN,
@@ -205,6 +206,79 @@ def _mask_ppo_padding_samples(data: DataProto) -> None:
     data.batch['response_mask'] = response_mask * valid_samples.unsqueeze(-1).to(response_mask.dtype)
 
 
+def _actor_positive_credit_eligibility(data: DataProto) -> torch.Tensor:
+    raw_records = data.non_tensor_batch.get(AGENTMEMORY_STEP_RECORD_JSON)
+    if raw_records is None or len(raw_records) != len(data):
+        raise RuntimeError(
+            "Positive actor-credit masking requires one step record per action row."
+        )
+    valid_samples = _get_ppo_valid_sample_mask(data).detach().cpu().tolist()
+    eligibility: list[bool] = []
+    for row_index, (raw_record, valid) in enumerate(zip(raw_records, valid_samples)):
+        if not valid:
+            eligibility.append(False)
+            continue
+        if not isinstance(raw_record, str):
+            raise RuntimeError(
+                f"Actor-credit step record {row_index} must be JSON text."
+            )
+        try:
+            record = json.loads(raw_record)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Actor-credit step record {row_index} is invalid JSON."
+            ) from exc
+        wrapper_evidence = record.get("wrapper_evidence")
+        receipt = (
+            wrapper_evidence.get("actor_credit")
+            if isinstance(wrapper_evidence, dict)
+            else None
+        )
+        if not isinstance(receipt, dict):
+            raise RuntimeError(
+                f"Actor-credit step record {row_index} is missing its receipt."
+            )
+        if receipt.get("schema") != "task_neutral_actor_credit_v1":
+            raise RuntimeError(
+                f"Actor-credit step record {row_index} has a schema mismatch."
+            )
+        positive_eligible = receipt.get("positive_eligible")
+        if type(positive_eligible) is not bool:
+            raise RuntimeError(
+                f"Actor-credit step record {row_index} eligibility must be boolean."
+            )
+        basis = receipt.get("basis")
+        if not isinstance(basis, str) or not basis:
+            raise RuntimeError(
+                f"Actor-credit step record {row_index} basis must be non-empty text."
+            )
+        eligibility.append(positive_eligible)
+    return torch.tensor(
+        eligibility,
+        dtype=torch.bool,
+        device=data.batch["response_mask"].device,
+    )
+
+
+def _mask_ineligible_positive_actor_advantages(
+    data: DataProto,
+    advantages: torch.Tensor,
+) -> torch.Tensor:
+    eligibility = _actor_positive_credit_eligibility(data)
+    response_mask = data.batch["response_mask"].to(dtype=torch.bool)
+    positive_tokens = advantages > 0
+    mask = (~eligibility).unsqueeze(-1) & response_mask & positive_tokens
+    masked_rows = torch.any(mask, dim=-1)
+    data.meta_info["agentmemory_positive_credit_masked_rows"] = int(
+        masked_rows.sum().item()
+    )
+    data.meta_info["agentmemory_positive_credit_masked_tokens"] = int(
+        mask.sum().item()
+    )
+    data.meta_info["agentmemory_positive_actor_credit_receipt_enabled"] = True
+    return torch.where(mask, torch.zeros_like(advantages), advantages)
+
+
 def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1):
     # prepare response group
     # TODO: add other ways to estimate advantages
@@ -222,6 +296,13 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
                 False if formal_required or runtime_evidence_required else None
             ),
         )
+        positive_credit_receipt = _agentmemory_env_flag(
+            "AGENTMEMORY_POSITIVE_ACTOR_CREDIT_RECEIPT"
+        )
+        if positive_credit_receipt and formal_groups is None:
+            raise RuntimeError(
+                "Positive actor-credit masking requires formal trajectory GAE."
+            )
         values = data.batch['values']
         response_mask = data.batch['response_mask']
         token_level_rewards = data.batch['token_level_rewards']
@@ -261,6 +342,11 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             data.meta_info[
                 "agentmemory_actor_advantage_mode"
             ] = "standard_trajectory_gae"
+            if positive_credit_receipt:
+                advantages = _mask_ineligible_positive_actor_advantages(
+                    data,
+                    advantages,
+                )
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
     elif adv_estimator == 'grpo':
@@ -684,6 +770,18 @@ def _agentmemory_dump_ppo_batch_debug(batch: DataProto, config, global_steps: in
             "actor_advantage_mode": batch.meta_info.get(
                 "agentmemory_actor_advantage_mode",
                 "standard_trajectory_gae",
+            ),
+            "positive_actor_credit_receipt_enabled": bool(
+                batch.meta_info.get(
+                    "agentmemory_positive_actor_credit_receipt_enabled",
+                    False,
+                )
+            ),
+            "positive_credit_masked_rows": int(
+                batch.meta_info.get("agentmemory_positive_credit_masked_rows", 0)
+            ),
+            "positive_credit_masked_tokens": int(
+                batch.meta_info.get("agentmemory_positive_credit_masked_tokens", 0)
             ),
             "prompt_attestation_passed": bool(
                 generation_prompt_lengths is not None
@@ -1136,6 +1234,13 @@ def compute_data_metrics(batch, use_critic=True):
         'prompt_length/min':
             torch.min(prompt_length).detach().item(),
     }
+    if batch.meta_info.get("agentmemory_positive_actor_credit_receipt_enabled"):
+        metrics["agentmemory/positive_credit_masked_rows"] = int(
+            batch.meta_info.get("agentmemory_positive_credit_masked_rows", 0)
+        )
+        metrics["agentmemory/positive_credit_masked_tokens"] = int(
+            batch.meta_info.get("agentmemory_positive_credit_masked_tokens", 0)
+        )
     step_record_arr = batch.non_tensor_batch.get("agentmemory_step_record_json")
     trajectory_uid_arr = batch.non_tensor_batch.get(AGENTMEMORY_TRAJECTORY_UID)
     if step_record_arr is not None or trajectory_uid_arr is not None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import importlib
 import importlib.util
+import json
 import os
 import sys
 import types
@@ -299,9 +300,11 @@ class CriticAlignmentTests(unittest.TestCase):
 
 
 class FakeDataProto:
-    def __init__(self) -> None:
+    def __init__(self, *, values=None, eligibility=(False, True, True)) -> None:
+        if values is None:
+            values = [0.0, 0.0, 0.0]
         self.batch = {
-            "values": torch.zeros(3, 1),
+            "values": torch.tensor(values, dtype=torch.float32).reshape(3, 1),
             "response_mask": torch.ones(3, 1),
             "token_level_rewards": torch.tensor([[0.0], [0.0], [1.0]]),
             "agentmemory_immediate_reward": torch.tensor([0.0, 0.0, 1.0]),
@@ -313,6 +316,27 @@ class FakeDataProto:
             "agentmemory_trajectory_uid": np.array(["a", "a", "a"], dtype=object),
             "agentmemory_trajectory_row_uid": np.array(["a-0", "a-1", "a-2"], dtype=object),
             "rollout_done_flags": np.array([False, False, True], dtype=object),
+            "agentmemory_step_record_json": np.array(
+                [
+                    json.dumps(
+                        {
+                            "wrapper_evidence": {
+                                "actor_credit": {
+                                    "schema": "task_neutral_actor_credit_v1",
+                                    "positive_eligible": bool(eligible),
+                                    "basis": (
+                                        "parser_rejected"
+                                        if not eligible
+                                        else "shell_executed"
+                                    ),
+                                }
+                            }
+                        }
+                    )
+                    for eligible in eligibility
+                ],
+                dtype=object,
+            ),
         }
         self.meta_info = {}
 
@@ -325,6 +349,8 @@ def load_trainer_functions(validate_calls):
     tree = ast.parse(trainer_path.read_text(encoding="utf-8"))
     names = {
         "_agentmemory_env_flag",
+        "_actor_positive_credit_eligibility",
+        "_mask_ineligible_positive_actor_advantages",
         "_get_ppo_valid_sample_mask",
         "compute_advantage",
         "_validate_formal_actor_advantage_config",
@@ -341,12 +367,14 @@ def load_trainer_functions(validate_calls):
 
     namespace = {
         "AGENTMEMORY_IMMEDIATE_REWARD": "agentmemory_immediate_reward",
+        "AGENTMEMORY_STEP_RECORD_JSON": "agentmemory_step_record_json",
         "AGENTMEMORY_TRAJECTORY_ROW_ORDER": "agentmemory_trajectory_row_order",
         "AGENTMEMORY_TRAJECTORY_ROW_UID": "agentmemory_trajectory_row_uid",
         "AGENTMEMORY_TRAJECTORY_TERMINAL": "agentmemory_trajectory_terminal",
         "AGENTMEMORY_TRAJECTORY_UID": "agentmemory_trajectory_uid",
         "DataProto": FakeDataProto,
         "core_algos": core_algos,
+        "json": json,
         "os": os,
         "requires_formal_trajectory_metadata": lambda data: True,
         "torch": torch,
@@ -368,6 +396,62 @@ class TrainerRoutingTests(unittest.TestCase):
             data.meta_info["agentmemory_actor_advantage_mode"],
             "standard_trajectory_gae",
         )
+
+    def test_receipt_masks_only_ineligible_positive_actor_credit(self) -> None:
+        functions = load_trainer_functions([])
+        data = FakeDataProto(values=[0.0, 0.0, 0.0])
+
+        with mock.patch.dict(
+            os.environ,
+            {"AGENTMEMORY_POSITIVE_ACTOR_CREDIT_RECEIPT": "1"},
+            clear=False,
+        ):
+            functions["compute_advantage"](
+                data, "gae", gamma=1.0, lam=1.0
+            )
+
+        torch.testing.assert_close(
+            data.batch["advantages"].flatten(), torch.tensor([0.0, 1.0, 1.0])
+        )
+        torch.testing.assert_close(
+            data.batch["returns"].flatten(), torch.ones(3)
+        )
+        self.assertEqual(data.meta_info["agentmemory_positive_credit_masked_rows"], 1)
+
+    def test_receipt_preserves_ineligible_negative_advantage(self) -> None:
+        functions = load_trainer_functions([])
+        data = FakeDataProto(values=[2.0, 0.0, 0.0])
+
+        with mock.patch.dict(
+            os.environ,
+            {"AGENTMEMORY_POSITIVE_ACTOR_CREDIT_RECEIPT": "1"},
+            clear=False,
+        ):
+            functions["compute_advantage"](
+                data, "gae", gamma=1.0, lam=1.0
+            )
+
+        torch.testing.assert_close(
+            data.batch["advantages"].flatten(), torch.tensor([-1.0, 1.0, 1.0])
+        )
+        torch.testing.assert_close(
+            data.batch["returns"].flatten(), torch.ones(3)
+        )
+
+    def test_enabled_receipt_fails_closed_when_evidence_is_missing(self) -> None:
+        functions = load_trainer_functions([])
+        data = FakeDataProto()
+        data.non_tensor_batch["agentmemory_step_record_json"][0] = "{}"
+
+        with mock.patch.dict(
+            os.environ,
+            {"AGENTMEMORY_POSITIVE_ACTOR_CREDIT_RECEIPT": "1"},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "missing its receipt"):
+                functions["compute_advantage"](
+                    data, "gae", gamma=1.0, lam=1.0
+                )
 
     def test_formal_config_rejects_legacy_suffix_and_mc_modes(self) -> None:
         functions = load_trainer_functions([])

@@ -31,6 +31,7 @@ from agentenv.envs.agentmemory import AgentMemoryEnvClient  # noqa: E402
 from agentenv.envs.swesmith import (  # noqa: E402
     SWE_CONTEXT_COMPACTION_REQUEST,
     SwesmithEnvClient,
+    _validate_actor_credit_receipt,
 )
 from agentenv.envs.webshop_handoff import (  # noqa: E402
     WEBSHOP_SESSION_HANDOFF_REQUEST,
@@ -124,7 +125,15 @@ class FakeSwesmithClient(SwesmithEnvClient):
             "observation": f"native tool output {step}",
             "reward": 0.0,
             "done": False,
-            "info": {"step": step, "action_kind": "shell_command"},
+            "info": {
+                "step": step,
+                "action_kind": "shell_command",
+                "actor_credit": {
+                    "schema": "task_neutral_actor_credit_v1",
+                    "positive_eligible": True,
+                    "basis": "shell_executed",
+                },
+            },
         }
 
     def reset(self, idx: int = 0) -> dict:
@@ -347,6 +356,14 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             client.env_id,
         )
         self.assertEqual(
+            action_output.info["wrapper_evidence"]["actor_credit"],
+            {
+                "schema": "task_neutral_actor_credit_v1",
+                "positive_eligible": True,
+                "basis": "shell_executed",
+            },
+        )
+        self.assertEqual(
             (action_output.info["policy_step_after"],
              action_output.info["native_call_count_after"]),
             (1, 1),
@@ -373,6 +390,14 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             client.env_id,
         )
         self.assertEqual(
+            compaction_output.info["wrapper_evidence"]["actor_credit"],
+            {
+                "schema": "task_neutral_actor_credit_v1",
+                "positive_eligible": True,
+                "basis": "policy_context_compaction",
+            },
+        )
+        self.assertEqual(
             (compaction_output.info["native_call_count_before"],
              compaction_output.info["native_call_count_after"]),
             (1, 1),
@@ -391,6 +416,25 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertIn(summary, str(messages))
         self.assertNotIn("native tool output 1", str(messages))
         self.assertNotIn(SWE_CONTEXT_COMPACTION_REQUEST, str(messages))
+
+    def test_swesmith_actor_credit_receipt_fails_closed(self) -> None:
+        invalid_receipts = (
+            None,
+            {
+                "schema": "task_neutral_actor_credit_v1",
+                "positive_eligible": "false",
+                "basis": "parser_rejected",
+            },
+            {
+                "schema": "task_neutral_actor_credit_v1",
+                "positive_eligible": False,
+                "basis": "workspace_changed",
+            },
+        )
+        for receipt in invalid_receipts:
+            with self.subTest(receipt=receipt):
+                with self.assertRaises(RuntimeError):
+                    _validate_actor_credit_receipt(receipt)
 
     def test_swesmith_replaces_legacy_acknowledgement_with_system_framing(self) -> None:
         client = FakeSwesmithClient()
