@@ -399,10 +399,13 @@ def main() -> None:
         parse_endpoint_probe_indices(args.endpoint_probe_indices),
         expected_data_indices,
     )
-    # Slot IDs are service-local and may include internal reservations between
-    # the endpoint probe and trainer allocation. Verify cardinality/frequency,
-    # while keeping dataset-index and audit-count checks exact.
+    # The resident manager allocates a fresh service-local slot for every
+    # episode and never reuses a closed slot.  Slot IDs may have gaps because
+    # the endpoint probe and other internal reservations use the same counter.
+    # Verify one unique slot per selected audit instead of assuming that the
+    # train batch owns a fixed reusable slot range.
     expected_slot_counts = None
+    expected_audit_count = segment_update_count * args.train_batch_size
 
     batch_path = (
         args.run_dir
@@ -512,10 +515,10 @@ def main() -> None:
         endpoint_probe,
         expected_data_indices,
         run_started_at,
-        expected_audit_count=segment_update_count * args.train_batch_size,
+        expected_audit_count=expected_audit_count,
         expected_data_idx_counts=expected_data_idx_counts,
         expected_slot_counts=expected_slot_counts,
-        expected_slot_cardinality=args.train_batch_size,
+        expected_slot_cardinality=expected_audit_count,
     )
     evidence = {
         "schema": "agentmemory_swesmith_ppo_gate_attestation_v1",
