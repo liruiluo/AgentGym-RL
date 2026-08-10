@@ -263,11 +263,14 @@ def _actor_positive_credit_eligibility(data: DataProto) -> torch.Tensor:
 def _mask_ineligible_positive_actor_advantages(
     data: DataProto,
     advantages: torch.Tensor,
+    *,
+    negative_ineligible_advantage: bool = False,
 ) -> torch.Tensor:
     eligibility = _actor_positive_credit_eligibility(data)
     response_mask = data.batch["response_mask"].to(dtype=torch.bool)
+    ineligible_tokens = (~eligibility).unsqueeze(-1) & response_mask
     positive_tokens = advantages > 0
-    mask = (~eligibility).unsqueeze(-1) & response_mask & positive_tokens
+    mask = ineligible_tokens & positive_tokens
     masked_rows = torch.any(mask, dim=-1)
     data.meta_info["agentmemory_positive_credit_masked_rows"] = int(
         masked_rows.sum().item()
@@ -276,6 +279,11 @@ def _mask_ineligible_positive_actor_advantages(
         mask.sum().item()
     )
     data.meta_info["agentmemory_positive_actor_credit_receipt_enabled"] = True
+    data.meta_info["agentmemory_ineligible_actor_credit_mode"] = (
+        "negative_abs" if negative_ineligible_advantage else "zero_positive"
+    )
+    if negative_ineligible_advantage:
+        return torch.where(ineligible_tokens, -torch.abs(advantages), advantages)
     return torch.where(mask, torch.zeros_like(advantages), advantages)
 
 
@@ -299,6 +307,14 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         positive_credit_receipt = _agentmemory_env_flag(
             "AGENTMEMORY_POSITIVE_ACTOR_CREDIT_RECEIPT"
         )
+        negative_ineligible_advantage = _agentmemory_env_flag(
+            "AGENTMEMORY_INELIGIBLE_ACTOR_NEGATIVE_ADVANTAGE"
+        )
+        if negative_ineligible_advantage and not positive_credit_receipt:
+            raise RuntimeError(
+                "Ineligible actor-local negative advantage requires "
+                "AGENTMEMORY_POSITIVE_ACTOR_CREDIT_RECEIPT=1."
+            )
         if positive_credit_receipt and formal_groups is None:
             raise RuntimeError(
                 "Positive actor-credit masking requires formal trajectory GAE."
@@ -346,6 +362,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
                 advantages = _mask_ineligible_positive_actor_advantages(
                     data,
                     advantages,
+                    negative_ineligible_advantage=negative_ineligible_advantage,
                 )
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
@@ -776,6 +793,10 @@ def _agentmemory_dump_ppo_batch_debug(batch: DataProto, config, global_steps: in
                     "agentmemory_positive_actor_credit_receipt_enabled",
                     False,
                 )
+            ),
+            "ineligible_actor_credit_mode": batch.meta_info.get(
+                "agentmemory_ineligible_actor_credit_mode",
+                "disabled",
             ),
             "positive_credit_masked_rows": int(
                 batch.meta_info.get("agentmemory_positive_credit_masked_rows", 0)
@@ -1235,6 +1256,10 @@ def compute_data_metrics(batch, use_critic=True):
             torch.min(prompt_length).detach().item(),
     }
     if batch.meta_info.get("agentmemory_positive_actor_credit_receipt_enabled"):
+        metrics["agentmemory/ineligible_negative_advantage_enabled"] = int(
+            batch.meta_info.get("agentmemory_ineligible_actor_credit_mode")
+            == "negative_abs"
+        )
         metrics["agentmemory/positive_credit_masked_rows"] = int(
             batch.meta_info.get("agentmemory_positive_credit_masked_rows", 0)
         )

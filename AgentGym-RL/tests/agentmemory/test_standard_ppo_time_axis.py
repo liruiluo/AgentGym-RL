@@ -438,6 +438,53 @@ class TrainerRoutingTests(unittest.TestCase):
             data.batch["returns"].flatten(), torch.ones(3)
         )
 
+    def test_actor_local_negative_credit_flips_only_ineligible_advantage(self) -> None:
+        functions = load_trainer_functions([])
+        data = FakeDataProto(values=[0.0, 0.0, 0.0])
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "AGENTMEMORY_POSITIVE_ACTOR_CREDIT_RECEIPT": "1",
+                "AGENTMEMORY_INELIGIBLE_ACTOR_NEGATIVE_ADVANTAGE": "1",
+            },
+            clear=False,
+        ):
+            functions["compute_advantage"](
+                data, "gae", gamma=1.0, lam=1.0
+            )
+
+        torch.testing.assert_close(
+            data.batch["advantages"].flatten(), torch.tensor([-1.0, 1.0, 1.0])
+        )
+        torch.testing.assert_close(
+            data.batch["returns"].flatten(), torch.ones(3)
+        )
+        self.assertEqual(
+            data.meta_info["agentmemory_ineligible_actor_credit_mode"],
+            "negative_abs",
+        )
+
+    def test_actor_local_negative_credit_requires_receipt_gate(self) -> None:
+        functions = load_trainer_functions([])
+        data = FakeDataProto()
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "AGENTMEMORY_POSITIVE_ACTOR_CREDIT_RECEIPT": "0",
+                "AGENTMEMORY_INELIGIBLE_ACTOR_NEGATIVE_ADVANTAGE": "1",
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "requires AGENTMEMORY_POSITIVE_ACTOR_CREDIT_RECEIPT=1",
+            ):
+                functions["compute_advantage"](
+                    data, "gae", gamma=1.0, lam=1.0
+                )
+
     def test_enabled_receipt_fails_closed_when_evidence_is_missing(self) -> None:
         functions = load_trainer_functions([])
         data = FakeDataProto()
