@@ -450,6 +450,74 @@ class SwesmithPpoGateAuditSelectionTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             module.optimizer_update_count(11, 10)
 
+    def test_accepts_return_signal_from_an_earlier_resume_update(self) -> None:
+        module = load_module()
+        endpoint_payload = {
+            "global_step": 20,
+            "stage": "post_adv",
+            "rows": [{"ppo_valid_sample": True, "return_nonzero": 0}],
+        }
+        with tempfile.TemporaryDirectory() as raw_root:
+            run_dir = Path(raw_root)
+            diagnostics = run_dir / "diagnostics"
+            diagnostics.mkdir()
+            (diagnostics / "ppo_batch_step14_post_adv.json").write_text(
+                json.dumps({
+                    "global_step": 14,
+                    "stage": "post_adv",
+                    "rows": [
+                        {"ppo_valid_sample": True, "return_nonzero": 1},
+                        {"ppo_valid_sample": False, "return_nonzero": 1},
+                    ],
+                }),
+                encoding="utf-8",
+            )
+            result = module.verify_segment_return_signal(
+                run_dir,
+                first_global_step=14,
+                global_step=20,
+                endpoint_payload=endpoint_payload,
+                endpoint_nonzero_return_rows=0,
+            )
+
+        self.assertEqual(result["source_global_step"], 14)
+        self.assertEqual(result["nonzero_return_rows"], 1)
+        self.assertFalse(result["endpoint_has_return_signal"])
+
+    def test_rejects_resume_segment_without_any_return_signal(self) -> None:
+        module = load_module()
+        endpoint_payload = {
+            "global_step": 3,
+            "stage": "post_adv",
+            "rows": [{"ppo_valid_sample": True, "return_nonzero": 0}],
+        }
+        with tempfile.TemporaryDirectory() as raw_root:
+            run_dir = Path(raw_root)
+            diagnostics = run_dir / "diagnostics"
+            diagnostics.mkdir()
+            for step in (1, 2):
+                (diagnostics / f"ppo_batch_step{step}_post_adv.json").write_text(
+                    json.dumps({
+                        "global_step": step,
+                        "stage": "post_adv",
+                        "rows": [
+                            {"ppo_valid_sample": True, "return_nonzero": 0}
+                        ],
+                    }),
+                    encoding="utf-8",
+                )
+            with self.assertRaisesRegex(
+                AssertionError,
+                "declared optimizer-update segment has no nonzero PPO return rows",
+            ):
+                module.verify_segment_return_signal(
+                    run_dir,
+                    first_global_step=1,
+                    global_step=3,
+                    endpoint_payload=endpoint_payload,
+                    endpoint_nonzero_return_rows=0,
+                )
+
     def test_endpoint_probe_slots_are_validated_without_fixing_service_offsets(self) -> None:
         module = load_module()
         self.assertEqual(

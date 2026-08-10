@@ -67,6 +67,51 @@ def optimizer_update_count(first_global_step: int, global_step: int) -> int:
     return global_step - first_global_step + 1
 
 
+def count_nonzero_return_rows(payload: dict[str, Any]) -> int:
+    return sum(
+        int(row.get("return_nonzero", 0) > 0)
+        for row in payload["rows"]
+        if row["ppo_valid_sample"]
+    )
+
+
+def verify_segment_return_signal(
+    run_dir: Path,
+    *,
+    first_global_step: int,
+    global_step: int,
+    endpoint_payload: dict[str, Any],
+    endpoint_nonzero_return_rows: int,
+) -> dict[str, Any]:
+    """Find real PPO return evidence anywhere in the declared update segment."""
+    assert int(endpoint_payload["global_step"]) == global_step
+    assert endpoint_payload["stage"] == "post_adv"
+    assert endpoint_nonzero_return_rows == count_nonzero_return_rows(endpoint_payload)
+    if endpoint_nonzero_return_rows > 0:
+        return {
+            "source_global_step": global_step,
+            "nonzero_return_rows": endpoint_nonzero_return_rows,
+            "endpoint_has_return_signal": True,
+        }
+
+    for step in range(first_global_step, global_step):
+        path = run_dir / "diagnostics" / f"ppo_batch_step{step}_post_adv.json"
+        payload = load_json(path)
+        assert int(payload["global_step"]) == step
+        assert payload["stage"] == "post_adv"
+        nonzero_return_rows = count_nonzero_return_rows(payload)
+        if nonzero_return_rows > 0:
+            return {
+                "source_global_step": step,
+                "nonzero_return_rows": nonzero_return_rows,
+                "endpoint_has_return_signal": False,
+            }
+
+    raise AssertionError(
+        "declared optimizer-update segment has no nonzero PPO return rows"
+    )
+
+
 def parse_endpoint_probe_indices(raw: str) -> list[int]:
     try:
         indices = [int(value) for value in raw.split(",") if value != ""]
@@ -466,7 +511,13 @@ def main() -> None:
 
     assert set(rows_by_parent) == expected_parent_indices
     assert nonzero_advantage_rows > 0
-    assert nonzero_return_rows > 0
+    segment_return_signal = verify_segment_return_signal(
+        args.run_dir,
+        first_global_step=args.first_global_step,
+        global_step=args.global_step,
+        endpoint_payload=payload,
+        endpoint_nonzero_return_rows=nonzero_return_rows,
+    )
 
     workspace_ids: dict[int, int] = {}
     for parent_index, records in sorted(rows_by_parent.items()):
@@ -520,6 +571,7 @@ def main() -> None:
         expected_slot_counts=expected_slot_counts,
         expected_slot_cardinality=expected_audit_count,
     )
+    assert int(audits["resolved_count"]) > 0
     evidence = {
         "schema": "agentmemory_swesmith_ppo_gate_attestation_v1",
         "status": "pass",
@@ -539,6 +591,8 @@ def main() -> None:
         "workspace_continuity_ids": workspace_ids,
         "truncation_contract": "exact_backend_response_cap_is_trainable_negative_v1",
         "truncated_rows": truncated_rows,
+        "endpoint_nonzero_return_rows": nonzero_return_rows,
+        "segment_return_signal": segment_return_signal,
         "readback": readback,
         "private_audits": audits,
         "metadata_after": metadata_after,
