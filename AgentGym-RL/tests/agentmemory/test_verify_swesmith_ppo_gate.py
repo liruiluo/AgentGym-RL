@@ -443,6 +443,13 @@ class SwesmithPpoGateAuditSelectionTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "must include a timezone"):
             module.parse_time("2026-08-09T01:00:00", "test.started_at")
 
+    def test_counts_only_updates_in_a_resume_segment(self) -> None:
+        module = load_module()
+        self.assertEqual(module.optimizer_update_count(11, 100), 90)
+        self.assertEqual(module.optimizer_update_count(1, 10), 10)
+        with self.assertRaises(AssertionError):
+            module.optimizer_update_count(11, 10)
+
     def test_endpoint_probe_slots_are_validated_without_fixing_service_offsets(self) -> None:
         module = load_module()
         self.assertEqual(

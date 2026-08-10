@@ -25,6 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--endpoint-probe", type=Path, required=True)
     parser.add_argument("--metadata-after", type=Path, required=True)
     parser.add_argument("--global-step", type=int, default=1)
+    parser.add_argument("--first-global-step", type=int, default=1)
     parser.add_argument("--train-batch-size", type=int, default=8)
     parser.add_argument("--task-count", type=int, default=8)
     parser.add_argument(
@@ -58,6 +59,12 @@ def finite(value: Any, label: str) -> float:
     if not math.isfinite(result):
         raise AssertionError(f"{label} is not finite: {value!r}")
     return result
+
+
+def optimizer_update_count(first_global_step: int, global_step: int) -> int:
+    assert first_global_step > 0
+    assert global_step >= first_global_step
+    return global_step - first_global_step + 1
 
 
 def parse_endpoint_probe_indices(raw: str) -> list[int]:
@@ -371,13 +378,17 @@ def verify_audits(
 def main() -> None:
     args = parse_args()
     assert args.global_step > 0
+    segment_update_count = optimizer_update_count(
+        args.first_global_step,
+        args.global_step,
+    )
     assert args.train_batch_size > 0
     assert args.task_count > 0
     assert args.train_batch_size % args.task_count == 0
     expected_parent_indices = set(range(args.train_batch_size))
     expected_data_indices = set(range(args.task_count))
     expected_data_idx_counts = Counter({
-        index: args.global_step * args.train_batch_size // args.task_count
+        index: segment_update_count * args.train_batch_size // args.task_count
         for index in expected_data_indices
     })
     endpoint_probe = load_json(args.endpoint_probe)
@@ -501,7 +512,7 @@ def main() -> None:
         endpoint_probe,
         expected_data_indices,
         run_started_at,
-        expected_audit_count=args.global_step * args.train_batch_size,
+        expected_audit_count=segment_update_count * args.train_batch_size,
         expected_data_idx_counts=expected_data_idx_counts,
         expected_slot_counts=expected_slot_counts,
         expected_slot_cardinality=args.train_batch_size,
@@ -510,7 +521,9 @@ def main() -> None:
         "schema": "agentmemory_swesmith_ppo_gate_attestation_v1",
         "status": "pass",
         "global_step": args.global_step,
-        "optimizer_update_count": args.global_step,
+        "first_global_step": args.first_global_step,
+        "optimizer_update_count": segment_update_count,
+        "cumulative_optimizer_update_count": args.global_step,
         "train_batch_size": args.train_batch_size,
         "task_count": args.task_count,
         "valid_rows": int(payload["valid_rows"]),
