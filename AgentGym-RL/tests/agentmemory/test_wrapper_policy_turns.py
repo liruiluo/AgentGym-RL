@@ -547,6 +547,38 @@ class RolloutFakeSwesmithClient(FakeSwesmithClient):
         return None
 
 
+class RolloutFakeLiteResearcherClient(FakeLiteResearcherClient):
+    def reset(self, idx: int = 0) -> dict:
+        del idx
+        self._reset_policy_transition_state()
+        return deepcopy(self.info)
+
+    def prepare_policy_turn(self, pressure):
+        del pressure
+        self._selected_policy_control = None
+        if self._native_call_count == 0:
+            return None
+        self._selected_policy_control = "context_compaction"
+        return LITERESEARCHER_CONTEXT_COMPACTION_REQUEST
+
+    def finalize_policy_horizon(self) -> StepOutput:
+        return StepOutput(
+            state="research answer grader completed",
+            reward=0.25,
+            done=True,
+            info=build_task_neutral_transition_info(
+                env_info={"resolved": True},
+                wrapper_evidence={
+                    "event": "horizon_grade",
+                    "outcome": "success",
+                },
+            ),
+        )
+
+    def close(self) -> None:
+        return None
+
+
 class FakeRolloutTokenizer:
     pad_token_id = 0
 
@@ -558,6 +590,13 @@ class FakeRolloutTokenizer:
         ),
         (204, 205, 999): (
             "Progress is in .agent_memory/MEMORY.md; inspect parser.py next."
+        ),
+        (301, 302, 999): (
+            '<tool_call>{"name":"search","arguments":{"query":["fact"]}}'
+            "></tool_call>"
+        ),
+        (304, 305, 999): (
+            "Evidence is in .agent_memory/research.md; visit the source next."
         ),
     }
 
@@ -572,10 +611,14 @@ class FakeRolloutTokenizer:
                 marker = 31
             elif content == SWE_CONTEXT_COMPACTION_REQUEST:
                 marker = 41
+            elif content == LITERESEARCHER_CONTEXT_COMPACTION_REQUEST:
+                marker = 61
             elif "WebShop" in content:
                 marker = 11
             elif "Coding" in content or "Fix the failing parser" in content:
                 marker = 21
+            elif "Research" in content or "source-backed fact" in content:
+                marker = 51
             token_ids.extend(
                 [
                     {"system": 1, "user": 2, "assistant": 3}[role],
@@ -591,7 +634,7 @@ class FakeRolloutTokenizer:
 
 
 class SharedRolloutRuntimeTest(unittest.TestCase):
-    def test_two_wrappers_share_exact_sampled_and_packed_policy_rows(self) -> None:
+    def test_three_wrappers_share_exact_sampled_and_packed_policy_rows(self) -> None:
         import torch
 
         from verl.utils.agentgym.rollout_context import (
@@ -639,6 +682,7 @@ class SharedRolloutRuntimeTest(unittest.TestCase):
 
         webshop = RolloutFakeWebShopClient([webshop_buy_response()])
         swesmith = RolloutFakeSwesmithClient()
+        literesearcher = RolloutFakeLiteResearcherClient()
         sampled_prompts: dict[str, list[int]] = {}
 
         def generate_token_ids(*, generation_prompt_idxs, sampling_params):
@@ -654,10 +698,14 @@ class SharedRolloutRuntimeTest(unittest.TestCase):
                     response_ids = [103, 999]
                 elif 41 in markers:
                     response_ids = [204, 205, 999]
+                elif 61 in markers:
+                    response_ids = [304, 305, 999]
                 elif 11 in markers:
                     response_ids = [101, 999]
                 elif 21 in markers:
                     response_ids = [201, 202, 999]
+                elif 51 in markers:
+                    response_ids = [301, 302, 999]
                 else:
                     raise AssertionError(f"unroutable fixture prompt: {prompt_ids}")
                 action = tokenizer.decode(response_ids, skip_special_tokens=True)
@@ -685,6 +733,9 @@ class SharedRolloutRuntimeTest(unittest.TestCase):
             "notes/state.md",
             'shell_command {"command":"rg -n parser .","workdir":"."}',
             "Progress is in .agent_memory/MEMORY.md; inspect parser.py next.",
+            '<tool_call>{"name":"search","arguments":{"query":["fact"]}}'
+            "></tool_call>",
+            "Evidence is in .agent_memory/research.md; visit the source next.",
         ]
         with tempfile.TemporaryDirectory() as tmpdir:
             rollout.config = SimpleNamespace(
@@ -703,8 +754,9 @@ class SharedRolloutRuntimeTest(unittest.TestCase):
                     rollout_handler_ls=[
                         make_handler("WebShop tool contract", 0),
                         make_handler("Coding tool contract", 1),
+                        make_handler("Research tool contract", 2),
                     ],
-                    env_clients=[webshop, swesmith],
+                    env_clients=[webshop, swesmith, literesearcher],
                     cur_device=torch.device("cpu"),
                     max_policy_turns=2,
                     sampling_kwargs={"max_tokens": 8},
@@ -716,7 +768,7 @@ class SharedRolloutRuntimeTest(unittest.TestCase):
             for value in output.non_tensor_batch[AGENTMEMORY_STEP_RECORD_JSON]
         ]
         self.assertEqual([record["action"] for record in records], expected_actions)
-        self.assertEqual(len(records), 4)
+        self.assertEqual(len(records), 6)
         prompt_width = rollout.config.prompt_length
         for row_index, record in enumerate(records):
             response_mask = output.batch["response_mask"][row_index].bool()
@@ -749,7 +801,7 @@ class SharedRolloutRuntimeTest(unittest.TestCase):
                 record["action"],
             )
 
-        handoff, compaction = records[1], records[3]
+        handoff, compaction, research_compaction = records[1], records[3], records[5]
         self.assertEqual(
             handoff["wrapper_evidence"]["event"],
             "webshop_session_handoff",
@@ -773,8 +825,23 @@ class SharedRolloutRuntimeTest(unittest.TestCase):
         self.assertTrue(compaction["done"])
         self.assertEqual(compaction["outcome"], "success")
         self.assertEqual(compaction["horizon_finalization"]["reward"], 0.5)
+        self.assertEqual(
+            research_compaction["wrapper_evidence"]["event"],
+            "context_compaction",
+        )
+        self.assertEqual(
+            research_compaction["context_transition"]["operation"],
+            "replace_messages",
+        )
+        self.assertEqual(research_compaction["immediate_reward"], 0.25)
+        self.assertTrue(research_compaction["done"])
+        self.assertEqual(research_compaction["outcome"], "success")
+        self.assertEqual(
+            research_compaction["horizon_finalization"]["reward"], 0.25
+        )
         self.assertEqual(webshop.native_calls, ["click[Buy Now]"])
         self.assertEqual(len(swesmith.native_calls), 1)
+        self.assertEqual(len(literesearcher.native_calls), 1)
 
 
 if __name__ == "__main__":
