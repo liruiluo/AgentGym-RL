@@ -89,7 +89,9 @@ class Endpoint:
         method: str,
         path: str,
         payload: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
+        *,
+        expected_type: type = dict,
+    ) -> Any:
         data = None if payload is None else json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
             f"{self.base_url}/{path.lstrip('/')}",
@@ -105,9 +107,10 @@ class Endpoint:
             raise RuntimeError(
                 f"LiteResearcher {method} {path} failed: HTTP {exc.code}: {detail}"
             ) from exc
-        if not isinstance(value, dict):
+        if not isinstance(value, expected_type):
             raise RuntimeError(
-                f"LiteResearcher {method} {path} returned non-object JSON"
+                f"LiteResearcher {method} {path} returned "
+                f"{type(value).__name__} JSON, expected {expected_type.__name__}"
             )
         return value
 
@@ -133,7 +136,11 @@ def close_slots(endpoint: Endpoint, slot_ids: list[int]) -> list[str]:
     errors: list[str] = []
     for slot_id in slot_ids:
         try:
-            endpoint.request("POST", "close", {"id": slot_id})
+            receipt = endpoint.request(
+                "POST", "close", {"id": slot_id}, expected_type=bool
+            )
+            if receipt is not True:
+                raise RuntimeError("LiteResearcher POST close did not return true")
         except Exception as exc:  # Preserve every cleanup failure for diagnosis.
             errors.append(f"slot {slot_id}: {type(exc).__name__}: {exc}")
     return errors
@@ -141,7 +148,7 @@ def close_slots(endpoint: Endpoint, slot_ids: list[int]) -> list[str]:
 
 def shell_action(command: str) -> str:
     return "shell_command " + json.dumps(
-        {"command": command, "workdir": ".", "timeout_ms": 120000},
+        {"command": command, "workdir": ".", "timeout_ms": 30000},
         separators=(",", ":"),
     )
 
