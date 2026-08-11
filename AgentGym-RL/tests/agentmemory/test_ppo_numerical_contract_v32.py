@@ -226,9 +226,10 @@ class PaddingInvariantGroupCreditTest(unittest.TestCase):
 
 
 class BatchContractTest(unittest.TestCase):
-    def test_action_row_contract_is_enabled_for_agentmemory_and_swesmith(self):
+    def test_action_row_contract_is_enabled_for_long_horizon_tasks(self):
         self.assertTrue(requires_flattened_action_row_batch_contract("agentmemory"))
         self.assertTrue(requires_flattened_action_row_batch_contract("SWEsmith"))
+        self.assertTrue(requires_flattened_action_row_batch_contract("LiteResearcher"))
         self.assertFalse(requires_flattened_action_row_batch_contract("webshop"))
 
     def test_swesmith_variable_action_rows_keep_exact_optimizer_steps(self):

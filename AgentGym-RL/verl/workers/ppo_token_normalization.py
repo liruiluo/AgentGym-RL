@@ -12,7 +12,9 @@ import torch.distributed as dist
 
 LEGACY_ASYMMETRIC_BATCH_MODE = "legacy_asymmetric_config_compensation_v1"
 PPO_BATCH_CONTRACT_META_KEY = "ppo_batch_contract"
-FLATTENED_ACTION_ROW_PPO_TASKS = frozenset({"agentmemory", "swesmith"})
+FLATTENED_ACTION_ROW_PPO_TASKS = frozenset(
+    {"agentmemory", "swesmith", "literesearcher"}
+)
 
 _PER_GPU_MICRO_BATCH_FIELDS = (
     "actor",

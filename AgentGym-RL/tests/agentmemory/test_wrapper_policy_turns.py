@@ -28,6 +28,10 @@ from agentenv.controller.types import (  # noqa: E402
     build_task_neutral_transition_info,
 )
 from agentenv.envs.agentmemory import AgentMemoryEnvClient  # noqa: E402
+from agentenv.envs.literesearcher import (  # noqa: E402
+    LITERESEARCHER_CONTEXT_COMPACTION_REQUEST,
+    LiteResearcherEnvClient,
+)
 from agentenv.envs.swesmith import (  # noqa: E402
     SWE_CONTEXT_COMPACTION_REQUEST,
     SwesmithEnvClient,
@@ -125,6 +129,51 @@ class FakeSwesmithClient(SwesmithEnvClient):
             "reward": 0.0,
             "done": False,
             "info": {"step": step, "action_kind": "shell_command"},
+        }
+
+    def reset(self, idx: int = 0) -> dict:
+        del idx
+        raise AssertionError("test fixture is already reset")
+
+
+class FakeLiteResearcherClient(LiteResearcherEnvClient):
+    def __init__(self) -> None:
+        BaseEnvClient.__init__(self, action_format=ActionFormat.REACT)
+        self.env_id = 303
+        self.data_len = 1
+        self.metadata = {
+            "domain_id": "literesearcher",
+            "task_count": 1,
+            "compaction_contract": "task_neutral_client_replace_messages_v1",
+        }
+        self.info = {
+            "observation": "Which source-backed fact answers this question?",
+            "reward": 0.0,
+            "done": False,
+            "info": {"status": "active", "sample_excluded": False},
+        }
+        self.native_calls: list[str] = []
+        self._reset_policy_transition_state()
+
+    def __len__(self) -> int:
+        return 1
+
+    def _request(self, method: str, path: str, **kwargs) -> dict:
+        if (method, path) != ("POST", "step"):
+            raise AssertionError(
+                f"unexpected fake LiteResearcher request: {method} {path}"
+            )
+        action = str(kwargs["json"]["action"])
+        self.native_calls.append(action)
+        return {
+            "observation": "opaque search result URL",
+            "reward": 0.0,
+            "done": False,
+            "info": {
+                "status": "active",
+                "sample_excluded": False,
+                "action_submission": {"raw_policy_output": action},
+            },
         }
 
     def reset(self, idx: int = 0) -> dict:
@@ -384,6 +433,76 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertIn(summary, str(messages))
         self.assertNotIn("native tool output 1", str(messages))
         self.assertNotIn(SWE_CONTEXT_COMPACTION_REQUEST, str(messages))
+
+    def test_literesearcher_compaction_is_local_trainable_policy_row(self) -> None:
+        client = FakeLiteResearcherClient()
+        initial = [
+            {"role": "system", "content": "Research and workspace tool contract"},
+            {"role": "user", "content": client.observe()},
+        ]
+        messages = bind_initial_policy_context(client, initial)
+
+        action = prepare(client, messages, capacity=4096)
+        self.assertIsNone(action.control_request)
+        action_output, messages = complete_policy_turn(
+            client,
+            action,
+            '<tool_call>{"name":"search","arguments":{"query":["fact"]}}</tool_call>',
+        )
+        self.assertEqual(len(client.native_calls), 1)
+        self.assertEqual(
+            (
+                action_output.info["policy_step_after"],
+                action_output.info["native_call_count_after"],
+            ),
+            (1, 1),
+        )
+
+        candidate_count = count_prompt_tokens(
+            messages
+            + [
+                {
+                    "role": "user",
+                    "content": LITERESEARCHER_CONTEXT_COMPACTION_REQUEST,
+                }
+            ]
+        )
+        compaction = prepare(client, messages, capacity=candidate_count + 1)
+        self.assertEqual(
+            compaction.control_request,
+            LITERESEARCHER_CONTEXT_COMPACTION_REQUEST,
+        )
+        summary = (
+            "Question remains unresolved. Evidence notes are in "
+            ".agent_memory/research.md; visit the opaque result next."
+        )
+        compaction_output, messages = complete_policy_turn(
+            client, compaction, summary
+        )
+
+        self.assertEqual(len(client.native_calls), 1)
+        self.assertEqual(
+            (
+                compaction_output.info["native_call_count_before"],
+                compaction_output.info["native_call_count_after"],
+            ),
+            (1, 1),
+        )
+        self.assertEqual(
+            (
+                compaction_output.info["policy_step_before"],
+                compaction_output.info["policy_step_after"],
+            ),
+            (1, 2),
+        )
+        self.assertEqual(
+            compaction_output.info["context_transition"]["operation"],
+            "replace_messages",
+        )
+        self.assertIn("Which source-backed fact", str(messages))
+        self.assertIn(".agent_memory/research.md", str(messages))
+        self.assertNotIn("opaque search result URL", str(messages))
+        self.assertNotIn(LITERESEARCHER_CONTEXT_COMPACTION_REQUEST, str(messages))
 
 
 class RolloutFakeWebShopClient(FakeWebShopClient):
