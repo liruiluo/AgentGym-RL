@@ -77,6 +77,25 @@ class FormalUpdateReadbackTaskRowsTests(unittest.TestCase):
         self.assertEqual(evidence["index_field"], "index")
         self.assertEqual(evidence["dataset_indices"], [5, 7])
 
+    def test_literesearcher_keeps_canonical_step_records_when_present(self) -> None:
+        helper = load_helper()
+        evidence = helper(
+            non_tensor_batch={
+                "agentmemory_step_record_json": [
+                    json.dumps({"row": 0, "domain_id": "literesearcher"}),
+                    json.dumps({"row": 1, "domain_id": "literesearcher"}),
+                ],
+                "index": [2, 5],
+            },
+            valid_row_indices=[1],
+            task_name="literesearcher",
+        )
+        self.assertEqual(evidence["schema"], "agentmemory_formal_step_records_v1")
+        self.assertEqual(evidence["task_name"], "literesearcher")
+        self.assertEqual(
+            evidence["rows"], [{"row": 1, "domain_id": "literesearcher"}]
+        )
+
     def test_generic_task_requires_valid_dataset_indices(self) -> None:
         helper = load_helper()
         with self.assertRaisesRegex(RuntimeError, "canonical dataset index"):
