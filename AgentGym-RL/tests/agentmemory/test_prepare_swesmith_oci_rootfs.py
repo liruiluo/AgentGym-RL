@@ -1,6 +1,7 @@
 import argparse
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -14,6 +15,25 @@ SPEC.loader.exec_module(MODULE)
 
 
 class PrepareSwesmithOciRootfsTest(unittest.TestCase):
+    def test_rootfs_contract_does_not_require_one_python_layout(self):
+        with tempfile.TemporaryDirectory() as raw:
+            rootfs = Path(raw)
+            for relative in ("testbed", "tmp", "var/tmp", "dev", "proc", "run"):
+                (rootfs / relative).mkdir(parents=True, exist_ok=True)
+            for relative in (
+                "bin/bash",
+                "usr/bin/setpriv",
+                "usr/bin/prlimit",
+                "usr/bin/env",
+                "bin/sleep",
+                "usr/bin/cut",
+                "usr/bin/python3.11",
+            ):
+                path = rootfs / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"executable")
+            self.assertEqual(MODULE._require_rootfs_contract(rootfs), rootfs / "bin/bash")
+
     def test_parses_binding_and_builds_profile_manifest(self):
         first = MODULE.parse_binding(
             "jyangballin/image-a=swebench/image-a@sha256:" + "a" * 64

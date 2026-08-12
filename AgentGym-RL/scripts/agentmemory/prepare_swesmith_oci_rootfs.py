@@ -198,7 +198,7 @@ def _measure_rootfs(rootfs: Path) -> tuple[int, int]:
     return total_bytes, regular_files
 
 
-def _require_rootfs_contract(rootfs: Path) -> tuple[Path, Path]:
+def _require_rootfs_contract(rootfs: Path) -> Path:
     for relative in (
         "testbed",
         "tmp",
@@ -217,14 +217,12 @@ def _require_rootfs_contract(rootfs: Path) -> tuple[Path, Path]:
         "usr/bin/env",
         "bin/sleep",
         "usr/bin/cut",
-        "opt/miniconda3/bin/python3.12",
-        "opt/miniconda3/envs/testbed/bin/python",
     )
     for relative in required_files:
         path = rootfs / relative
         if not path.is_file():
             raise RuntimeError(f"OCI rootfs is missing required file: /{relative}")
-    return rootfs / "bin/bash", rootfs / "opt/miniconda3/bin/python3.12"
+    return rootfs / "bin/bash"
 
 
 def _validate_complete_cache(cache_dir: Path, binding: ImageBinding) -> dict[str, Any]:
@@ -354,7 +352,7 @@ def _materialize_one(
         )
     image_tarball.unlink(missing_ok=True)
 
-    bash, python312 = _require_rootfs_contract(rootfs)
+    bash = _require_rootfs_contract(rootfs)
     rootfs_bytes, regular_files = _measure_rootfs(rootfs)
     crane_version = _run_bytes([str(crane), "version"], environment=environment).decode(
         "utf-8", errors="replace"
@@ -384,7 +382,6 @@ def _materialize_one(
             "bytes": rootfs_bytes,
             "regular_files": regular_files,
             "bash_sha256": _sha256_file(bash),
-            "python312_sha256": _sha256_file(python312),
         },
     }
     _atomic_write(partial / "metadata.json", _json_bytes(metadata))
