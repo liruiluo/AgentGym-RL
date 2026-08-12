@@ -29,6 +29,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-batch-size", type=int, default=8)
     parser.add_argument("--task-count", type=int, default=8)
     parser.add_argument(
+        "--routing-file",
+        type=Path,
+        help=(
+            "Optional ordered JSONL routing schedule. When set, PPO parent indices "
+            "remain local to each batch while item_id and endpoint data_idx are "
+            "verified against the declared global schedule."
+        ),
+    )
+    parser.add_argument(
         "--endpoint-probe-indices",
         default="0,1,2,3,4,5,6,7",
     )
@@ -65,6 +74,69 @@ def optimizer_update_count(first_global_step: int, global_step: int) -> int:
     assert first_global_step > 0
     assert global_step >= first_global_step
     return global_step - first_global_step + 1
+
+
+def load_routing_contract(
+    path: Path,
+    *,
+    train_batch_size: int,
+    first_global_step: int,
+    global_step: int,
+) -> dict[str, Any]:
+    """Bind a no-shuffle PPO segment to its ordered endpoint routing rows."""
+    assert train_batch_size > 0
+    optimizer_update_count(first_global_step, global_step)
+    rows: list[dict[str, Any]] = []
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise AssertionError(
+                f"routing row {line_number} is not valid JSON"
+            ) from exc
+        assert isinstance(row, dict)
+        position = len(rows)
+        assert row["item_id"] == f"swesmith_{position}"
+        data_idx = row["data_idx"]
+        assert isinstance(data_idx, int) and not isinstance(data_idx, bool)
+        assert data_idx >= 0
+        extra_info = row["extra_info"]
+        assert isinstance(extra_info, dict)
+        assert int(extra_info["index"]) == data_idx
+        assert int(extra_info["schedule_position"]) == position
+        rows.append(row)
+
+    required_rows = global_step * train_batch_size
+    assert len(rows) >= required_rows
+    segment_start = (first_global_step - 1) * train_batch_size
+    segment_rows = rows[segment_start:required_rows]
+    current_rows = rows[required_rows - train_batch_size : required_rows]
+    assert len(current_rows) == train_batch_size
+    assert len(segment_rows) == (
+        optimizer_update_count(first_global_step, global_step) * train_batch_size
+    )
+
+    current_item_ids = {
+        parent_index: str(row["item_id"])
+        for parent_index, row in enumerate(current_rows)
+    }
+    segment_data_idx_counts = Counter(int(row["data_idx"]) for row in segment_rows)
+    return {
+        "routing_row_count": len(rows),
+        "segment_schedule_positions": [
+            int(row["extra_info"]["schedule_position"]) for row in segment_rows
+        ],
+        "current_schedule_positions": [
+            int(row["extra_info"]["schedule_position"]) for row in current_rows
+        ],
+        "current_item_ids": current_item_ids,
+        "current_data_indices": [int(row["data_idx"]) for row in current_rows],
+        "segment_data_idx_counts": segment_data_idx_counts,
+    }
 
 
 def count_nonzero_return_rows(payload: dict[str, Any]) -> int:
@@ -279,7 +351,9 @@ def verify_wrapper_transition(
 
 
 def verify_row_evidence(
-    payload: dict[str, Any], expected_indices: set[int]
+    payload: dict[str, Any],
+    expected_indices: set[int],
+    expected_item_ids: dict[int, str] | None = None,
 ) -> dict[str, Any]:
     evidence = payload["row_evidence"]
     assert evidence["task_name"] == "swesmith"
@@ -292,7 +366,12 @@ def verify_row_evidence(
         assert set(indices) == expected_indices
         for row, index in zip(rows, indices):
             assert row["schema_version"] == STEP_SCHEMA
-            assert row["item_id"] == f"swesmith_{index}"
+            expected_item_id = (
+                f"swesmith_{index}"
+                if expected_item_ids is None
+                else expected_item_ids[index]
+            )
+            assert row["item_id"] == expected_item_id
         return {
             "schema": schema,
             "dataset_indices": sorted(set(indices)),
@@ -315,14 +394,21 @@ def verify_row_evidence(
 
 
 def verify_readback(
-    run_dir: Path, global_step: int, expected_indices: set[int]
+    run_dir: Path,
+    global_step: int,
+    expected_indices: set[int],
+    expected_item_ids: dict[int, str] | None = None,
 ) -> dict[str, Any]:
     path = run_dir / "diagnostics" / f"formal_update_readback_step{global_step}.json"
     payload = load_json(path)
     assert int(payload["global_step"]) == global_step
     assert payload["role"] == "same_batch_post_optimizer_readback"
     result: dict[str, Any] = {
-        "row_evidence": verify_row_evidence(payload, expected_indices)
+        "row_evidence": verify_row_evidence(
+            payload,
+            expected_indices,
+            expected_item_ids,
+        )
     }
     for role in ("actor", "critic"):
         role_payload = payload[role]
@@ -454,13 +540,29 @@ def main() -> None:
     )
     assert args.train_batch_size > 0
     assert args.task_count > 0
-    assert args.train_batch_size % args.task_count == 0
     expected_parent_indices = set(range(args.train_batch_size))
-    expected_data_indices = set(range(args.task_count))
-    expected_data_idx_counts = Counter({
-        index: segment_update_count * args.train_batch_size // args.task_count
-        for index in expected_data_indices
-    })
+    routing_contract = None
+    expected_current_item_ids = {
+        index: f"swesmith_{index}" for index in expected_parent_indices
+    }
+    if args.routing_file is None:
+        assert args.train_batch_size % args.task_count == 0
+        expected_data_indices = set(range(args.task_count))
+        expected_data_idx_counts = Counter({
+            index: segment_update_count * args.train_batch_size // args.task_count
+            for index in expected_data_indices
+        })
+    else:
+        routing_contract = load_routing_contract(
+            args.routing_file,
+            train_batch_size=args.train_batch_size,
+            first_global_step=args.first_global_step,
+            global_step=args.global_step,
+        )
+        assert args.task_count == routing_contract["routing_row_count"]
+        expected_data_idx_counts = routing_contract["segment_data_idx_counts"]
+        expected_data_indices = set(expected_data_idx_counts)
+        expected_current_item_ids = routing_contract["current_item_ids"]
     endpoint_probe = load_json(args.endpoint_probe)
     assert endpoint_probe["status"] == "pass"
     parse_endpoint_probe_slots(endpoint_probe)
@@ -504,7 +606,7 @@ def main() -> None:
         assert record["schema_version"] == STEP_SCHEMA
         assert int(record["parent_index"]) == parent_index
         assert int(record["task_round"]) == int(row["task_round"])
-        assert record["item_id"] == f"swesmith_{parent_index}"
+        assert record["item_id"] == expected_current_item_ids[parent_index]
         assert record["action"] == row["agentmemory_action_text"]
         assert record["action_submission"]["raw_policy_output"] == record["action"]
         assert record["generation_token_ids_are_exact"] is True
@@ -580,7 +682,10 @@ def main() -> None:
         assert int(metadata_after[key]) == 0
 
     readback = verify_readback(
-        args.run_dir, args.global_step, expected_parent_indices
+        args.run_dir,
+        args.global_step,
+        expected_parent_indices,
+        expected_current_item_ids,
     )
     run_started_at = parse_time(
         (args.run_dir / "started_at").read_text(encoding="utf-8"),
@@ -606,6 +711,31 @@ def main() -> None:
         "cumulative_optimizer_update_count": args.global_step,
         "train_batch_size": args.train_batch_size,
         "task_count": args.task_count,
+        "sampling_contract": (
+            "ordered_routing_without_shuffle_v1"
+            if routing_contract is not None
+            else "fixed_task_panel_v1"
+        ),
+        "routing": (
+            None
+            if routing_contract is None
+            else {
+                "path": str(args.routing_file),
+                "routing_row_count": routing_contract["routing_row_count"],
+                "segment_schedule_position_first": routing_contract[
+                    "segment_schedule_positions"
+                ][0],
+                "segment_schedule_position_last": routing_contract[
+                    "segment_schedule_positions"
+                ][-1],
+                "current_schedule_positions": routing_contract[
+                    "current_schedule_positions"
+                ],
+                "current_data_indices": routing_contract[
+                    "current_data_indices"
+                ],
+            }
+        ),
         "valid_rows": int(payload["valid_rows"]),
         "parent_row_counts": {
             str(parent): len(records) for parent, records in sorted(rows_by_parent.items())

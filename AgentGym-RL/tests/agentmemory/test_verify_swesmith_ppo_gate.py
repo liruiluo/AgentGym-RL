@@ -374,6 +374,89 @@ class SwesmithPpoGateRowEvidenceTests(unittest.TestCase):
                 set(range(8)),
             )
 
+    def test_loads_nonrepeating_fullpool_routing_segment(self) -> None:
+        module = load_module()
+        with tempfile.TemporaryDirectory() as raw_root:
+            path = Path(raw_root) / "routing.jsonl"
+            rows = [
+                {
+                    "item_id": f"swesmith_{position}",
+                    "data_idx": 1000 + position,
+                    "extra_info": {
+                        "index": 1000 + position,
+                        "schedule_position": position,
+                    },
+                }
+                for position in range(16)
+            ]
+            path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            contract = module.load_routing_contract(
+                path,
+                train_batch_size=4,
+                first_global_step=2,
+                global_step=3,
+            )
+
+        self.assertEqual(contract["routing_row_count"], 16)
+        self.assertEqual(contract["segment_schedule_positions"], list(range(4, 12)))
+        self.assertEqual(contract["current_schedule_positions"], list(range(8, 12)))
+        self.assertEqual(
+            contract["current_item_ids"],
+            {index: f"swesmith_{8 + index}" for index in range(4)},
+        )
+        self.assertEqual(
+            contract["segment_data_idx_counts"],
+            module.Counter({index: 1 for index in range(1004, 1012)}),
+        )
+
+    def test_rejects_noncontiguous_routing_positions(self) -> None:
+        module = load_module()
+        with tempfile.TemporaryDirectory() as raw_root:
+            path = Path(raw_root) / "routing.jsonl"
+            path.write_text(
+                json.dumps({
+                    "item_id": "swesmith_9",
+                    "data_idx": 12,
+                    "extra_info": {"index": 12, "schedule_position": 9},
+                })
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(AssertionError):
+                module.load_routing_contract(
+                    path,
+                    train_batch_size=1,
+                    first_global_step=1,
+                    global_step=1,
+                )
+
+    def test_binds_current_fullpool_item_ids_in_readback_rows(self) -> None:
+        module = load_module()
+        rows = [
+            {
+                "schema_version": module.STEP_SCHEMA,
+                "parent_index": index,
+                "item_id": f"swesmith_{64 + index}",
+            }
+            for index in range(8)
+        ]
+        result = module.verify_row_evidence(
+            {
+                "row_evidence": {
+                    "schema": "agentmemory_formal_step_records_v1",
+                    "task_name": "swesmith",
+                    "rows": rows,
+                },
+                "formal_step_records": rows,
+            },
+            set(range(8)),
+            {index: f"swesmith_{64 + index}" for index in range(8)},
+        )
+        self.assertEqual(result["dataset_indices"], list(range(8)))
+
 
 class SwesmithPpoGateAuditSelectionTests(unittest.TestCase):
     @staticmethod
