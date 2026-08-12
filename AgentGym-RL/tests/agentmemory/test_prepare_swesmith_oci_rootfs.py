@@ -55,6 +55,19 @@ class PrepareSwesmithOciRootfsTest(unittest.TestCase):
                 source_revision="d" * 40,
             )
 
+    def test_normalizes_and_deduplicates_transport_prefixes(self):
+        self.assertEqual(
+            MODULE._transport_prefixes(
+                "docker.1ms.run/",
+                ("dockerproxy.net", "docker.1ms.run", "docker.1panel.live/"),
+            ),
+            ("docker.1ms.run", "dockerproxy.net", "docker.1panel.live"),
+        )
+
+    def test_rejects_empty_transport_prefix(self):
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            MODULE._transport_prefixes("docker.1ms.run", ("  ",))
+
 
 if __name__ == "__main__":
     unittest.main()
