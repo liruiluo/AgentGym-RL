@@ -46,6 +46,14 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument(
+        "--online",
+        action="store_true",
+        help=(
+            "Verify a completed PPO prefix while the trainer may already be "
+            "processing the next disjoint full-pool batch."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -444,11 +452,13 @@ def verify_audits(
     expected_data_idx_counts: Counter[int] | None = None,
     expected_slot_counts: Counter[int] | None = None,
     expected_slot_cardinality: int | None = None,
+    allowed_future_indices: set[int] | None = None,
 ) -> dict[str, Any]:
     probe_audit_ids = set(str(value) for value in endpoint_probe["audit_ids"])
     trainer_audits: list[dict[str, Any]] = []
     ungraded_terminal_rejections: list[dict[str, Any]] = []
     stale_audit_count = 0
+    future_distinct_audit_count = 0
     for path in sorted(audit_root.glob("episode-*.json")):
         payload = load_json(path)
         if str(payload["audit_id"]) in probe_audit_ids:
@@ -459,6 +469,16 @@ def verify_audits(
         if audit_started_at < run_started_at:
             stale_audit_count += 1
             continue
+        if int(payload["data_idx"]) not in expected_indices:
+            if (
+                allowed_future_indices is not None
+                and int(payload["data_idx"]) in allowed_future_indices
+            ):
+                future_distinct_audit_count += 1
+                continue
+            raise AssertionError(
+                f"unexpected in-run audit data_idx: {payload['data_idx']!r}"
+            )
         assert payload["schema"] == AUDIT_SCHEMA
         assert payload["close_reason"] == "client_close"
         assert payload["done"] is True
@@ -528,6 +548,7 @@ def verify_audits(
         "selection": "run-start-time-minus-current-probe",
         "run_started_at": run_started_at.isoformat(),
         "stale_audit_count": stale_audit_count,
+        "future_distinct_audit_count": future_distinct_audit_count,
     }
 
 
@@ -542,6 +563,7 @@ def main() -> None:
     assert args.task_count > 0
     expected_parent_indices = set(range(args.train_batch_size))
     routing_contract = None
+    allowed_future_indices: set[int] | None = None
     expected_current_item_ids = {
         index: f"swesmith_{index}" for index in expected_parent_indices
     }
@@ -563,6 +585,15 @@ def main() -> None:
         expected_data_idx_counts = routing_contract["segment_data_idx_counts"]
         expected_data_indices = set(expected_data_idx_counts)
         expected_current_item_ids = routing_contract["current_item_ids"]
+        if args.online:
+            future_rows = []
+            for line in args.routing_file.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    future_rows.append(json.loads(line))
+            future_start = args.global_step * args.train_batch_size
+            allowed_future_indices = {
+                int(row["data_idx"]) for row in future_rows[future_start:]
+            }
     endpoint_probe = load_json(args.endpoint_probe)
     assert endpoint_probe["status"] == "pass"
     parse_endpoint_probe_slots(endpoint_probe)
@@ -679,7 +710,10 @@ def main() -> None:
         "active_environment_count",
         "active_workspace_count",
     ):
-        assert int(metadata_after[key]) == 0
+        value = int(metadata_after[key])
+        assert value >= 0
+        if not args.online:
+            assert value == 0
 
     readback = verify_readback(
         args.run_dir,
@@ -700,6 +734,7 @@ def main() -> None:
         expected_data_idx_counts=expected_data_idx_counts,
         expected_slot_counts=expected_slot_counts,
         expected_slot_cardinality=expected_audit_count,
+        allowed_future_indices=allowed_future_indices,
     )
     assert int(audits["resolved_count"]) > 0
     evidence = {
@@ -743,6 +778,7 @@ def main() -> None:
         "event_counts": dict(event_counts),
         "action_kind_counts": dict(action_kind_counts),
         "compaction_required": args.require_compaction,
+        "online_prefix_verification": args.online,
         "workspace_continuity_ids": workspace_ids,
         "truncation_contract": "exact_backend_response_cap_is_trainable_negative_v1",
         "truncated_rows": truncated_rows,

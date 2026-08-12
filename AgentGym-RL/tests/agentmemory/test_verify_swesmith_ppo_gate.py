@@ -672,6 +672,56 @@ class SwesmithPpoGateAuditSelectionTests(unittest.TestCase):
         self.assertEqual(len(result["slot_counts"]), 16)
         self.assertEqual(set(result["slot_counts"].values()), {1})
 
+    def test_online_prefix_accepts_only_declared_future_indices(self) -> None:
+        module = load_module()
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            for offset, index in enumerate((10, 11, 12)):
+                payload = self._audit(
+                    audit_id=f"{offset + 1:032x}",
+                    index=index,
+                    slot=offset + 100,
+                    started_at=f"2026-08-09T01:00:0{offset + 1}Z",
+                )
+                (root / f"episode-{payload['audit_id']}.json").write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+            result = module.verify_audits(
+                root,
+                {"audit_ids": []},
+                {10, 11},
+                module.parse_time("2026-08-09T01:00:00Z", "test.started_at"),
+                expected_audit_count=2,
+                expected_data_idx_counts=module.Counter({10: 1, 11: 1}),
+                expected_slot_cardinality=2,
+                allowed_future_indices={12, 13},
+            )
+            self.assertEqual(result["future_distinct_audit_count"], 1)
+
+    def test_online_prefix_rejects_undeclared_index(self) -> None:
+        module = load_module()
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            payload = self._audit(
+                audit_id="1" * 32,
+                index=99,
+                slot=100,
+                started_at="2026-08-09T01:00:01Z",
+            )
+            (root / "episode-unknown.json").write_text(
+                json.dumps(payload), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(AssertionError, "unexpected in-run"):
+                module.verify_audits(
+                    root,
+                    {"audit_ids": []},
+                    {10},
+                    module.parse_time(
+                        "2026-08-09T01:00:00Z", "test.started_at"
+                    ),
+                    allowed_future_indices={11, 12},
+                )
+
     def test_accepts_ungraded_authoritative_executor_rejection(self) -> None:
         module = load_module()
         with tempfile.TemporaryDirectory() as raw_root:
