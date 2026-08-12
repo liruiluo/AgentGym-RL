@@ -31,6 +31,8 @@ from agentenv.controller.types import (  # noqa: E402
 from agentenv.envs.agentmemory import AgentMemoryEnvClient  # noqa: E402
 from agentenv.envs.swesmith import (  # noqa: E402
     SWE_CONTEXT_COMPACTION_REQUEST,
+    SWE_MEMORY_CONTRACT,
+    SWE_POLICY_SYSTEM_PROMPT,
     SwesmithEnvClient,
     _validate_action_progress_receipt,
     _validate_actor_credit_receipt,
@@ -104,7 +106,10 @@ class FakeSwesmithClient(SwesmithEnvClient):
         BaseEnvClient.__init__(self, action_format=ActionFormat.REACT)
         self.env_id = 202
         self.data_len = 1
-        self.metadata = {"task_count": 1}
+        self.metadata = {
+            "task_count": 1,
+            "memory_contract": SWE_MEMORY_CONTRACT,
+        }
         self.info = {
             "observation": "Fix the failing parser in this repository.",
             "reward": 0.0,
@@ -190,6 +195,29 @@ def webshop_buy_response() -> dict:
 
 
 class SharedWrapperPolicyTurnTest(unittest.TestCase):
+    def test_swesmith_endpoint_memory_contract_mismatch_fails_closed(self) -> None:
+        for endpoint_contract in (None, "policy_compaction_only_v1"):
+            calls = []
+
+            class MismatchedSwesmithClient(SwesmithEnvClient):
+                def _request(self, method: str, path: str, **kwargs) -> dict:
+                    del kwargs
+                    calls.append((method, path))
+                    if (method, path) == ("GET", "metadata"):
+                        metadata = {"task_count": 1}
+                        if endpoint_contract is not None:
+                            metadata["memory_contract"] = endpoint_contract
+                        return metadata
+                    raise AssertionError("client must fail before creating an episode")
+
+            with self.subTest(endpoint_contract=endpoint_contract):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "SWE-smith endpoint memory contract mismatch",
+                ):
+                    MismatchedSwesmithClient("http://unused.invalid")
+                self.assertEqual(calls, [("GET", "metadata")])
+
     @staticmethod
     def bind_webshop(client: FakeWebShopClient) -> list[dict[str, str]]:
         return bind_initial_policy_context(
@@ -351,6 +379,16 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
 
     def test_swesmith_compaction_uses_same_entrypoint_without_native_call(self) -> None:
         client = FakeSwesmithClient()
+        self.assertEqual(
+            SWE_MEMORY_CONTRACT,
+            "policy_compaction_plus_optional_durable_filesystem_v1",
+        )
+        self.assertIn("# Durable debugging notes", SWE_POLICY_SYSTEM_PROMPT)
+        self.assertIn(
+            "maintain a concise evidence ledger incrementally",
+            SWE_POLICY_SYSTEM_PROMPT,
+        )
+        self.assertIn("rediscover and read the notes", SWE_POLICY_SYSTEM_PROMPT)
         initial = client.policy_framing() + [
             {"role": "user", "content": client.observe()},
         ]
@@ -429,6 +467,30 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertIn(summary, str(messages))
         self.assertNotIn("native tool output 1", str(messages))
         self.assertNotIn(SWE_CONTEXT_COMPACTION_REQUEST, str(messages))
+
+        reread = prepare(client, messages, capacity=4096)
+        self.assertIsNone(reread.control_request)
+        reread_action = (
+            'shell_command {"command":"rg -n hypothesis '
+            '.agent_memory/debugging.md","workdir":"."}'
+        )
+        reread_output, messages = complete_policy_turn(
+            client,
+            reread,
+            reread_action,
+        )
+        self.assertEqual(client.native_calls[-1], reread_action)
+        self.assertEqual(len(client.native_calls), 2)
+        self.assertEqual(
+            reread_output.info["wrapper_evidence"]["workspace_continuity_id"],
+            client.env_id,
+        )
+        self.assertEqual(
+            (reread_output.info["context_epoch_before"],
+             reread_output.info["context_epoch_after"]),
+            (1, 1),
+        )
+        self.assertIn("native tool output 2", str(messages))
 
     def test_swesmith_actor_credit_receipt_fails_closed(self) -> None:
         invalid_receipts = (
