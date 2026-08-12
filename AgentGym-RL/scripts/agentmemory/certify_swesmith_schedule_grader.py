@@ -208,7 +208,13 @@ def run_arm(
 
 def result_passes(result: dict[str, Any]) -> bool:
     arm = str(result["arm"])
-    if result.get("errors") or float(result.get("reward", -1.0)) != EXPECTED_REWARD[arm]:
+    reward = result.get("reward")
+    if (
+        result.get("errors")
+        or not isinstance(reward, (int, float))
+        or isinstance(reward, bool)
+        or float(reward) != EXPECTED_REWARD[arm]
+    ):
         return False
     if result.get("grader_error") not in (None, ""):
         return False

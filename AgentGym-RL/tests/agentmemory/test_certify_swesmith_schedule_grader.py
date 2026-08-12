@@ -94,6 +94,18 @@ class CertifySwesmithScheduleGraderTest(unittest.TestCase):
                 }
             )
         )
+        self.assertFalse(
+            result_passes(
+                {
+                    "arm": "gold",
+                    "reward": None,
+                    "episode_success": False,
+                    "resolution_status": None,
+                    "grader_error": None,
+                    "errors": ["reset failed"],
+                }
+            )
+        )
 
 
 if __name__ == "__main__":
