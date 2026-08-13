@@ -31,7 +31,7 @@ class ParallelResetResult:
 class _ResetOutcome:
     index: int
     reset_index: int
-    messages: tuple[PolicyMessage, ...]
+    initial_messages: tuple[PolicyMessage, ...]
     excluded: bool
     error: Exception | None
     started_offset_seconds: float
@@ -50,9 +50,9 @@ def reset_task_neutral_policy_contexts(
 ) -> ParallelResetResult:
     """Reset independent clients concurrently while preserving batch order.
 
-    Workers own only their matching ``(handler, client)`` pair. Results and
-    failures are consumed in input-index order, matching the old serial loop's
-    deterministic row/error semantics.
+    Workers own only their matching ``(handler, client)`` pair through reset
+    and observation. Policy-context binding runs on the caller thread in input
+    order, matching the old serial loop's state mutation and error semantics.
     """
 
     if len(rollout_handlers) != len(env_clients):
@@ -91,11 +91,12 @@ def reset_task_neutral_policy_contexts(
             initial_messages.append(
                 {"role": "user", "content": str(client.observe())}
             )
-            messages = bind_initial_policy_context(client, initial_messages)
             return _ResetOutcome(
                 index=index,
                 reset_index=reset_index,
-                messages=tuple(dict(message) for message in messages),
+                initial_messages=tuple(
+                    dict(message) for message in initial_messages
+                ),
                 excluded=False,
                 error=None,
                 started_offset_seconds=started - batch_started,
@@ -105,7 +106,7 @@ def reset_task_neutral_policy_contexts(
             return _ResetOutcome(
                 index=index,
                 reset_index=reset_index,
-                messages=(),
+                initial_messages=(),
                 excluded=bool(getattr(client, "sample_excluded", False)),
                 error=exc,
                 started_offset_seconds=started - batch_started,
@@ -129,8 +130,19 @@ def reset_task_neutral_policy_contexts(
                 elapsed_seconds=outcome.elapsed_seconds,
             )
         )
-        if outcome.error is not None:
-            if outcome.excluded:
+        error = outcome.error
+        messages: Sequence[Mapping[str, str]] = ()
+        if error is None:
+            try:
+                messages = bind_initial_policy_context(
+                    env_clients[outcome.index], outcome.initial_messages
+                )
+            except Exception as exc:
+                error = exc
+        if error is not None:
+            if outcome.excluded or bool(
+                getattr(env_clients[outcome.index], "sample_excluded", False)
+            ):
                 excluded_indices.add(outcome.index)
                 rollout_handlers[outcome.index].done = True
                 continue
@@ -138,9 +150,11 @@ def reset_task_neutral_policy_contexts(
             raise RuntimeError(
                 "task-neutral environment reset failed: "
                 f"row={outcome.index} item_id={handler.item_id} "
-                f"error={type(outcome.error).__name__}: {outcome.error}"
-            ) from outcome.error
-        policy_messages[outcome.index] = outcome.messages
+                f"error={type(error).__name__}: {error}"
+            ) from error
+        policy_messages[outcome.index] = tuple(
+            dict(message) for message in messages
+        )
 
     return ParallelResetResult(
         policy_messages=tuple(policy_messages),

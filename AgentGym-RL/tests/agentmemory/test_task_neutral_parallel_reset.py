@@ -139,6 +139,54 @@ class TaskNeutralParallelResetTest(unittest.TestCase):
             [[100], [101], [102]],
         )
 
+    def test_policy_context_binding_runs_on_caller_thread_in_batch_order(
+        self,
+    ) -> None:
+        handlers = self.handlers(3)
+        clients = [Client(index, delay=(2 - index) * 0.01) for index in range(3)]
+        caller_thread = threading.get_ident()
+        bind_calls: list[tuple[int, int]] = []
+
+        def bind(client: Client, messages):
+            bind_calls.append((client.index, threading.get_ident()))
+            return bind_initial_context(client, messages)
+
+        result = self.module.reset_task_neutral_policy_contexts(
+            handlers,
+            clients,
+            resolve_reset_index=lambda handler: handler.data_idx,
+            bind_initial_policy_context=bind,
+        )
+
+        self.assertEqual(
+            bind_calls,
+            [(0, caller_thread), (1, caller_thread), (2, caller_thread)],
+        )
+        self.assertEqual(
+            [messages[-1]["content"] for messages in result.policy_messages],
+            ["bound-0", "bound-1", "bound-2"],
+        )
+
+    def test_bind_failure_names_original_row_and_item(self) -> None:
+        handlers = self.handlers(3)
+        clients = [Client(index) for index in range(3)]
+
+        def bind(client: Client, messages):
+            if client.index == 1:
+                raise ValueError("invalid policy framing")
+            return bind_initial_context(client, messages)
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"row=1 item_id=item-1 error=ValueError: invalid policy framing",
+        ):
+            self.module.reset_task_neutral_policy_contexts(
+                handlers,
+                clients,
+                resolve_reset_index=lambda handler: handler.data_idx,
+                bind_initial_policy_context=bind,
+            )
+
     def test_reset_failure_names_original_row_and_item(self) -> None:
         handlers = self.handlers(3)
         clients = [
