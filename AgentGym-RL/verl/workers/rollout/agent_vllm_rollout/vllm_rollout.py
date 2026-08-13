@@ -91,6 +91,9 @@ from verl.utils.agentgym.task_neutral_rollout import (
     outcome_from_receipt,
     receipt_parts,
 )
+from verl.utils.agentgym.task_neutral_parallel_reset import (
+    reset_task_neutral_policy_contexts,
+)
 from agentenv.controller import (
     bind_initial_policy_context,
     complete_policy_turn,
@@ -1409,35 +1412,41 @@ class vLLMRollout(BaseRollout):
             [] for _ in rollout_handler_ls
         ]
         excluded_rollout_indices: set[int] = set()
+        raw_reset_max_workers = read_config(
+            self.agentgym_config, "reset_max_workers_per_rank", None
+        )
+        reset_max_workers = (
+            len(rollout_handler_ls)
+            if raw_reset_max_workers is None
+            else int(raw_reset_max_workers)
+        )
 
-        for index, handler in enumerate(rollout_handler_ls):
-            try:
-                env_clients[index].reset(resolve_rollout_reset_index(handler))
-                initial_messages = [
-                    message.to_dict() for message in handler.messages
-                ]
-                initial_messages.append(
-                    {
-                        "role": "user",
-                        "content": str(env_clients[index].observe()),
-                    }
-                )
-                policy_messages[index] = bind_initial_policy_context(
-                    env_clients[index], initial_messages
-                )
-                self._task_neutral_bind_handler_messages(
-                    handler, policy_messages[index]
-                )
-            except Exception as exc:
-                if getattr(env_clients[index], "sample_excluded", False):
-                    excluded_rollout_indices.add(index)
-                    handler.done = True
-                    continue
-                raise RuntimeError(
-                    "task-neutral environment reset failed: "
-                    f"row={index} item_id={handler.item_id} "
-                    f"error={type(exc).__name__}: {exc}"
-                ) from exc
+        reset_started = time.perf_counter()
+        reset_result = reset_task_neutral_policy_contexts(
+            rollout_handler_ls,
+            env_clients,
+            resolve_reset_index=resolve_rollout_reset_index,
+            bind_initial_policy_context=bind_initial_policy_context,
+            max_workers=reset_max_workers,
+        )
+        reset_elapsed = time.perf_counter() - reset_started
+        excluded_rollout_indices.update(reset_result.excluded_indices)
+        for index, messages in enumerate(reset_result.policy_messages):
+            if index in excluded_rollout_indices:
+                continue
+            policy_messages[index] = [dict(message) for message in messages]
+            self._task_neutral_bind_handler_messages(
+                rollout_handler_ls[index], policy_messages[index]
+            )
+        if global_steps is not None:
+            print(
+                "AgentMemoryGym task-neutral reset profile: "
+                f"wall_seconds={reset_elapsed:.3f} "
+                f"items={len(rollout_handler_ls)} "
+                f"max_workers={reset_max_workers} "
+                f"excluded={len(excluded_rollout_indices)}",
+                flush=True,
+            )
 
         rollout_bar = tqdm(
             total=max_policy_turns,
