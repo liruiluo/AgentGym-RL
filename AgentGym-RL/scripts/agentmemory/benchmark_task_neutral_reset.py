@@ -22,6 +22,7 @@ from verl.utils.agentgym.task_neutral_parallel_reset import (
 from verl.utils.agent_dataset.procedural_index import (
     resolve_rollout_reset_index,
 )
+from verl.workers.rollout.schemas import Message
 
 
 def _sha256_bytes(value: bytes) -> str:
@@ -30,6 +31,26 @@ def _sha256_bytes(value: bytes) -> str:
 
 def _sha256_text(value: str) -> str:
     return _sha256_bytes(value.encode("utf-8"))
+
+
+def _rollout_messages(conversation_start: Any) -> list[Message]:
+    messages: list[Message] = []
+    for index, turn in enumerate(conversation_start):
+        if not isinstance(turn, dict):
+            raise TypeError(f"conversation turn {index} must be a dictionary")
+        source = turn.get("from")
+        content = turn.get("value")
+        if source not in {"human", "gpt"} or not isinstance(content, str):
+            raise ValueError(f"invalid conversation turn {index}: {turn!r}")
+        messages.append(
+            Message(
+                role=("user" if source == "human" else "assistant"),
+                content=content,
+            )
+        )
+    if not messages:
+        raise ValueError("conversation start must not be empty")
+    return messages
 
 
 def _rank_reset(
@@ -53,7 +74,7 @@ def _rank_reset(
         ]
         handlers = [
             SimpleNamespace(
-                messages=client.conversation_start,
+                messages=_rollout_messages(client.conversation_start),
                 item_id=f"swesmith_{data_idx}",
                 data_idx=data_idx,
                 done=False,
