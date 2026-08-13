@@ -8,7 +8,6 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict
 import hashlib
 import json
-import os
 from pathlib import Path
 import time
 from types import SimpleNamespace
@@ -31,44 +30,6 @@ def _sha256_bytes(value: bytes) -> str:
 
 def _sha256_text(value: str) -> str:
     return _sha256_bytes(value.encode("utf-8"))
-
-
-def _tree_digest(root: Path) -> str:
-    entries: list[dict[str, Any]] = []
-    for path in sorted(root.rglob("*")):
-        relative = path.relative_to(root).as_posix()
-        stat_result = path.lstat()
-        if path.is_symlink():
-            entries.append(
-                {
-                    "kind": "symlink",
-                    "path": relative,
-                    "target": os.readlink(path),
-                    "mode": stat_result.st_mode & 0o7777,
-                }
-            )
-        elif path.is_dir():
-            entries.append(
-                {
-                    "kind": "directory",
-                    "path": relative,
-                    "mode": stat_result.st_mode & 0o7777,
-                }
-            )
-        elif path.is_file():
-            entries.append(
-                {
-                    "kind": "file",
-                    "path": relative,
-                    "mode": stat_result.st_mode & 0o7777,
-                    "size": stat_result.st_size,
-                    "sha256": _sha256_bytes(path.read_bytes()),
-                }
-            )
-        else:
-            raise RuntimeError(f"unsupported workspace entry: {path}")
-    payload = json.dumps(entries, sort_keys=True, separators=(",", ":"))
-    return _sha256_text(payload)
 
 
 def _rank_reset(
@@ -113,7 +74,6 @@ def _rank_reset(
             detail = client.detail(private_token=detail_token)
             reset_evidence = detail["evidence"][0]
             workspace = detail["workspace"]
-            policy_root = Path(workspace["policy_root"])
             profile = reset_evidence["profile"]
             hidden_tests = tuple(
                 dict.fromkeys(
@@ -136,7 +96,9 @@ def _rank_reset(
                     "policy_messages_sha256": _sha256_text(
                         json.dumps(messages, sort_keys=True, separators=(",", ":"))
                     ),
-                    "workspace_tree_sha256": _tree_digest(policy_root),
+                    "workspace_tree_sha256": reset_evidence["workspace_initial"][
+                        "tree_sha256"
+                    ],
                     "hidden_test_sha256": hidden_digests,
                     "model_uid": workspace["model_uid"],
                     "model_gid": workspace["model_gid"],
