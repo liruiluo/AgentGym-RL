@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import torch
 
@@ -11,6 +12,7 @@ from verl.experimental.remote_opd.dpca import (
     DPCAOPDError,
     DPCAOPDSettings,
     RemoteDPCAOPDScorer,
+    _load_teacher_tokenizer,
     attach_dpca_opd_advantages,
     dpca_minimal_chunks,
     dpca_semantic_prior_credit,
@@ -151,6 +153,46 @@ class TestDPCAOPD(unittest.TestCase):
         self.assertEqual(targets, [-3.0, -2.0])
         self.assertLess(error, 1e-8)
         self.assertEqual(clipped, 0)
+
+    def test_teacher_loader_honors_declared_custom_tokenizer_class(self):
+        class TikTokenTokenizer:
+            loaded_path = None
+
+            @classmethod
+            def from_pretrained(cls, path):
+                cls.loaded_path = path
+                return cls()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "tokenizer_config.json").write_text(
+                json.dumps(
+                    {
+                        "auto_map": {
+                            "AutoTokenizer": [
+                                "tokenization_kimi.TikTokenTokenizer",
+                                None,
+                            ]
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch(
+                    "transformers.dynamic_module_utils.get_class_from_dynamic_module",
+                    return_value=TikTokenTokenizer,
+                ) as dynamic_loader,
+                mock.patch("transformers.AutoTokenizer.from_pretrained") as generic_loader,
+            ):
+                tokenizer = _load_teacher_tokenizer(tmpdir)
+
+        self.assertIsInstance(tokenizer, TikTokenTokenizer)
+        self.assertEqual(TikTokenTokenizer.loaded_path, tmpdir)
+        dynamic_loader.assert_called_once_with(
+            "tokenization_kimi.TikTokenTokenizer",
+            tmpdir,
+        )
+        generic_loader.assert_not_called()
 
     def test_remote_score_and_attach_supervises_visible_and_first_stop_tokens(self):
         chatml = (

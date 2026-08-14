@@ -707,6 +707,66 @@ def _surface_tokens(tokenizer: Any, token_ids: Sequence[int]) -> list[str]:
     ]
 
 
+def _declared_auto_tokenizer_class(tokenizer_path: str) -> str | None:
+    config_path = Path(tokenizer_path) / "tokenizer_config.json"
+    if not config_path.is_file():
+        return None
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DPCAOPDError(
+            f"cannot read teacher tokenizer config at {config_path}"
+        ) from exc
+    auto_map = config.get("auto_map")
+    if not isinstance(auto_map, Mapping) or "AutoTokenizer" not in auto_map:
+        return None
+    declaration = auto_map["AutoTokenizer"]
+    if isinstance(declaration, str):
+        candidates = [declaration]
+    elif isinstance(declaration, Sequence) and not isinstance(
+        declaration, (str, bytes)
+    ):
+        candidates = list(declaration)
+    else:
+        raise DPCAOPDError("teacher AutoTokenizer declaration is malformed")
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    raise DPCAOPDError("teacher AutoTokenizer declaration has no usable class")
+
+
+def _load_teacher_tokenizer(tokenizer_path: str) -> Any:
+    class_reference = _declared_auto_tokenizer_class(tokenizer_path)
+    if class_reference is None:
+        from transformers import AutoTokenizer
+
+        return AutoTokenizer.from_pretrained(
+            tokenizer_path,
+            trust_remote_code=True,
+        )
+
+    try:
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+        tokenizer_class = get_class_from_dynamic_module(
+            class_reference,
+            tokenizer_path,
+        )
+        tokenizer = tokenizer_class.from_pretrained(tokenizer_path)
+    except Exception as exc:
+        raise DPCAOPDError(
+            "failed to load the teacher tokenizer class declared by "
+            f"tokenizer_config.json: {class_reference}"
+        ) from exc
+    expected_name = class_reference.rsplit(".", 1)[-1]
+    if tokenizer.__class__.__name__ != expected_name:
+        raise DPCAOPDError(
+            "teacher tokenizer class differs from tokenizer_config.json: "
+            f"{tokenizer.__class__.__name__} != {expected_name}"
+        )
+    return tokenizer
+
+
 class RemoteDPCAOPDScorer:
     """Asynchronously score student actions through a Kimi-compatible endpoint."""
 
@@ -724,11 +784,8 @@ class RemoteDPCAOPDScorer:
         self.settings = settings
         self.student_tokenizer = student_tokenizer
         if teacher_tokenizer is None:
-            from transformers import AutoTokenizer
-
-            teacher_tokenizer = AutoTokenizer.from_pretrained(
-                settings.teacher_tokenizer_path,
-                trust_remote_code=True,
+            teacher_tokenizer = _load_teacher_tokenizer(
+                str(settings.teacher_tokenizer_path)
             )
         self.teacher_tokenizer = teacher_tokenizer
         self.request_fn = request_fn or _default_request
