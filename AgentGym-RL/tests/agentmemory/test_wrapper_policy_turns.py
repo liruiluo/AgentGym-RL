@@ -283,6 +283,34 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertNotIn("click[Buy Now]", str(messages))
         self.assertNotIn(WEBSHOP_SESSION_HANDOFF_REQUEST, str(messages))
 
+    def test_native_webshop_buy_reports_session_advance_without_handoff(self) -> None:
+        client = FakeWebShopClient([webshop_buy_response()])
+        client.is_filesystem = False
+        client.metadata = {"surface": "memoryarena_webshop_native_v1"}
+        client.info["metadata"] = client.metadata
+        messages = self.bind_webshop(client)
+
+        output, messages = complete_policy_turn(
+            client,
+            prepare(client, messages),
+            "click[Buy Now]",
+        )
+
+        self.assertTrue(output.info["wrapper_evidence"]["session_advanced"])
+        self.assertEqual(
+            (
+                output.info["session_epoch_before"],
+                output.info["session_epoch_after"],
+            ),
+            (0, 1),
+        )
+        self.assertEqual(
+            output.info["context_transition"]["operation"],
+            "replace_messages",
+        )
+        self.assertIsNone(client._pending_session_handoff)
+        self.assertIn("session-1 fresh observation", str(messages))
+
     def test_invalid_webshop_handoff_remains_evidence_but_not_context(self) -> None:
         client = FakeWebShopClient([webshop_buy_response()])
         messages = self.bind_webshop(client)
