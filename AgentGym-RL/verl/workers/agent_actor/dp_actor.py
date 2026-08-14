@@ -26,6 +26,10 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from verl import DataProto
 from verl.agent_trainer.ppo import core_algos
+from verl.experimental.remote_opd.dpca import (
+    DPCA_OPD_ADVANTAGES,
+    DPCA_OPD_TOKEN_MASK,
+)
 from verl.workers.agent_actor import BasePPOActor
 from verl.utils.torch_functional import logprobs_from_logits, masked_mean
 from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_unpad
@@ -351,6 +355,11 @@ class DataParallelPPOActor(BasePPOActor):
         temperature = data.meta_info['temperature']  # temperature must be in the data.meta_info to avoid slient error
 
         select_keys = ['input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages', 'responses', 'response_mask']
+        dpca_opd_enabled = DPCA_OPD_ADVANTAGES in data.batch.keys()
+        if dpca_opd_enabled:
+            if DPCA_OPD_TOKEN_MASK not in data.batch.keys():
+                raise ValueError("DPCA OPD advantages require a token mask.")
+            select_keys.extend([DPCA_OPD_ADVANTAGES, DPCA_OPD_TOKEN_MASK])
         if core_algos.PPO_VALID_SAMPLE_MASK in data.batch.keys():
             select_keys.append(core_algos.PPO_VALID_SAMPLE_MASK)
         if self.config.use_kl_loss:
@@ -379,6 +388,15 @@ class DataParallelPPOActor(BasePPOActor):
 
         metrics = {}
         token_metrics = TokenWeightedMetricAccumulator()
+        dpca_token_metrics = TokenWeightedMetricAccumulator()
+        dpca_loss_coef = float(
+            data.meta_info.get("dpca_opd_distillation_loss_coef", 0.0)
+        )
+        dpca_clip_ratio = float(
+            data.meta_info.get("dpca_opd_clip_ratio", self.config.clip_ratio)
+        )
+        if dpca_opd_enabled and dpca_loss_coef <= 0:
+            raise ValueError("DPCA OPD requires a positive distillation coefficient.")
         optimizer_steps = 0
         dynamic_summaries = []
         for _ in range(ppo_epochs):
@@ -405,6 +423,18 @@ class DataParallelPPOActor(BasePPOActor):
                 )
                 if global_token_count.item() <= 0:
                     raise ValueError("PPO actor mini-batch has no valid response tokens.")
+                global_dpca_token_count = None
+                if dpca_opd_enabled:
+                    mini_batch_dpca_mask = mask_padding_rows(
+                        mini_batch[DPCA_OPD_TOKEN_MASK],
+                        mini_batch.get(core_algos.PPO_VALID_SAMPLE_MASK),
+                    )
+                    global_dpca_token_count = distributed_sum(
+                        valid_response_token_count(mini_batch_dpca_mask),
+                        group=loss_group,
+                    )
+                    if global_dpca_token_count.item() <= 0:
+                        raise ValueError("DPCA OPD mini-batch has no aligned policy tokens.")
 
                 for data in micro_batches:
                     data = data.cuda()  # actor device is cpu when using offload
@@ -449,6 +479,44 @@ class DataParallelPPOActor(BasePPOActor):
                         global_token_count,
                         group=loss_group,
                     )
+                    if dpca_opd_enabled:
+                        dpca_mask = mask_padding_rows(
+                            data[DPCA_OPD_TOKEN_MASK],
+                            data.get(core_algos.PPO_VALID_SAMPLE_MASK),
+                        )
+                        local_dpca_token_count = valid_response_token_count(
+                            dpca_mask
+                        )
+                        if local_dpca_token_count.item() > 0:
+                            dpca_loss, dpca_clipfrac, dpca_ppo_kl = (
+                                core_algos.compute_policy_loss(
+                                    old_log_prob=old_log_prob,
+                                    log_prob=log_prob,
+                                    advantages=data[DPCA_OPD_ADVANTAGES],
+                                    eos_mask=dpca_mask,
+                                    cliprange=dpca_clip_ratio,
+                                )
+                            )
+                        else:
+                            dpca_loss = (log_prob * 0.0).sum()
+                            dpca_clipfrac = torch.zeros_like(dpca_loss)
+                            dpca_ppo_kl = torch.zeros_like(dpca_loss)
+                        scaled_dpca_loss = scale_token_mean_loss(
+                            dpca_loss,
+                            local_dpca_token_count,
+                            global_dpca_token_count,
+                            group=loss_group,
+                        )
+                        loss = loss + dpca_loss_coef * scaled_dpca_loss
+                        dpca_token_metrics.add(
+                            {
+                                'distillation/loss': dpca_loss.detach().item(),
+                                'distillation/pg_clipfrac': dpca_clipfrac.detach().item(),
+                                'distillation/ppo_kl': dpca_ppo_kl.detach().item(),
+                                'distillation/coefficient': dpca_loss_coef,
+                            },
+                            local_dpca_token_count,
+                        )
                     loss.backward()
                     token_metrics.add(
                         {
@@ -513,4 +581,5 @@ class DataParallelPPOActor(BasePPOActor):
                 if name not in {'rank', 'role'}:
                     metrics[f'actor/dynamic_{name}'] = [float(value)]
         metrics.update(token_metrics.reduce(group=metric_group))
+        metrics.update(dpca_token_metrics.reduce(group=metric_group))
         return metrics

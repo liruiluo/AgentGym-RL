@@ -182,6 +182,26 @@ custom_reward_function:
   name: null
 
 algorithm:
+  # Cross-tokenizer PG-OPD via DPCA (arXiv:2606.09456), including the first
+  # policy stop token. Disabled paths preserve the original trainer exactly.
+  # Runtime launchers supply the remote endpoint and tokenizer path.
+  dpca_opd:
+    enabled: False
+    teacher_base_url: null
+    teacher_model: null
+    teacher_tokenizer_path: null
+    api_key_env: null
+    request_batch_size: 16
+    request_timeout_s: 300.0
+    max_retries: 3
+    retry_backoff_s: 1.0
+    distillation_loss_coef: 1.0
+    clip_ratio: 0.2
+    loss_max_clamp: null
+    log_prob_min_clamp: null
+    strict_echo_token_check: True
+    alignment_dump_dir: null
+    alignment_dump_rows: 4
   gamma: 1.0
   lam: 1.0
   adv_estimator: gae

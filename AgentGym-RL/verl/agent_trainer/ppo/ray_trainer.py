@@ -34,6 +34,11 @@ from verl.single_controller.base import Worker
 from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, RayClassWithInitArgs
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.agent_trainer.ppo import core_algos
+from verl.experimental.remote_opd.dpca import (
+    DPCAOPDSettings,
+    RemoteDPCAOPDScorer,
+    attach_dpca_opd_advantages,
+)
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.agent_dataset.rl_dataset import RLHFDataset, collate_fn
@@ -1237,6 +1242,13 @@ class RayPPOTrainer(object):
 
         self.tokenizer = tokenizer
         self.config = config
+        dpca_config = config.algorithm.get("dpca_opd", {})
+        self.dpca_opd_settings = DPCAOPDSettings.from_config(
+            OmegaConf.to_container(dpca_config, resolve=True)
+            if OmegaConf.is_config(dpca_config)
+            else dict(dpca_config)
+        )
+        self.dpca_opd_scorer = None
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, 'Currently, only support hybrid engine'
@@ -1276,6 +1288,11 @@ class RayPPOTrainer(object):
 
         self._validate_config()
         self._create_dataloader()
+        if self.dpca_opd_settings.enabled:
+            self.dpca_opd_scorer = RemoteDPCAOPDScorer(
+                self.dpca_opd_settings,
+                student_tokenizer=self.tokenizer,
+            )
 
     def _validate_config(self):
         config = self.config
@@ -1991,6 +2008,11 @@ class RayPPOTrainer(object):
                                     f'ppo_batch/{role}_max_token_len_per_gpu'
                                 ] = float(dynamic_caps[role])
 
+                    dpca_teacher_future = None
+                    if self.dpca_opd_scorer is not None:
+                        with _timer('dpca_teacher_submit', timing_raw):
+                            dpca_teacher_future = self.dpca_opd_scorer.submit(batch)
+
                     # recompute old_log_probs
                     with _timer('old_log_prob', timing_raw):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
@@ -2023,6 +2045,21 @@ class RayPPOTrainer(object):
                                 core_algos.validate_near_zero_critic_values(
                                     values=batch.batch['values'],
                                     eos_mask=valid_value_mask,
+                                )
+                            )
+
+                    if dpca_teacher_future is not None:
+                        with _timer('dpca_teacher_wait', timing_raw):
+                            dpca_teacher_scores = dpca_teacher_future.result()
+                        with _timer('dpca_credit', timing_raw):
+                            metrics.update(
+                                attach_dpca_opd_advantages(
+                                    batch,
+                                    dpca_teacher_scores,
+                                    self.dpca_opd_settings,
+                                    student_tokenizer=self.tokenizer,
+                                    teacher_tokenizer=self.dpca_opd_scorer.teacher_tokenizer,
+                                    global_step=self.global_steps,
                                 )
                             )
 
