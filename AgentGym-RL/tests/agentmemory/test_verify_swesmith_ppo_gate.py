@@ -313,6 +313,39 @@ class SwesmithPpoGateRowEvidenceTests(unittest.TestCase):
                 set(range(64)),
             )
 
+    def test_online_prefix_accepts_probe_from_full_routing_pool(self) -> None:
+        module = load_module()
+        with tempfile.TemporaryDirectory() as raw_root:
+            routing_file = Path(raw_root) / "routing.jsonl"
+            rows = [
+                {
+                    "data_idx": index,
+                    "extra_info": {
+                        "index": index,
+                        "schedule_position": index,
+                    },
+                    "item_id": f"swesmith_{index}",
+                }
+                for index in range(128)
+            ]
+            routing_file.write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+
+            routing = module.load_routing_contract(
+                routing_file,
+                train_batch_size=64,
+                first_global_step=1,
+                global_step=1,
+            )
+            probe_indices = list(range(64, 72))
+            module.verify_endpoint_probe_indices(
+                {"indices": probe_indices},
+                probe_indices,
+                routing["training_data_indices"],
+            )
+
     def test_accepts_formal_step_records_and_binds_all_indices(self) -> None:
         module = load_module()
         rows = [

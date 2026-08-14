@@ -152,6 +152,7 @@ def load_routing_contract(
     segment_data_idx_counts = Counter(int(row["data_idx"]) for row in segment_rows)
     return {
         "routing_row_count": len(rows),
+        "training_data_indices": {int(row["data_idx"]) for row in rows},
         "segment_schedule_positions": [
             int(row["extra_info"]["schedule_position"]) for row in segment_rows
         ],
@@ -600,6 +601,7 @@ def main() -> None:
     expected_parent_indices = set(range(args.train_batch_size))
     routing_contract = None
     allowed_future_indices: set[int] | None = None
+    endpoint_training_indices: set[int] | None = None
     expected_current_item_ids = {
         index: f"swesmith_{index}" for index in expected_parent_indices
     }
@@ -610,6 +612,7 @@ def main() -> None:
             index: segment_update_count * args.train_batch_size // args.task_count
             for index in expected_data_indices
         })
+        endpoint_training_indices = expected_data_indices
     else:
         routing_contract = load_routing_contract(
             args.routing_file,
@@ -620,6 +623,7 @@ def main() -> None:
         assert args.task_count == routing_contract["routing_row_count"]
         expected_data_idx_counts = routing_contract["segment_data_idx_counts"]
         expected_data_indices = set(expected_data_idx_counts)
+        endpoint_training_indices = routing_contract["training_data_indices"]
         expected_current_item_ids = routing_contract["current_item_ids"]
         if args.online:
             future_rows = []
@@ -630,13 +634,14 @@ def main() -> None:
             allowed_future_indices = {
                 int(row["data_idx"]) for row in future_rows[future_start:]
             }
+    assert endpoint_training_indices is not None
     endpoint_probe = load_json(args.endpoint_probe)
     assert endpoint_probe["status"] == "pass"
     parse_endpoint_probe_slots(endpoint_probe)
     verify_endpoint_probe_indices(
         endpoint_probe,
         parse_endpoint_probe_indices(args.endpoint_probe_indices),
-        expected_data_indices,
+        endpoint_training_indices,
     )
     # The resident manager allocates a fresh service-local slot for every
     # episode and never reuses a closed slot.  Slot IDs may have gaps because
