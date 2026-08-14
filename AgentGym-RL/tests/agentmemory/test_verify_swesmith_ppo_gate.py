@@ -601,6 +601,44 @@ class SwesmithPpoGateAuditSelectionTests(unittest.TestCase):
                     endpoint_nonzero_return_rows=0,
                 )
 
+    def test_accepts_return_signal_from_verified_parent_run(self) -> None:
+        module = load_module()
+        endpoint_payload = {
+            "global_step": 21,
+            "stage": "post_adv",
+            "rows": [{"ppo_valid_sample": True, "return_nonzero": 0}],
+        }
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            run_dir = root / "resume"
+            parent_run_dir = root / "parent"
+            (run_dir / "diagnostics").mkdir(parents=True)
+            (parent_run_dir / "diagnostics").mkdir(parents=True)
+            (parent_run_dir / "diagnostics" / "ppo_batch_step1_post_adv.json").write_text(
+                json.dumps({
+                    "global_step": 1,
+                    "stage": "post_adv",
+                    "rows": [
+                        {"ppo_valid_sample": True, "return_nonzero": 1},
+                        {"ppo_valid_sample": True, "return_nonzero": 0},
+                    ],
+                }),
+                encoding="utf-8",
+            )
+            result = module.verify_segment_return_signal(
+                run_dir,
+                first_global_step=21,
+                global_step=21,
+                endpoint_payload=endpoint_payload,
+                endpoint_nonzero_return_rows=0,
+                parent_run_dir=parent_run_dir,
+            )
+
+        self.assertEqual(result["source"], "verified_parent_run")
+        self.assertEqual(result["source_global_step"], 1)
+        self.assertEqual(result["nonzero_return_rows"], 1)
+        self.assertFalse(result["endpoint_has_return_signal"])
+
     def test_endpoint_probe_slots_are_validated_without_fixing_service_offsets(self) -> None:
         module = load_module()
         self.assertEqual(
