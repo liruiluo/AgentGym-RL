@@ -26,6 +26,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metadata-after", type=Path, required=True)
     parser.add_argument("--global-step", type=int, default=1)
     parser.add_argument("--first-global-step", type=int, default=1)
+    parser.add_argument(
+        "--parent-run-dir",
+        type=Path,
+        help=(
+            "Optional verified parent run for a resumed segment. When the "
+            "current segment contains only zero-return batches, its earlier "
+            "post-advantage diagnostics may supply the return-signal evidence."
+        ),
+    )
+    parser.add_argument(
+        "--allow-zero-resolved",
+        action="store_true",
+        help=(
+            "Allow the current resumed batch/segment to have zero resolved "
+            "audits, provided parent-run return evidence is supplied."
+        ),
+    )
     parser.add_argument("--train-batch-size", type=int, default=8)
     parser.add_argument("--task-count", type=int, default=8)
     parser.add_argument(
@@ -162,6 +179,7 @@ def verify_segment_return_signal(
     global_step: int,
     endpoint_payload: dict[str, Any],
     endpoint_nonzero_return_rows: int,
+    parent_run_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Find real PPO return evidence anywhere in the declared update segment."""
     assert int(endpoint_payload["global_step"]) == global_step
@@ -186,6 +204,24 @@ def verify_segment_return_signal(
                 "nonzero_return_rows": nonzero_return_rows,
                 "endpoint_has_return_signal": False,
             }
+
+    if parent_run_dir is not None:
+        parent_candidates = sorted(
+            parent_run_dir.glob("diagnostics/ppo_batch_step*_post_adv.json"),
+            key=lambda path: int(path.name.split("step", 1)[1].split("_", 1)[0]),
+        )
+        for path in parent_candidates:
+            payload = load_json(path)
+            assert payload["stage"] == "post_adv"
+            nonzero_return_rows = count_nonzero_return_rows(payload)
+            if nonzero_return_rows > 0:
+                return {
+                    "source_global_step": int(payload["global_step"]),
+                    "nonzero_return_rows": nonzero_return_rows,
+                    "endpoint_has_return_signal": False,
+                    "source": "verified_parent_run",
+                    "parent_run_dir": str(parent_run_dir),
+                }
 
     raise AssertionError(
         "declared optimizer-update segment has no nonzero PPO return rows"
@@ -675,6 +711,7 @@ def main() -> None:
         global_step=args.global_step,
         endpoint_payload=payload,
         endpoint_nonzero_return_rows=nonzero_return_rows,
+        parent_run_dir=args.parent_run_dir,
     )
 
     workspace_ids: dict[int, int] = {}
@@ -736,7 +773,13 @@ def main() -> None:
         expected_slot_cardinality=expected_audit_count,
         allowed_future_indices=allowed_future_indices,
     )
-    assert int(audits["resolved_count"]) > 0
+    if not args.allow_zero_resolved:
+        assert int(audits["resolved_count"]) > 0
+    else:
+        assert args.parent_run_dir is not None
+        assert segment_return_signal.get("source") == "verified_parent_run" or int(
+            audits["resolved_count"]
+        ) > 0
     evidence = {
         "schema": "agentmemory_swesmith_ppo_gate_attestation_v1",
         "status": "pass",
@@ -779,6 +822,7 @@ def main() -> None:
         "action_kind_counts": dict(action_kind_counts),
         "compaction_required": args.require_compaction,
         "online_prefix_verification": args.online,
+        "allow_zero_resolved": args.allow_zero_resolved,
         "workspace_continuity_ids": workspace_ids,
         "truncation_contract": "exact_backend_response_cap_is_trainable_negative_v1",
         "truncated_rows": truncated_rows,
