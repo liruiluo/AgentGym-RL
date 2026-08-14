@@ -23,6 +23,7 @@ _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 _CACHE_SCHEMA = "swesmith_oci_rootfs_cache_v1"
 _MANIFEST_SCHEMA = "swesmith_oci_image_manifest_v1"
+_VERIFIED_LAYER_CACHE_FILES: set[tuple[str, int, int, int]] = set()
 
 
 @dataclass(frozen=True)
@@ -109,6 +110,25 @@ def _transport_prefixes(primary: str, fallbacks: Iterable[str]) -> tuple[str, ..
     return tuple(prefixes)
 
 
+def _purge_invalid_cached_layers(layer_cache_root: Path) -> tuple[str, ...]:
+    """Remove corrupt crane cache entries before they poison another retry."""
+    removed: list[str] = []
+    for path in layer_cache_root.iterdir():
+        if not path.is_file() or _DIGEST_RE.fullmatch(path.name) is None:
+            continue
+        stat = path.stat()
+        identity = (str(path), stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        if identity in _VERIFIED_LAYER_CACHE_FILES:
+            continue
+        expected = path.name.removeprefix("sha256:")
+        if _sha256_file(path) != expected:
+            path.unlink()
+            removed.append(path.name)
+            continue
+        _VERIFIED_LAYER_CACHE_FILES.add(identity)
+    return tuple(sorted(removed))
+
+
 def _pull_cached_tarball(
     binding: ImageBinding,
     *,
@@ -129,6 +149,7 @@ def _pull_cached_tarball(
     with lock_path.open("a+b") as lock_handle:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
         for attempt in range(download_attempts):
+            invalid_layers = _purge_invalid_cached_layers(layer_cache_root)
             prefix = transport_prefixes[attempt % len(transport_prefixes)]
             reference = f"{prefix}/{binding.source_image}@{binding.digest}"
             image_tarball.unlink(missing_ok=True)
@@ -150,6 +171,14 @@ def _pull_cached_tarball(
                         "registry config bytes do not match the manifest descriptor"
                     )
                 with pull_log.open("ab") as error_handle:
+                    if invalid_layers:
+                        error_handle.write(
+                            (
+                                "purged_invalid_layer_cache="
+                                + ",".join(invalid_layers)
+                                + "\n"
+                            ).encode("ascii")
+                        )
                     error_handle.write(
                         f"attempt={attempt + 1} reference={reference}\n".encode("utf-8")
                     )

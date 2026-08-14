@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import importlib.util
 import sys
 import tempfile
@@ -87,6 +88,27 @@ class PrepareSwesmithOciRootfsTest(unittest.TestCase):
     def test_rejects_empty_transport_prefix(self):
         with self.assertRaisesRegex(ValueError, "must not be empty"):
             MODULE._transport_prefixes("docker.1ms.run", ("  ",))
+
+    def test_purges_corrupt_crane_layer_cache_entries(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cache = Path(raw)
+            valid_raw = b"verified compressed layer"
+            valid_digest = hashlib.sha256(valid_raw).hexdigest()
+            valid = cache / f"sha256:{valid_digest}"
+            corrupt = cache / f"sha256:{'0' * 64}"
+            ignored = cache / ".pull.lock"
+            valid.write_bytes(valid_raw)
+            corrupt.write_bytes(b"")
+            ignored.write_bytes(b"")
+
+            self.assertEqual(
+                MODULE._purge_invalid_cached_layers(cache),
+                (corrupt.name,),
+            )
+            self.assertEqual(valid.read_bytes(), valid_raw)
+            self.assertFalse(corrupt.exists())
+            self.assertTrue(ignored.exists())
+            self.assertEqual(MODULE._purge_invalid_cached_layers(cache), ())
 
 
 if __name__ == "__main__":
