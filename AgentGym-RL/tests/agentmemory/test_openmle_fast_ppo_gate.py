@@ -38,12 +38,13 @@ def manifest() -> dict:
             "data_idx": index,
             "task_id": f"task-{index:02d}@1",
             "source_family": f"KAGGLE_DATASET:owner/source-{index:02d}",
+            "role": "gate_only",
         }
         for index in range(64)
     ]
     return {
         "schema": "openmle_fast_public_manifest_v1",
-        "panel_id": "openmle-fast-train64-v1",
+        "panel_id": "openmle-fast-g64-v1",
         "role": "gate_only",
         "openmle_tasks_revision": "f56e4b31252a9b81d95fea100098cd49b7290398",
         "task_count": len(records),
@@ -220,6 +221,14 @@ def update_evidence(document: dict) -> dict:
         rows.append(row(record, 2, terminal=True, manifest_digest=digest_value))
     return {
         "schema": "openmle_fast_ppo_update_evidence_v1",
+        "gate_contract": {
+            "schema": "openmle_fast_gate_contract_v1",
+            "role": "gate_only",
+            "optimizer_update_limit": 1,
+            "initialization": "fresh_base_checkpoint",
+            "resume_checkpoint": None,
+            "checkpoint_reuse_allowed": False,
+        },
         "manifest_sha256": digest_value,
         "runtime_source": {
             "outer_commit": OUTER_COMMIT,
@@ -283,6 +292,12 @@ def update_evidence(document: dict) -> dict:
                 "matched_pids": [1001, 1002],
                 "residual_pids": [],
             },
+            "checkpoint_disposition": {
+                "schema": "openmle_fast_gate_checkpoint_disposition_v1",
+                "policy": "discard_after_readback",
+                "checkpoint_reuse_allowed": False,
+                "remaining_checkpoint_paths": [],
+            },
         },
     }
 
@@ -336,7 +351,7 @@ class OpenMLEFastPpoGateTests(unittest.TestCase):
             forbidden_canaries=["NEVER_PUBLIC_CANARY"],
         )
 
-    def test_accepts_exactly_one_complete_train64_update(self) -> None:
+    def test_accepts_exactly_one_complete_g64_update(self) -> None:
         document = manifest()
         attestation = self.verify(update_evidence(document), document)
 
@@ -345,6 +360,31 @@ class OpenMLEFastPpoGateTests(unittest.TestCase):
         self.assertEqual(attestation["task_receipt_count"], 64)
         self.assertEqual(attestation["sampled_action_row_count"], 128)
         self.assertEqual(attestation["graded_terminal_count"], 64)
+        self.assertFalse(attestation["checkpoint_reuse_allowed"])
+
+    def test_rejects_non_gate_manifest_or_resumable_gate(self) -> None:
+        document = manifest()
+        for field, value in (("role", "train_pool"), ("panel_id", "other-panel")):
+            mutated = json.loads(json.dumps(document))
+            mutated[field] = value
+            if field == "role":
+                for record in mutated["records"]:
+                    record["role"] = value
+            evidence = update_evidence(mutated)
+            with self.subTest(field=field), self.assertRaises(AssertionError):
+                self.verify(evidence, mutated, endpoint_evidence=endpoint_probe(mutated))
+
+        evidence = update_evidence(document)
+        evidence["gate_contract"]["resume_checkpoint"] = "/tmp/checkpoint"
+        with self.assertRaisesRegex(AssertionError, "resume checkpoint"):
+            self.verify(evidence, document)
+
+        evidence = update_evidence(document)
+        evidence["cleanup"]["checkpoint_disposition"][
+            "remaining_checkpoint_paths"
+        ] = ["global_step_1"]
+        with self.assertRaisesRegex(AssertionError, "remaining gate checkpoints"):
+            self.verify(evidence, document)
 
     def test_rejects_a_missing_manifest_task_receipt(self) -> None:
         document = manifest()

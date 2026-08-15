@@ -23,6 +23,8 @@ DOMAIN_ID = "openmle_fast"
 CONTRACT_VERSION = "openmle_fast_v1"
 EXPECTED_OPENMLE_TASKS_REVISION = "f56e4b31252a9b81d95fea100098cd49b7290398"
 EXPECTED_TASK_COUNT = 64
+EXPECTED_PANEL_ID = "openmle-fast-g64-v1"
+EXPECTED_ROLE = "gate_only"
 COUNTER_KEYS = (
     "action_count",
     "execution_action_count",
@@ -191,6 +193,8 @@ def validate_manifest(
         EXPECTED_OPENMLE_TASKS_REVISION,
         label="manifest OpenMLE revision",
     )
+    _require_exact(document.get("panel_id"), EXPECTED_PANEL_ID, label="gate panel_id")
+    _require_exact(document.get("role"), EXPECTED_ROLE, label="gate role")
     records = document.get("records")
     if not isinstance(records, list):
         raise AssertionError("manifest records are missing")
@@ -216,6 +220,11 @@ def validate_manifest(
             raise AssertionError(
                 f"manifest record {expected_index} lacks source_family"
             )
+        _require_exact(
+            record.get("role"),
+            EXPECTED_ROLE,
+            label=f"manifest record {expected_index} role",
+        )
         if task_id in task_ids:
             raise AssertionError(f"duplicate manifest task_id: {task_id}")
         if source_family in source_families:
@@ -962,6 +971,30 @@ def validate_cleanup(
         [],
         label="process census residual PIDs",
     )
+
+    checkpoint = cleanup.get("checkpoint_disposition")
+    if not isinstance(checkpoint, dict):
+        raise AssertionError("gate checkpoint disposition is missing")
+    _require_exact(
+        checkpoint.get("schema"),
+        "openmle_fast_gate_checkpoint_disposition_v1",
+        label="checkpoint disposition schema",
+    )
+    _require_exact(
+        checkpoint.get("policy"),
+        "discard_after_readback",
+        label="checkpoint disposition policy",
+    )
+    _require_exact(
+        checkpoint.get("checkpoint_reuse_allowed"),
+        False,
+        label="checkpoint reuse policy",
+    )
+    _require_exact(
+        checkpoint.get("remaining_checkpoint_paths"),
+        [],
+        label="remaining gate checkpoints",
+    )
     return {
         "client_close_count": EXPECTED_TASK_COUNT,
         "owned_process_count": 2,
@@ -1006,6 +1039,35 @@ def verify_ppo_gate(
         expected_prompt_sha256=expected_prompt_sha256,
     )
     _require_exact(evidence.get("schema"), UPDATE_SCHEMA, label="update schema")
+    gate_contract = evidence.get("gate_contract")
+    if not isinstance(gate_contract, dict):
+        raise AssertionError("gate contract evidence is missing")
+    _require_exact(
+        gate_contract.get("schema"),
+        "openmle_fast_gate_contract_v1",
+        label="gate contract schema",
+    )
+    _require_exact(gate_contract.get("role"), EXPECTED_ROLE, label="gate contract role")
+    _require_exact(
+        gate_contract.get("optimizer_update_limit"),
+        1,
+        label="gate optimizer-update limit",
+    )
+    _require_exact(
+        gate_contract.get("initialization"),
+        "fresh_base_checkpoint",
+        label="gate initialization",
+    )
+    _require_exact(
+        gate_contract.get("resume_checkpoint"),
+        None,
+        label="gate resume checkpoint",
+    )
+    _require_exact(
+        gate_contract.get("checkpoint_reuse_allowed"),
+        False,
+        label="gate checkpoint reuse",
+    )
     _require_exact(
         evidence.get("manifest_sha256"),
         manifest_sha256,
@@ -1101,6 +1163,7 @@ def verify_ppo_gate(
         "manifest_sha256": manifest_sha256,
         "global_step": last_global_step,
         "optimizer_update_count": 1,
+        "checkpoint_reuse_allowed": False,
         "task_receipt_count": len(task_receipts),
         "sampled_action_row_count": len(rows),
         "sampled_response_token_count": sum(
