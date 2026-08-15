@@ -372,7 +372,9 @@ class OpenMLEFastPpoGateTests(unittest.TestCase):
                     record["role"] = value
             evidence = update_evidence(mutated)
             with self.subTest(field=field), self.assertRaises(AssertionError):
-                self.verify(evidence, mutated, endpoint_evidence=endpoint_probe(mutated))
+                self.verify(
+                    evidence, mutated, endpoint_evidence=endpoint_probe(mutated)
+                )
 
         evidence = update_evidence(document)
         evidence["gate_contract"]["resume_checkpoint"] = "/tmp/checkpoint"
@@ -380,9 +382,9 @@ class OpenMLEFastPpoGateTests(unittest.TestCase):
             self.verify(evidence, document)
 
         evidence = update_evidence(document)
-        evidence["cleanup"]["checkpoint_disposition"][
-            "remaining_checkpoint_paths"
-        ] = ["global_step_1"]
+        evidence["cleanup"]["checkpoint_disposition"]["remaining_checkpoint_paths"] = [
+            "global_step_1"
+        ]
         with self.assertRaisesRegex(AssertionError, "remaining gate checkpoints"):
             self.verify(evidence, document)
 

@@ -41,7 +41,9 @@ def load_procedural_index_module():
     return module
 
 
-def manifest(*, role: str = "gate_only", panel_id: str = "openmle-fast-test-v1") -> dict:
+def manifest(
+    *, role: str = "gate_only", panel_id: str = "openmle-fast-test-v1"
+) -> dict:
     return {
         "schema": "openmle_fast_public_manifest_v1",
         "panel_id": panel_id,
