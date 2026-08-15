@@ -44,6 +44,13 @@ FORBIDDEN_PUBLIC_KEYS = (
     "secret",
     "traceback",
 )
+POLICY_TERMINAL_REASONS = frozenset(
+    {
+        "action_budget_exhausted",
+        "managed_runtime_limit",
+        "episode_wall_limit",
+    }
+)
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 
@@ -645,6 +652,55 @@ def validate_grade_receipt(
     _sha256_string(receipt.get("audit_digest"), label=f"{label} grade audit digest")
 
 
+def validate_ungraded_policy_terminal(
+    row: dict[str, Any],
+    *,
+    reward: float,
+    action: str,
+    action_submission: dict[str, Any],
+    grading_increment: int,
+    counters_after: dict[str, int],
+    max_policy_actions: int,
+    runtime_success: bool,
+    episode_success: bool,
+    label: str,
+) -> None:
+    reason = row.get("terminal_reason")
+    if reason not in POLICY_TERMINAL_REASONS:
+        raise AssertionError(f"{label} ungraded policy terminal reason is invalid")
+    if (
+        reward != -1.0
+        or row.get("grade_receipt") is not None
+        or row.get("terminal_classification") is not None
+        or row.get("truncated") is not False
+        or runtime_success
+        or episode_success
+    ):
+        raise AssertionError(f"{label} ungraded policy terminal is inconsistent")
+    if set(action_submission) != {"raw_policy_output"}:
+        raise AssertionError(
+            f"{label} ungraded policy terminal fabricated submission identity"
+        )
+    if reason == "action_budget_exhausted" and (
+        counters_after["action_count"] != max_policy_actions
+    ):
+        raise AssertionError(
+            f"{label} action-budget terminal ended before max_policy_actions"
+        )
+    if grading_increment == 0:
+        if counters_after["grading_count"] != 0:
+            raise AssertionError(f"{label} ungraded terminal grade ledger drifted")
+    elif not (
+        grading_increment == 1
+        and counters_after["grading_count"] == 1
+        and action.strip() == "submit"
+        and reason == "episode_wall_limit"
+    ):
+        raise AssertionError(
+            f"{label} receipt-free grade attempt is not a bounded submit timeout"
+        )
+
+
 def validate_task_rows(
     rows: list[dict[str, Any]],
     record: dict[str, Any],
@@ -674,6 +730,7 @@ def validate_task_rows(
     episode_ids: set[str] = set()
     previous_after = {key: 0 for key in COUNTER_KEYS}
     sampled_token_count = 0
+    graded_terminal = False
     for offset, row in enumerate(rows):
         label = f"data_idx {index} row {offset + 1}"
         _require_exact(row.get("schema"), STEP_SCHEMA, label=f"{label} schema")
@@ -765,24 +822,39 @@ def validate_task_rows(
                     f"{label} violates terminal-only grading and reward"
                 )
         else:
-            _require_exact(
-                grading_increment,
-                1,
-                label=f"{label} terminal-only grading count",
-            )
-            validate_grade_receipt(
-                row.get("grade_receipt"),
-                record,
-                reward,
-                action_submission=submission,
-                episode_id=episode_id,
-                terminal_reason=row.get("terminal_reason"),
-                terminal_classification=row.get("terminal_classification"),
-                runtime_success=runtime_success,
-                episode_success=episode_success,
-                truncated=row["truncated"],
-                label=label,
-            )
+            if row.get("grade_receipt") is None:
+                validate_ungraded_policy_terminal(
+                    row,
+                    reward=reward,
+                    action=action,
+                    action_submission=submission,
+                    grading_increment=grading_increment,
+                    counters_after=after,
+                    max_policy_actions=max_policy_actions,
+                    runtime_success=runtime_success,
+                    episode_success=episode_success,
+                    label=label,
+                )
+            else:
+                _require_exact(
+                    grading_increment,
+                    1,
+                    label=f"{label} terminal-only grading count",
+                )
+                validate_grade_receipt(
+                    row.get("grade_receipt"),
+                    record,
+                    reward,
+                    action_submission=submission,
+                    episode_id=episode_id,
+                    terminal_reason=row.get("terminal_reason"),
+                    terminal_classification=row.get("terminal_classification"),
+                    runtime_success=runtime_success,
+                    episode_success=episode_success,
+                    truncated=row["truncated"],
+                    label=label,
+                )
+                graded_terminal = True
         previous_after = after
 
     _require_exact(len(item_ids), 1, label=f"data_idx {index} item_id continuity")
@@ -791,17 +863,13 @@ def validate_task_rows(
         1,
         label=f"data_idx {index} episode_id continuity",
     )
-    _require_exact(
-        previous_after["grading_count"],
-        1,
-        label=f"data_idx {index} final grading count",
-    )
     return {
         "data_idx": index,
         "item_id": next(iter(item_ids)),
         "action_row_count": len(rows),
         "sampled_response_token_count": sampled_token_count,
         "final_reward": float(rows[-1]["reward"]),
+        "graded_terminal": graded_terminal,
     }
 
 
@@ -1169,7 +1237,12 @@ def verify_ppo_gate(
         "sampled_response_token_count": sum(
             receipt["sampled_response_token_count"] for receipt in task_receipts
         ),
-        "graded_terminal_count": len(task_receipts),
+        "graded_terminal_count": sum(
+            int(receipt["graded_terminal"]) for receipt in task_receipts
+        ),
+        "ungraded_policy_terminal_count": sum(
+            int(not receipt["graded_terminal"]) for receipt in task_receipts
+        ),
         "dataset_indices": [receipt["data_idx"] for receipt in task_receipts],
         "optimizer_readback": readback,
         "cleanup": cleanup,

@@ -327,6 +327,26 @@ def rebind_manifest_digest(evidence: dict, probe: dict, digest_value: str) -> No
         probe[field]["task_manifest_sha256"] = digest_value
 
 
+def make_first_terminal_ungraded(evidence: dict) -> dict:
+    terminal = evidence["update"]["rows"][1]
+    action = 'shell_command {"command":"python train.py"}'
+    terminal.update(
+        {
+            "action": action,
+            "action_submission": {"raw_policy_output": action},
+            "reward": -1.0,
+            "terminal_reason": "episode_wall_limit",
+            "terminal_classification": None,
+            "runtime_success": False,
+            "episode_success": False,
+            "grade_receipt": None,
+        }
+    )
+    terminal["counters_after"]["grading_count"] = 0
+    terminal["counter_delta"]["grading_count"] = 0
+    return terminal
+
+
 class OpenMLEFastPpoGateTests(unittest.TestCase):
     def verify(
         self,
@@ -360,7 +380,32 @@ class OpenMLEFastPpoGateTests(unittest.TestCase):
         self.assertEqual(attestation["task_receipt_count"], 64)
         self.assertEqual(attestation["sampled_action_row_count"], 128)
         self.assertEqual(attestation["graded_terminal_count"], 64)
+        self.assertEqual(attestation["ungraded_policy_terminal_count"], 0)
         self.assertFalse(attestation["checkpoint_reuse_allowed"])
+
+    def test_accepts_a_real_policy_terminal_without_forcing_submit(self) -> None:
+        document = manifest()
+        evidence = update_evidence(document)
+        make_first_terminal_ungraded(evidence)
+
+        attestation = self.verify(evidence, document)
+
+        self.assertEqual(attestation["graded_terminal_count"], 63)
+        self.assertEqual(attestation["ungraded_policy_terminal_count"], 1)
+
+    def test_rejects_inconsistent_ungraded_policy_terminals(self) -> None:
+        document = manifest()
+        for mutation in ("reason", "reward", "fabricated_submission"):
+            evidence = update_evidence(document)
+            terminal = make_first_terminal_ungraded(evidence)
+            if mutation == "reason":
+                terminal["terminal_reason"] = "grader_infrastructure_fault"
+            elif mutation == "reward":
+                terminal["reward"] = 0.0
+            else:
+                terminal["action_submission"]["request_id"] = "fabricated"
+            with self.subTest(mutation=mutation), self.assertRaises(AssertionError):
+                self.verify(evidence, document)
 
     def test_rejects_non_gate_manifest_or_resumable_gate(self) -> None:
         document = manifest()
