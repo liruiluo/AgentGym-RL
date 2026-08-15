@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -113,6 +114,27 @@ def validate_manifest(document: Any) -> list[dict[str, Any]]:
             raise ValueError(
                 f"records[{position}].role must match manifest role {role!r}"
             )
+        if record.get("reward_eligible") is not True:
+            raise ValueError(
+                f"records[{position}] is not eligible for executable routing"
+            )
+        baseline = record.get("baseline_score")
+        ideal = record.get("ideal_score")
+        direction = record.get("higher_is_better")
+        if (
+            isinstance(baseline, bool)
+            or not isinstance(baseline, (int, float))
+            or not math.isfinite(float(baseline))
+            or isinstance(ideal, bool)
+            or not isinstance(ideal, (int, float))
+            or not math.isfinite(float(ideal))
+            or type(direction) is not bool
+        ):
+            raise ValueError(f"records[{position}] has invalid normalization fields")
+        directed_gap = (1.0 if direction else -1.0) * (float(ideal) - float(baseline))
+        scale = max(1.0, abs(float(baseline)), abs(float(ideal)))
+        if directed_gap <= 1e-6 * scale:
+            raise ValueError(f"records[{position}] has no positive normalization gap")
         if task_id in task_ids:
             raise ValueError(f"duplicate task_id: {task_id!r}")
         if role == "gate_only" and source_family in source_families:

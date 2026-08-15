@@ -59,12 +59,20 @@ def manifest(
                 "task_id": "alpha@1",
                 "source_family": "KAGGLE_DATASET:alpha",
                 "role": role,
+                "reward_eligible": True,
+                "baseline_score": 0.5,
+                "ideal_score": 1.0,
+                "higher_is_better": True,
             },
             {
                 "data_idx": 1,
                 "task_id": "beta@1",
                 "source_family": "KAGGLE_DATASET:beta",
                 "role": role,
+                "reward_eligible": True,
+                "baseline_score": 1.0,
+                "ideal_score": 0.0,
+                "higher_is_better": False,
             },
         ],
     }
@@ -191,6 +199,21 @@ class OpenMLEFastRoutingTests(unittest.TestCase):
         document["records"][1]["role"] = "heldout"
         with self.assertRaisesRegex(ValueError, "must match manifest role"):
             module.validate_manifest(document)
+
+    def test_rejects_non_reward_bearing_routing_rows(self) -> None:
+        module = load_module()
+        for mutation, message in (
+            ({"reward_eligible": False}, "not eligible"),
+            ({"reward_eligible": None}, "not eligible"),
+            ({"baseline_score": 1.0, "ideal_score": 1.0}, "normalization gap"),
+            ({"higher_is_better": "yes"}, "normalization fields"),
+        ):
+            document = manifest(role="train_pool")
+            document["records"][0].update(mutation)
+            with self.subTest(mutation=mutation), self.assertRaisesRegex(
+                ValueError, message
+            ):
+                module.validate_manifest(document)
 
     def test_gate_only_rejects_duplicate_source_family(self) -> None:
         module = load_module()
