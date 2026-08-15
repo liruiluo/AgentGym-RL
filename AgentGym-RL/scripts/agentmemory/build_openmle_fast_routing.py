@@ -18,6 +18,8 @@ ITEM_ID_SCHEME = "openmle_fast_opaque_schedule_v1"
 EXPECTED_OPENMLE_TASKS_REVISION = "f56e4b31252a9b81d95fea100098cd49b7290398"
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 REVISION_PATTERN = re.compile(r"[0-9a-f]{40}")
+ALLOWED_ROLES = frozenset({"gate_only", "train_pool", "heldout"})
+G64_PANEL_ID = "openmle-fast-g64-v1"
 
 
 def canonical_json_bytes(value: Any) -> bytes:
@@ -53,8 +55,12 @@ def validate_manifest(document: Any) -> list[dict[str, Any]]:
         raise ValueError("manifest must be a JSON object")
     if document.get("schema") != MANIFEST_SCHEMA:
         raise ValueError(f"manifest schema must be {MANIFEST_SCHEMA!r}")
-    require_nonempty_string(document.get("panel_id"), "panel_id")
-    require_nonempty_string(document.get("role"), "role")
+    panel_id = require_nonempty_string(document.get("panel_id"), "panel_id")
+    role = require_nonempty_string(document.get("role"), "role")
+    if role not in ALLOWED_ROLES:
+        raise ValueError(f"role must be one of {sorted(ALLOWED_ROLES)!r}")
+    if panel_id == G64_PANEL_ID and role != "gate_only":
+        raise ValueError("the frozen G64 panel must remain gate_only")
     revision = require_nonempty_string(
         document.get("openmle_tasks_revision"),
         "openmle_tasks_revision",
@@ -99,10 +105,18 @@ def validate_manifest(document: Any) -> list[dict[str, Any]]:
             record.get("source_family"),
             f"records[{position}].source_family",
         )
+        record_role = require_nonempty_string(
+            record.get("role"),
+            f"records[{position}].role",
+        )
+        if record_role != role:
+            raise ValueError(
+                f"records[{position}].role must match manifest role {role!r}"
+            )
         if task_id in task_ids:
             raise ValueError(f"duplicate task_id: {task_id!r}")
-        if source_family in source_families:
-            raise ValueError(f"duplicate source_family: {source_family!r}")
+        if role == "gate_only" and source_family in source_families:
+            raise ValueError(f"duplicate gate-only source_family: {source_family!r}")
         task_ids.add(task_id)
         source_families.add(source_family)
     return records
@@ -125,6 +139,9 @@ def build_routing_rows(
     repetitions = require_integer(repetitions, "repetitions")
     if repetitions <= 0:
         raise ValueError("repetitions must be positive")
+    role = document["role"]
+    if role != "train_pool" and repetitions != 1:
+        raise ValueError(f"{role} routing must be a single pass")
 
     rows = []
     for repetition in range(repetitions):
@@ -147,6 +164,7 @@ def build_routing_rows(
                         "index": data_idx,
                         "manifest_digest": manifest_sha256,
                         "panel_id": document["panel_id"],
+                        "role": document["role"],
                         "schedule_position": schedule_position,
                         "schedule_repetition": repetition,
                     },
@@ -216,10 +234,17 @@ def write_routing_artifacts(
         "role": document["role"],
         "routing_row_count": len(rows),
         "routing_sha256": sha256_bytes(encoded_routing),
-        "schedule_policy": "manifest_order_repeated",
+        "schedule_policy": (
+            "full_pool_pass_before_repetition"
+            if document["role"] == "train_pool"
+            else f"single_pass_{document['role']}"
+        ),
         "task_count": document["task_count"],
         "task_id_list_sha256": document["task_id_list_sha256"],
         "unique_data_idx_count": len({row["data_idx"] for row in rows}),
+        "unique_source_family_count": len(
+            {record["source_family"] for record in document["records"]}
+        ),
         "unique_task_id_count": len(
             {record["task_id"] for record in document["records"]}
         ),

@@ -44,7 +44,7 @@ def manifest() -> dict:
     return {
         "schema": "openmle_fast_public_manifest_v1",
         "panel_id": "openmle-fast-train64-v1",
-        "role": "mechanism_gate",
+        "role": "gate_only",
         "openmle_tasks_revision": "f56e4b31252a9b81d95fea100098cd49b7290398",
         "task_count": len(records),
         "task_id_list_sha256": "4" * 64,
