@@ -36,6 +36,16 @@ from agentenv.envs import (
     SwesmithEnvClient,
 )
 
+try:
+    from agentenv.envs import OpenMLEFastEnvClient
+except ImportError as exc:
+    if (
+        exc.name != "agentenv.envs"
+        or "cannot import name 'OpenMLEFastEnvClient'" not in str(exc)
+    ):
+        raise
+    OpenMLEFastEnvClient = None
+
 
 ENVCLIENT_CLASSES = {
     "agentmemory": AgentMemoryEnvClient,
@@ -56,6 +66,8 @@ ENVCLIENT_CLASSES = {
     "searchqa": SearchQAEnvClient,
     "swesmith": SwesmithEnvClient,
 }
+if OpenMLEFastEnvClient is not None:
+    ENVCLIENT_CLASSES["openmle_fast"] = OpenMLEFastEnvClient
 
 def configured_multitask_env_addrs(args) -> tuple[str, ...]:
     raw = getattr(args, "multitask_env_addrs", None)
@@ -158,7 +170,11 @@ def init_env_client(args, *, env_addr: str | None = None):
     while True:
         try:
             data_len = getattr(args, "data_len", 1)
-            if resolved_task_name in {"agentmemory", "swesmith"} and not hasattr(args, "data_len"):
+            if resolved_task_name in {
+                "agentmemory",
+                "openmle_fast",
+                "swesmith",
+            } and not hasattr(args, "data_len"):
                 data_len = None
             env_client = envclient_class(env_server_base=resolved_env_addr, data_len=data_len, timeout=_client_timeout_seconds())
             if resolved_task_name == "agentmemory":
