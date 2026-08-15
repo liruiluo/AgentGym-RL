@@ -11,6 +11,17 @@ existing non-test Python source file. Formal PPO must use a manifest derived
 from the native train split; the historical `oauthlib` `simple_train8` panel is
 held-out plumbing and is not a training distribution.
 
+`build_swesmith_formal_schedule.py` owns formal routing order. A fresh schedule
+uses an explicit seeded global permutation and repeats only the declared
+permutation prefix. An exclude-only rebuild uses `filter-source` mode so it
+filters and densely remaps the existing random routing sequence instead of
+iterating the endpoint's physical shard order. Every build emits a structured
+schedule contract, 10-update repository/image composition, and exact repeat
+pairs. Run `certify_swesmith_schedule_order.py` in the launcher preflight. It
+fails closed on selection or routing drift, monotonic physical order, an
+incomplete permutation, seed replay mismatch, or a block-composition threshold
+violation. Keep `data.shuffle=false` only when this routing certificate passes.
+
 `prepare_swesmith_oci_rootfs.py` resolves already-frozen image digests into the
 out-of-band rootfs cache consumed by the sandbox. It streams `crane export`
 through `tar`, verifies the manifest/config/rootfs contract, writes the
