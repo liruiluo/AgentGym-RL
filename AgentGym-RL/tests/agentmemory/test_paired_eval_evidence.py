@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,7 @@ from paired_eval.controller import DependencyLightPolicyTurnController
 from paired_eval.evidence import AppendSafeJsonlWriter, PrivateEvidenceStore
 from paired_eval.runner import PairedRunner
 from paired_eval.verifier import (
+    PairVerificationError,
     ResultValidationError,
     build_public_summary,
     validate_result_row,
@@ -79,13 +81,90 @@ class EvidenceSafetyTest(unittest.TestCase):
         with self.assertRaises(ResultValidationError):
             validate_result_row(forbidden_compaction)
 
+        compaction_row = self.result_row(
+            with_arm(make_config(), Arm.AMG_COMPACTION_ONLY)
+        )
         memory_row = self.result_row(with_arm(make_config(), Arm.AMG_MEMORY))
-        summary = build_public_summary([row, memory_row])
+        for result, score in zip(
+            (row, compaction_row, memory_row),
+            (0.25, 0.5, 0.9),
+        ):
+            result["scorer"]["public_metrics"] = {
+                "score": score,
+                "passed": score >= 0.5,
+            }
+        summary = build_public_summary([row, compaction_row, memory_row])
         serialized = json.dumps(summary, sort_keys=True)
         self.assertNotIn("evidence://", serialized)
         self.assertNotIn("protected_ref", serialized)
         self.assertNotIn("private_grader_detail", serialized)
         self.assertNotIn("messages", serialized)
+        self.assertNotIn("interaction", serialized.lower())
+        self.assertEqual(summary["row_count"], 3)
+        self.assertEqual(summary["triad_count"], 1)
+        triad = summary["triads"][0]
+        self.assertEqual(
+            triad["raw_arm_metrics"],
+            {
+                "native": {"score": 0.25, "passed": False},
+                "amg_compaction_only": {"score": 0.5, "passed": True},
+                "amg_memory": {"score": 0.9, "passed": True},
+            },
+        )
+        self.assertEqual(
+            triad["contrasts"],
+            {
+                "compaction_effect": {"score": 0.25},
+                "external_memory_incremental_effect": {
+                    "score": 0.4,
+                },
+                "full_amg_effect": {"score": 0.65},
+            },
+        )
+
+    def test_public_summary_rejects_absolute_path_labels(self) -> None:
+        protected_path = "/protected/private/gold-answer.json"
+        base_config = make_config()
+        identity_configs = {
+            "run_id": replace(base_config, run_id=protected_path),
+            "benchmark": replace(
+                base_config,
+                task=replace(base_config.task, benchmark=protected_path),
+            ),
+            "protocol": replace(
+                base_config,
+                task=replace(base_config.task, protocol=protected_path),
+            ),
+            "task_id": replace(
+                base_config,
+                task=replace(base_config.task, task_id=protected_path),
+            ),
+        }
+        for field, config in identity_configs.items():
+            with self.subTest(identity=field):
+                rows = [
+                    self.result_row(with_arm(config, arm))
+                    for arm in (
+                        Arm.NATIVE,
+                        Arm.AMG_COMPACTION_ONLY,
+                        Arm.AMG_MEMORY,
+                    )
+                ]
+                with self.assertRaises(PairVerificationError):
+                    build_public_summary(rows)
+
+        metric_rows = [
+            self.result_row(with_arm(base_config, arm))
+            for arm in (
+                Arm.NATIVE,
+                Arm.AMG_COMPACTION_ONLY,
+                Arm.AMG_MEMORY,
+            )
+        ]
+        for row in metric_rows:
+            row["scorer"]["public_metrics"] = {protected_path: 1.0}
+        with self.assertRaises(PairVerificationError):
+            build_public_summary(metric_rows)
 
 
 if __name__ == "__main__":

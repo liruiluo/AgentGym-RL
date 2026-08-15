@@ -15,18 +15,20 @@ from test_paired_eval_support import (
 )
 
 from paired_eval.controller import DependencyLightPolicyTurnController
+from paired_eval.contracts import EXTERNAL_MEMORY_CAPABILITY_SURFACES
 from paired_eval.evidence import AppendSafeJsonlWriter, PrivateEvidenceStore
 from paired_eval.manifest import execute_manifest, expand_manifest
 from paired_eval.runner import PairedRunner
+from paired_eval.serialization import sha256_json
 from paired_eval.verifier import PairVerificationError, verify_pair_completeness
 
 
 def manifest_payload() -> dict:
     return {
         "schema": "amg.paired_eval.manifest",
-        "schema_version": "1.0.0",
-        "run_id": "six-case-run",
-        "arms": ["native", "amg_memory"],
+        "schema_version": "2.0.0",
+        "run_id": "nine-cell-run",
+        "arms": ["native", "amg_compaction_only", "amg_memory"],
         "common": {
             "model": {
                 "model_id": "test-model",
@@ -53,6 +55,12 @@ def manifest_payload() -> dict:
                 "policy": "policy_authored_task_neutral_v1",
                 "trigger": "wrapper_token_pressure_v1",
                 "summary_max_tokens": 256,
+                "summary_instruction_sha256": SHA_C,
+                "context_pressure_policy_sha256": SHA_D,
+                "context_transition_schema": (
+                    "agentmemory_task_neutral_context_transition_v1"
+                ),
+                "action_accounting": "global_policy_action_budget_v1",
                 "config_sha256": SHA_B,
             },
             "source": {
@@ -117,9 +125,9 @@ class ManifestExecutionTest(unittest.TestCase):
             clock=ManualClock(),
         )
 
-    def test_all_six_cases_call_the_same_real_run_task(self) -> None:
+    def test_exact_nine_cells_call_the_same_real_run_task(self) -> None:
         configs = expand_manifest(manifest_payload())
-        self.assertEqual(len(configs), 6)
+        self.assertEqual(len(configs), 9)
         original = PairedRunner.run_task
         calls = []
 
@@ -141,22 +149,35 @@ class ManifestExecutionTest(unittest.TestCase):
         finally:
             PairedRunner.run_task = original
 
-        self.assertEqual(len(rows), 6)
-        self.assertEqual(len(calls), 6)
+        self.assertEqual(len(rows), 9)
+        self.assertEqual(len(calls), 9)
         self.assertTrue(all(instance is self.runner for instance, _, _ in calls))
         self.assertEqual(
             {(benchmark, arm) for _, benchmark, arm in calls},
             {
                 ("gaia_text", "native"),
+                ("gaia_text", "amg_compaction_only"),
                 ("gaia_text", "amg_memory"),
                 ("swebench_verified", "native"),
+                ("swebench_verified", "amg_compaction_only"),
                 ("swebench_verified", "amg_memory"),
                 ("mlebench_lite", "native"),
+                ("mlebench_lite", "amg_compaction_only"),
                 ("mlebench_lite", "amg_memory"),
             },
         )
         report = verify_pair_completeness(rows)
         self.assertEqual(report["pair_count"], 3)
+        self.assertEqual(report["triad_count"], 3)
+        self.assertEqual(report["cell_count"], 9)
+        self.assertEqual(
+            report["capability_lattice"],
+            {
+                "native": "00",
+                "amg_compaction_only": "10",
+                "amg_memory": "11",
+            },
+        )
         with self.assertRaises(RuntimeError):
             execute_manifest(
                 manifest_payload(),
@@ -228,16 +249,141 @@ class ManifestExecutionTest(unittest.TestCase):
         with self.assertRaises(PairVerificationError):
             verify_pair_completeness(root_reuse)
 
+    def test_compaction_only_leakage_fails_closed(self) -> None:
+        rows = execute_manifest(
+            manifest_payload(),
+            runner=self.runner,
+            runtime_factory=lambda config: make_fake_runtime(config, self.store),
+            writer=self.writer,
+        )
+        compaction_index = next(
+            index
+            for index, row in enumerate(rows)
+            if row["benchmark"] == "gaia_text"
+            and row["arm"] == "amg_compaction_only"
+        )
+
+        for surface in EXTERNAL_MEMORY_CAPABILITY_SURFACES:
+            leaked = deepcopy(rows)
+            leaked[compaction_index]["config"]["capability"][
+                "external_memory_surfaces"
+            ] = [surface]
+            leaked[compaction_index]["treatment"][
+                "external_memory_surfaces"
+            ] = [surface]
+            with self.subTest(surface=surface), self.assertRaises(
+                PairVerificationError
+            ):
+                verify_pair_completeness(leaked)
+
+        prompt_leak = deepcopy(rows)
+        prompt_leak[compaction_index]["config"]["capability"][
+            "prompt_declaration"
+        ] += " External WRITE(key,value)."
+        prompt_leak[compaction_index]["treatment"]["prompt_declaration"] = (
+            prompt_leak[compaction_index]["config"]["capability"][
+                "prompt_declaration"
+            ]
+        )
+        with self.assertRaises(PairVerificationError):
+            verify_pair_completeness(prompt_leak)
+
+        tool_leak = deepcopy(rows)
+        tool_leak[compaction_index]["config"]["capability"]["tools"] = [
+            "WRITE(key,value)"
+        ]
+        tool_leak[compaction_index]["treatment"]["tools"] = [
+            "WRITE(key,value)"
+        ]
+        with self.assertRaises(PairVerificationError):
+            verify_pair_completeness(tool_leak)
+
+        root_leak = deepcopy(rows)
+        leaked_row = root_leak[compaction_index]
+        external_root = {
+            "capability_id": "external_memory",
+            "root_kind": "external_memory",
+            "root_id": sha256_json(
+                {
+                    "namespace": leaked_row["namespace"],
+                    "capability_id": "external_memory",
+                    "root_kind": "external_memory",
+                }
+            ),
+            "namespace_sha256": leaked_row["namespace_sha256"],
+        }
+        leaked_row["lifecycle"]["declared_roots"].append(external_root)
+        leaked_row["lifecycle"]["closed_roots"].append(external_root)
+        with self.assertRaises(PairVerificationError):
+            verify_pair_completeness(root_leak)
+
+        receipt_leak = deepcopy(rows)
+        leaked_turn = receipt_leak[compaction_index]["turns"][0]
+        leaked_turn["capability_id"] = "external_memory"
+        leaked_turn["root_kind"] = "external_memory"
+        leaked_turn["root_id"] = external_root["root_id"]
+        with self.assertRaises(PairVerificationError):
+            verify_pair_completeness(receipt_leak)
+
+    def test_individually_valid_non_capability_drift_fails_closed(self) -> None:
+        rows = execute_manifest(
+            manifest_payload(),
+            runner=self.runner,
+            runtime_factory=lambda config: make_fake_runtime(config, self.store),
+            writer=self.writer,
+        )
+        compaction_index = next(
+            index
+            for index, row in enumerate(rows)
+            if row["benchmark"] == "gaia_text"
+            and row["arm"] == "amg_compaction_only"
+        )
+
+        def refresh_config_digests(row):
+            row["full_config_sha256"] = sha256_json(row["config"])
+            excluded = deepcopy(row["config"])
+            del excluded["capability"]
+            row["treatment_excluded_config_sha256"] = sha256_json(excluded)
+
+        drifted = deepcopy(rows)
+        row = drifted[compaction_index]
+        row["config"]["budgets"]["max_policy_turns"] += 1
+        row["budgets"]["max_policy_turns"] += 1
+        refresh_config_digests(row)
+        with self.assertRaises(PairVerificationError):
+            verify_pair_completeness(drifted)
+
+        native_tool_drift = deepcopy(rows)
+        row = native_tool_drift[compaction_index]
+        row["config"]["task"]["native_tools"].append("leaked_tool")
+        refresh_config_digests(row)
+        with self.assertRaises(PairVerificationError):
+            verify_pair_completeness(native_tool_drift)
+
     def test_manifest_rejects_duplicate_or_incomplete_arm_declarations(self) -> None:
         missing = manifest_payload()
-        missing["arms"] = ["native"]
+        missing["arms"] = ["native", "amg_compaction_only"]
         with self.assertRaises(ValueError):
             expand_manifest(missing)
 
         duplicate = manifest_payload()
-        duplicate["arms"] = ["native", "native", "amg_memory"]
+        duplicate["arms"] = [
+            "native",
+            "amg_compaction_only",
+            "amg_compaction_only",
+        ]
         with self.assertRaises(ValueError):
             expand_manifest(duplicate)
+
+        fourth = manifest_payload()
+        fourth["arms"] = [
+            "native",
+            "amg_compaction_only",
+            "amg_memory",
+            "memory_only",
+        ]
+        with self.assertRaises(ValueError):
+            expand_manifest(fourth)
 
 
 if __name__ == "__main__":

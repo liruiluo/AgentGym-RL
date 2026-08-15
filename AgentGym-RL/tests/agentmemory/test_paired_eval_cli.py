@@ -66,7 +66,7 @@ class PairedEvalCliTest(unittest.TestCase):
             timeout=30,
         )
         expanded = [json.loads(line) for line in completed.stdout.splitlines()]
-        self.assertEqual(len(expanded), 6)
+        self.assertEqual(len(expanded), 9)
 
         store = PrivateEvidenceStore(self.root / "evidence")
         results = self.root / "results.jsonl"
@@ -87,8 +87,19 @@ class PairedEvalCliTest(unittest.TestCase):
 
         report = self.run_cli("verify", "--results", str(results))
         self.assertEqual(report["pair_count"], 3)
+        self.assertEqual(report["triad_count"], 3)
+        self.assertEqual(report["cell_count"], 9)
         summary = self.run_cli("public-summary", "--results", str(results))
-        self.assertEqual(summary["row_count"], 6)
+        self.assertEqual(summary["row_count"], 9)
+        self.assertEqual(summary["triad_count"], 3)
+        self.assertEqual(len(summary["triads"]), 3)
+        self.assertTrue(
+            all(
+                set(triad["raw_arm_metrics"])
+                == {"native", "amg_compaction_only", "amg_memory"}
+                for triad in summary["triads"]
+            )
+        )
         serialized = json.dumps(summary, sort_keys=True)
         self.assertNotIn("evidence://", serialized)
         self.assertNotIn("protected_ref", serialized)

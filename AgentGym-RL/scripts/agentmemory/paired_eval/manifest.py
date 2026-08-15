@@ -99,14 +99,22 @@ def expand_manifest(payload: Mapping[str, Any]) -> list[RunConfig]:
     treatment_values = manifest["arms"]
     if not isinstance(treatment_values, list):
         raise TypeError("manifest arms must be a list")
-    if len(treatment_values) != 2:
-        raise ValueError("manifest must declare exactly two treatments")
+    if len(treatment_values) != 3:
+        raise ValueError("manifest must declare exactly three arms")
     try:
         treatments = tuple(Arm(value) for value in treatment_values)
     except ValueError as error:
         raise ValueError("manifest declares an unsupported treatment") from error
-    if set(treatments) != {Arm.NATIVE, Arm.AMG_MEMORY}:
-        raise ValueError("manifest must declare native and amg_memory exactly once")
+    expected_arms = {
+        Arm.NATIVE,
+        Arm.AMG_COMPACTION_ONLY,
+        Arm.AMG_MEMORY,
+    }
+    if set(treatments) != expected_arms:
+        raise ValueError(
+            "manifest must declare native, amg_compaction_only, and "
+            "amg_memory exactly once"
+        )
 
     common = require_mapping("manifest.common", manifest["common"])
     exact_keys("manifest.common", common, COMMON_KEYS)

@@ -27,6 +27,7 @@ from paired_eval.contracts import (  # noqa: E402
     BudgetConfig,
     CapabilityRoot,
     CompactionConfig,
+    CONTEXT_TRANSITION_SCHEMA,
     DecodingConfig,
     FinalizationContext,
     GraderConfig,
@@ -107,6 +108,10 @@ def make_config(
             policy="policy_authored_task_neutral_v1",
             trigger="wrapper_token_pressure_v1",
             summary_max_tokens=256,
+            summary_instruction_sha256=SHA_C,
+            context_pressure_policy_sha256=SHA_D,
+            context_transition_schema=CONTEXT_TRANSITION_SCHEMA,
+            action_accounting="global_policy_action_budget_v1",
             config_sha256=SHA_B,
         ),
         source=SourceConfig(

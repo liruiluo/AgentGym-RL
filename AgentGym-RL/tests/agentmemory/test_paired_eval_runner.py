@@ -123,6 +123,89 @@ class PairedRunnerTest(unittest.TestCase):
             ["append_observation", "replace_messages", "append_observation"],
         )
 
+    def test_compaction_only_uses_compaction_but_memory_fails_closed(self) -> None:
+        config = make_config(
+            arm=Arm.AMG_COMPACTION_ONLY,
+            max_policy_turns=2,
+            max_tool_calls=2,
+        )
+        row, bindings = self.run_case(
+            config,
+            plan=(
+                {
+                    "state": "compacted",
+                    "done": False,
+                    "control_request": "Author a compact continuation state.",
+                    "operation": "replace_messages",
+                },
+                {"state": "terminal", "reward": 1.0, "done": True},
+            ),
+            outputs=("Policy-authored compact state.", "ordinary final output"),
+        )
+
+        self.assertIsNone(bindings.adapter.memory_service)
+        self.assertEqual(row["usage"]["policy_turns"], 2)
+        self.assertEqual(row["usage"]["tool_calls"], 2)
+        self.assertEqual(row["compaction"]["receipt_count"], 1)
+        self.assertEqual(
+            [turn["root_kind"] for turn in row["turns"]],
+            ["policy_context", "benchmark_task"],
+        )
+
+        leaked, leaked_bindings = self.run_case(
+            replace(config, task=replace(config.task, task_id="memory-leak")),
+            plan=({"state": "must not execute", "done": True},),
+            outputs=("WRITE(note,forbidden)",),
+        )
+        self.assertIsNone(leaked_bindings.adapter.memory_service)
+        self.assertEqual(leaked["failure"]["class"], "environment_failure")
+        self.assertFalse(leaked["comparable"])
+
+    def test_enabled_arms_share_compaction_and_action_accounting(self) -> None:
+        plan = (
+            {
+                "state": "compacted",
+                "done": False,
+                "control_request": "Author a compact continuation state.",
+                "operation": "replace_messages",
+            },
+            {"state": "terminal", "reward": 1.0, "done": True},
+        )
+        outputs = ("Policy-authored compact state.", "ordinary final output")
+        rows = []
+        for arm in (Arm.AMG_COMPACTION_ONLY, Arm.AMG_MEMORY):
+            row, _ = self.run_case(
+                make_config(
+                    arm=arm,
+                    max_policy_turns=2,
+                    max_tool_calls=2,
+                ),
+                plan=plan,
+                outputs=outputs,
+            )
+            rows.append(row)
+
+        self.assertEqual(rows[0]["compaction"], rows[1]["compaction"])
+        self.assertEqual(rows[0]["budgets"], rows[1]["budgets"])
+        self.assertEqual(
+            {
+                name: rows[0]["usage"][name]
+                for name in ("policy_turns", "tool_calls")
+            },
+            {
+                name: rows[1]["usage"][name]
+                for name in ("policy_turns", "tool_calls")
+            },
+        )
+        self.assertEqual(
+            [turn["execution_kind"] for turn in rows[0]["turns"]],
+            ["policy_compaction", "benchmark_action"],
+        )
+        self.assertEqual(
+            [turn["execution_kind"] for turn in rows[1]["turns"]],
+            ["policy_compaction", "benchmark_action"],
+        )
+
     def test_wrapper_owned_memory_routing_and_namespace_isolation(self) -> None:
         memory_config = make_config(
             task_id="memory-routing",
@@ -301,8 +384,8 @@ class PairedRunnerTest(unittest.TestCase):
         prompt_row, prompt_bindings = self.run_case(
             make_config(task_id="prompt-drift", arm=Arm.AMG_MEMORY),
             prompt_declaration_override=(
-                "AMG combined capability: policy-authored compaction plus "
-                "explicit external WRITE(key,value) and READ(key). EXTRA"
+                make_config(arm=Arm.AMG_MEMORY).capability.prompt_declaration
+                + " EXTRA"
             ),
         )
         self.assertEqual(prompt_row["failure"]["class"], "environment_failure")

@@ -1,18 +1,28 @@
 # AMG paired external-evaluation runner
 
-This package is the thin, benchmark-agnostic orchestration layer for matched
-`native` and `amg_memory` evaluation. `PairedRunner.run_task` contains the only
-sampling loop. It samples one normal policy output, sends it through the
-injected task-neutral policy-turn controller, accounts the ordinary
-turn/tool/token/wall budgets, and records digest-addressed private evidence.
+This package is the thin, benchmark-agnostic orchestration layer for the frozen
+matched triad: `native`, `amg_compaction_only`, and `amg_memory`.
+`PairedRunner.run_task` contains the only sampling loop. It samples one normal
+policy output, sends it through the injected task-neutral policy-turn
+controller, accounts the ordinary turn/tool/token/wall budgets, and records
+digest-addressed private evidence.
 
 The injected wrapper owns reset/close, benchmark lifecycle, action parsing,
 external `WRITE(key,value)` / `READ(key)` parsing and execution, compaction
 trigger/timing, context-transition receipts, final artifacts, and official
 grader handoff. The runner neither parses an action language nor dispatches on
-benchmark or treatment. `amg_memory` is one frozen combined capability:
-policy-authored compaction plus explicit external read/write memory. `native`
-has neither capability.
+benchmark or arm. The capability lattice is exact: `native=00`,
+`amg_compaction_only=10`, and `amg_memory=11`, where the bits denote
+policy-authored compaction and external read/write memory. There is no
+memory-only fourth arm.
+
+The two compaction-enabled arms share the exact trigger, summary-instruction
+digest, context-pressure-policy digest, context-transition schema, and global
+policy-action accounting. External memory is an all-or-none bundle covering
+its dedicated namespace/root, mount, endpoint, environment variable, prompt
+declaration, tool schema, parser/dispatch path, action receipt, private evidence
+store, and cleanup handle. Disabled arms attest none of those surfaces.
+Benchmark-native tools and task workspaces remain matched across all arms.
 
 The full initial prompt must equal the treatment-excluded prompt plus the one
 frozen capability declaration exactly. Client-side normalization must be
@@ -22,9 +32,9 @@ additional treatment-specific instructions.
 ## Manifest and CLI
 
 A manifest declares common model, decoding, budget, compaction, source,
-runtime, and grader configuration; a nonempty task list; and exactly the two
-treatments `native` and `amg_memory`. Expansion produces one immutable
-`RunConfig` per task/treatment combination.
+runtime, and grader configuration; a nonempty task list; and exactly the three
+arms `native`, `amg_compaction_only`, and `amg_memory`. Expansion produces one
+immutable `RunConfig` per task/arm combination.
 
 ```bash
 PYTHONPATH=scripts/agentmemory python3 -m paired_eval expand --manifest paired.json
@@ -58,9 +68,9 @@ reused, mismatched, or unclosed roots make the row non-comparable.
 Exact-tokenization errors retain a typed model cause even when the policy-turn
 controller wraps them.
 
-`run` requires a fresh/empty result path. It validates all rows and both arms
-before appending the complete batch under one file lock; reuse of a nonempty
-path fails closed. Every row includes a successful generic wrapper-close
+`run` requires a fresh/empty result path. It validates all rows and every exact
+three-arm group before appending the complete batch under one file lock; reuse
+of a nonempty path fails closed. Every row includes a successful generic wrapper-close
 receipt before it can be comparable, and the wall budget covers final artifact,
 grader, and close time as well as sampling and environment steps.
 
@@ -68,7 +78,12 @@ JSONL and evidence directories are mode `0700`; files are mode `0600`.
 Messages, policy outputs, observations, wrapper receipts, artifacts, grader
 details, and error text stay behind `evidence://<category>/<sha256>` references.
 The public-summary command projects only identity fields, termination classes,
-comparability, and explicitly scalar public metrics.
+comparability, and explicitly scalar public metrics. It reports raw metrics for
+all three arms plus `compaction_effect`,
+`external_memory_incremental_effect`, and `full_amg_effect` numeric contrasts.
+Public identity fields and metric names must be bounded ASCII labels; paths,
+URIs, whitespace, and other unrestricted strings fail closed instead of being
+copied into a summary.
 
 This package does not provide benchmark adapters, official graders, datasets,
 containers, registry wiring, or a real inference runtime. Passing its local

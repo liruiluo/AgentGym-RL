@@ -23,9 +23,9 @@ from .serialization import canonical_json_bytes, sha256_json
 
 
 RESULT_SCHEMA = "amg.paired_eval.result"
-RESULT_SCHEMA_VERSION = "1.0.0"
+RESULT_SCHEMA_VERSION = "2.0.0"
 MANIFEST_SCHEMA = "amg.paired_eval.manifest"
-MANIFEST_SCHEMA_VERSION = "1.0.0"
+MANIFEST_SCHEMA_VERSION = "2.0.0"
 CONTEXT_TRANSITION_SCHEMA = "agentmemory_task_neutral_context_transition_v1"
 CONTEXT_OPERATION_APPEND = "append_observation"
 CONTEXT_OPERATION_PRESERVE = "preserve"
@@ -41,6 +41,20 @@ TASK_NEUTRAL_RECEIPT_SCHEMA = "agentmemory_task_neutral_transition_v1"
 BENCHMARK_ROUTE = ("benchmark_task", "benchmark_task")
 EXTERNAL_MEMORY_ROUTE = ("external_memory", "external_memory")
 POLICY_COMPACTION_ROUTE = ("policy_compaction", "policy_context")
+GLOBAL_POLICY_ACTION_ACCOUNTING = "global_policy_action_budget_v1"
+EXTERNAL_MEMORY_CAPABILITY_SURFACES = (
+    "dedicated_memory_namespace",
+    "dedicated_memory_root",
+    "mount",
+    "endpoint",
+    "environment_variable",
+    "prompt_declaration",
+    "tool_schema",
+    "parser_dispatch_path",
+    "action_receipt",
+    "private_evidence_store",
+    "cleanup_handle",
+)
 ROUTE_EXECUTION_KINDS = MappingProxyType(
     {
         BENCHMARK_ROUTE: "benchmark_action",
@@ -104,7 +118,17 @@ def require_nonnegative_int(name: str, value: Any) -> int:
 
 class Arm(str, Enum):
     NATIVE = "native"
+    AMG_COMPACTION_ONLY = "amg_compaction_only"
     AMG_MEMORY = "amg_memory"
+
+
+CAPABILITY_LATTICE = MappingProxyType(
+    {
+        Arm.NATIVE.value: "00",
+        Arm.AMG_COMPACTION_ONLY.value: "10",
+        Arm.AMG_MEMORY.value: "11",
+    }
+)
 
 
 class ModelClientFailure(RuntimeError):
@@ -113,7 +137,7 @@ class ModelClientFailure(RuntimeError):
 
 @dataclass(frozen=True)
 class CapabilityConfig:
-    """The sole paired treatment, including both requested AMG capabilities."""
+    """The frozen compaction/external-memory capability declaration."""
 
     arm: Arm
     name: str
@@ -122,6 +146,7 @@ class CapabilityConfig:
     external_read_write_memory: bool
     tools: Tuple[str, ...]
     prompt_declaration: str
+    external_memory_surfaces: Tuple[str, ...]
     implicit_retrieval: bool = False
     hidden_context_injection: bool = False
 
@@ -129,30 +154,59 @@ class CapabilityConfig:
         arm = Arm(self.arm)
         object.__setattr__(self, "arm", arm)
         object.__setattr__(self, "tools", tuple(self.tools))
+        object.__setattr__(
+            self,
+            "external_memory_surfaces",
+            tuple(self.external_memory_surfaces),
+        )
         require_text("capability.name", self.name)
-        expected_enabled = arm is Arm.AMG_MEMORY
+        expected_name = {
+            Arm.NATIVE: "native_without_amg_capability_v1",
+            Arm.AMG_COMPACTION_ONLY: (
+                "amg_policy_compaction_without_external_memory_v1"
+            ),
+            Arm.AMG_MEMORY: "amg_policy_compaction_external_read_write_v1",
+        }[arm]
+        if self.name != expected_name:
+            raise ValueError("capability name does not match the frozen arm")
+        expected_enabled = arm is not Arm.NATIVE
+        expected_compaction = arm is not Arm.NATIVE
+        expected_external_memory = arm is Arm.AMG_MEMORY
         if self.enabled is not expected_enabled:
             raise ValueError("capability enabled flag does not match its arm")
-        if self.policy_authored_compaction is not expected_enabled:
-            raise ValueError("compaction enablement must be part of the sole treatment")
-        if self.external_read_write_memory is not expected_enabled:
-            raise ValueError(
-                "external memory enablement must be part of the sole treatment"
-            )
+        if self.policy_authored_compaction is not expected_compaction:
+            raise ValueError("compaction enablement does not match its arm")
+        if self.external_read_write_memory is not expected_external_memory:
+            raise ValueError("external memory enablement does not match its arm")
         expected_tools = (
-            ("WRITE(key,value)", "READ(key)") if expected_enabled else ()
+            ("WRITE(key,value)", "READ(key)")
+            if expected_external_memory
+            else ()
         )
         if tuple(self.tools) != expected_tools:
-            raise ValueError("capability tools do not match the frozen treatment")
-        expected_declaration = (
-            "AMG combined capability: policy-authored compaction plus explicit "
-            "external WRITE(key,value) and READ(key)."
-            if expected_enabled
-            else ""
+            raise ValueError("capability tools do not match the frozen arm")
+        compaction_declaration = (
+            "AMG capability: policy-authored context compaction."
         )
+        memory_declaration = (
+            " External read/write memory capability: WRITE(key,value) and "
+            "READ(key)."
+        )
+        expected_declaration = {
+            Arm.NATIVE: "",
+            Arm.AMG_COMPACTION_ONLY: compaction_declaration,
+            Arm.AMG_MEMORY: compaction_declaration + memory_declaration,
+        }[arm]
         if self.prompt_declaration != expected_declaration:
+            raise ValueError("capability prompt does not match the frozen arm")
+        expected_surfaces = (
+            EXTERNAL_MEMORY_CAPABILITY_SURFACES
+            if expected_external_memory
+            else ()
+        )
+        if self.external_memory_surfaces != expected_surfaces:
             raise ValueError(
-                "capability prompt does not match the frozen treatment"
+                "external-memory surfaces must be absent or the exact full bundle"
             )
         if self.implicit_retrieval:
             raise ValueError("implicit retrieval is forbidden")
@@ -168,6 +222,7 @@ class CapabilityConfig:
             "external_read_write_memory": self.external_read_write_memory,
             "tools": list(self.tools),
             "prompt_declaration": self.prompt_declaration,
+            "external_memory_surfaces": list(self.external_memory_surfaces),
             "implicit_retrieval": self.implicit_retrieval,
             "hidden_context_injection": self.hidden_context_injection,
         }
@@ -193,6 +248,9 @@ class CapabilityConfig:
             external_read_write_memory=payload["external_read_write_memory"],
             tools=tuple(payload.get("tools", ())),
             prompt_declaration=payload["prompt_declaration"],
+            external_memory_surfaces=tuple(
+                payload.get("external_memory_surfaces", ())
+            ),
             implicit_retrieval=payload.get("implicit_retrieval", False),
             hidden_context_injection=payload.get(
                 "hidden_context_injection", False
@@ -208,6 +266,18 @@ NATIVE_CAPABILITY = CapabilityConfig(
     external_read_write_memory=False,
     tools=(),
     prompt_declaration="",
+    external_memory_surfaces=(),
+)
+
+AMG_COMPACTION_ONLY_CAPABILITY = CapabilityConfig(
+    arm=Arm.AMG_COMPACTION_ONLY,
+    name="amg_policy_compaction_without_external_memory_v1",
+    enabled=True,
+    policy_authored_compaction=True,
+    external_read_write_memory=False,
+    tools=(),
+    prompt_declaration="AMG capability: policy-authored context compaction.",
+    external_memory_surfaces=(),
 )
 
 AMG_MEMORY_CAPABILITY = CapabilityConfig(
@@ -218,9 +288,10 @@ AMG_MEMORY_CAPABILITY = CapabilityConfig(
     external_read_write_memory=True,
     tools=("WRITE(key,value)", "READ(key)"),
     prompt_declaration=(
-        "AMG combined capability: policy-authored compaction plus explicit "
-        "external WRITE(key,value) and READ(key)."
+        "AMG capability: policy-authored context compaction. External "
+        "read/write memory capability: WRITE(key,value) and READ(key)."
     ),
+    external_memory_surfaces=EXTERNAL_MEMORY_CAPABILITY_SURFACES,
 )
 
 
@@ -228,6 +299,8 @@ def capability_for_arm(arm: Any) -> CapabilityConfig:
     selected = Arm(arm)
     if selected is Arm.NATIVE:
         return NATIVE_CAPABILITY
+    if selected is Arm.AMG_COMPACTION_ONLY:
+        return AMG_COMPACTION_ONLY_CAPABILITY
     return AMG_MEMORY_CAPABILITY
 
 
@@ -337,12 +410,32 @@ class CompactionConfig:
     policy: str
     trigger: str
     summary_max_tokens: int
+    summary_instruction_sha256: str
+    context_pressure_policy_sha256: str
+    context_transition_schema: str
+    action_accounting: str
     config_sha256: str
 
     def __post_init__(self) -> None:
         require_text("compaction.policy", self.policy)
         require_text("compaction.trigger", self.trigger)
         require_positive_int("compaction.summary_max_tokens", self.summary_max_tokens)
+        require_sha256(
+            "compaction.summary_instruction_sha256",
+            self.summary_instruction_sha256,
+        )
+        require_sha256(
+            "compaction.context_pressure_policy_sha256",
+            self.context_pressure_policy_sha256,
+        )
+        if self.context_transition_schema != CONTEXT_TRANSITION_SCHEMA:
+            raise ValueError(
+                "compaction context-transition schema must be task-neutral"
+            )
+        if self.action_accounting != GLOBAL_POLICY_ACTION_ACCOUNTING:
+            raise ValueError(
+                "compaction must use the global policy-action budget"
+            )
         require_sha256("compaction.config_sha256", self.config_sha256)
 
     def to_payload(self) -> dict[str, Any]:
@@ -350,6 +443,12 @@ class CompactionConfig:
             "policy": self.policy,
             "trigger": self.trigger,
             "summary_max_tokens": self.summary_max_tokens,
+            "summary_instruction_sha256": self.summary_instruction_sha256,
+            "context_pressure_policy_sha256": (
+                self.context_pressure_policy_sha256
+            ),
+            "context_transition_schema": self.context_transition_schema,
+            "action_accounting": self.action_accounting,
             "config_sha256": self.config_sha256,
         }
 

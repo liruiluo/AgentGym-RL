@@ -9,6 +9,7 @@ from typing import Any, Mapping, Sequence
 
 from .contracts import (
     Arm,
+    CAPABILITY_LATTICE,
     CapabilityRoot,
     CONTEXT_OPERATIONS,
     FAILURE_CLASSES,
@@ -30,6 +31,9 @@ from .serialization import canonical_json_bytes, sha256_json
 
 
 EVIDENCE_PATTERN = re.compile(r"^evidence://[a-z][a-z0-9_]*/[0-9a-f]{64}$")
+PUBLIC_LABEL_PATTERN = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._:@+#=-]{0,255}$"
+)
 RESULT_KEYS = frozenset(
     {
         "schema",
@@ -157,6 +161,15 @@ def require_evidence_sha(name: str, reference: Any, digest: Any) -> None:
         raise ResultValidationError(f"{name} reference and SHA-256 disagree")
 
 
+def require_public_label(name: str, value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or PUBLIC_LABEL_PATTERN.fullmatch(value) is None
+    ):
+        raise ResultValidationError(f"{name} must be a public ASCII label")
+    return value
+
+
 def reject_forbidden_keys(value: Any, path: str = "result") -> None:
     if isinstance(value, Mapping):
         for key, child in value.items():
@@ -173,8 +186,7 @@ def reject_forbidden_keys(value: Any, path: str = "result") -> None:
 def validate_public_metrics(value: Any) -> None:
     metrics = require_mapping("scorer.public_metrics", value)
     for name, metric in metrics.items():
-        if not isinstance(name, str) or not name:
-            raise ResultValidationError("public metric names must be nonempty text")
+        require_public_label("public metric name", name)
         if name in FORBIDDEN_PUBLIC_KEYS:
             raise ResultValidationError("private-looking metric name is forbidden")
         if metric is not None and type(metric) not in {bool, int, float}:
@@ -241,6 +253,8 @@ def validate_result_row(row: Mapping[str, Any]) -> None:
         raise ResultValidationError("unsupported result schema")
     if result["schema_version"] != RESULT_SCHEMA_VERSION:
         raise ResultValidationError("unsupported result schema version")
+    for name in ("run_id", "benchmark", "protocol", "task_id"):
+        require_public_label(f"result.{name}", result[name])
 
     config_payload = require_mapping("config", result["config"])
     try:
@@ -856,7 +870,7 @@ def validate_result_row(row: Mapping[str, Any]) -> None:
 
 
 def verify_pair_completeness(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """Require exactly one matched row for each frozen treatment."""
+    """Require exactly one matched row for each frozen triad arm."""
 
     if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
         raise PairVerificationError("rows must be a sequence")
@@ -883,47 +897,84 @@ def verify_pair_completeness(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any
     except ResultValidationError as error:
         raise PairVerificationError(str(error)) from error
 
-    expected_treatments = {Arm.NATIVE.value, Arm.AMG_MEMORY.value}
-    comparable_pairs = 0
+    arm_order = (
+        Arm.NATIVE.value,
+        Arm.AMG_COMPACTION_ONLY.value,
+        Arm.AMG_MEMORY.value,
+    )
+    expected_arms = set(arm_order)
+    comparable_triads = 0
     for pair_key, pair_rows in grouped.items():
-        if len(pair_rows) != 2:
+        if len(pair_rows) != 3:
             raise PairVerificationError(
-                f"pair {pair_key!r} must contain exactly two rows"
+                f"pair {pair_key!r} must contain exactly three rows"
             )
-        by_treatment = {row["arm"]: row for row in pair_rows}
-        if set(by_treatment) != expected_treatments:
+        by_arm = {row["arm"]: row for row in pair_rows}
+        if set(by_arm) != expected_arms:
             raise PairVerificationError(
-                f"pair {pair_key!r} does not contain both frozen treatments"
+                f"pair {pair_key!r} does not contain the frozen triad"
             )
-        native = by_treatment[Arm.NATIVE.value]
-        memory = by_treatment[Arm.AMG_MEMORY.value]
+        native = by_arm[Arm.NATIVE.value]
         native_config = dict(native["config"])
-        memory_config = dict(memory["config"])
         native_config.pop("capability")
-        memory_config.pop("capability")
-        if native_config != memory_config:
-            raise PairVerificationError(
-                f"pair {pair_key!r} has treatment-excluded config drift"
-            )
-        if (
-            native["treatment_excluded_config_sha256"]
-            != memory["treatment_excluded_config_sha256"]
-        ):
-            raise PairVerificationError(
-                f"pair {pair_key!r} has treatment-excluded digest drift"
-            )
+        native_digest = native["treatment_excluded_config_sha256"]
         native_prompt = native["prompt"]["treatment_excluded_sha256"]
-        memory_prompt = memory["prompt"]["treatment_excluded_sha256"]
-        if native_prompt is None or native_prompt != memory_prompt:
-            raise PairVerificationError(
-                f"pair {pair_key!r} has missing or drifted base prompt evidence"
-            )
         native_namespace = dict(native["namespace"])
-        memory_namespace = dict(memory["namespace"])
         native_namespace.pop("arm")
-        memory_namespace.pop("arm")
-        if native_namespace != memory_namespace:
-            raise PairVerificationError(f"pair {pair_key!r} namespace base drifted")
+        if native_prompt is None:
+            raise PairVerificationError(
+                f"pair {pair_key!r} lacks base prompt evidence"
+            )
+
+        observed_lattice = {}
+        for arm in arm_order:
+            row = by_arm[arm]
+            row_config = dict(row["config"])
+            capability = row_config.pop("capability")
+            if row_config != native_config:
+                raise PairVerificationError(
+                    f"pair {pair_key!r} has non-capability config drift"
+                )
+            if row["treatment_excluded_config_sha256"] != native_digest:
+                raise PairVerificationError(
+                    f"pair {pair_key!r} has treatment-excluded digest drift"
+                )
+            if row["prompt"]["treatment_excluded_sha256"] != native_prompt:
+                raise PairVerificationError(
+                    f"pair {pair_key!r} has missing or drifted base prompt evidence"
+                )
+            namespace = dict(row["namespace"])
+            namespace.pop("arm")
+            if namespace != native_namespace:
+                raise PairVerificationError(
+                    f"pair {pair_key!r} namespace base drifted"
+                )
+            observed_lattice[arm] = "{}{}".format(
+                int(capability["policy_authored_compaction"]),
+                int(capability["external_read_write_memory"]),
+            )
+        if observed_lattice != dict(CAPABILITY_LATTICE):
+            raise PairVerificationError(
+                f"pair {pair_key!r} violates the frozen capability lattice"
+            )
+
+        compaction_only = by_arm[Arm.AMG_COMPACTION_ONLY.value]
+        memory = by_arm[Arm.AMG_MEMORY.value]
+        compaction_contract_fields = (
+            "trigger",
+            "summary_instruction_sha256",
+            "context_pressure_policy_sha256",
+            "context_transition_schema",
+            "action_accounting",
+        )
+        for field in compaction_contract_fields:
+            if (
+                compaction_only["config"]["compaction"][field]
+                != memory["config"]["compaction"][field]
+            ):
+                raise PairVerificationError(
+                    f"pair {pair_key!r} has compaction contract drift"
+                )
         try:
             rendered = PairKey(
                 run_id=native["run_id"],
@@ -936,7 +987,9 @@ def verify_pair_completeness(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any
             raise PairVerificationError("invalid pair identity") from error
         if pair_key != rendered:
             raise PairVerificationError("pair key includes drift or treatment state")
-        comparable_pairs += int(native["comparable"] and memory["comparable"])
+        comparable_triads += int(
+            all(by_arm[arm]["comparable"] for arm in arm_order)
+        )
 
     failure_counts = Counter(
         row["failure"]["class"] or "none" for row in rows
@@ -946,7 +999,11 @@ def verify_pair_completeness(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any
         "schema_version": RESULT_SCHEMA_VERSION,
         "row_count": len(rows),
         "pair_count": len(grouped),
-        "comparable_pair_count": comparable_pairs,
+        "triad_count": len(grouped),
+        "cell_count": len(rows),
+        "capability_lattice": dict(CAPABILITY_LATTICE),
+        "comparable_pair_count": comparable_triads,
+        "comparable_triad_count": comparable_triads,
         "failure_counts": dict(sorted(failure_counts.items())),
     }
 
@@ -955,10 +1012,17 @@ def build_public_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Project only explicit public scalars; never copy protected references."""
 
     verify_pair_completeness(rows)
+    arm_order = (
+        Arm.NATIVE.value,
+        Arm.AMG_COMPACTION_ONLY.value,
+        Arm.AMG_MEMORY.value,
+    )
     public_rows = []
+    grouped: dict[str, dict[str, Mapping[str, Any]]] = defaultdict(dict)
     for row in rows:
         validate_result_row(row)
         metrics = {} if row["scorer"] is None else row["scorer"]["public_metrics"]
+        grouped[row["pair_key"]][row["arm"]] = row
         public_rows.append(
             {
                 "run_id": row["run_id"],
@@ -973,9 +1037,63 @@ def build_public_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
                 "public_metrics": dict(metrics),
             }
         )
+
+    public_triads = []
+    for pair_key in sorted(grouped):
+        by_arm = grouped[pair_key]
+        reference = by_arm[Arm.NATIVE.value]
+        raw_metrics = {
+            arm: (
+                {}
+                if by_arm[arm]["scorer"] is None
+                else dict(by_arm[arm]["scorer"]["public_metrics"])
+            )
+            for arm in arm_order
+        }
+        numeric_metric_names = set(raw_metrics[arm_order[0]])
+        for arm in arm_order[1:]:
+            numeric_metric_names &= set(raw_metrics[arm])
+        numeric_metric_names = {
+            name
+            for name in numeric_metric_names
+            if all(type(raw_metrics[arm][name]) in {int, float} for arm in arm_order)
+        }
+
+        def metric_delta(minuend: str, subtrahend: str) -> dict[str, Any]:
+            return {
+                name: raw_metrics[minuend][name] - raw_metrics[subtrahend][name]
+                for name in sorted(numeric_metric_names)
+            }
+
+        public_triads.append(
+            {
+                "run_id": reference["run_id"],
+                "benchmark": reference["benchmark"],
+                "protocol": reference["protocol"],
+                "task_id": reference["task_id"],
+                "seed": reference["seed"],
+                "raw_arm_metrics": raw_metrics,
+                "contrasts": {
+                    "compaction_effect": metric_delta(
+                        Arm.AMG_COMPACTION_ONLY.value,
+                        Arm.NATIVE.value,
+                    ),
+                    "external_memory_incremental_effect": metric_delta(
+                        Arm.AMG_MEMORY.value,
+                        Arm.AMG_COMPACTION_ONLY.value,
+                    ),
+                    "full_amg_effect": metric_delta(
+                        Arm.AMG_MEMORY.value,
+                        Arm.NATIVE.value,
+                    ),
+                },
+            }
+        )
     return {
         "schema": "amg.paired_eval.public_summary",
         "schema_version": RESULT_SCHEMA_VERSION,
         "row_count": len(public_rows),
+        "triad_count": len(public_triads),
         "rows": public_rows,
+        "triads": public_triads,
     }
