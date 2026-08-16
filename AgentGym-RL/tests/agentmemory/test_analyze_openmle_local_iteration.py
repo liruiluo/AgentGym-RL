@@ -195,6 +195,38 @@ def test_missing_post_compaction_read_rejects_complete_chain():
     assert result["counts"].get("post_compaction_document_read", 0) == 0
 
 
+def test_explicit_validation_metric_prefix_accepts_short_metric_names():
+    for line in (
+        "validation_rmse=0.0640",
+        "validation_f1=0.6284",
+        "validation_ap=0.7920",
+    ):
+        document = _complete_document()
+        first = document["rows"][0]["formal_step_record"]["env_info_after"][
+            "execution"
+        ]
+        rerun = document["rows"][5]["formal_step_record"]["env_info_after"][
+            "execution"
+        ]
+        first["stdout"] = line + "\n"
+        rerun["stdout"] = "training_loss=0.1\n"
+        result = MODULE.analyze_documents([(1, document)])
+        assert result["trajectories"][0]["local_validation_rows"] == 1
+        assert result["trajectories"][0]["local_validation_evidence"][0][
+            "matched_excerpts"
+        ] == [line]
+
+
+def test_validation_not_measured_marker_is_not_local_validation():
+    document = _complete_document()
+    first = document["rows"][0]["formal_step_record"]["env_info_after"]["execution"]
+    rerun = document["rows"][5]["formal_step_record"]["env_info_after"]["execution"]
+    first["stdout"] = "validation: not measured yet\n"
+    rerun["stdout"] = "validation_rmse=nan\n"
+    result = MODULE.analyze_documents([(1, document)])
+    assert result["trajectories"][0]["local_validation_rows"] == 0
+
+
 def test_metric_word_without_measured_number_is_not_local_validation():
     document = _complete_document()
     execution = document["rows"][0]["formal_step_record"]["env_info_after"]["execution"]

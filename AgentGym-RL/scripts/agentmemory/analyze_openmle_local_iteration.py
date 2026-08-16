@@ -22,6 +22,10 @@ METRIC_RE = re.compile(
     r"(?i)\b(?:accuracy|auc|auroc|f1|rmse|rmsle|mae|mse|log[-_ ]?loss|"
     r"map|ndcg|pearson|spearman)\b"
 )
+EXPLICIT_VALIDATION_RE = re.compile(
+    r"(?im)^\s*validation_([A-Za-z][A-Za-z0-9_.-]{0,63})\s*=\s*"
+    r"([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)\s*$"
+)
 DOCUMENT_SUFFIXES = frozenset({".md", ".txt", ".rst", ".log", ".yaml", ".yml", ".toml"})
 CODE_SUFFIXES = frozenset({".py", ".ipynb", ".sh", ".r", ".jl"})
 IGNORED_DOCUMENTS = frozenset({"TASK.md"})
@@ -122,7 +126,9 @@ def _is_completed_managed_execution(row: Mapping[str, Any]) -> bool:
 
 def _validation_excerpts(stdout: str) -> list[str]:
     lines = [line.strip() for line in stdout.splitlines() if line.strip()]
-    excerpts: list[str] = []
+    excerpts = [
+        match.group(0).strip() for match in EXPLICIT_VALIDATION_RE.finditer(stdout)
+    ]
     for index in range(len(lines)):
         for width in (1, 2):
             excerpt = "\n".join(lines[index : index + width])
