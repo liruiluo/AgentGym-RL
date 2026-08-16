@@ -12,8 +12,8 @@ The policy may repeatedly:
 1. inspect public task files;
 2. edit code;
 3. run and debug code in the sandbox;
-4. construct a validation split from public labelled training data and print its
-   own local metric;
+4. construct a deterministic validation split from public labelled training data
+   and print its own measured local metric;
 5. write hypotheses, results, failures, and next steps to ordinary workspace
    files;
 6. recover those files after a policy-authored context compaction and continue
@@ -131,3 +131,25 @@ submission, task pool, or shared rollout.  `vllm_rollout.py` remains byte
 identical.  Because the prompt and visible environment state change policy
 behaviour, the next gate and formal start from the declared fresh Qwen3.5-4B
 base rather than resuming an earlier checkpoint.
+
+## 7. Gate and formal-training scope
+
+The 64-task G64 run is an engineering and real-policy behaviour gate.  It must
+prove that the action parser, sandbox, local-validation loop, continuation-file
+chain, context replacement, terminal submission, learner update, and cleanup are
+reachable together.  G64 is not a fixed training set and cannot provide the
+formal learning result.
+
+The next formal run starts from fresh Qwen3.5-4B and uses the frozen full-pool
+schedule: 354 tasks from 307 source families, 64 episodes per optimizer update,
+100 optimizer updates, and 6,400 total episodes.  The schedule traverses the
+complete pool before repetition; it must not be replaced by a small fixed task
+subset.
+
+Before update 100, supervision uses only training-health and online receipts:
+VSR, online PS/BBR over all episodes, BBR conditional on valid submissions,
+valid-only continuous normalized reward, trajectory return, stage timing, and
+the canonical continuation chain.  It does not run a held-out evaluation or
+query an additional private-score oracle.  A claim about memory use requires the
+behaviour evidence in Section 5, and a claim about improved modelling quality
+requires valid-only continuous evidence rather than BBR alone.
