@@ -32,6 +32,7 @@ from agentenv.controller.types import (  # noqa: E402
 from agentenv.envs.agentmemory import AgentMemoryEnvClient  # noqa: E402
 from agentenv.envs.openmle_fast import (  # noqa: E402
     OPENMLE_CONTEXT_COMPACTION_REQUEST,
+    OPENMLE_POLICY_CONTINUATION_MARKER,
     OPENMLE_FAST_POLICY_SYSTEM_PROMPT,
     OpenMLEFastEnvClient,
 )
@@ -435,6 +436,14 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             prepared.control_request,
             OPENMLE_CONTEXT_COMPACTION_REQUEST,
         )
+        marker = getattr(
+            openmle_fast_module,
+            "OPENMLE_POLICY_CONTINUATION_MARKER",
+            None,
+        )
+        self.assertIsInstance(marker, str)
+        self.assertIn("Earlier conversation was removed", marker)
+        self.assertNotIn("but you may instead", prepared.control_request)
         env_info = {
             "action_kind": "apply_patch",
             "action_status": "completed",
@@ -477,7 +486,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
                 {
                     "role": "user",
                     "content": "action_status=completed\n\n"
-                    "Continue the same task in the unchanged workspace.",
+                    + OPENMLE_POLICY_CONTINUATION_MARKER,
                 },
             ],
         )
@@ -580,7 +589,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             {
                 "role": "user",
                 "content": "parser error\n\n"
-                "Continue the same task in the unchanged workspace.",
+                + OPENMLE_POLICY_CONTINUATION_MARKER,
             },
         )
         self.assertTrue(
