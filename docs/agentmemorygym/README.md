@@ -13,6 +13,12 @@ Current model-facing training and evaluation must use the native MemoryArena
 WebShop runtime. The retired SQLite/FTS surrogate and scripted-search evidence
 must not be restored as an experiment path.
 
+## OpenMLE-fast
+
+The frozen interaction, local-validation, filesystem experiment-memory, and
+one-terminal-private-submission boundary is documented in
+[`openmle-local-validation-memory-contract.md`](openmle-local-validation-memory-contract.md).
+
 ## Procedural shopping stream
 
 The legacy training/control surface
