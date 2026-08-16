@@ -125,7 +125,9 @@ that existing protocol usable and auditable:
 - a policy-created non-independent workspace object or other workspace invariant
   violation is a terminal policy failure with reward `-1`, even if the sandbox
   runner also reports a handling fault; it is not an infrastructure truncation
-  and the trajectory must not be dropped or silently resampled;
+  and the trajectory must not be dropped or silently resampled.  After the
+  terminal receipt is fixed, the executor empties the invalid policy tree with
+  descriptor-anchored, no-follow cleanup so the exact runner can unmount it;
 - the evidence verifier records generation truncation separately from
   environment/infrastructure truncation.
 
