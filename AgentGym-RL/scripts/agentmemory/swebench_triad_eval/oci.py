@@ -1146,8 +1146,20 @@ def ensure_repository_mirror(
         ["git", "-C", str(testbed), "rev-parse", "HEAD^{commit}"],
         "rootfs HEAD check",
     ).stdout.strip()
-    if resolved != base_commit or head != base_commit:
-        raise OciCacheError("rootfs testbed is not at the dataset base commit")
+    if resolved != base_commit:
+        raise OciCacheError("rootfs dataset base commit drifted")
+    run_git(
+        [
+            "git",
+            "-C",
+            str(testbed),
+            "merge-base",
+            "--is-ancestor",
+            base_commit,
+            head,
+        ],
+        "rootfs base commit ancestry check",
+    )
 
     root = ensure_private_directory(mirror_root)
     mirror_name = repo.replace("/", "__") + ".git"

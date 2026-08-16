@@ -350,7 +350,7 @@ class CachedOciTest(unittest.TestCase):
         with self.assertRaises(OciCacheError):
             docker.ensure_loaded(binding, self.root / "unused.tar")
 
-    def test_repository_mirror_is_local_and_base_commit_bound(self) -> None:
+    def test_repository_mirror_accepts_official_setup_descendant(self) -> None:
         source_root = self.root / "rootfs"
         testbed = source_root / "testbed"
         testbed.mkdir(parents=True)
@@ -375,6 +375,27 @@ class CachedOciTest(unittest.TestCase):
         commit = subprocess.check_output(
             ["git", "-C", str(testbed), "rev-parse", "HEAD"], text=True
         ).strip()
+        (testbed / "pyproject.toml").write_text(
+            "[tool.swebench]\nsetup = true\n", encoding="utf-8"
+        )
+        subprocess.run(
+            ["git", "-C", str(testbed), "add", "pyproject.toml"], check=True
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(testbed),
+                "-c",
+                "user.name=SWE-bench",
+                "-c",
+                "user.email=setup@swebench.com",
+                "commit",
+                "-qm",
+                "SWE-bench",
+            ],
+            check=True,
+        )
         mirror_root = self.root / "mirrors"
         mirror_root.mkdir()
         stale = mirror_root / ".owner__repo.git.partial-123-dead"
@@ -411,6 +432,63 @@ class CachedOciTest(unittest.TestCase):
                 mirror_root,
                 repo="owner/repo",
                 base_commit="0" * 40,
+            )
+
+    def test_repository_mirror_rejects_base_outside_head_ancestry(self) -> None:
+        source_root = self.root / "rootfs"
+        testbed = source_root / "testbed"
+        testbed.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(testbed)], check=True)
+        (testbed / "base.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(testbed), "add", "base.txt"], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(testbed),
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "base",
+            ],
+            check=True,
+        )
+        base_commit = subprocess.check_output(
+            ["git", "-C", str(testbed), "rev-parse", "HEAD"], text=True
+        ).strip()
+        empty_tree = subprocess.check_output(
+            ["git", "-C", str(testbed), "mktree"], input="", text=True
+        ).strip()
+        unrelated = subprocess.check_output(
+            [
+                "git",
+                "-C",
+                str(testbed),
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit-tree",
+                empty_tree,
+                "-m",
+                "unrelated",
+            ],
+            text=True,
+        ).strip()
+        subprocess.run(
+            ["git", "-C", str(testbed), "checkout", "-q", "--detach", unrelated],
+            check=True,
+        )
+
+        with self.assertRaisesRegex(OciCacheError, "base commit"):
+            ensure_repository_mirror(
+                source_root,
+                self.root / "mirrors",
+                repo="owner/repo",
+                base_commit=base_commit,
             )
 
     def test_eviction_requires_exact_triad_and_three_boolean_outcomes(self) -> None:
