@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -235,4 +237,34 @@ def test_plain_shell_after_code_edit_is_not_a_model_rerun():
     rerun["env_info_after"]["execution"]["execution_attempt_delta"] = 0
     rerun["env_info_after"]["execution"]["stdout"] = "print('candidate')\n"
     result = MODULE.analyze_documents([(1, document)])
+    assert result["counts"].get("complete_iteration_memory_chain", 0) == 0
+
+
+def test_require_chain_failure_still_writes_diagnostic_output(tmp_path):
+    diagnostics = tmp_path / "diagnostics"
+    diagnostics.mkdir()
+    document = _complete_document()
+    document["rows"] = document["rows"][:4]
+    (diagnostics / "ppo_batch_step1_post_adv.json").write_text(
+        json.dumps(document), encoding="utf-8"
+    )
+    output = tmp_path / "analysis.json"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--diagnostics-dir",
+            str(diagnostics),
+            "--output",
+            str(output),
+            "--require-chain",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode != 0
+    assert "no complete OpenMLE local-iteration memory chain found" in completed.stderr
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result["counts"].get("post_compaction_document_read", 0) == 1
     assert result["counts"].get("complete_iteration_memory_chain", 0) == 0

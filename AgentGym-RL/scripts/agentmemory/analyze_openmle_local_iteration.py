@@ -469,14 +469,16 @@ def main() -> int:
     paths = _step_paths(args.diagnostics_dir, args.max_step)
     documents = [(step, json.loads(path.read_text(encoding="utf-8"))) for step, path in paths]
     result = analyze_documents(documents, block_size=args.block_size)
-    if args.require_chain and result["counts"].get("complete_iteration_memory_chain", 0) < 1:
-        raise SystemExit("no complete OpenMLE local-iteration memory chain found")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
         json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     print(json.dumps({"output": str(args.output), "counts": result["counts"]}, sort_keys=True))
+    if args.require_chain and result["counts"].get(
+        "complete_iteration_memory_chain", 0
+    ) < 1:
+        raise SystemExit("no complete OpenMLE local-iteration memory chain found")
     return 0
 
 
