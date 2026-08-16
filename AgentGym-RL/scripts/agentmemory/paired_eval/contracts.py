@@ -179,23 +179,16 @@ class CapabilityConfig:
         if self.external_read_write_memory is not expected_external_memory:
             raise ValueError("external memory enablement does not match its arm")
         expected_tools = (
-            ("WRITE(key,value)", "READ(key)")
+            ("external_memory_read", "external_memory_write")
             if expected_external_memory
             else ()
         )
         if tuple(self.tools) != expected_tools:
             raise ValueError("capability tools do not match the frozen arm")
-        compaction_declaration = (
-            "AMG capability: policy-authored context compaction."
-        )
-        memory_declaration = (
-            " External read/write memory capability: WRITE(key,value) and "
-            "READ(key)."
-        )
         expected_declaration = {
             Arm.NATIVE: "",
-            Arm.AMG_COMPACTION_ONLY: compaction_declaration,
-            Arm.AMG_MEMORY: compaction_declaration + memory_declaration,
+            Arm.AMG_COMPACTION_ONLY: "",
+            Arm.AMG_MEMORY: "adapter_owned_external_memory_declaration_v1",
         }[arm]
         if self.prompt_declaration != expected_declaration:
             raise ValueError("capability prompt does not match the frozen arm")
@@ -276,7 +269,7 @@ AMG_COMPACTION_ONLY_CAPABILITY = CapabilityConfig(
     policy_authored_compaction=True,
     external_read_write_memory=False,
     tools=(),
-    prompt_declaration="AMG capability: policy-authored context compaction.",
+    prompt_declaration="",
     external_memory_surfaces=(),
 )
 
@@ -286,11 +279,8 @@ AMG_MEMORY_CAPABILITY = CapabilityConfig(
     enabled=True,
     policy_authored_compaction=True,
     external_read_write_memory=True,
-    tools=("WRITE(key,value)", "READ(key)"),
-    prompt_declaration=(
-        "AMG capability: policy-authored context compaction. External "
-        "read/write memory capability: WRITE(key,value) and READ(key)."
-    ),
+    tools=("external_memory_read", "external_memory_write"),
+    prompt_declaration="adapter_owned_external_memory_declaration_v1",
     external_memory_surfaces=EXTERNAL_MEMORY_CAPABILITY_SURFACES,
 )
 
@@ -939,8 +929,10 @@ class ExternalMemoryExecutionReceipt:
     memory_receipt_sha256: str
 
     def __post_init__(self) -> None:
-        if self.operation not in {"read", "write"}:
-            raise ValueError("external memory operation must be read or write")
+        if self.operation not in {"read", "write", "read_write"}:
+            raise ValueError(
+                "external memory operation must be read, write, or read_write"
+            )
         require_sha256("external memory submission", self.submission_sha256)
         require_sha256("external memory receipt", self.memory_receipt_sha256)
 

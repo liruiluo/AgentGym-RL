@@ -79,7 +79,11 @@ class PairedEvalContractTest(unittest.TestCase):
         self.assertNotIn("READ", compaction_only.capability.prompt_declaration)
         self.assertEqual(
             memory.capability.tools,
-            ("WRITE(key,value)", "READ(key)"),
+            ("external_memory_read", "external_memory_write"),
+        )
+        self.assertEqual(
+            memory.capability.prompt_declaration,
+            "adapter_owned_external_memory_declaration_v1",
         )
         self.assertEqual(
             memory.capability.external_memory_surfaces,

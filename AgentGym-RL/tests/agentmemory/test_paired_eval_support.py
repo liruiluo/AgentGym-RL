@@ -56,6 +56,7 @@ SHA_C = "c" * 64
 SHA_D = "d" * 64
 OUTER_COMMIT = "d5892e63de0f8ad2ebdcedf09be46d3bca4117d1"
 INNER_COMMIT = "017ebd2fbc0ab8e53a0ba743f79b50d6e46d1a42"
+FAKE_MEMORY_PROMPT_SUFFIX = "\nAdapter-owned durable memory instructions."
 
 
 def make_config(
@@ -190,24 +191,24 @@ class FakeMemoryService:
         }
 
     def execute(self, policy_output: str) -> Mapping[str, Any]:
-        if policy_output.startswith("WRITE(") and policy_output.endswith(")"):
-            body = policy_output[6:-1]
+        if policy_output.startswith("MEMORY_WRITE(") and policy_output.endswith(")"):
+            body = policy_output[13:-1]
             if "," not in body:
-                raise RuntimeError("invalid WRITE syntax")
+                raise RuntimeError("invalid fake memory-write syntax")
             key, value = (part.strip() for part in body.split(",", 1))
             if not key or not value:
-                raise RuntimeError("WRITE requires a key and value")
+                raise RuntimeError("fake memory write requires a key and value")
             self.values[key] = value
             self.events.append(("write", key, value))
-            return {"operation": "write", "key": key, "status": "ok"}
-        if policy_output.startswith("READ(") and policy_output.endswith(")"):
-            key = policy_output[5:-1].strip()
+            return {"operation": "read_write", "key": key, "status": "ok"}
+        if policy_output.startswith("MEMORY_READ(") and policy_output.endswith(")"):
+            key = policy_output[12:-1].strip()
             if not key or "," in key:
-                raise RuntimeError("invalid READ syntax")
+                raise RuntimeError("invalid fake memory-read syntax")
             value = self.values.get(key)
             self.events.append(("read", key, value))
             return {
-                "operation": "read",
+                "operation": "read_write",
                 "key": key,
                 "found": value is not None,
                 "value": value,
@@ -371,7 +372,7 @@ class FakeClient:
         operation = item.get("operation", "append_observation")
         if operation == "replace_messages" and not self.allow_compaction:
             raise RuntimeError("policy compaction is disabled")
-        memory_action = policy_output.startswith(("WRITE(", "READ("))
+        memory_action = policy_output.startswith(("MEMORY_WRITE(", "MEMORY_READ("))
         if memory_action:
             if self.memory_service is None:
                 raise RuntimeError("external memory is forbidden for this treatment")
@@ -532,14 +533,17 @@ class FakeAdapter:
         )
         actual_messages = list(base_messages)
         declaration = (
-            config.capability.prompt_declaration
-            if self.prompt_declaration_override is None
-            else self.prompt_declaration_override
+            FAKE_MEMORY_PROMPT_SUFFIX
+            if (
+                config.capability.external_read_write_memory
+                and self.prompt_declaration_override is None
+            )
+            else self.prompt_declaration_override or ""
         )
         if declaration:
             actual_messages[0] = {
                 "role": "system",
-                "content": "Public task framing\n" + declaration,
+                "content": "Public task framing" + declaration,
             }
         return AdapterReset(
             namespace=Namespace.from_config(config),

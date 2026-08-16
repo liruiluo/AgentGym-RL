@@ -33,23 +33,37 @@ from .serialization import sha256_json, sha256_text, token_ids_sha256
 def validate_prompt_binding(
     initial_messages,
     treatment_excluded_messages,
-    capability_declaration: str,
+    *,
+    external_memory_enabled: bool,
 ):
-    """Require the full prompt to be one exact frozen capability transform."""
+    """Require one exact adapter-owned memory suffix and no other drift."""
 
     excluded = normalize_messages(treatment_excluded_messages)
     declared = normalize_messages(initial_messages)
-    expected = [dict(message) for message in excluded]
-    if capability_declaration:
-        if expected[0]["role"] != "system":
+    if not external_memory_enabled:
+        if declared != excluded:
             raise ValueError(
-                "capability declaration requires a leading system message"
+                "memory-disabled prompt differs from its treatment-excluded prompt"
             )
-        expected[0]["content"] += "\n" + capability_declaration
-    if declared != tuple(expected):
+        return declared, excluded
+    if len(declared) != len(excluded):
+        raise ValueError("external-memory prompt changed the message structure")
+    if not declared or declared[0]["role"] != "system":
+        raise ValueError("external-memory prompt requires a leading system message")
+    if excluded[0]["role"] != "system":
+        raise ValueError("treatment-excluded prompt requires a leading system message")
+    expected_tail = tuple(excluded[1:])
+    if tuple(declared[1:]) != expected_tail:
+        raise ValueError("external-memory prompt changed non-system messages")
+    base = excluded[0]["content"]
+    full = declared[0]["content"]
+    if not full.startswith(base) or full == base:
         raise ValueError(
-            "initial prompt differs beyond the frozen capability declaration"
+            "external-memory prompt must append one adapter-owned declaration"
         )
+    suffix = full[len(base) :]
+    if not suffix.strip():
+        raise ValueError("external-memory prompt declaration is empty")
     return declared, excluded
 
 
@@ -199,7 +213,9 @@ class PairedRunner:
                 declared_messages, excluded_messages = validate_prompt_binding(
                     reset_result.initial_messages,
                     reset_result.treatment_excluded_messages,
-                    config.capability.prompt_declaration,
+                    external_memory_enabled=(
+                        config.capability.external_read_write_memory
+                    ),
                 )
                 messages = self.controller.bind_initial(
                     adapter.client,

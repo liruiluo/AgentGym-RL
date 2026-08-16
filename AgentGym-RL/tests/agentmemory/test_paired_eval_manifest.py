@@ -279,7 +279,7 @@ class ManifestExecutionTest(unittest.TestCase):
         prompt_leak = deepcopy(rows)
         prompt_leak[compaction_index]["config"]["capability"][
             "prompt_declaration"
-        ] += " External WRITE(key,value)."
+        ] += " unexpected_external_memory_declaration"
         prompt_leak[compaction_index]["treatment"]["prompt_declaration"] = (
             prompt_leak[compaction_index]["config"]["capability"][
                 "prompt_declaration"
@@ -290,10 +290,10 @@ class ManifestExecutionTest(unittest.TestCase):
 
         tool_leak = deepcopy(rows)
         tool_leak[compaction_index]["config"]["capability"]["tools"] = [
-            "WRITE(key,value)"
+            "external_memory_write"
         ]
         tool_leak[compaction_index]["treatment"]["tools"] = [
-            "WRITE(key,value)"
+            "external_memory_write"
         ]
         with self.assertRaises(PairVerificationError):
             verify_pair_completeness(tool_leak)

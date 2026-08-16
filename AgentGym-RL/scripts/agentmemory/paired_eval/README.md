@@ -7,11 +7,12 @@ policy output, sends it through the injected task-neutral policy-turn
 controller, accounts the ordinary turn/tool/token/wall budgets, and records
 digest-addressed private evidence.
 
-The injected wrapper owns reset/close, benchmark lifecycle, action parsing,
-external `WRITE(key,value)` / `READ(key)` parsing and execution, compaction
-trigger/timing, context-transition receipts, final artifacts, and official
-grader handoff. The runner neither parses an action language nor dispatches on
-benchmark or arm. The capability lattice is exact: `native=00`,
+The injected wrapper owns reset/close, benchmark lifecycle, its native memory
+action parsing and execution, compaction trigger/timing, context-transition
+receipts, final artifacts, and official grader handoff. The runner sees only
+the abstract external read/write capability and structured operation receipts;
+it neither parses an action language nor dispatches on benchmark or arm. The
+capability lattice is exact: `native=00`,
 `amg_compaction_only=10`, and `amg_memory=11`, where the bits denote
 policy-authored compaction and external read/write memory. There is no
 memory-only fourth arm.
@@ -24,10 +25,12 @@ declaration, tool schema, parser/dispatch path, action receipt, private evidence
 store, and cleanup handle. Disabled arms attest none of those surfaces.
 Benchmark-native tools and task workspaces remain matched across all arms.
 
-The full initial prompt must equal the treatment-excluded prompt plus the one
-frozen capability declaration exactly. Client-side normalization must be
-idempotent, so an adapter cannot self-attest a clean base digest while injecting
-additional treatment-specific instructions.
+For memory-disabled arms, the full initial prompt must be byte-identical to the
+treatment-excluded prompt. For `amg_memory`, the benchmark adapter must strip
+and attest its exact frozen memory suffix; the runner then verifies that this is
+the only prompt change. Client-side normalization must be idempotent, so an
+adapter cannot self-attest a clean base digest while injecting additional
+treatment-specific instructions.
 
 ## Manifest and CLI
 
@@ -54,6 +57,10 @@ uses `AgentGymPolicyTurnController`, which imports and calls the exact
 `bind_initial_policy_context`, `prepare_policy_turn`, and
 `complete_policy_turn` functions. The dependency-light controller exists for
 stdlib-only contract tests.
+
+In-process callers can use
+`make_runtime_factory(builders, evidence_store=store)` to capture the private
+store and obtain the one-argument factory accepted by `execute_manifest`.
 
 At reset, a wrapper returns deterministic namespace-and-route-bound lifecycle
 root IDs for every route enabled by the frozen capability. Every ordinary step
@@ -85,7 +92,8 @@ Public identity fields and metric names must be bounded ASCII labels; paths,
 URIs, whitespace, and other unrestricted strings fail closed instead of being
 copied into a summary.
 
-This package does not provide benchmark adapters, official graders, datasets,
-containers, registry wiring, or a real inference runtime. Passing its local
-tests establishes the orchestration contract only; it does not establish real
-benchmark readiness.
+This package provides the shared orchestration contract plus the frozen-client
+registry and lifecycle bridge. Deployment-specific runtime builders, official
+graders, datasets and containers, inference services, and benchmark runtime
+readiness remain external. Passing local tests establishes the integration code
+contract only; it does not establish real benchmark readiness.

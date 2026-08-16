@@ -6,7 +6,7 @@ import json
 from typing import Any, Mapping, Optional, Protocol, Sequence
 from urllib import error, request
 
-from .contracts import DecodingConfig, ModelClientFailure, ModelConfig, ModelOutput
+from .contracts import ModelClientFailure, ModelConfig, ModelOutput
 from .evidence import PrivateEvidenceStore
 from .serialization import sha256_json
 

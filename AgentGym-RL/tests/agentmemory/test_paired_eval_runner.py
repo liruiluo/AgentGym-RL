@@ -104,7 +104,7 @@ class PairedRunnerTest(unittest.TestCase):
             },
         ]
         outputs = (
-            "WRITE(policy-note,private-value)",
+            "MEMORY_WRITE(policy-note,private-value)",
             "Policy-authored compact continuation.",
             "ordinary final output",
         )
@@ -155,7 +155,7 @@ class PairedRunnerTest(unittest.TestCase):
         leaked, leaked_bindings = self.run_case(
             replace(config, task=replace(config.task, task_id="memory-leak")),
             plan=({"state": "must not execute", "done": True},),
-            outputs=("WRITE(note,forbidden)",),
+            outputs=("MEMORY_WRITE(note,forbidden)",),
         )
         self.assertIsNone(leaked_bindings.adapter.memory_service)
         self.assertEqual(leaked["failure"]["class"], "environment_failure")
@@ -219,7 +219,7 @@ class PairedRunnerTest(unittest.TestCase):
                 {"state": "write receipt", "done": False},
                 {"state": "read receipt", "done": True},
             ),
-            outputs=("WRITE(note,private-value)", "READ(note)"),
+            outputs=("MEMORY_WRITE(note,private-value)", "MEMORY_READ(note)"),
         )
         memory_service = memory_bindings.adapter.memory_service
         self.assertIsNotNone(memory_service)
@@ -239,7 +239,7 @@ class PairedRunnerTest(unittest.TestCase):
                 turn["execution_receipt"]["operation"]
                 for turn in memory_row["turns"]
             ],
-            ["write", "read"],
+            ["read_write", "read_write"],
         )
         self.assertEqual(
             {
@@ -286,7 +286,7 @@ class PairedRunnerTest(unittest.TestCase):
         native_row, native_bindings = self.run_case(
             native_config,
             plan=({"state": "must not execute", "done": True},),
-            outputs=("WRITE(note,forbidden)",),
+            outputs=("MEMORY_WRITE(note,forbidden)",),
         )
         self.assertIsNone(native_bindings.adapter.memory_service)
         self.assertEqual(native_row["failure"]["class"], "environment_failure")
@@ -324,7 +324,7 @@ class PairedRunnerTest(unittest.TestCase):
                     "route_override": {"root_id": "f" * 64},
                 },
             ),
-            outputs=("WRITE(note,private-value)",),
+            outputs=("MEMORY_WRITE(note,private-value)",),
         )
         self.assertEqual(wrong_root["failure"]["class"], "environment_failure")
         self.assertIsNone(wrong_root["turns"][0]["environment_ref"])
@@ -339,7 +339,7 @@ class PairedRunnerTest(unittest.TestCase):
                     "execution_kind_override": "benchmark_action",
                 },
             ),
-            outputs=("WRITE(note,private-value)",),
+            outputs=("MEMORY_WRITE(note,private-value)",),
         )
         self.assertEqual(cross_spoof["failure"]["class"], "environment_failure")
         self.assertIsNone(cross_spoof["turns"][0]["environment_ref"])
@@ -383,10 +383,7 @@ class PairedRunnerTest(unittest.TestCase):
 
         prompt_row, prompt_bindings = self.run_case(
             make_config(task_id="prompt-drift", arm=Arm.AMG_MEMORY),
-            prompt_declaration_override=(
-                make_config(arm=Arm.AMG_MEMORY).capability.prompt_declaration
-                + " EXTRA"
-            ),
+            prompt_declaration_override="",
         )
         self.assertEqual(prompt_row["failure"]["class"], "environment_failure")
         self.assertIsNone(prompt_row["prompt"]["full_sha256"])
@@ -601,6 +598,17 @@ class PairedRunnerTest(unittest.TestCase):
             self.assertNotIn(literal, lowered)
 
         tree = ast.parse(source)
+        string_literals = {
+            node.value.casefold()
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        }
+        for command in ("write", "read", "memory_write", "memory_read"):
+            self.assertNotIn(command, string_literals)
+        referenced_names = {
+            node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
+        }
+        self.assertNotIn("parse_policy_action", referenced_names)
         run_task = next(
             node
             for node in ast.walk(tree)
