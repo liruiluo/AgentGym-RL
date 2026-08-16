@@ -142,7 +142,9 @@ def test_complete_local_iteration_memory_chain_is_detected():
         "complete_iteration_memory_chain": 1,
         "has_compaction": 1,
         "has_document_write": 1,
+        "has_continuation_write": 1,
         "has_local_validation": 1,
+        "post_compaction_continuation_read": 1,
         "post_compaction_document_read": 1,
         "terminal_submit": 1,
     }
@@ -173,7 +175,9 @@ def test_complete_local_iteration_memory_chain_is_detected():
         "mean_trajectory_return": 0.4,
         "local_validation_rate": 1.0,
         "document_write_rate": 1.0,
+        "continuation_write_rate": 1.0,
         "post_compaction_document_read_rate": 1.0,
+        "post_compaction_continuation_read_rate": 1.0,
         "complete_iteration_memory_chain_rate": 1.0,
         "mean_execution_attempt_count": 3.0,
         "mean_execution_completed_count": 3.0,
@@ -267,4 +271,22 @@ def test_require_chain_failure_still_writes_diagnostic_output(tmp_path):
     assert "no complete OpenMLE local-iteration memory chain found" in completed.stderr
     result = json.loads(output.read_text(encoding="utf-8"))
     assert result["counts"].get("post_compaction_document_read", 0) == 1
+    assert result["counts"].get("complete_iteration_memory_chain", 0) == 0
+
+
+def test_ordinary_document_chain_does_not_satisfy_canonical_continuation_gate():
+    document = _complete_document()
+    canonical = ".agent_memory/OPENMLE_CONTINUATION.md"
+    for row in document["rows"]:
+        record = row["formal_step_record"]
+        record["action"] = record["action"].replace(canonical, "experiments.md")
+        execution = record["env_info_after"].get("execution")
+        if execution:
+            execution["changed_paths"] = [
+                "experiments.md" if path == canonical else path
+                for path in execution["changed_paths"]
+            ]
+    result = MODULE.analyze_documents([(1, document)])
+    assert result["counts"].get("post_compaction_document_read", 0) == 1
+    assert result["counts"].get("post_compaction_continuation_read", 0) == 0
     assert result["counts"].get("complete_iteration_memory_chain", 0) == 0

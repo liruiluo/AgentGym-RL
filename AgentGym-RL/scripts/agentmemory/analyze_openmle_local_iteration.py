@@ -262,13 +262,21 @@ def _trajectory_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         for write in doc_writes
         if (result := _post_compaction_read(rows, compactions, write)) is not None
     ]
+    continuation_writes = [
+        row for row in doc_writes if CONTINUATION_PATH in row["document_paths"]
+    ]
+    continuation_read_sequences = [
+        sequence
+        for sequence in read_sequences
+        if CONTINUATION_PATH in sequence[0]["document_paths"]
+    ]
 
     chain: dict[str, Any] | None = None
     for validation in local:
         validation_order = validation.get("row_order")
         if not isinstance(validation_order, int):
             continue
-        for write, compaction, read in read_sequences:
+        for write, compaction, read in continuation_read_sequences:
             write_order = write.get("row_order")
             if not isinstance(write_order, int) or write_order <= validation_order:
                 continue
@@ -309,11 +317,13 @@ def _trajectory_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "local_validation_rows": len(local),
         "local_validation_evidence": local[:5],
         "document_write_rows": len(doc_writes),
+        "continuation_write_rows": len(continuation_writes),
         "document_paths": sorted(
             {path for row in doc_writes for path in row["document_paths"]}
         ),
         "compaction_rows": len(compactions),
         "post_compaction_document_read": bool(read_sequences),
+        "post_compaction_continuation_read": bool(continuation_read_sequences),
         "terminal_submit": terminal_submit is not None,
         "terminal_reason": terminal_info.get("terminal_reason"),
         "submission_valid": grade.get("submission_valid"),
@@ -375,8 +385,16 @@ def _aggregate_trajectories(trajectories: Sequence[Mapping[str, Any]]) -> dict[s
             sum(int(row.get("document_write_rows", 0) > 0) for row in trajectories),
             total,
         ),
+        "continuation_write_rate": _rate(
+            sum(int(row.get("continuation_write_rows", 0) > 0) for row in trajectories),
+            total,
+        ),
         "post_compaction_document_read_rate": _rate(
             sum(row.get("post_compaction_document_read") is True for row in trajectories),
+            total,
+        ),
+        "post_compaction_continuation_read_rate": _rate(
+            sum(row.get("post_compaction_continuation_read") is True for row in trajectories),
             total,
         ),
         "complete_iteration_memory_chain_rate": _rate(
@@ -419,11 +437,15 @@ def analyze_documents(
         for key in (
             "terminal_submit",
             "post_compaction_document_read",
+            "post_compaction_continuation_read",
             "complete_iteration_memory_chain",
         ):
             counts[key] += int(trajectory[key])
         counts["has_local_validation"] += int(trajectory["local_validation_rows"] > 0)
         counts["has_document_write"] += int(trajectory["document_write_rows"] > 0)
+        counts["has_continuation_write"] += int(
+            trajectory["continuation_write_rows"] > 0
+        )
         counts["has_compaction"] += int(trajectory["compaction_rows"] > 0)
 
     by_step: dict[int, list[dict[str, Any]]] = defaultdict(list)
