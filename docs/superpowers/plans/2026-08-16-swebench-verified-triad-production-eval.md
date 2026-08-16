@@ -10,6 +10,8 @@
 
 **Frozen deployment root and identities:** `/home/ai-jingyan-train/luolirui.1/post-train/agentmemorygym-rl-workspace/runtime/external-evals/swebench-verified-v4.1.0/triad-eval-20260816`; outer `aa2e9c80d572b513b5849c6d9b37a8dc4698bbc3`; inner `a0cc3ecf989ee89ba19a8e979617b4ec38909331`; dataset revision `c104f840cc67f8b6eec6f759ebc8b2693d585d4a`, JSONL `392529c5e79ca273bf0b073be35169beb68c604a26d9aef5514912fc584fa6cb`, ID ledger `a6b0fd7c8c2969a0eef892e032250adcfa6d32362d395c246930e61b575ac9b9`; harness `726c5461e2ef52d83cf1ea2107870a8bb3328d57`, tree `f178530b37202c549b1b2b3300db2da90da648db`; tag ledger `b69e618cfcfd2a59c3897e3f4856dbd88c4eeb921a5b24467a90bff6fa48581a`; manifest index `f2c1fb29457b66034cb04067f93707833125c8284b93771c924c10878ad9cd9b`; derived 500-row tag/digest TSV `b327b313612adefbc12161e2bf1e63e54925cbfcdccc26a416c1f7e94686af6b`; certified cache 1,158 descriptors / 117,637,519,356 bytes / bad=0.
 
+**Recovery supersession (2026-08-16):** Continue from deployed outer `218f64d706fd755f99bbaaecabc922328f70d2d6` / inner `a0cc3ecf989ee89ba19a8e979617b4ec38909331`; the older outer SHA above remains provenance for the published integration only. The real task-index-0 `00/10/11` gate must run the pinned official grader. Those three accepted cells and boolean outcomes are the first cells of the canonical 1,500-cell manifest and must be resumed, not rerun, when the full driver continues with the remaining 1,497 cells. The gate is still not a standalone benchmark result.
+
 **Frozen model:** `/home/ai-jingyan-train/luolirui.1/post-train/models/Qwen3.5-4B`; shard 1 (5,329,398,688 bytes) `26a93f066e1916adb13453dae5a0c707c0fbc71299ed98779571a907b8e74c61`; shard 2 (3,990,429,408 bytes) `cb544bd9bfae93dc59b0f22b292f5933573854a7f9b97835c67060d7d910e188`; `model.safetensors.index.json` `cf3f798ee02ba45f9622aa8892a47369ab667d0afbf154ee7c2212de42e6302d`; `config.json` `ddc63e1c717afa86c865bb5e01313d89d72bb53b97ad4a8a03ba8510c0621670`; `tokenizer.json` `5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42`; `tokenizer_config.json` `316230d6a809701f4db5ea8f8fc862bc3a6f3229c937c174e674ff3ca0a64ac8`; `chat_template.jinja` `a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715`.
 
 **Literal asset paths:** dataset `/home/ai-jingyan-train/luolirui.1/post-train/agentmemorygym-rl-workspace/runtime/external-evals/swebench-verified-v4.1.0/data/pinned_verified_test.jsonl`; harness `/home/ai-jingyan-train/luolirui.1/post-train/agentmemorygym-rl-workspace/runtime/external-evals/swebench-verified-v4.1.0/src/SWE-bench`; manifest index `/home/ai-jingyan-train/luolirui.1/post-train/agentmemorygym-rl-workspace/runtime/external-evals/swebench-verified-v4.1.0/images/instance-manifest-index.jsonl`; certified blob cache `/home/ai-jingyan-train/luolirui.1/post-train/agentmemorygym-rl-workspace/runtime/external-evals/swebench-verified-v4.1.0/images/blob-cache`; isolated Docker socket `/root/.local/state/amg-external-eval-container-runtime-v1/docker.sock`.
@@ -117,7 +119,7 @@
 
 - [ ] Write failing tests that gate on exact source/model/data/blob/runtime certificates, live pod UUID, Docker identity, resource-guard live negative-test receipt, vLLM health/model ID, SWE metadata shape, zero active workspaces, and owned-process PID files.
 - [ ] Implement `preflight`, `gate`, `run`, `resume`, `grade`, `status`, `audit`, and `cleanup` subcommands.
-- [ ] Make `gate` execute one real task under all three arms and validate endpoint reset/step/artifact/close, prompt treatment exclusion, lattice, dedupe, no official score, and zero workspace/container residue.
+- [ ] Make `gate` execute one real task under all three arms, run the pinned official grader for all three predictions, and validate endpoint reset/step/artifact/close, prompt treatment exclusion, lattice, dedupe, three unique boolean outcomes, and zero workspace/container residue. Accept the cells into the canonical manifest; do not publish them as a standalone benchmark score.
 - [ ] Make `run` require the gate PASS certificate, then automatically enter the full 500-task manifest; for each task stage its image, execute missing cells, accept the triad, close policy state, run/retry official grading, evict owned task staging, emit a heartbeat, and continue.
 - [ ] Make cleanup stop only owned services, remove only owned task containers/images/scratch, verify residue 0, and leave allocation/Docker assets/model/source intact.
 - [ ] Run all deployment tests and the published 42-test paired suite.
@@ -140,7 +142,7 @@
 
 - [ ] Re-inventory the sole 1-card job and prove both pod-exec and SSH reachability immediately before launch.
 - [ ] Materialize/load only sorted task index 0, build its exact mirror, launch the SWE server through the proven cgroup/quota/rootfs guard with private roots and frozen identities, and verify `/metadata` plus a no-secret client reset/close regression.
-- [ ] Run all three gate arms through `PairedRunner.run_task`, validate one triad, fenced crash/recovery/dedupe, cgroup peak+empty state, hard quota cleanup, and rootfs re-attestation before writing `gate/PASS.json`; do not call the official grader and do not include the gate in scores.
+- [ ] Run all three gate arms through `PairedRunner.run_task`, grade each immutable prediction with the pinned official grader, and validate one triad, three boolean outcomes, fenced crash/recovery/dedupe, cgroup peak+empty state, hard quota cleanup, and rootfs re-attestation before writing `gate/PASS.json`. These are canonical manifest cells `task_index=0` / lattice `00/10/11`; never rerun them after PASS and never report the three-row gate alone as a benchmark score.
 - [ ] If any concrete failure occurs, preserve evidence, repair only that failure, restart only owned services, and rerun the gate from a new private attempt namespace.
 - [ ] On PASS, automatically start Task 9 without requesting permission.
 
@@ -149,7 +151,7 @@
 **Files:**
 - Runtime-only: `/home/ai-jingyan-train/luolirui.1/post-train/agentmemorygym-rl-workspace/runtime/external-evals/swebench-verified-v4.1.0/triad-eval-20260816/full/**`, heartbeat, attempts, accepted cells, predictions, evidence, official outcomes, timing ledger.
 
-- [ ] Start the full immutable manifest in its supervised tmux binding and verify the first accepted triad and official outcomes.
+- [ ] Continue the full immutable manifest in its supervised tmux binding from the accepted task-0 triad and official outcomes; verify resume selects exactly the remaining 1,497 cells without duplicate rows.
 - [ ] After 10 and 20 real tasks, compute cell/task p50 and p95 durations, failure/retry rates, and measured ETA; update supervisor state without pausing the run.
 - [ ] Continuously audit PID liveness, heartbeat freshness, GPU process identity, Docker residue, active SWE slots, completed-cell monotonicity, and official outcome count; repair concrete failures and resume automatically.
 - [ ] Do not change model, decoding, budgets, order, images, grader, or any arm setting for throughput.
