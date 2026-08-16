@@ -42,6 +42,34 @@ def _apply_training_triton_cache_env(env_vars):
     env_vars['FLA_CACHE_RESULTS'] = '1'
 
 
+def _forward_ray_worker_runtime_env(env_vars, source_env=None):
+    source_env = os.environ if source_env is None else source_env
+    for key in (
+        'VLLM_USE_V1',
+        'VLLM_ATTENTION_BACKEND',
+        'VLLM_WORKER_MULTIPROC_METHOD',
+        'VLLM_USE_MODELSCOPE',
+        'VLLM_ALLOW_INSECURE_SERIALIZATION',
+        'VLLM_DBO_COMM_SMS',
+        'VLLM_USE_DEEP_GEMM',
+        'VLLM_MOE_USE_DEEP_GEMM',
+        'VLLM_USE_DEEP_GEMM_E8M0',
+        'VERL_AGENTMEMORY_HF_SYNC_DIR',
+        'VERL_PPO_LOGGING_LEVEL',
+        'VERL_TRAINING_TRITON_CACHE_DIR',
+        'FLA_CACHE_RESULTS',
+        'AGENTMEMORY_DATA_PATH',
+        'AGENTMEMORY_SPLIT',
+        'AGENTMEMORY_SPLIT_DIR',
+        'AGENTMEMORY_CATALOG_INDEX_PATH',
+        'HYDRA_FULL_ERROR',
+        'WANDB_MODE',
+    ):
+        value = source_env.get(key)
+        if value is not None:
+            env_vars[key] = value
+
+
 def get_random_string(length: int) -> str:
     import random
     import string
@@ -263,26 +291,7 @@ class RayWorkerGroup(WorkerGroup):
                 # Preserve selected shell/runtime knobs in every actor. This is
                 # required for vLLM engine selection (for example VLLM_USE_V1=0)
                 # because vLLM reads them at import/engine-construction time.
-                for key in (
-                    'VLLM_USE_V1',
-                    'VLLM_ATTENTION_BACKEND',
-                    'VLLM_WORKER_MULTIPROC_METHOD',
-                    'VLLM_USE_MODELSCOPE',
-        'VLLM_ALLOW_INSECURE_SERIALIZATION',
-                    'VERL_AGENTMEMORY_HF_SYNC_DIR',
-                    'VERL_PPO_LOGGING_LEVEL',
-                    'VERL_TRAINING_TRITON_CACHE_DIR',
-                    'FLA_CACHE_RESULTS',
-                    'AGENTMEMORY_DATA_PATH',
-                    'AGENTMEMORY_SPLIT',
-                    'AGENTMEMORY_SPLIT_DIR',
-                    'AGENTMEMORY_CATALOG_INDEX_PATH',
-                    'HYDRA_FULL_ERROR',
-                    'WANDB_MODE',
-                ):
-                    value = os.environ.get(key)
-                    if value is not None:
-                        env_vars[key] = value
+                _forward_ray_worker_runtime_env(env_vars)
                 _apply_training_triton_cache_env(env_vars)
                 # Keep Ray actors aligned with main_task for active
                 # AgentMemoryGym runtime settings. Missing these can silently

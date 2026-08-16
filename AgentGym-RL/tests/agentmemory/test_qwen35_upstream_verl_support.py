@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import importlib.util
 import os
 import sys
@@ -36,6 +37,19 @@ def _load_module(path: Path, name: str):
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
+
+
+def _load_standalone_function(path: Path, function_name: str):
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == function_name
+    )
+    module = ast.Module(body=[function], type_ignores=[])
+    namespace = {"os": os}
+    exec(compile(module, str(path), "exec"), namespace)
+    return namespace[function_name]
 
 
 class _FakeTensor:
@@ -130,12 +144,19 @@ class OfficialVllmRuntimeConfigTests(unittest.TestCase):
             "verl.agent_trainer.ppo.ray_trainer"
         )
         fake_trainer.RayPPOTrainer = object
+        fake_reference_policy = types.ModuleType(
+            "verl.agent_trainer.reference_policy"
+        )
+        fake_reference_policy.should_create_reference_policy = (
+            lambda _config: False
+        )
         with patch.dict(
             sys.modules,
             {
                 "ray": fake_ray,
                 "hydra": fake_hydra,
                 "verl.agent_trainer.ppo.ray_trainer": fake_trainer,
+                "verl.agent_trainer.reference_policy": fake_reference_policy,
             },
         ):
             return _load_module(_MAIN_PPO, "main_ppo_cache_env_under_test")
@@ -282,6 +303,38 @@ class OfficialVllmRuntimeConfigTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "absolute"):
                 module._ray_runtime_env_vars()
+
+    def test_deep_gemm_workaround_reaches_ray_main_and_worker_envs(self):
+        expected = {
+            "VLLM_DBO_COMM_SMS": "0",
+            "VLLM_USE_DEEP_GEMM": "0",
+            "VLLM_MOE_USE_DEEP_GEMM": "0",
+            "VLLM_USE_DEEP_GEMM_E8M0": "0",
+        }
+        main_ppo = self._load_main_ppo()
+        with patch.dict(os.environ, expected, clear=True):
+            main_task_env = main_ppo._ray_runtime_env_vars()
+        self.assertEqual(
+            {key: main_task_env.get(key) for key in expected}, expected
+        )
+
+        forward_worker_env = _load_standalone_function(
+            _RAY_BASE, "_forward_ray_worker_runtime_env"
+        )
+        worker_env = {}
+        forward_worker_env(worker_env, expected)
+        self.assertEqual(worker_env, expected)
+
+        source = _RAY_BASE.read_text(encoding="utf-8")
+        forward_call = source.index(
+            "_forward_ray_worker_runtime_env(env_vars)",
+            source.index("def _init_with_resource_pool"),
+        )
+        actor_options = source.index(
+            "ray_cls_with_init.update_options({'runtime_env': {'env_vars': env_vars}",
+            forward_call,
+        )
+        self.assertLess(forward_call, actor_options)
 
     def test_training_triton_cache_restore_order_and_env_propagation(self):
         rollout_source = _VLLM_ROLLOUT.read_text(encoding="utf-8")
