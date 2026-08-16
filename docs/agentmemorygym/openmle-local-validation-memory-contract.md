@@ -122,6 +122,10 @@ that existing protocol usable and auditable:
 - the sandbox returns `EPERM` for blocked socket creation instead of killing a
   basic utility with `SIGSYS`, while the network namespace and no-egress probes
   remain enforced;
+- a policy-created non-independent workspace object or other workspace invariant
+  violation is a terminal policy failure with reward `-1`, even if the sandbox
+  runner also reports a handling fault; it is not an infrastructure truncation
+  and the trajectory must not be dropped or silently resampled;
 - the evidence verifier records generation truncation separately from
   environment/infrastructure truncation.
 
@@ -144,7 +148,10 @@ The next formal run starts from fresh Qwen3.5-4B and uses the frozen full-pool
 schedule: 354 tasks from 307 source families, 64 episodes per optimizer update,
 100 optimizer updates, and 6,400 total episodes.  The schedule traverses the
 complete pool before repetition; it must not be replaced by a small fixed task
-subset.
+subset.  Each update must retain 64 unique trajectory groups.  A fixed trainer
+batch-size metric is not evidence for that count; the health gate reconstructs
+unique groups from the persisted action receipts and fails closed on any
+exclusion.
 
 The formal and G64 behaviour gate use the same 16,384-token prompt-width
 context-pressure contract.  This leaves room for the sampled response and the
