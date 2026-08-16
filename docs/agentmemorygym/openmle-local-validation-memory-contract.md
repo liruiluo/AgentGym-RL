@@ -1,6 +1,6 @@
 # OpenMLE-fast local iteration and terminal submission contract
 
-Status: canonical for the next fresh OpenMLE-fast lineage as of 2026-08-16.
+Status: canonical for the next fresh OpenMLE-fast lineage as of 2026-08-17.
 
 ## 1. Decision
 
@@ -128,6 +128,11 @@ that existing protocol usable and auditable:
   and the trajectory must not be dropped or silently resampled.  After the
   terminal receipt is fixed, the executor empties the invalid policy tree with
   descriptor-anchored, no-follow cleanup so the exact runner can unmount it;
+- if workspace freeze fails only after the episode has less remaining wall time
+  than the private grader's bounded total wall budget, the late `submit` is an
+  `episode_wall_limit` policy failure with reward `-1`; it is retained rather
+  than resampled.  A freeze failure with sufficient grading time remaining is a
+  genuine infrastructure truncation with null reward;
 - the evidence verifier records generation truncation separately from
   environment/infrastructure truncation.
 
