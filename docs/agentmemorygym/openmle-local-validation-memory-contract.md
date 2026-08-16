@@ -122,6 +122,10 @@ that existing protocol usable and auditable:
 - the sandbox returns `EPERM` for blocked socket creation instead of killing a
   basic utility with `SIGSYS`, while the network namespace and no-egress probes
   remain enforced;
+- a policy-requested shell timeout no longer than the exact-runner adapter's
+  3,000 ms admission/cleanup grace is a terminal `wall_timeout` policy failure
+  with reward `-1`; the adapter does not launch the runner, and the trajectory
+  is retained instead of being mislabeled as an infrastructure truncation;
 - a policy-created non-independent workspace object or other workspace invariant
   violation is a terminal policy failure with reward `-1`, even if the sandbox
   runner also reports a handling fault; it is not an infrastructure truncation
