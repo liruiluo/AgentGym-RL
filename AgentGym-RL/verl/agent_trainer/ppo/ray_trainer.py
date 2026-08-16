@@ -18,7 +18,9 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import os
 import uuid
+import hashlib
 import json
+import math
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -894,6 +896,9 @@ def _formal_update_readback_row_evidence(
     non_tensor_batch: dict,
     valid_row_indices: list[int],
     task_name: str,
+    response_token_rows,
+    response_mask_rows,
+    old_logprob_rows,
 ) -> dict:
     """Return canonical row identities without imposing WebShop metadata on other tasks."""
 
@@ -903,13 +908,114 @@ def _formal_update_readback_row_evidence(
 
     step_record_arr = non_tensor_batch.get("agentmemory_step_record_json")
     if step_record_arr is not None:
+        if (
+            response_token_rows is None
+            or response_mask_rows is None
+            or old_logprob_rows is None
+        ):
+            raise RuntimeError(
+                "Formal canonical step records require exact token/logprob tensor evidence."
+            )
+        tensor_row_count = len(response_token_rows)
+        if (
+            len(response_mask_rows) != tensor_row_count
+            or len(old_logprob_rows) != tensor_row_count
+            or len(step_record_arr) != tensor_row_count
+        ):
+            raise RuntimeError(
+                "Formal canonical step records and token/logprob tensors are not row-aligned."
+            )
+
+        def canonical_sha256(value) -> str:
+            raw = json.dumps(
+                value, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+            return hashlib.sha256(raw).hexdigest()
+
+        rows = []
+        for row_index in valid_row_indices:
+            record = json.loads(str(step_record_arr[row_index]))
+            if not isinstance(record, dict):
+                raise RuntimeError(
+                    f"Formal canonical step record {row_index} is not an object."
+                )
+            if not record.get("generation_token_ids_are_exact") or not record.get(
+                "backend_token_ids_are_exact"
+            ):
+                raise RuntimeError(
+                    f"Formal canonical step record {row_index} lacks exact token identity."
+                )
+            try:
+                packed_tokens = [int(value) for value in response_token_rows[row_index]]
+                packed_mask = [int(value) for value in response_mask_rows[row_index]]
+                packed_logprobs = [
+                    float(value) for value in old_logprob_rows[row_index]
+                ]
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise RuntimeError(
+                    f"Formal token/logprob tensor evidence is non-numeric at row {row_index}."
+                ) from exc
+            if not (
+                len(packed_tokens) == len(packed_mask) == len(packed_logprobs)
+            ):
+                raise RuntimeError(
+                    f"Formal token/logprob tensor widths differ at row {row_index}."
+                )
+            if any(value not in (0, 1) for value in packed_mask):
+                raise RuntimeError(
+                    f"Formal response mask is not binary at row {row_index}."
+                )
+            if not all(math.isfinite(value) for value in packed_logprobs):
+                raise RuntimeError(
+                    f"Formal old logprobs are non-finite at row {row_index}."
+                )
+            sampled_tokens = [
+                token
+                for token, visible in zip(packed_tokens, packed_mask)
+                if visible == 1
+            ]
+            sampled_logprobs = [
+                value
+                for value, visible in zip(packed_logprobs, packed_mask)
+                if visible == 1
+            ]
+            if not sampled_tokens:
+                raise RuntimeError(
+                    f"Formal canonical step record {row_index} has no sampled tokens."
+                )
+            raw_response_tokens = record.get("response_token_ids")
+            if raw_response_tokens != sampled_tokens:
+                raise RuntimeError(
+                    "Formal sampled response tokens differ from the canonical step "
+                    f"record at row {row_index}."
+                )
+            if record.get("response_token_count") != len(sampled_tokens):
+                raise RuntimeError(
+                    f"Formal response token count differs at row {row_index}."
+                )
+
+            record.update(
+                {
+                    "sampled_response_token_ids": sampled_tokens,
+                    "packed_token_ids": packed_tokens,
+                    "response_mask": packed_mask,
+                    "sampled_old_logprobs": sampled_logprobs,
+                    "packed_old_logprobs": packed_logprobs,
+                    "sampled_response_token_ids_sha256": canonical_sha256(
+                        sampled_tokens
+                    ),
+                    "packed_token_ids_sha256": canonical_sha256(packed_tokens),
+                    "response_mask_sha256": canonical_sha256(packed_mask),
+                    "sampled_old_logprobs_sha256": canonical_sha256(
+                        sampled_logprobs
+                    ),
+                }
+            )
+            rows.append(record)
         return {
             "schema": "agentmemory_formal_step_records_v1",
             "task_name": normalized_task_name,
-            "rows": [
-                json.loads(str(step_record_arr[row_index]))
-                for row_index in valid_row_indices
-            ],
+            "rows": rows,
         }
     if normalized_task_name == "agentmemory":
         raise RuntimeError(
@@ -998,6 +1104,9 @@ def _agentmemory_dump_formal_update_readback(
         non_tensor_batch=batch.non_tensor_batch,
         valid_row_indices=valid_row_indices,
         task_name=task_name,
+        response_token_rows=batch.batch["responses"].detach().cpu().tolist(),
+        response_mask_rows=response_mask.detach().cpu().tolist(),
+        old_logprob_rows=batch.batch["old_log_probs"].detach().cpu().tolist(),
     )
     actor_before = _masked_row_values(
         batch.batch["old_log_probs"],
