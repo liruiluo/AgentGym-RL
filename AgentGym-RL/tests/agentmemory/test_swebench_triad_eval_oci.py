@@ -398,7 +398,7 @@ class CachedOciTest(unittest.TestCase):
         )
         mirror_root = self.root / "mirrors"
         mirror_root.mkdir()
-        stale = mirror_root / ".owner__repo.git.partial-123-dead"
+        stale = mirror_root / ".owner__repo.partial-123-dead"
         stale.mkdir()
         mirror = ensure_repository_mirror(
             source_root,
@@ -406,6 +406,7 @@ class CachedOciTest(unittest.TestCase):
             repo="owner/repo",
             base_commit=commit,
         )
+        self.assertEqual(mirror.name, "owner__repo")
         resolved = subprocess.check_output(
             ["git", "--git-dir", str(mirror), "rev-parse", f"{commit}^{{commit}}"],
             text=True,
@@ -415,7 +416,7 @@ class CachedOciTest(unittest.TestCase):
 
         outside = self.root / "outside-mirror"
         outside.mkdir()
-        attack = mirror_root / ".owner__other.git.partial-456-link"
+        attack = mirror_root / ".owner__other.partial-456-link"
         attack.symlink_to(outside, target_is_directory=True)
         with self.assertRaises(OciCacheError):
             ensure_repository_mirror(

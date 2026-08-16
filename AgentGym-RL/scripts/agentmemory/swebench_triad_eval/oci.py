@@ -1162,7 +1162,7 @@ def ensure_repository_mirror(
     )
 
     root = ensure_private_directory(mirror_root)
-    mirror_name = repo.replace("/", "__") + ".git"
+    mirror_name = repo.replace("/", "__")
     mirror = root / mirror_name
     lock = root / f".{mirror_name}.lock"
     with exclusive_lock(lock):
