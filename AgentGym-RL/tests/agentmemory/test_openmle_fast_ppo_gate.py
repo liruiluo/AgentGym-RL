@@ -6,6 +6,7 @@ import hashlib
 import io
 import importlib.util
 import json
+import signal
 from pathlib import Path
 from contextlib import redirect_stdout
 import tempfile
@@ -44,7 +45,7 @@ def manifest() -> dict:
     ]
     return {
         "schema": "openmle_fast_public_manifest_v1",
-        "panel_id": "openmle-fast-g64-v1",
+        "panel_id": "openmle-fast-integration-v1-g64-gate",
         "role": "gate_only",
         "openmle_tasks_revision": "f56e4b31252a9b81d95fea100098cd49b7290398",
         "task_count": len(records),
@@ -273,7 +274,8 @@ def update_evidence(document: dict) -> dict:
                     "run_id": "openmle-fast-gate-run-1",
                     "process_owner": "openmle-fast-gate-owner",
                     "alive": False,
-                    "exit_code": 0,
+                    "exit_code": -int(signal.SIGTERM),
+                    "termination_requested": True,
                 },
                 {
                     "role": "private-grader",
@@ -283,6 +285,7 @@ def update_evidence(document: dict) -> dict:
                     "process_owner": "openmle-fast-gate-owner",
                     "alive": False,
                     "exit_code": 0,
+                    "termination_requested": True,
                 },
             ],
             "process_census": {
@@ -392,6 +395,49 @@ class OpenMLEFastPpoGateTests(unittest.TestCase):
 
         self.assertEqual(attestation["graded_terminal_count"], 63)
         self.assertEqual(attestation["ungraded_policy_terminal_count"], 1)
+
+    def test_accepts_source_backed_policy_terminal_reasons(self) -> None:
+        document = manifest()
+        policy_reasons = (
+            "managed_runtime_limit",
+            "episode_wall_limit",
+            "wall_timeout",
+            "output_limit",
+            "memory_limit",
+            "pid_limit",
+            "disk_limit",
+            "file_limit",
+            "security_violation",
+            "background_process",
+            "surviving_background_process",
+            "immutable_public_tree_changed",
+            "workspace_invariant_violation",
+            "policy_resource_violation",
+        )
+        for reason in policy_reasons:
+            with self.subTest(reason=reason):
+                evidence = update_evidence(document)
+                terminal = make_first_terminal_ungraded(evidence)
+                terminal["terminal_reason"] = reason
+                attestation = self.verify(evidence, document)
+                self.assertEqual(attestation["ungraded_policy_terminal_count"], 1)
+
+    def test_rejects_unrequested_or_forced_signal_cleanup(self) -> None:
+        document = manifest()
+        for exit_code, termination_requested in (
+            (-int(signal.SIGTERM), False),
+            (-int(signal.SIGKILL), True),
+        ):
+            with self.subTest(
+                exit_code=exit_code,
+                termination_requested=termination_requested,
+            ):
+                evidence = update_evidence(document)
+                process = evidence["cleanup"]["owned_processes"][0]
+                process["exit_code"] = exit_code
+                process["termination_requested"] = termination_requested
+                with self.assertRaisesRegex(AssertionError, "clean managed exit"):
+                    self.verify(evidence, document)
 
     def test_rejects_inconsistent_ungraded_policy_terminals(self) -> None:
         document = manifest()

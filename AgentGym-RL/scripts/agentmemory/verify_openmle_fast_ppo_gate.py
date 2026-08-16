@@ -10,6 +10,7 @@ import json
 import math
 from pathlib import Path
 import re
+import signal
 from typing import Any
 
 
@@ -23,7 +24,7 @@ DOMAIN_ID = "openmle_fast"
 CONTRACT_VERSION = "openmle_fast_v1"
 EXPECTED_OPENMLE_TASKS_REVISION = "f56e4b31252a9b81d95fea100098cd49b7290398"
 EXPECTED_TASK_COUNT = 64
-EXPECTED_PANEL_ID = "openmle-fast-g64-v1"
+EXPECTED_PANEL_ID = "openmle-fast-integration-v1-g64-gate"
 EXPECTED_ROLE = "gate_only"
 COUNTER_KEYS = (
     "action_count",
@@ -49,6 +50,18 @@ POLICY_TERMINAL_REASONS = frozenset(
         "action_budget_exhausted",
         "managed_runtime_limit",
         "episode_wall_limit",
+        "wall_timeout",
+        "output_limit",
+        "memory_limit",
+        "pid_limit",
+        "disk_limit",
+        "file_limit",
+        "security_violation",
+        "background_process",
+        "surviving_background_process",
+        "immutable_public_tree_changed",
+        "workspace_invariant_violation",
+        "policy_resource_violation",
     }
 )
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
@@ -1006,11 +1019,21 @@ def validate_cleanup(
             False,
             label=f"owned process {role} cleanup",
         )
-        _require_exact(
-            process.get("exit_code"),
-            0,
-            label=f"owned process {role} exit status",
+        termination_requested = process.get("termination_requested")
+        if not isinstance(termination_requested, bool):
+            raise AssertionError(
+                f"owned process {role} termination_requested must be boolean"
+            )
+        exit_code = process.get("exit_code")
+        if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+            raise AssertionError(f"owned process {role} exit status must be integer")
+        clean_exit = exit_code == 0 or (
+            termination_requested and exit_code == -int(signal.SIGTERM)
         )
+        if not clean_exit:
+            raise AssertionError(
+                f"owned process {role} exit status is not a clean managed exit"
+            )
     _require_exact(roles, expected_roles, label="owned cleanup roles")
 
     census = cleanup.get("process_census")
