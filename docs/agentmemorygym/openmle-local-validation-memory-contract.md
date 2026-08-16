@@ -1,6 +1,6 @@
 # OpenMLE-fast local iteration and terminal submission contract
 
-Status: frozen for the next fresh OpenMLE-fast lineage on 2026-08-16.
+Status: canonical for the next fresh OpenMLE-fast lineage as of 2026-08-16.
 
 ## 1. Decision
 
@@ -40,8 +40,11 @@ submit
 Every policy reply consumes one global action.  Reading with `cat` or `grep`,
 editing, launching Python, computing local validation, writing or reading an
 experiment log, context compaction, and terminal submission are all charged.
-Python starts, completed executions, fits, and nested subprocesses remain
-separate audit counters and are not aliases for the policy-action count.
+The reset observation and every charged-action observation report the completed
+action number and the remaining shared budget; compaction preserves that status
+in the replacement context.  Python starts, completed executions, fits, and
+nested subprocesses remain separate audit counters and are not aliases for the
+policy-action count.
 
 `run` means an ordinary `shell_command` sandbox execution.  It is not a formal
 submission.  `formal` names the complete PPO experiment, never a model action.
@@ -65,7 +68,7 @@ behalf of the policy.
 | Surface | Owns | Must not own |
 | --- | --- | --- |
 | OpenMLE-fast wrapper prompt | Explain the public local-validation loop, name `.agent_memory/OPENMLE_CONTINUATION.md` as an ordinary charged workspace note, require context recovery, and reserve one terminal `submit` | Hidden answers, task-specific modelling recipes, free memory actions, or private-score feedback |
-| OpenMLE-fast environment | Charge each ordinary action, preserve one episode workspace, execute the terminal private grade, enforce action/time/resource limits | Repeatable private scoring, automatic final submission, or cross-episode memory |
+| OpenMLE-fast environment | Charge each ordinary action, expose the completed/remaining action budget, preserve one episode workspace, execute the terminal private grade, and enforce action/time/resource limits | Repeatable private scoring, automatic final submission, or cross-episode memory |
 | Sandbox executor | Run ordinary commands, report bounded stdout/stderr and counters, reap descendants, preserve public/private isolation | MLE strategy, metric selection, memory semantics, or terminal decisions |
 | Private grader | Authenticate and score the one terminal submission | Policy-visible iterative feedback |
 | Environment wrapper context transition | Request an ordinary charged compaction action and return a task-neutral `replace_messages` receipt while the workspace persists | Domain parsing or an extra sampling loop |
@@ -103,12 +106,28 @@ and no-memory controls.
 
 ## 6. Migration boundary
 
-The active r5 lineage already supports repeated `shell_command`/`apply_patch`
-actions followed by one terminal `submit`; it is not a single-execution
-environment.  Its missing evidence is policy-authored experiment memory and
-valid-only modelling-quality lift.  The next lineage therefore changes the
-prompt and verification surfaces, plus their prompt hashes and source locks.
-It does not change the action parser, sandbox resource semantics, private grader,
-terminal submission semantics, or shared rollout.  Because the prompt contract
-changes policy behaviour, the next formal starts from the declared fresh base
-checkpoint rather than resuming r5.
+The earlier lineage already supported repeated `shell_command`/`apply_patch`
+actions followed by one terminal `submit`; it was not a single-execution
+environment.  The missing evidence is a real policy-authored chain containing
+local validation, experiment memory, compaction recovery, further code changes,
+and an intentional final submission.
+
+The next fresh lineage may change only the task-owned surfaces needed to make
+that existing protocol usable and auditable:
+
+- the prompt gives explicit plain-text raw-action examples and generic measured
+  local-validation guidance;
+- the environment observation reports completed and remaining actions without
+  adding an action, reward, oracle, or free memory operation;
+- the sandbox returns `EPERM` for blocked socket creation instead of killing a
+  basic utility with `SIGSYS`, while the network namespace and no-egress probes
+  remain enforced;
+- the evidence verifier records generation truncation separately from
+  environment/infrastructure truncation.
+
+These are compatibility and observability fixes.  They do not change the three
+action parser, 30-action accounting, reward, private grader, single terminal
+submission, task pool, or shared rollout.  `vllm_rollout.py` remains byte
+identical.  Because the prompt and visible environment state change policy
+behaviour, the next gate and formal start from the declared fresh Qwen3.5-4B
+base rather than resuming an earlier checkpoint.
