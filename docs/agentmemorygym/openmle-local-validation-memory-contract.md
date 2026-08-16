@@ -146,6 +146,16 @@ schedule: 354 tasks from 307 source families, 64 episodes per optimizer update,
 complete pool before repetition; it must not be replaced by a small fixed task
 subset.
 
+The formal and G64 behaviour gate use the same 16,384-token prompt-width
+context-pressure contract.  This leaves room for the sampled response and the
+bounded next observation, so the wrapper requests the charged continuation-note
+action before the history reaches the hard prompt cap.  A formal launcher must
+fail closed if its prompt width drifts from the G64 contract.  Raising the
+formal width to 30,720 suppresses most context replacements, changes the tested
+memory behaviour, and roughly doubles learner token load; that configuration is
+not the admitted lineage.  Any correction of this setting starts a fresh
+optimizer lineage.
+
 Before update 100, supervision uses only training-health and online receipts:
 VSR, online PS/BBR over all episodes, BBR conditional on valid submissions,
 valid-only continuous normalized reward, trajectory return, stage timing, and
