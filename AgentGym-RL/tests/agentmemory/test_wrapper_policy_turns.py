@@ -17,6 +17,7 @@ AGENTENV_ROOT = ROOT.parent / "AgentGym" / "agentenv"
 if str(AGENTENV_ROOT) not in sys.path:
     sys.path.insert(0, str(AGENTENV_ROOT))
 
+import agentenv.envs.openmle_fast as openmle_fast_module  # noqa: E402
 from agentenv.controller import (  # noqa: E402
     StepOutput,
     bind_initial_policy_context,
@@ -29,6 +30,11 @@ from agentenv.controller.types import (  # noqa: E402
     build_task_neutral_transition_info,
 )
 from agentenv.envs.agentmemory import AgentMemoryEnvClient  # noqa: E402
+from agentenv.envs.openmle_fast import (  # noqa: E402
+    OPENMLE_CONTEXT_COMPACTION_REQUEST,
+    OPENMLE_FAST_POLICY_SYSTEM_PROMPT,
+    OpenMLEFastEnvClient,
+)
 from agentenv.envs.swesmith import (  # noqa: E402
     SWE_CONTEXT_COMPACTION_REQUEST,
     SWE_MEMORY_CONTRACT,
@@ -153,6 +159,37 @@ class FakeSwesmithClient(SwesmithEnvClient):
                 },
             },
         }
+
+    def reset(self, idx: int = 0) -> dict:
+        del idx
+        raise AssertionError("test fixture is already reset")
+
+
+class FakeOpenMLEClient(OpenMLEFastEnvClient):
+    def __init__(self) -> None:
+        BaseEnvClient.__init__(self, action_format=ActionFormat.REACT)
+        self.env_id = 303
+        self.data_len = 1
+        self.metadata = {"max_policy_actions": 30}
+        self.info = {
+            "observation": "Solve the OpenMLE task from TASK.md.",
+            "reward": 0.0,
+            "done": False,
+            "info": {},
+        }
+        self._episode_identity = {"episode_id": "fake-openmle"}
+        self.native_calls: list[str] = []
+        self._reset_transition_state()
+
+    def __len__(self) -> int:
+        return 1
+
+    def _request(self, method: str, path: str, **kwargs) -> dict:
+        if (method, path) != ("POST", "step"):
+            raise AssertionError(f"unexpected fake OpenMLE request: {method} {path}")
+        action = str(kwargs["json"]["action"])
+        self.native_calls.append(action)
+        return {"sentinel": len(self.native_calls)}
 
     def reset(self, idx: int = 0) -> dict:
         del idx
@@ -376,6 +413,82 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertNotIn(invalid, str(messages))
         self.assertIn("session-0 search result", str(messages))
         self.assertNotIn("session-0 fresh observation", str(messages))
+
+    def test_openmle_compaction_uses_same_entrypoint_and_real_native_action(self) -> None:
+        client = FakeOpenMLEClient()
+        initial = client.policy_framing() + [
+            {"role": "user", "content": client.observe()},
+        ]
+        messages = bind_initial_policy_context(client, initial)
+        messages.extend(
+            [
+                {"role": "assistant", "content": "old action output"},
+                {"role": "user", "content": "large previous execution evidence"},
+            ]
+        )
+        candidate_count = count_prompt_tokens(
+            messages
+            + [{"role": "user", "content": OPENMLE_CONTEXT_COMPACTION_REQUEST}]
+        )
+        prepared = prepare(client, messages, capacity=candidate_count + 1)
+        self.assertEqual(
+            prepared.control_request,
+            OPENMLE_CONTEXT_COMPACTION_REQUEST,
+        )
+        env_info = {
+            "action_kind": "apply_patch",
+            "action_status": "completed",
+            "counters": {"action_count": 1},
+            "execution": {
+                "changed_paths": [".agent_memory/OPENMLE_CONTINUATION.md"],
+            },
+        }
+        action = """apply_patch
+*** Begin Patch
+*** Add File: .agent_memory/OPENMLE_CONTINUATION.md
++next inspect train.csv
+*** End Patch"""
+        with mock.patch.object(
+            openmle_fast_module,
+            "_validate_step_response",
+            return_value=("action_status=completed", 0.0, False, env_info),
+        ):
+            output, replacement = complete_policy_turn(client, prepared, action)
+
+        self.assertEqual(client.native_calls, [action])
+        self.assertEqual(client.metadata["max_policy_actions"], 30)
+        self.assertEqual(
+            (
+                output.info["native_call_count_before"],
+                output.info["native_call_count_after"],
+                output.info["policy_step_before"],
+                output.info["policy_step_after"],
+                output.info["context_epoch_before"],
+                output.info["context_epoch_after"],
+            ),
+            (0, 1, 0, 1, 0, 1),
+        )
+        self.assertEqual(
+            replacement,
+            [
+                {"role": "system", "content": OPENMLE_FAST_POLICY_SYSTEM_PROMPT},
+                {"role": "user", "content": initial[-1]["content"]},
+                {
+                    "role": "user",
+                    "content": "Continue the same task in the unchanged workspace.",
+                },
+            ],
+        )
+        self.assertNotIn("large previous execution evidence", str(replacement))
+        self.assertNotIn(action, str(replacement))
+        self.assertEqual(
+            output.info["wrapper_evidence"]["workspace_continuity_id"],
+            client.env_id,
+        )
+        self.assertEqual(
+            output.info["wrapper_evidence"]["event"],
+            "context_compaction",
+        )
 
     def test_swesmith_compaction_uses_same_entrypoint_without_native_call(self) -> None:
         client = FakeSwesmithClient()
