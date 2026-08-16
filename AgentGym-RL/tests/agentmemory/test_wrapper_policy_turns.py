@@ -473,14 +473,16 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             [
                 {"role": "system", "content": OPENMLE_FAST_POLICY_SYSTEM_PROMPT},
                 {"role": "user", "content": initial[-1]["content"]},
+                {"role": "assistant", "content": action},
                 {
                     "role": "user",
-                    "content": "Continue the same task in the unchanged workspace.",
+                    "content": "action_status=completed\n\n"
+                    "Continue the same task in the unchanged workspace.",
                 },
             ],
         )
         self.assertNotIn("large previous execution evidence", str(replacement))
-        self.assertNotIn(action, str(replacement))
+        self.assertEqual(replacement[-2]["content"], action)
         self.assertEqual(
             output.info["wrapper_evidence"]["workspace_continuity_id"],
             client.env_id,
@@ -488,6 +490,104 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertEqual(
             output.info["wrapper_evidence"]["event"],
             "context_compaction",
+        )
+        self.assertTrue(
+            output.info["wrapper_evidence"]["continuation_persisted"]
+        )
+        self.assertEqual(
+            output.info["wrapper_evidence"]["continuation_path"],
+            ".agent_memory/OPENMLE_CONTINUATION.md",
+        )
+        self.assertTrue(
+            output.info["wrapper_evidence"]["preserved_policy_output"]
+        )
+        self.assertTrue(
+            output.info["wrapper_evidence"]["preserved_native_observation"]
+        )
+
+    def test_openmle_failed_continuation_write_compacts_without_state_loss(
+        self,
+    ) -> None:
+        client = FakeOpenMLEClient()
+        initial = client.policy_framing() + [
+            {"role": "user", "content": client.observe()},
+        ]
+        messages = bind_initial_policy_context(client, initial)
+        messages.extend(
+            [
+                {"role": "assistant", "content": "old action output"},
+                {"role": "user", "content": "large previous execution evidence"},
+            ]
+        )
+        candidate_count = count_prompt_tokens(
+            messages
+            + [{"role": "user", "content": OPENMLE_CONTEXT_COMPACTION_REQUEST}]
+        )
+        prepared = prepare(client, messages, capacity=candidate_count + 1)
+        malformed = (
+            'apply_patch {"patch":"*** Begin Patch\\n'
+            '# state\\n*** End Patch"}'
+        )
+        failed_info = {
+            "action_kind": "parser_error",
+            "action_status": "parser_error",
+            "counters": {"action_count": 1},
+            "execution": {
+                "changed_paths": [],
+            },
+        }
+        with mock.patch.object(
+            openmle_fast_module,
+            "_validate_step_response",
+            return_value=("parser error", 0.0, False, failed_info),
+        ):
+            output, retry_messages = complete_policy_turn(
+                client,
+                prepared,
+                malformed,
+            )
+
+        self.assertEqual(client.native_calls, [malformed])
+        self.assertEqual(
+            output.info["context_transition"]["operation"],
+            "replace_messages",
+        )
+        self.assertEqual(
+            output.info["wrapper_evidence"]["event"],
+            "context_compaction",
+        )
+        self.assertFalse(
+            output.info["wrapper_evidence"]["continuation_persisted"]
+        )
+        self.assertEqual(
+            (
+                output.info["native_call_count_before"],
+                output.info["native_call_count_after"],
+                output.info["policy_step_before"],
+                output.info["policy_step_after"],
+                output.info["context_epoch_before"],
+                output.info["context_epoch_after"],
+            ),
+            (0, 1, 0, 1, 0, 1),
+        )
+        self.assertNotIn("large previous execution evidence", str(retry_messages))
+        self.assertEqual(
+            retry_messages[-2],
+            {"role": "assistant", "content": malformed},
+        )
+        self.assertEqual(
+            retry_messages[-1],
+            {
+                "role": "user",
+                "content": "parser error\n\n"
+                "Continue the same task in the unchanged workspace.",
+            },
+        )
+        self.assertTrue(
+            output.info["wrapper_evidence"]["preserved_policy_output"]
+        )
+        self.assertTrue(
+            output.info["wrapper_evidence"]["preserved_native_observation"]
         )
 
     def test_swesmith_compaction_uses_same_entrypoint_without_native_call(self) -> None:
