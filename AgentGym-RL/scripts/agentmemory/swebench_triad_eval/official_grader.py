@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
+import signal
 import stat
 import subprocess
 import time
 from typing import Any, Mapping
+
+from paired_eval.serialization import canonical_json_bytes
 
 from . import ARMS
 from .atomic import (
@@ -79,6 +83,8 @@ AGGREGATE_REPORT_FIELDS = {
 }
 REPORT_FRESHNESS_TOLERANCE_NS = 2_000_000_000
 PROCESS_TIMEOUT_GRACE_SECONDS = 300
+GRADER_OWNER_ENV = "AMG_SWEBENCH_GRADER_BINDING_SHA256"
+PROCESS_GROUP_SETTLE_SECONDS = 30.0
 MAX_DIAGNOSTIC_LOG_BYTES = 16 * 1024 * 1024
 MAX_IMPORT_PROBE_STDERR_BYTES = 4 * 1024
 
@@ -106,6 +112,11 @@ class RetryableGraderError(RuntimeError):
         self.attempt_directory = attempt_directory
 
 
+class GraderBusyError(RuntimeError):
+    """A previously launched, identity-bound official grader is still live."""
+
+
+
 def require_absolute_path(path: Path | str, label: str) -> Path:
     value = Path(path)
     if not value.is_absolute():
@@ -122,6 +133,7 @@ class OfficialGraderConfig:
     docker_socket: Path = DOCKER_SOCKET
     timeout_seconds: int = 1_800
     namespace: str = "swebench"
+    command_ledger_path: Path | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -142,6 +154,14 @@ class OfficialGraderConfig:
             raise ValueError("official SWE-bench timeout is pinned to 1800 seconds")
         if self.namespace != "swebench":
             raise ValueError("official SWE-bench namespace drifted")
+        if self.command_ledger_path is not None:
+            object.__setattr__(
+                self,
+                "command_ledger_path",
+                require_absolute_path(
+                    self.command_ledger_path, "command_ledger_path"
+                ),
+            )
 
 
 @dataclass(frozen=True)
@@ -229,7 +249,11 @@ def validate_prediction(value: Any) -> None:
         raise ValueError("official prediction model label is unsafe")
 
 
-def grader_environment(config: OfficialGraderConfig) -> dict[str, str]:
+def grader_environment(
+    config: OfficialGraderConfig,
+    *,
+    owner_binding_sha256: str | None = None,
+) -> dict[str, str]:
     environment = dict(os.environ)
     environment.update(
         {
@@ -240,6 +264,9 @@ def grader_environment(config: OfficialGraderConfig) -> dict[str, str]:
             "TRANSFORMERS_OFFLINE": "1",
         }
     )
+    if owner_binding_sha256 is not None:
+        require_sha256(owner_binding_sha256, "grader owner binding")
+        environment[GRADER_OWNER_ENV] = owner_binding_sha256
     return environment
 
 
@@ -700,6 +727,8 @@ def expected_raw_paths(
 def finish_grade_attempt(
     attempt_root: Path,
     request: OfficialGradeRequest,
+    *,
+    command: list[str] | None = None,
 ) -> dict[str, Any]:
     process_result = read_json(attempt_root / "process-result.json")
     if not isinstance(process_result, Mapping):
@@ -708,6 +737,7 @@ def finish_grade_attempt(
     retryable_process_failures = {
         "process_timeout": "grader_process_timeout",
         "spawn_error": "grader_spawn_failure",
+        "post_spawn_error": "grader_post_spawn_failure",
     }
     if process_status in retryable_process_failures:
         failure_class = retryable_process_failures[process_status]
@@ -725,6 +755,8 @@ def finish_grade_attempt(
             "official grader process exited nonzero",
         )
     started = read_json(attempt_root / "started.json")
+    if command is not None:
+        started_process(attempt_root, command)
     started_at_ns = (
         started.get("started_at_ns")
         if isinstance(started, Mapping)
@@ -873,6 +905,526 @@ def bytes_or_empty(value: Any) -> bytes:
     raise GraderContractError("grader process output has an unsupported type")
 
 
+def process_stat_fields(pid: int) -> list[str]:
+    if type(pid) is not int or pid <= 0:
+        raise ValueError("grader process PID is invalid")
+    try:
+        stat_line = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError as error:
+        raise ProcessLookupError(pid) from error
+    close = stat_line.rfind(")")
+    fields = stat_line[close + 2 :].split() if close >= 0 else []
+    if (
+        len(fields) <= 19
+        or len(fields[0]) != 1
+        or not fields[19].isdigit()
+    ):
+        raise GraderContractError("grader process stat is malformed")
+    return fields
+
+
+def process_state(pid: int) -> str:
+    return process_stat_fields(pid)[0]
+
+
+def process_start_ticks(pid: int) -> int:
+    fields = process_stat_fields(pid)
+    return int(fields[19])
+
+
+def process_arguments(pid: int) -> list[str]:
+    try:
+        payload = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError as error:
+        raise ProcessLookupError(pid) from error
+    values = [
+        value.decode("utf-8", errors="surrogateescape")
+        for value in payload.split(b"\0")
+        if value
+    ]
+    if not values:
+        raise ProcessLookupError(pid)
+    return values
+
+
+def process_environment_value(pid: int, name: str) -> str | None:
+    if not name or "=" in name or "\0" in name:
+        raise ValueError("process environment name is invalid")
+    try:
+        payload = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError as error:
+        raise ProcessLookupError(pid) from error
+    prefix = name.encode("utf-8") + b"="
+    matches = [
+        value[len(prefix) :]
+        for value in payload.split(b"\0")
+        if value.startswith(prefix)
+    ]
+    if len(matches) > 1:
+        raise GraderContractError("grader owner environment is duplicated")
+    if not matches:
+        return None
+    try:
+        return matches[0].decode("utf-8", errors="strict")
+    except UnicodeError as error:
+        raise GraderContractError("grader owner environment is not UTF-8") from error
+
+
+def grader_process_group_members(pgid: int) -> set[int]:
+    if type(pgid) is not int or pgid <= 0:
+        raise ValueError("grader process-group ID is invalid")
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return set()
+    members: set[int] = set()
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            if process_state(pid) == "Z":
+                continue
+            current_pgid = os.getpgid(pid)
+        except (OSError, ProcessLookupError):
+            continue
+        if current_pgid == pgid:
+            members.add(pid)
+    return members
+
+
+def owned_grader_group_members(pgid: int, binding_sha256: str) -> set[int]:
+    require_sha256(binding_sha256, "grader owner binding")
+    members = grader_process_group_members(pgid)
+    owned: set[int] = set()
+    foreign: list[int] = []
+    for pid in sorted(members):
+        try:
+            if process_state(pid) == "Z":
+                continue
+            marker = process_environment_value(pid, GRADER_OWNER_ENV)
+        except ProcessLookupError:
+            continue
+        if marker == binding_sha256:
+            owned.add(pid)
+        else:
+            foreign.append(pid)
+    if foreign:
+        raise GraderContractError(
+            "refusing to signal a grader group with foreign members: "
+            + ",".join(str(pid) for pid in foreign)
+        )
+    return owned
+
+
+def owned_grader_process_groups(binding_sha256: str) -> dict[int, set[int]]:
+    require_sha256(binding_sha256, "grader owner binding")
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return {}
+    groups: dict[int, set[int]] = {}
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            if process_state(pid) == "Z":
+                continue
+            if process_environment_value(pid, GRADER_OWNER_ENV) != binding_sha256:
+                continue
+            pgid = os.getpgid(pid)
+        except (OSError, ProcessLookupError):
+            continue
+        groups.setdefault(pgid, set()).add(pid)
+    return groups
+
+
+def terminate_owned_grader_group(
+    pgid: int,
+    binding_sha256: str,
+    *,
+    timeout_seconds: float = PROCESS_GROUP_SETTLE_SECONDS,
+) -> dict[str, Any]:
+    if timeout_seconds < 0:
+        raise ValueError("grader group timeout cannot be negative")
+    before = owned_grader_group_members(pgid, binding_sha256)
+    if before:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + timeout_seconds
+    residue = owned_grader_group_members(pgid, binding_sha256)
+    while residue and time.monotonic() < deadline:
+        time.sleep(0.05)
+        residue = owned_grader_group_members(pgid, binding_sha256)
+    if residue:
+        raise GraderContractError(
+            "owned grader process group did not become empty: "
+            + ",".join(str(pid) for pid in sorted(residue))
+        )
+    return {
+        "pgid": pgid,
+        "members_before": sorted(before),
+        "residue": [],
+    }
+
+
+def grader_process_is_alive(
+    pid: int,
+    start_ticks: int,
+    command: list[str],
+) -> bool:
+    try:
+        return (
+            process_state(pid) != "Z"
+            and process_start_ticks(pid) == start_ticks
+            and process_arguments(pid) == command
+        )
+    except ProcessLookupError:
+        return False
+
+
+def find_matching_grader_process(command: list[str]) -> tuple[int, int] | None:
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return None
+    matches = []
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            if process_state(pid) != "Z" and process_arguments(pid) == command:
+                matches.append((pid, process_start_ticks(pid)))
+        except (OSError, ProcessLookupError):
+            continue
+    if len(matches) > 1:
+        raise GraderContractError("multiple identity-matching grader processes are live")
+    return matches[0] if matches else None
+
+
+def append_command_ledger(
+    config: OfficialGraderConfig,
+    event: Mapping[str, Any],
+) -> None:
+    path = config.command_ledger_path
+    if path is None:
+        return
+    if not isinstance(event, Mapping) or not isinstance(event.get("event_id"), str):
+        raise GraderContractError("command-ledger event is invalid")
+    ensure_private_directory(path.parent)
+    payload = canonical_json_bytes(dict(event)) + b"\n"
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "r+b", closefd=False) as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            existing = stream.read().splitlines()
+            for line in existing:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError as error:
+                    raise GraderContractError(
+                        "command-exit ledger is malformed"
+                    ) from error
+                if row.get("event_id") == event["event_id"]:
+                    if canonical_json_bytes(row) + b"\n" != payload:
+                        raise GraderContractError(
+                            "command-ledger event identity conflicted"
+                        )
+                    return
+            stream.seek(0, os.SEEK_END)
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        os.close(descriptor)
+
+
+def read_started_receipt(
+    attempt_root: Path,
+    command: list[str],
+) -> dict[str, Any]:
+    started = read_json(attempt_root / "started.json")
+    if not isinstance(started, Mapping):
+        raise GraderContractError("grader start receipt is invalid")
+    schema = started.get("schema")
+    v2_fields = {
+        "schema",
+        "started_at_ns",
+        "pid",
+        "start_ticks",
+        "command_sha256",
+    }
+    v3_fields = v2_fields | {"pgid"}
+    v4_fields = v3_fields | {"owner_binding_sha256"}
+    if (schema == "swebench_triad_grader_started_v2" and set(started) != v2_fields) or (
+        schema == "swebench_triad_grader_started_v3" and set(started) != v3_fields
+    ) or (
+        schema == "swebench_triad_grader_started_v4" and set(started) != v4_fields
+    ):
+        raise GraderContractError("grader start receipt is invalid")
+    if schema not in {
+        "swebench_triad_grader_started_v2",
+        "swebench_triad_grader_started_v3",
+        "swebench_triad_grader_started_v4",
+    }:
+        raise GraderContractError("grader start receipt schema drifted")
+    pid = started.get("pid")
+    ticks = started.get("start_ticks")
+    if type(pid) is not int or pid <= 0 or type(ticks) is not int or ticks <= 0:
+        raise GraderContractError("grader process identity is invalid")
+    if schema in {
+        "swebench_triad_grader_started_v3",
+        "swebench_triad_grader_started_v4",
+    } and started.get("pgid") != pid:
+        raise GraderContractError("grader process-group identity drifted")
+    if schema == "swebench_triad_grader_started_v4":
+        require_sha256(started.get("owner_binding_sha256"), "grader owner binding")
+    if started.get("command_sha256") != sha256_json(command):
+        raise GraderContractError("grader process command digest drifted")
+    return dict(started)
+
+
+def started_process(
+    attempt_root: Path,
+    command: list[str],
+) -> tuple[int, int, bool]:
+    started = read_started_receipt(attempt_root, command)
+    pid = started["pid"]
+    ticks = started["start_ticks"]
+    alive = grader_process_is_alive(pid, ticks, command)
+    if alive:
+        try:
+            pgid = os.getpgid(pid)
+        except ProcessLookupError:
+            alive = False
+        else:
+            if pgid != pid:
+                raise GraderContractError("live grader escaped its exact process group")
+    return pid, ticks, alive
+
+
+def read_launching_receipt(
+    attempt_root: Path,
+    command: list[str],
+    binding_sha256: str,
+) -> dict[str, Any] | None:
+    path = attempt_root / "launching.json"
+    if not path.exists():
+        return None
+    value = read_json(path)
+    fields = {
+        "schema",
+        "binding_sha256",
+        "started_at_ns",
+        "command_sha256",
+    }
+    if not isinstance(value, Mapping) or set(value) != fields:
+        raise GraderContractError("grader launching receipt is invalid")
+    if value.get("schema") != "swebench_triad_grader_launching_v1":
+        raise GraderContractError("grader launching receipt schema drifted")
+    if value.get("binding_sha256") != binding_sha256:
+        raise GraderContractError("grader launching binding drifted")
+    started_at_ns = value.get("started_at_ns")
+    if type(started_at_ns) is not int or started_at_ns <= 0:
+        raise GraderContractError("grader launching time is invalid")
+    if value.get("command_sha256") != sha256_json(command):
+        raise GraderContractError("grader launching command drifted")
+    return dict(value)
+
+
+def terminate_grader_process_group(
+    process: subprocess.Popen[Any],
+    *,
+    expected_start_ticks: int,
+    binding_sha256: str,
+) -> None:
+    """Kill and reap only the new session created for this exact Popen."""
+
+    pid = getattr(process, "pid", None)
+    if type(pid) is not int or pid <= 0:
+        raise GraderContractError("spawned grader PID is invalid")
+    try:
+        current_ticks = process_start_ticks(pid)
+    except ProcessLookupError:
+        current_ticks = None
+    if current_ticks is not None and current_ticks != expected_start_ticks:
+        raise GraderContractError("refusing to signal a reused grader PID")
+    terminate_unreceipted_grader_process_group(process, binding_sha256)
+
+
+def terminate_unreceipted_grader_process_group(
+    process: subprocess.Popen[Any],
+    binding_sha256: str,
+) -> None:
+    pid = getattr(process, "pid", None)
+    if type(pid) is not int or pid <= 0:
+        raise GraderContractError("spawned grader PID is invalid")
+    try:
+        pgid = os.getpgid(pid)
+    except ProcessLookupError:
+        pgid = None
+    if pgid is not None and pgid != pid:
+        raise GraderContractError("spawned grader did not own a new session")
+    members = owned_grader_group_members(pid, binding_sha256)
+    if members:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        process.communicate()
+    except (OSError, ValueError):
+        try:
+            process.wait(timeout=30)
+        except (AttributeError, OSError, subprocess.TimeoutExpired):
+            pass
+    terminate_owned_grader_group(pid, binding_sha256)
+
+
+def abandon_pre_receipt_attempt(
+    config: OfficialGraderConfig,
+    request: OfficialGradeRequest,
+    attempt_root: Path,
+    ledger_base: Mapping[str, Any],
+    command: list[str],
+    *,
+    reason: str,
+) -> None:
+    del request
+    binding_sha256 = str(ledger_base["binding_sha256"])
+    append_start_ledger(config, attempt_root, command, ledger_base)
+    write_immutable_json(
+        attempt_root / "abandoned.json",
+        {
+            "schema": "swebench_triad_grader_abandoned_v1",
+            "binding_sha256": binding_sha256,
+            "reason": reason,
+        },
+    )
+    append_command_ledger(
+        config,
+        {
+            **dict(ledger_base),
+            "event_id": binding_sha256 + ":abandoned",
+            "event": "abandoned",
+            "reason": reason,
+        },
+    )
+    raise_retryable(
+        attempt_root,
+        "grader_pre_receipt_attempt_abandoned",
+        "grader pre-receipt attempt was durably abandoned; use a new attempt",
+    )
+
+
+def recover_abandoned_attempt(
+    config: OfficialGraderConfig,
+    request: OfficialGradeRequest,
+    attempt_root: Path,
+    ledger_base: Mapping[str, Any],
+    command: list[str],
+) -> None:
+    value = read_json(attempt_root / "abandoned.json")
+    fields = {"schema", "binding_sha256", "reason"}
+    if not isinstance(value, Mapping) or set(value) != fields:
+        raise GraderContractError("grader abandoned receipt is invalid")
+    if value.get("schema") != "swebench_triad_grader_abandoned_v1":
+        raise GraderContractError("grader abandoned receipt schema drifted")
+    binding_sha256 = str(ledger_base["binding_sha256"])
+    if value.get("binding_sha256") != binding_sha256:
+        raise GraderContractError("grader abandoned binding drifted")
+    reason = value.get("reason")
+    pre_receipt_reasons = {
+        "pre_receipt_group_without_leader",
+        "pre_receipt_output_without_process",
+        "launching_without_process",
+    }
+    if reason not in pre_receipt_reasons | {"dead_without_process_result"}:
+        raise GraderContractError("grader abandoned reason drifted")
+    event = {
+        **dict(ledger_base),
+        "event_id": binding_sha256 + ":abandoned",
+        "event": "abandoned",
+        "reason": reason,
+    }
+    started_path = attempt_root / "started.json"
+    if reason == "dead_without_process_result":
+        if not started_path.exists():
+            raise GraderContractError("dead grader abandonment lacks start receipt")
+        started = read_started_receipt(attempt_root, command)
+        event.update(pid=started["pid"], start_ticks=started["start_ticks"])
+        failure_class = "grader_attempt_incomplete"
+        message = "grader attempt has no process completion receipt"
+    else:
+        if started_path.exists():
+            raise GraderContractError("pre-receipt abandonment has a start receipt")
+        failure_class = "grader_pre_receipt_attempt_abandoned"
+        message = "grader pre-receipt attempt was durably abandoned; use a new attempt"
+    append_start_ledger(config, attempt_root, command, ledger_base)
+    append_command_ledger(config, event)
+    raise_retryable(attempt_root, failure_class, message)
+
+
+def append_start_ledger(
+    config: OfficialGraderConfig,
+    attempt_root: Path,
+    command: list[str],
+    ledger_base: Mapping[str, Any],
+) -> None:
+    binding_sha256 = str(ledger_base["binding_sha256"])
+    append_command_ledger(
+        config,
+        {
+            **dict(ledger_base),
+            "event_id": binding_sha256 + ":start",
+            "event": "start",
+            "command": command,
+            "cwd": str(attempt_root),
+            "environment": safe_environment_receipt(config),
+        },
+    )
+
+
+def persist_process_timeout(
+    config: OfficialGraderConfig,
+    attempt_root: Path,
+    process_result_path: Path,
+    ledger_base: Mapping[str, Any],
+    *,
+    stdout: bytes = b"",
+    stderr: bytes = b"",
+) -> None:
+    stdout = bytes_or_empty(stdout)
+    stderr = bytes_or_empty(stderr)
+    write_immutable_bytes(attempt_root / "stdout.log", stdout)
+    write_immutable_bytes(attempt_root / "stderr.log", stderr)
+    process_result = {
+        "schema": "swebench_triad_grader_process_v1",
+        "status": "process_timeout",
+        "returncode": None,
+        "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
+        "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+    }
+    write_immutable_json(process_result_path, process_result)
+    binding_sha256 = str(ledger_base["binding_sha256"])
+    append_command_ledger(
+        config,
+        {
+            **dict(ledger_base),
+            "event_id": binding_sha256 + ":exit",
+            "event": "exit",
+            "process_result": process_result,
+        },
+    )
+    raise_retryable(
+        attempt_root,
+        "grader_process_timeout",
+        "official grader process exceeded its outer timeout",
+    )
+
+
 def run_official_grader(
     config: OfficialGraderConfig,
     request: OfficialGradeRequest,
@@ -899,32 +1451,215 @@ def run_official_grader(
 
     started_path = attempt_root / "started.json"
     process_result_path = attempt_root / "process-result.json"
-    if started_path.exists():
-        if process_result_path.exists():
-            return finish_grade_attempt(attempt_root, request)
-        raise RetryableGraderError(
-            "grader attempt has no process completion receipt",
-            failure_class="grader_attempt_incomplete",
-            attempt_directory=attempt_root,
-        )
-
-    aggregate_path, _, _, _ = expected_raw_paths(attempt_root, request)
-    run_root = attempt_root / "logs" / "run_evaluation" / grader_run_id(request)
-    if aggregate_path.exists() or run_root.exists():
-        raise GraderContractError("grader attempt contains stale pre-launch output")
-
-    environment_receipt = verify_grader_environment(config)
-    verify_instance_in_dataset(config.dataset_path, request.prediction["instance_id"])
     command = grader_command(
         config,
         request,
         prediction_path=prediction_path,
     )
+    binding_sha256 = sha256_json(binding)
+    ledger_base = {
+        "schema": "swebench_triad_command_exit_event_v1",
+        "binding_sha256": binding_sha256,
+        "task_index": request.task_index,
+        "arm": request.arm,
+        "generation": request.generation,
+        "grader_attempt": request.grader_attempt,
+        "prediction_sha256": binding["prediction_sha256"],
+    }
+    abandoned_path = attempt_root / "abandoned.json"
+    if abandoned_path.exists() and process_result_path.exists():
+        raise GraderContractError("grader attempt has multiple terminal receipts")
+    if abandoned_path.exists():
+        recover_abandoned_attempt(
+            config,
+            request,
+            attempt_root,
+            ledger_base,
+            command,
+        )
+    if process_result_path.exists() and not started_path.exists():
+        append_start_ledger(config, attempt_root, command, ledger_base)
+        result = read_json(process_result_path)
+        append_command_ledger(
+            config,
+            {
+                **ledger_base,
+                "event_id": binding_sha256 + ":exit",
+                "event": "exit",
+                "process_result": result,
+            },
+        )
+        return finish_grade_attempt(attempt_root, request, command=command)
+    launching = read_launching_receipt(attempt_root, command, binding_sha256)
+    if started_path.exists():
+        started = read_started_receipt(attempt_root, command)
+        owner_binding = started.get("owner_binding_sha256")
+        if owner_binding is not None and owner_binding != binding_sha256:
+            raise GraderContractError("grader start owner binding drifted")
+        pgid = int(started.get("pgid", started["pid"]))
+        if process_result_path.exists():
+            terminate_owned_grader_group(pgid, binding_sha256)
+            result = read_json(process_result_path)
+            append_command_ledger(
+                config,
+                {
+                    **ledger_base,
+                    "event_id": binding_sha256 + ":exit",
+                    "event": "exit",
+                    "process_result": result,
+                },
+            )
+            return finish_grade_attempt(
+                attempt_root, request, command=command
+            )
+        pid, ticks, alive = started_process(attempt_root, command)
+        if owner_binding is not None:
+            group_members = owned_grader_group_members(pgid, binding_sha256)
+            if alive and pid not in group_members:
+                raise GraderContractError(
+                    "live grader leader is absent from its owned process group"
+                )
+        if alive:
+            started_at_ns = started["started_at_ns"]
+            deadline_ns = started_at_ns + int(
+                (config.timeout_seconds + PROCESS_TIMEOUT_GRACE_SECONDS)
+                * 1_000_000_000
+            )
+            if time.time_ns() >= deadline_ns:
+                terminate_owned_grader_group(pgid, binding_sha256)
+                persist_process_timeout(
+                    config,
+                    attempt_root,
+                    process_result_path,
+                    ledger_base,
+                )
+            raise GraderBusyError(
+                f"official grader is still live: pid={pid} start_ticks={ticks}"
+            )
+        terminate_owned_grader_group(pgid, binding_sha256)
+        write_immutable_json(
+            attempt_root / "abandoned.json",
+            {
+                "schema": "swebench_triad_grader_abandoned_v1",
+                "binding_sha256": binding_sha256,
+                "reason": "dead_without_process_result",
+            },
+        )
+        append_command_ledger(
+            config,
+            {
+                **ledger_base,
+                "event_id": binding_sha256 + ":abandoned",
+                "event": "abandoned",
+                "pid": pid,
+                "start_ticks": ticks,
+                "reason": "dead_without_process_result",
+            },
+        )
+        raise_retryable(
+            attempt_root,
+            "grader_attempt_incomplete",
+            "grader attempt has no process completion receipt",
+        )
+
+    aggregate_path, _, _, _ = expected_raw_paths(attempt_root, request)
+    run_root = attempt_root / "logs" / "run_evaluation" / grader_run_id(request)
+    matching = find_matching_grader_process(command)
+    if matching is not None:
+        try:
+            matching_pgid = os.getpgid(matching[0])
+        except ProcessLookupError:
+            matching = None
+        else:
+            if matching_pgid != matching[0]:
+                raise GraderContractError(
+                    "pre-receipt grader escaped its exact process group"
+                )
+    if matching is not None:
+        if process_environment_value(matching[0], GRADER_OWNER_ENV) != binding_sha256:
+            raise GraderContractError("pre-receipt grader owner binding drifted")
+        if matching[0] not in owned_grader_group_members(
+            matching[0], binding_sha256
+        ):
+            raise GraderContractError(
+                "pre-receipt grader leader is absent from its owned process group"
+            )
+        if launching is None:
+            raise GraderContractError("live pre-receipt grader lacks launch time")
+        append_start_ledger(config, attempt_root, command, ledger_base)
+        write_immutable_json(
+            started_path,
+            {
+                "schema": "swebench_triad_grader_started_v4",
+                "started_at_ns": launching["started_at_ns"],
+                "pid": matching[0],
+                "pgid": matching[0],
+                "start_ticks": matching[1],
+                "command_sha256": sha256_json(command),
+                "owner_binding_sha256": binding_sha256,
+            },
+        )
+        deadline_ns = launching["started_at_ns"] + int(
+            (config.timeout_seconds + PROCESS_TIMEOUT_GRACE_SECONDS)
+            * 1_000_000_000
+        )
+        if time.time_ns() >= deadline_ns:
+            terminate_owned_grader_group(matching[0], binding_sha256)
+            persist_process_timeout(
+                config,
+                attempt_root,
+                process_result_path,
+                ledger_base,
+            )
+        raise GraderBusyError(
+            "official grader is live in the pre-receipt crash window: "
+            f"pid={matching[0]} start_ticks={matching[1]}"
+        )
+
+    owned_groups = owned_grader_process_groups(binding_sha256)
+    if len(owned_groups) > 1:
+        raise GraderContractError("pre-receipt grader spans multiple process groups")
+    if owned_groups:
+        pgid = next(iter(owned_groups))
+        terminate_owned_grader_group(pgid, binding_sha256)
+        abandon_pre_receipt_attempt(
+            config,
+            request,
+            attempt_root,
+            ledger_base,
+            command,
+            reason="pre_receipt_group_without_leader",
+        )
+    if launching is not None:
+        abandon_pre_receipt_attempt(
+            config,
+            request,
+            attempt_root,
+            ledger_base,
+            command,
+            reason=(
+                "pre_receipt_output_without_process"
+                if aggregate_path.exists() or run_root.exists()
+                else "launching_without_process"
+            ),
+        )
+    if aggregate_path.exists() or run_root.exists():
+        abandon_pre_receipt_attempt(
+            config,
+            request,
+            attempt_root,
+            ledger_base,
+            command,
+            reason="pre_receipt_output_without_process",
+        )
+
+    environment_receipt = verify_grader_environment(config)
+    verify_instance_in_dataset(config.dataset_path, request.prediction["instance_id"])
     write_immutable_json(
         attempt_root / "invocation.json",
         {
             "schema": "swebench_triad_official_invocation_v1",
-            "binding_sha256": sha256_json(binding),
+            "binding_sha256": binding_sha256,
             "command": command,
             "cwd": str(attempt_root),
             "environment": safe_environment_receipt(config),
@@ -933,75 +1668,138 @@ def run_official_grader(
     )
 
     started_at_ns = time.time_ns()
-    write_immutable_json(
-        started_path,
-        {
-            "schema": "swebench_triad_grader_started_v1",
-            "started_at_ns": started_at_ns,
-        },
+    append_start_ledger(config, attempt_root, command, ledger_base)
+    environment = grader_environment(
+        config,
+        owner_binding_sha256=binding_sha256,
     )
-    environment = grader_environment(config)
+    process: subprocess.Popen[Any] | None = None
+    ticks: int | None = None
     try:
-        completed = subprocess.run(
+        write_immutable_json(
+            attempt_root / "launching.json",
+            {
+                "schema": "swebench_triad_grader_launching_v1",
+                "binding_sha256": binding_sha256,
+                "started_at_ns": started_at_ns,
+                "command_sha256": sha256_json(command),
+            },
+        )
+        process = subprocess.Popen(
             command,
             cwd=attempt_root,
             env=environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=config.timeout_seconds + PROCESS_TIMEOUT_GRACE_SECONDS,
-            check=False,
+            start_new_session=True,
+        )
+        ticks = process_start_ticks(process.pid)
+        write_immutable_json(
+            started_path,
+            {
+                "schema": "swebench_triad_grader_started_v4",
+                "started_at_ns": started_at_ns,
+                "pid": process.pid,
+                "pgid": process.pid,
+                "start_ticks": ticks,
+                "command_sha256": sha256_json(command),
+                "owner_binding_sha256": binding_sha256,
+            },
+        )
+        stdout, stderr = process.communicate(
+            timeout=config.timeout_seconds + PROCESS_TIMEOUT_GRACE_SECONDS
         )
     except subprocess.TimeoutExpired as error:
-        stdout = bytes_or_empty(error.stdout)
-        stderr = bytes_or_empty(error.stderr)
-        write_immutable_bytes(attempt_root / "stdout.log", stdout)
-        write_immutable_bytes(attempt_root / "stderr.log", stderr)
-        write_immutable_json(
-            process_result_path,
-            {
-                "schema": "swebench_triad_grader_process_v1",
-                "status": "process_timeout",
-                "returncode": None,
-                "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
-                "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
-            },
+        if process is None or ticks is None:
+            raise GraderContractError("grader timeout preceded process identity") from error
+        terminate_grader_process_group(
+            process,
+            expected_start_ticks=ticks,
+            binding_sha256=binding_sha256,
         )
-        raise_retryable(
+        final_stdout = getattr(error, "stdout", None)
+        final_stderr = getattr(error, "stderr", None)
+        stdout = bytes_or_empty(final_stdout or error.stdout)
+        stderr = bytes_or_empty(final_stderr or error.stderr)
+        persist_process_timeout(
+            config,
             attempt_root,
-            "grader_process_timeout",
-            "official grader process exceeded its outer timeout",
+            process_result_path,
+            ledger_base,
+            stdout=stdout,
+            stderr=stderr,
         )
     except OSError as error:
-        write_immutable_json(
-            process_result_path,
+        post_spawn = process is not None
+        if process is not None:
+            if ticks is None:
+                terminate_unreceipted_grader_process_group(
+                    process, binding_sha256
+                )
+            else:
+                terminate_grader_process_group(
+                    process,
+                    expected_start_ticks=ticks,
+                    binding_sha256=binding_sha256,
+                )
+        process_result = {
+            "schema": "swebench_triad_grader_process_v1",
+            "status": "post_spawn_error" if post_spawn else "spawn_error",
+            "returncode": None,
+            "error_class": type(error).__name__,
+        }
+        write_immutable_json(process_result_path, process_result)
+        append_command_ledger(
+            config,
             {
-                "schema": "swebench_triad_grader_process_v1",
-                "status": "spawn_error",
-                "returncode": None,
-                "error_class": type(error).__name__,
+                **ledger_base,
+                "event_id": binding_sha256 + ":exit",
+                "event": "exit",
+                "process_result": process_result,
             },
         )
         raise_retryable(
             attempt_root,
-            "grader_spawn_failure",
-            "official grader process could not start",
+            "grader_post_spawn_failure" if post_spawn else "grader_spawn_failure",
+            "official grader process could not start or persist its identity",
         )
+    except BaseException:
+        if process is not None:
+            if ticks is None:
+                terminate_unreceipted_grader_process_group(
+                    process, binding_sha256
+                )
+            else:
+                terminate_grader_process_group(
+                    process,
+                    expected_start_ticks=ticks,
+                    binding_sha256=binding_sha256,
+                )
+        raise
 
-    stdout = bytes_or_empty(completed.stdout)
-    stderr = bytes_or_empty(completed.stderr)
+    terminate_owned_grader_group(process.pid, binding_sha256)
+    stdout = bytes_or_empty(stdout)
+    stderr = bytes_or_empty(stderr)
     write_immutable_bytes(attempt_root / "stdout.log", stdout)
     write_immutable_bytes(attempt_root / "stderr.log", stderr)
-    write_immutable_json(
-        process_result_path,
+    process_result = {
+        "schema": "swebench_triad_grader_process_v1",
+        "status": "completed",
+        "returncode": process.returncode,
+        "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
+        "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+    }
+    write_immutable_json(process_result_path, process_result)
+    append_command_ledger(
+        config,
         {
-            "schema": "swebench_triad_grader_process_v1",
-            "status": "completed",
-            "returncode": completed.returncode,
-            "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
-            "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+            **ledger_base,
+            "event_id": binding_sha256 + ":exit",
+            "event": "exit",
+            "process_result": process_result,
         },
     )
-    return finish_grade_attempt(attempt_root, request)
+    return finish_grade_attempt(attempt_root, request, command=command)
 
 
 __all__ = [
@@ -1012,8 +1810,10 @@ __all__ = [
     "OfficialGraderConfig",
     "RetryableGraderError",
     "grade_attempt_directory",
+    "expected_raw_paths",
     "grader_run_id",
     "run_official_grader",
+    "terminate_grader_process_group",
     "verify_grader_environment",
     "verify_pinned_import",
 ]

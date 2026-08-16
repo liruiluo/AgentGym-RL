@@ -5,8 +5,10 @@ import os
 from pathlib import Path
 import stat
 import tempfile
+import threading
 import unittest
 
+from paired_eval.serialization import sha256_json as paired_sha256_json
 from swebench_triad_eval.atomic import (
     ImmutableConflictError,
     atomic_write_json,
@@ -19,9 +21,11 @@ from swebench_triad_eval.state import (
     CellKey,
     CellStateStore,
     ClaimBusyError,
+    DriverLeaseRegistry,
     FenceViolationError,
     ManifestCell,
     OwnerIdentity,
+    sha256_json,
 )
 
 
@@ -92,6 +96,10 @@ class AtomicStateTest(unittest.TestCase):
         with self.assertRaises(ImmutableConflictError):
             write_immutable_json(path, {"value": 2})
         self.assertEqual(path.read_bytes(), canonical_json_bytes({"value": 1}))
+
+    def test_logical_json_digest_matches_paired_evidence_encoding(self) -> None:
+        value = {"task_id": "task-0", "model_patch": ""}
+        self.assertEqual(sha256_json(value), paired_sha256_json(value))
 
     def test_live_claim_is_busy_dead_claim_is_fenced_and_reclaimed(self) -> None:
         store_a = self.make_store(self.owner_a)
@@ -185,6 +193,58 @@ class AtomicStateTest(unittest.TestCase):
         with self.assertRaises(ImmutableConflictError):
             store.record_endpoint(token, changed)
 
+    def test_accepted_record_is_bound_to_current_manifest_and_all_artifacts(
+        self,
+    ) -> None:
+        store = self.make_store(self.owner_a)
+        for cell in self.cells:
+            self.accept(store, cell)
+        key = self.cells[0].key
+        path = store.accepted_path(key)
+        original = json.loads(path.read_text())
+        mutations = {
+            "schema": {**original, "schema": "stale-schema"},
+            "cell": {
+                **original,
+                "cell": {"task_index": 0, "arm": "amg_memory"},
+            },
+            "instance": {**original, "instance_id": "other-task"},
+            "manifest": {**original, "manifest_cell_sha256": SHA_D},
+            "generation": {**original, "attempt_generation": 0},
+            "endpoint": {**original, "endpoint_sha256": SHA_D},
+            "prediction": {**original, "prediction_sha256": SHA_D},
+            "handoff": {**original, "handoff_sha256": SHA_D},
+            "fields": {**original, "unexpected": True},
+        }
+        for label, mutation in mutations.items():
+            with self.subTest(label=label):
+                atomic_write_json(path, mutation)
+                with self.assertRaises(ValueError):
+                    store.assemble_results()
+                atomic_write_json(path, original)
+
+        stale_cells = (
+            ManifestCell(key, "task-0", SHA_D),
+            *self.cells[1:],
+        )
+        stale_store = CellStateStore(
+            self.root,
+            manifest=stale_cells,
+            owner=self.owner_a,
+            owner_is_alive=lambda candidate: candidate in self.live,
+            endpoint_validator=endpoint_validator,
+        )
+        with self.assertRaises(ValueError):
+            stale_store.assemble_results()
+
+    def test_endpoint_rejects_conflicting_dual_task_identities(self) -> None:
+        store = self.make_store(self.owner_a)
+        token = store.acquire(self.cells[0].key)
+        row = endpoint_row("task-0", "native")
+        row["task_id"] = "different-task"
+        with self.assertRaisesRegex(ValueError, "cell identity drifted"):
+            store.record_endpoint(token, row)
+
     def test_results_and_outcomes_require_exact_manifest_join(self) -> None:
         store = self.make_store(self.owner_a)
         for cell in self.cells:
@@ -192,9 +252,11 @@ class AtomicStateTest(unittest.TestCase):
         rows = store.assemble_results()
         self.assertEqual([row["arm"] for row in rows], [cell.key.arm for cell in self.cells])
 
+        grade_tokens = {}
         for index, cell in enumerate(self.cells):
+            grade_tokens[cell.key] = store.acquire_grade(cell.key)
             store.record_official_outcome(
-                cell.key,
+                grade_tokens[cell.key],
                 {
                     "instance_id": cell.instance_id,
                     "arm": cell.key.arm,
@@ -211,7 +273,7 @@ class AtomicStateTest(unittest.TestCase):
 
         with self.assertRaises(ImmutableConflictError):
             store.record_official_outcome(
-                self.cells[0].key,
+                grade_tokens[self.cells[0].key],
                 {
                     "instance_id": "task-0",
                     "arm": "native",
@@ -220,6 +282,44 @@ class AtomicStateTest(unittest.TestCase):
                     "report_sha256": SHA_D,
                 },
             )
+
+    def test_official_outcome_is_bound_to_validated_accepted_attempt(self) -> None:
+        store = self.make_store(self.owner_a)
+        for cell in self.cells:
+            self.accept(store, cell)
+            token = store.acquire_grade(cell.key)
+            store.record_official_outcome(
+                token,
+                {
+                    "instance_id": cell.instance_id,
+                    "arm": cell.key.arm,
+                    "resolved": False,
+                    "failure_class": None,
+                    "report_sha256": SHA_D,
+                },
+            )
+
+        key = self.cells[0].key
+        path = store.outcome_path(key)
+        original = json.loads(path.read_text())
+        mutations = {
+            "schema": {**original, "schema": "stale-schema"},
+            "prediction": {**original, "prediction_sha256": SHA_A},
+            "generation": {
+                **original,
+                "attempt_generation": original["attempt_generation"] + 1,
+            },
+            "report": {**original, "report_sha256": "not-a-digest"},
+            "fields": {**original, "unexpected": True},
+        }
+        for label, mutation in mutations.items():
+            with self.subTest(label=label):
+                atomic_write_json(path, mutation)
+                with self.assertRaises(ValueError):
+                    store.official_summary()
+                with self.assertRaises(ValueError):
+                    store.acquire_grade(key)
+                atomic_write_json(path, original)
 
     def test_invalid_manifest_and_non_boolean_outcomes_fail_closed(self) -> None:
         with self.assertRaises(ValueError):
@@ -232,9 +332,10 @@ class AtomicStateTest(unittest.TestCase):
             )
         store = self.make_store(self.owner_a)
         self.accept(store, self.cells[0])
+        grade_token = store.acquire_grade(self.cells[0].key)
         with self.assertRaises(ValueError):
             store.record_official_outcome(
-                self.cells[0].key,
+                grade_token,
                 {
                     "instance_id": "task-0",
                     "arm": "native",
@@ -243,6 +344,100 @@ class AtomicStateTest(unittest.TestCase):
                     "report_sha256": SHA_D,
                 },
             )
+
+    def test_official_grading_is_live_owner_fenced(self) -> None:
+        store_a = self.make_store(self.owner_a)
+        self.accept(store_a, self.cells[0])
+        token_a = store_a.acquire_grade(self.cells[0].key)
+        self.live.remove(self.owner_a)
+        store_b = self.make_store(self.owner_b)
+        token_b = store_b.acquire_grade(self.cells[0].key)
+        self.assertEqual(token_b.generation, token_a.generation + 1)
+        outcome = {
+            "instance_id": "task-0",
+            "arm": "native",
+            "resolved": False,
+            "failure_class": None,
+            "report_sha256": SHA_D,
+        }
+        with self.assertRaises(FenceViolationError):
+            store_a.record_official_outcome(token_a, outcome)
+        store_b.record_official_outcome(token_b, outcome)
+
+
+class CrossHostLeaseRegistryTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name) / "leases"
+        self.now = 1_000_000_000
+        self.owner_a = OwnerIdentity("host-a", "boot-a", 101, 1001)
+        self.owner_b = OwnerIdentity("host-b", "boot-b", 202, 2002)
+
+    def registry(self, owner, tasks):
+        return DriverLeaseRegistry(
+            self.root,
+            owner=owner,
+            assigned_task_indices=tasks,
+            now_ns=lambda: self.now,
+            ttl_ns=60_000_000_000,
+            local_owner_is_alive=lambda _owner: True,
+        )
+
+    def test_disjoint_shards_coexist_and_global_lane_is_exclusive(self) -> None:
+        first = self.registry(self.owner_a, (0, 2, 4))
+        second = self.registry(self.owner_b, (1, 3, 5))
+        first.acquire()
+        second.acquire()
+        self.assertTrue(second.owner_is_alive(self.owner_a))
+        self.assertEqual(first.assigned_task_indices, (0, 2, 4))
+        self.assertEqual(second.assigned_task_indices, (1, 3, 5))
+
+        first.acquire_lane(task_index=0)
+        with self.assertRaises(ClaimBusyError):
+            second.acquire_lane(task_index=1)
+        first.release_lane()
+        second.acquire_lane(task_index=1)
+
+    def test_overlapping_two_driver_race_has_exactly_one_winner(self) -> None:
+        first = self.registry(self.owner_a, (0,))
+        second = self.registry(self.owner_b, (0,))
+        barrier = threading.Barrier(2)
+        results = []
+        result_lock = threading.Lock()
+
+        def race(registry):
+            barrier.wait()
+            try:
+                registry.acquire()
+                value = "acquired"
+            except ClaimBusyError:
+                value = "busy"
+            with result_lock:
+                results.append(value)
+
+        threads = [
+            threading.Thread(target=race, args=(registry,))
+            for registry in (first, second)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(sorted(results), ["acquired", "busy"])
+
+    def test_cross_host_lock_must_release_before_takeover(self) -> None:
+        first = self.registry(self.owner_a, (0,))
+        first.acquire()
+        second = self.registry(self.owner_b, (0,))
+        self.assertTrue(second.owner_is_alive(self.owner_a))
+        self.now += 61_000_000_000
+        self.assertTrue(second.owner_is_alive(self.owner_a))
+        first._close_process_liveness_lock()
+        self.assertFalse(second.owner_is_alive(self.owner_a))
+        second.acquire()
+        self.assertTrue(second.owner_is_alive(self.owner_b))
 
 
 if __name__ == "__main__":
