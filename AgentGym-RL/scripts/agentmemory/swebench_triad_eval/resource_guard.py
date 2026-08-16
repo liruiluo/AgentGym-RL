@@ -950,21 +950,50 @@ def _read_pid_file(path: Path) -> list[int]:
     return sorted(set(values))
 
 
-def _ensure_cgroup_directory(path: Path, *, created: list[Path]) -> None:
-    pending: list[Path] = []
-    current = path
-    root = Path("/sys/fs/cgroup")
-    while current != root and not current.exists():
-        pending.append(current)
-        current = current.parent
-    _require_real_directory(current, "cgroup ancestor")
-    for candidate in reversed(pending):
+def _cgroup_directory_chain(path: Path, root: Path) -> list[Path]:
+    try:
+        relative_parts = path.relative_to(root).parts
+    except ValueError as error:
+        raise ResourceGuardError("owned cgroup path escaped its controller") from error
+    if not relative_parts:
+        raise ResourceGuardError("owned cgroup path is empty")
+    resolved_root = _require_real_directory(root, "cgroup controller root")
+    chain: list[Path] = []
+    current = resolved_root
+    for part in relative_parts:
+        current = current / part
+        chain.append(current)
+    return chain
+
+
+def _require_cgroup_directory_chain(path: Path, root: Path) -> None:
+    for candidate in _cgroup_directory_chain(path, root):
+        resolved = _require_real_directory(candidate, "owned cgroup component")
+        if resolved != candidate:
+            raise ResourceGuardError(
+                "owned cgroup component must be a real directory"
+            )
+
+
+def _ensure_cgroup_directory(
+    path: Path,
+    *,
+    root: Path,
+    created: list[Path],
+) -> None:
+    for candidate in _cgroup_directory_chain(path, root):
         try:
-            candidate.mkdir(mode=0o755)
+            candidate.lstat()
+        except FileNotFoundError:
+            try:
+                candidate.mkdir(mode=0o755)
+            except OSError as error:
+                raise ResourceGuardError("cannot create owned cgroup") from error
+            created.append(candidate)
         except OSError as error:
-            raise ResourceGuardError("cannot create owned cgroup") from error
-        created.append(candidate)
-        _require_real_directory(candidate, "owned cgroup")
+            raise ResourceGuardError("cannot inspect owned cgroup") from error
+        _require_real_directory(candidate, "owned cgroup component")
+    _require_cgroup_directory_chain(path, root)
 
 
 def _helper_prepare(request: Mapping[str, Any]) -> dict[str, Any]:
@@ -977,14 +1006,18 @@ def _helper_prepare(request: Mapping[str, Any]) -> dict[str, Any]:
     pids = _cgroup_directory("pids", relative)
     created: list[Path] = []
     try:
-        _require_real_directory(
-            memory.parents[1], "Docker-owned memory cgroup parent"
+        _ensure_cgroup_directory(
+            memory,
+            root=memory.parents[2],
+            created=created,
         )
-        _require_real_directory(
-            pids.parents[1], "Docker-owned pids cgroup parent"
+        _ensure_cgroup_directory(
+            pids,
+            root=pids.parents[2],
+            created=created,
         )
-        _ensure_cgroup_directory(memory, created=created)
-        _ensure_cgroup_directory(pids, created=created)
+        _require_cgroup_directory_chain(memory, memory.parents[2])
+        _require_cgroup_directory_chain(pids, pids.parents[2])
         if _read_pid_file(memory / "tasks") or _read_pid_file(pids / "tasks"):
             raise ResourceGuardError("owned cgroup is not empty before limits")
         _cgroup_write(memory / "memory.use_hierarchy", 1)

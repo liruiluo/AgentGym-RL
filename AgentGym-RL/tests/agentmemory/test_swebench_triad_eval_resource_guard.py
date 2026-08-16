@@ -4,7 +4,9 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
+from swebench_triad_eval import resource_guard
 from swebench_triad_eval.resource_guard import (
     CgroupV1CellEnvelope,
     CgroupV1Limits,
@@ -14,6 +16,281 @@ from swebench_triad_eval.resource_guard import (
     RootfsMutationGuard,
     TmpfsQuotaMounts,
 )
+
+
+class CgroupV1NamespaceHelperTest(unittest.TestCase):
+    request = {
+        "relative_path": (
+            "amg-external-eval-container-runtime-v1/"
+            "swebench-triad-v1/0000-native"
+        ),
+        "memory_bytes": 8 * 1024 * 1024,
+        "max_processes": 16,
+    }
+
+    def call_prepare(self, controller_roots):
+        written_values = {}
+
+        def cgroup_directory(controller, relative_path):
+            return controller_roots[controller] / relative_path
+
+        def cgroup_write(path, value):
+            written_values[path] = value
+
+        def cgroup_read(path):
+            return str(written_values[path])
+
+        with (
+            mock.patch.object(
+                resource_guard,
+                "_cgroup_directory",
+                side_effect=cgroup_directory,
+            ),
+            mock.patch.object(
+                resource_guard,
+                "_cgroup_write",
+                side_effect=cgroup_write,
+            ),
+            mock.patch.object(
+                resource_guard,
+                "_cgroup_read",
+                side_effect=cgroup_read,
+            ),
+            mock.patch.object(
+                resource_guard,
+                "_read_pid_file",
+                return_value=[],
+            ),
+        ):
+            return resource_guard._helper_prepare(self.request)
+
+    def test_prepare_creates_only_the_missing_owned_parent_hierarchy(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            controller_roots = {
+                "memory": root / "memory",
+                "pids": root / "pids",
+            }
+            for controller_root in controller_roots.values():
+                controller_root.mkdir()
+
+            receipt = self.call_prepare(controller_roots)
+
+            self.assertTrue(receipt["limits_applied_before_tasks"])
+            expected_directories = set()
+            for controller in controller_roots:
+                runtime_parent = (
+                    Path(controller) / "amg-external-eval-container-runtime-v1"
+                )
+                evaluation_parent = runtime_parent / "swebench-triad-v1"
+                expected_directories.update(
+                    {
+                        runtime_parent,
+                        evaluation_parent,
+                        evaluation_parent / "0000-native",
+                    }
+                )
+            actual_directories = {
+                path.relative_to(root)
+                for path in root.rglob("*")
+                if path.is_dir() and path not in controller_roots.values()
+            }
+            self.assertEqual(actual_directories, expected_directories)
+            for controller in controller_roots:
+                runtime_parent = (
+                    controller_roots[controller]
+                    / "amg-external-eval-container-runtime-v1"
+                )
+                self.assertTrue(runtime_parent.is_dir())
+
+    def test_prepare_rejects_symlinked_runtime_parents(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            outside = root / "outside"
+            controller_roots = {
+                "memory": root / "memory",
+                "pids": root / "pids",
+            }
+            for controller, controller_root in controller_roots.items():
+                controller_root.mkdir()
+                outside_runtime = outside / controller
+                (outside_runtime / resource_guard.CGROUP_EVALUATION_PARENT).mkdir(
+                    parents=True
+                )
+                (controller_root / resource_guard.CGROUP_RUNTIME_PARENT).symlink_to(
+                    outside_runtime,
+                    target_is_directory=True,
+                )
+
+            with self.assertRaisesRegex(ResourceGuardError, "real directory"):
+                self.call_prepare(controller_roots)
+
+            for controller, controller_root in controller_roots.items():
+                self.assertTrue(
+                    (controller_root / resource_guard.CGROUP_RUNTIME_PARENT).is_symlink()
+                )
+                self.assertFalse(
+                    (
+                        outside
+                        / controller
+                        / resource_guard.CGROUP_EVALUATION_PARENT
+                        / "0000-native"
+                    ).exists()
+                )
+
+    def test_prepare_rejects_symlinked_evaluation_parents(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            outside = root / "outside"
+            controller_roots = {
+                "memory": root / "memory",
+                "pids": root / "pids",
+            }
+            for controller, controller_root in controller_roots.items():
+                evaluation_parent = (
+                    controller_root
+                    / resource_guard.CGROUP_RUNTIME_PARENT
+                    / resource_guard.CGROUP_EVALUATION_PARENT
+                )
+                evaluation_parent.parent.mkdir(parents=True)
+                outside_evaluation = outside / controller
+                (outside_evaluation / "0000-native").mkdir(parents=True)
+                evaluation_parent.symlink_to(
+                    outside_evaluation,
+                    target_is_directory=True,
+                )
+
+            with self.assertRaisesRegex(ResourceGuardError, "real directory"):
+                self.call_prepare(controller_roots)
+
+            for controller_root in controller_roots.values():
+                self.assertTrue(
+                    (
+                        controller_root
+                        / resource_guard.CGROUP_RUNTIME_PARENT
+                        / resource_guard.CGROUP_EVALUATION_PARENT
+                    ).is_symlink()
+                )
+
+    def test_prepare_rejects_symlinked_cell_leaves(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            outside = root / "outside"
+            controller_roots = {
+                "memory": root / "memory",
+                "pids": root / "pids",
+            }
+            for controller, controller_root in controller_roots.items():
+                cell_parent = (
+                    controller_root
+                    / resource_guard.CGROUP_RUNTIME_PARENT
+                    / resource_guard.CGROUP_EVALUATION_PARENT
+                )
+                cell_parent.mkdir(parents=True)
+                outside_cell = outside / controller
+                outside_cell.mkdir(parents=True)
+                (cell_parent / "0000-native").symlink_to(
+                    outside_cell,
+                    target_is_directory=True,
+                )
+
+            with self.assertRaisesRegex(ResourceGuardError, "real directory"):
+                self.call_prepare(controller_roots)
+
+            for controller, controller_root in controller_roots.items():
+                cell = (
+                    controller_root
+                    / resource_guard.CGROUP_RUNTIME_PARENT
+                    / resource_guard.CGROUP_EVALUATION_PARENT
+                    / "0000-native"
+                )
+                self.assertTrue(cell.is_symlink())
+                self.assertEqual(list((outside / controller).iterdir()), [])
+
+    def test_prepare_rolls_back_memory_for_symlinked_pids_cell(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            outside_cell = root / "outside" / "pids-cell"
+            outside_cell.mkdir(parents=True)
+            controller_roots = {
+                "memory": root / "memory",
+                "pids": root / "pids",
+            }
+            for controller_root in controller_roots.values():
+                controller_root.mkdir()
+            pids_cell_parent = (
+                controller_roots["pids"]
+                / resource_guard.CGROUP_RUNTIME_PARENT
+                / resource_guard.CGROUP_EVALUATION_PARENT
+            )
+            pids_cell_parent.mkdir(parents=True)
+            (pids_cell_parent / "0000-native").symlink_to(
+                outside_cell,
+                target_is_directory=True,
+            )
+
+            with self.assertRaisesRegex(ResourceGuardError, "real directory"):
+                self.call_prepare(controller_roots)
+
+            self.assertFalse(
+                (
+                    controller_roots["memory"]
+                    / resource_guard.CGROUP_RUNTIME_PARENT
+                ).exists()
+            )
+            self.assertTrue((pids_cell_parent / "0000-native").is_symlink())
+            self.assertEqual(list(outside_cell.iterdir()), [])
+
+    def test_prepare_rolls_back_created_controller_hierarchy_on_rejection(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            outside_runtime = root / "outside" / "pids"
+            (outside_runtime / resource_guard.CGROUP_EVALUATION_PARENT).mkdir(
+                parents=True
+            )
+            controller_roots = {
+                "memory": root / "memory",
+                "pids": root / "pids",
+            }
+            for controller_root in controller_roots.values():
+                controller_root.mkdir()
+            (
+                controller_roots["pids"] / resource_guard.CGROUP_RUNTIME_PARENT
+            ).symlink_to(outside_runtime, target_is_directory=True)
+
+            with self.assertRaisesRegex(ResourceGuardError, "real directory"):
+                self.call_prepare(controller_roots)
+
+            self.assertFalse(
+                (
+                    controller_roots["memory"]
+                    / resource_guard.CGROUP_RUNTIME_PARENT
+                ).exists()
+            )
+            self.assertFalse(
+                (
+                    outside_runtime
+                    / resource_guard.CGROUP_EVALUATION_PARENT
+                    / "0000-native"
+                ).exists()
+            )
+
+    def test_prepare_rejects_a_path_outside_the_exact_owned_hierarchy(self) -> None:
+        with mock.patch.object(resource_guard, "_cgroup_directory") as directory:
+            with self.assertRaisesRegex(ResourceGuardError, "outside the owned scope"):
+                resource_guard._helper_prepare(
+                    {
+                        "relative_path": (
+                            "amg-external-eval-container-runtime-v1/"
+                            "swebench-triad-v1/../escape"
+                        ),
+                        "memory_bytes": 8 * 1024 * 1024,
+                        "max_processes": 16,
+                    }
+                )
+        directory.assert_not_called()
 
 
 class FakeCgroupBackend:
