@@ -140,7 +140,7 @@ class SwesmithPpoGateRowEvidenceTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             module.verify_wrapper_transition(record, previous_native_step=6)
 
-    def test_accepts_hidden_reward_on_horizon_tool_row(self) -> None:
+    def test_accepts_explicit_submission_reward_on_native_row(self) -> None:
         module = load_module()
         record = {
             "wrapper_evidence": {
@@ -168,7 +168,7 @@ class SwesmithPpoGateRowEvidenceTests(unittest.TestCase):
         result = module.verify_wrapper_transition(record, previous_native_step=29)
         self.assertEqual(result["action_kind"], "shell_command")
 
-    def test_accepts_horizon_grading_attached_to_last_native_row(self) -> None:
+    def test_accepts_no_submission_horizon_failure_attached_to_last_native_row(self) -> None:
         module = load_module()
         record = {
             "task_round": 30,
@@ -189,13 +189,13 @@ class SwesmithPpoGateRowEvidenceTests(unittest.TestCase):
                 "messages": [],
             },
             "action_submission": {"submitted_action": "shell_command"},
-            "immediate_reward": 1.0,
+            "immediate_reward": 0.0,
             "trajectory_terminal": True,
             "done": True,
-            "outcome": "success",
+            "outcome": "terminal_failure",
             "horizon_finalization": {
-                "state": "Submission accepted and graded. The issue is resolved.",
-                "reward": 1.0,
+                "state": "Episode ended without the explicit submission sentinel.",
+                "reward": 0.0,
                 "done": True,
                 "info": {
                     "env_info": {
@@ -203,7 +203,7 @@ class SwesmithPpoGateRowEvidenceTests(unittest.TestCase):
                         "step": 30,
                         "action_kind": "policy_turn_horizon",
                         "terminal": True,
-                        "episode_success": True,
+                        "episode_success": False,
                     },
                     "action_submission": {"control_action": "horizon"},
                     "native_step_before": 30,
@@ -216,7 +216,7 @@ class SwesmithPpoGateRowEvidenceTests(unittest.TestCase):
         result = module.verify_wrapper_transition(record, previous_native_step=29)
         self.assertEqual(result["action_kind"], "shell_command")
 
-    def test_rejects_horizon_reward_mismatch(self) -> None:
+    def test_rejects_horizon_positive_reward(self) -> None:
         module = load_module()
         record = {
             "task_round": 30,
@@ -288,6 +288,40 @@ class SwesmithPpoGateRowEvidenceTests(unittest.TestCase):
             indices,
             set(range(64)),
         )
+
+    def test_requires_live_submission_contract_probe(self) -> None:
+        module = load_module()
+        result = module.verify_endpoint_submission_contract_probe(
+            {
+                "schema": module.ENDPOINT_PROBE_SCHEMA,
+                "submission_contract_probe": {
+                    "horizon_slot_id": 10,
+                    "horizon_grade": None,
+                    "non_first_line_done": False,
+                    "nonzero_exit_done": False,
+                    "valid_submission_slot_id": 11,
+                    "valid_submission_grade_present": True,
+                    "valid_submission_reward": 0.0,
+                },
+            },
+            list(range(8, 16)),
+        )
+        self.assertEqual(
+            result,
+            {
+                "horizon_slot_id": 10,
+                "valid_submission_slot_id": 11,
+                "valid_submission_reward": 0.0,
+            },
+        )
+
+    def test_rejects_legacy_endpoint_probe_without_submission_contract(self) -> None:
+        module = load_module()
+        with self.assertRaises(AssertionError):
+            module.verify_endpoint_submission_contract_probe(
+                {"schema": "agentmemory_swesmith_resident_endpoint_probe_v1"},
+                list(range(8)),
+            )
 
     def test_rejects_endpoint_probe_outside_training_curriculum(self) -> None:
         module = load_module()
@@ -840,6 +874,56 @@ class SwesmithPpoGateAuditSelectionTests(unittest.TestCase):
                 "step_count": 3,
                 "actor_credit_basis": "executor_rejected",
                 "action_kind": "shell_command",
+            }],
+        )
+
+    def test_accepts_ungraded_horizon_exhaustion_without_grading(self) -> None:
+        module = load_module()
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            payload = self._audit(
+                audit_id="3" * 32,
+                index=3,
+                slot=17,
+                started_at="2026-08-09T01:00:01Z",
+            )
+            payload.update({
+                "reward": 0.0,
+                "grade": None,
+                "step_count": 30,
+                "evidence": [{
+                    "event": "horizon_exhaustion",
+                    "action": {"kind": "policy_turn_horizon"},
+                    "termination_reason": "policy_turn_horizon",
+                    "terminal_grade": {
+                        "reward": 0.0,
+                        "resolved": False,
+                        "grader_error": None,
+                        "graded": False,
+                    },
+                }],
+            })
+            (root / "episode-horizon.json").write_text(
+                json.dumps(payload), encoding="utf-8"
+            )
+            result = module.verify_audits(
+                root,
+                {"audit_ids": []},
+                {3},
+                module.parse_time("2026-08-09T01:00:00Z", "test.started_at"),
+            )
+
+        self.assertEqual(result["audit_count"], 1)
+        self.assertEqual(result["graded_audit_count"], 0)
+        self.assertEqual(
+            result["ungraded_horizon_exhaustions"],
+            [{
+                "audit_id": "3" * 32,
+                "data_idx": 3,
+                "slot_id": 17,
+                "step_count": 30,
+                "action_kind": "policy_turn_horizon",
+                "termination_reason": "policy_turn_horizon",
             }],
         )
 

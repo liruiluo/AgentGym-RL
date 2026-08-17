@@ -641,7 +641,8 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertIn("Think privately", system_prompt)
         self.assertIn("A shell command can edit", system_prompt)
         self.assertIn("workspace intentionally has no .git directory", system_prompt)
-        self.assertIn("Do not submit plain text until", system_prompt)
+        self.assertIn("COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT", system_prompt)
+        self.assertIn("turn limit ends the episode with reward 0", system_prompt)
         self.assertIn("Prose before or after a tool action is a parser error", system_prompt)
 
 
@@ -671,14 +672,14 @@ class RolloutFakeSwesmithClient(FakeSwesmithClient):
 
     def finalize_policy_horizon(self) -> StepOutput:
         return StepOutput(
-            state="workspace grader completed",
-            reward=0.5,
+            state="policy turn limit reached without submission",
+            reward=0.0,
             done=True,
             info=build_task_neutral_transition_info(
-                env_info={"resolved": True},
+                env_info={"episode_success": False, "terminal": True},
                 wrapper_evidence={
-                    "event": "horizon_grade",
-                    "outcome": "success",
+                    "event": "horizon_exhaustion",
+                    "outcome": "terminal_failure",
                 },
             ),
         )
@@ -909,10 +910,10 @@ class SharedRolloutRuntimeTest(unittest.TestCase):
             compaction["context_transition"]["operation"],
             "replace_messages",
         )
-        self.assertEqual(compaction["immediate_reward"], 0.5)
+        self.assertEqual(compaction["immediate_reward"], 0.0)
         self.assertTrue(compaction["done"])
-        self.assertEqual(compaction["outcome"], "success")
-        self.assertEqual(compaction["horizon_finalization"]["reward"], 0.5)
+        self.assertEqual(compaction["outcome"], "terminal_failure")
+        self.assertEqual(compaction["horizon_finalization"]["reward"], 0.0)
         self.assertEqual(webshop.native_calls, ["click[Buy Now]"])
         self.assertEqual(len(swesmith.native_calls), 1)
 

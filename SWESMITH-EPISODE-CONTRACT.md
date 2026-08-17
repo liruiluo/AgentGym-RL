@@ -2,11 +2,32 @@
 
 Status: active AgentMemoryGym SWE-smith RL contract.
 
+## Pinned upstream parity
+
+The semantic reference is Mini-SWE-Agent repository `SWE-agent/mini-swe-agent`
+at commit `a83fcae82d2a08f0ee0c688f9d137b3566c097f8`. SWE-smith repository code
+at `9b74ac08118a85c39c356802f7961893af73e07f` supplies the task and image;
+Mini-SWE-Agent supplies the interaction and termination contract.
+
+| Surface | Pinned upstream | AMG training adapter | Difference classification |
+| --- | --- | --- | --- |
+| Action grammar | A response contains a bash tool action; malformed responses are format errors | One sampled turn is exactly one `shell_command` or `apply_patch`; malformed/plain text is a parser error | RL serialization constraint |
+| Submission trigger | A successful shell command whose first stdout line is `COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` raises `Submitted` | The same sentinel and zero-exit/first-line check are applied after the sandbox command | Semantically identical |
+| Submission payload | SWE-bench config emits `echo ... && cat patch.txt`; remaining stdout is the patch | The persistent workspace is graded directly, so the adapter emits the sentinel-only command and records the workspace digest | Deliberate workspace-grade adaptation; not byte-equivalent patch transport |
+| Plain text | No bash action means a format error, never a submission | Plain text, including `final`, is a parser error and leaves the episode running | Semantically equivalent fail-closed behavior |
+| Turn exhaustion | `LimitsExceeded` exits with an empty submission; no workspace grade is requested | Horizon terminates with reward `0`, `grade=None`, and no hidden-grader call | Explicitly preserves upstream no-submission failure |
+| Budget | Pinned SWE-bench config uses `step_limit: 250` | Formal training launcher uses a bounded 30-turn curriculum; endpoint default remains 75; held-out native evaluation uses 250 | Deliberate training compute bound |
+| Workspace | Upstream submits a patch from a `.git` worktree | AMG keeps a persistent no-`.git` workspace and grades it once on the sentinel | Deliberate runtime adaptation |
+
+The source and contract identities above are exposed in `/metadata` and are
+checked by the procedural index and resident endpoint verifier. Any mismatch
+is fail-closed before PPO.
+
 ## Policy surface
 
 - The policy receives the issue text and a persistent repository workspace.
 - The only executable tools are Codex-style `shell_command` and `apply_patch`.
-- A normal final response submits the current workspace for grading.
+- A successful sentinel shell command submits the current workspace for grading.
 - Tool actions receive zero reward. The terminal reward is `1` only when the
   hidden verifier reports a fully resolved instance; every other terminal
   outcome receives `0`.
@@ -15,12 +36,13 @@ Status: active AgentMemoryGym SWE-smith RL contract.
 
 ## Interaction budget
 
-- Training uses at most 75 policy turns per episode. `shell_command`,
-  `apply_patch`, final submission, parser errors, and policy-authored context
+- Training uses a bounded policy-turn budget. The current formal launcher uses
+  30 turns; the endpoint default is 75. `shell_command`, `apply_patch`, the
+  sentinel submission, parser errors, and policy-authored context
   compaction each consume exactly one turn. There are no free compactions or
   parser retries, and a successful submission terminates early.
-- The 75-turn value is an AgentMemoryGym training compute bound. It is not the
-  upstream default. Pinned Mini-SWE-Agent commit
+- The configured training value is an AgentMemoryGym compute bound. It is not
+  the upstream default. Pinned Mini-SWE-Agent commit
   `a83fcae82d2a08f0ee0c688f9d137b3566c097f8` sets `step_limit: 250` for
   SWE-bench/SWE-smith in
   `src/minisweagent/config/benchmarks/swebench.yaml`.
