@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify an eight-slot SWE-smith resident endpoint without grading tasks."""
+"""Verify an eight-slot SWE-smith resident endpoint and submission contract."""
 
 from __future__ import annotations
 
@@ -17,6 +17,14 @@ from typing import Any, Callable
 
 EXPECTED_SCHEMA = "agentmemory_swesmith_native_episode_v1"
 AUDIT_SCHEMA = "agentmemory_swesmith_private_episode_audit_v1"
+EXPECTED_UPSTREAM_AGENT_REPOSITORY = "SWE-agent/mini-swe-agent"
+EXPECTED_UPSTREAM_AGENT_REVISION = (
+    "a83fcae82d2a08f0ee0c688f9d137b3566c097f8"
+)
+EXPECTED_REWARD_CONTRACT = "explicit_submission_full_resolution_binary_v2"
+EXPECTED_SUBMISSION_CONTRACT = "upstream_shell_output_sentinel_v1"
+EXPECTED_HORIZON_CONTRACT = "unified_policy_step_no_submission_failure_v2"
+SUBMISSION_SENTINEL = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
 
 
 def parse_args() -> argparse.Namespace:
@@ -109,6 +117,17 @@ def close_slots(endpoint: Endpoint, slot_ids: list[int]) -> list[str]:
     return errors
 
 
+def shell_action(command: str) -> str:
+    return "shell_command " + json.dumps(
+        {
+            "command": command,
+            "workdir": ".",
+            "timeout_ms": 120000,
+        },
+        separators=(",", ":"),
+    )
+
+
 def main() -> None:
     args = parse_args()
     indices = parse_probe_indices(args.indices)
@@ -126,7 +145,15 @@ def main() -> None:
     assert metadata_before["tool_serialization"] == (
         "qwen35_native_single_function_v1"
     )
-    assert metadata_before["reward_contract"] == "terminal_full_resolution_binary_v1"
+    assert metadata_before["upstream_agent_repository"] == (
+        EXPECTED_UPSTREAM_AGENT_REPOSITORY
+    )
+    assert metadata_before["upstream_agent_revision"] == (
+        EXPECTED_UPSTREAM_AGENT_REVISION
+    )
+    assert metadata_before["reward_contract"] == EXPECTED_REWARD_CONTRACT
+    assert metadata_before["submission_contract"] == EXPECTED_SUBMISSION_CONTRACT
+    assert metadata_before["horizon_contract"] == EXPECTED_HORIZON_CONTRACT
     assert metadata_before["context_contract"] == "one_native_issue_continuous_episode_v1"
     assert metadata_before["private_audit_contract"] == AUDIT_SCHEMA
     runtime_source = metadata_before["runtime_source"]
@@ -189,18 +216,10 @@ def main() -> None:
                 "step",
                 {
                     "id": item[0],
-                    "action": "shell_command "
-                    + json.dumps(
-                        {
-                            "command": (
-                                "mkdir -p .agent_memory && printf %s "
-                                + json.dumps(item[1])
-                                + " > .agent_memory/MEMORY.md"
-                            ),
-                            "workdir": ".",
-                            "timeout_ms": 120000,
-                        },
-                        separators=(",", ":"),
+                    "action": shell_action(
+                        "mkdir -p .agent_memory && printf %s "
+                        + json.dumps(item[1])
+                        + " > .agent_memory/MEMORY.md"
                     ),
                 },
             ),
@@ -217,15 +236,7 @@ def main() -> None:
                 "step",
                 {
                     "id": slot_id,
-                    "action": "shell_command "
-                    + json.dumps(
-                        {
-                            "command": "cat .agent_memory/MEMORY.md",
-                            "workdir": ".",
-                            "timeout_ms": 120000,
-                        },
-                        separators=(",", ":"),
-                    ),
+                    "action": shell_action("cat .agent_memory/MEMORY.md"),
                 },
             ),
             slot_ids,
@@ -235,6 +246,79 @@ def main() -> None:
             assert float(value["reward"]) == 0.0
             assert marker in value["observation"]
             assert sum(other in value["observation"] for other in markers) == 1
+
+        horizon_slot = slot_ids[0]
+        valid_submission_slot = slot_ids[1]
+        non_first_line = endpoint.request(
+            "POST",
+            "step",
+            {
+                "id": horizon_slot,
+                "action": shell_action(
+                    f"printf 'prefix\\n{SUBMISSION_SENTINEL}\\n'"
+                ),
+            },
+        )
+        assert non_first_line["done"] is False
+        assert float(non_first_line["reward"]) == 0.0
+        assert non_first_line["info"]["action_kind"] == "shell_command"
+
+        nonzero_submission = endpoint.request(
+            "POST",
+            "step",
+            {
+                "id": horizon_slot,
+                "action": shell_action(
+                    f"printf '{SUBMISSION_SENTINEL}\\n'; exit 7"
+                ),
+            },
+        )
+        assert nonzero_submission["done"] is False
+        assert float(nonzero_submission["reward"]) == 0.0
+        assert nonzero_submission["info"]["action_kind"] == "shell_command"
+
+        horizon = endpoint.request("POST", "horizon", {"id": horizon_slot})
+        assert horizon["done"] is True
+        assert float(horizon["reward"]) == 0.0
+        assert horizon["info"]["action_kind"] == "policy_turn_horizon"
+        assert horizon["info"]["episode_success"] is False
+
+        valid_submission = endpoint.request(
+            "POST",
+            "step",
+            {
+                "id": valid_submission_slot,
+                "action": shell_action(f"printf '{SUBMISSION_SENTINEL}\\n'"),
+            },
+        )
+        assert valid_submission["done"] is True
+        valid_reward = float(valid_submission["reward"])
+        assert valid_reward in {0.0, 1.0}
+        assert valid_submission["info"]["action_kind"] == "final"
+        assert valid_submission["info"]["episode_success"] is (valid_reward == 1.0)
+
+        horizon_detail = endpoint.request(
+            "GET", f"detail?id={horizon_slot}", private=True
+        )
+        assert horizon_detail["grade"] is None
+        assert horizon_detail["evidence"][-1]["event"] == "horizon_exhaustion"
+        assert horizon_detail["evidence"][-1]["terminal_grade"] == {
+            "reward": 0.0,
+            "resolved": False,
+            "grader_error": None,
+            "graded": False,
+        }
+        valid_detail = endpoint.request(
+            "GET", f"detail?id={valid_submission_slot}", private=True
+        )
+        assert valid_detail["grade"] is not None
+        assert valid_detail["evidence"][-1]["action"]["kind"] == "shell_command"
+        assert valid_detail["evidence"][-1]["termination_reason"] == (
+            "submission_sentinel"
+        )
+        assert valid_detail["evidence"][-1]["terminal_grade"]["reward"] == (
+            valid_reward
+        )
 
         metadata_active = endpoint.request("GET", "metadata")
         assert int(metadata_active["active_slot_count"]) == len(indices)
@@ -266,15 +350,31 @@ def main() -> None:
         assert int(payload["data_idx"]) == index
         assert int(payload["slot_id"]) == slot_id
         assert payload["close_reason"] == "client_close"
-        assert payload["done"] is False
-        assert float(payload["reward"]) == 0.0
-        assert int(payload["step_count"]) == 2
+        if slot_id == horizon_slot:
+            assert payload["done"] is True
+            assert float(payload["reward"]) == 0.0
+            assert int(payload["step_count"]) == 4
+            assert payload["grade"] is None
+            assert payload["evidence"][-1]["event"] == "horizon_exhaustion"
+        elif slot_id == valid_submission_slot:
+            assert payload["done"] is True
+            assert float(payload["reward"]) in {0.0, 1.0}
+            assert int(payload["step_count"]) == 3
+            assert payload["grade"] is not None
+            assert payload["evidence"][-1]["action"]["kind"] == "shell_command"
+            assert payload["evidence"][-1]["termination_reason"] == (
+                "submission_sentinel"
+            )
+        else:
+            assert payload["done"] is False
+            assert float(payload["reward"]) == 0.0
+            assert int(payload["step_count"]) == 2
         assert payload["evidence"][1]["action"]["kind"] == "shell_command"
         assert payload["evidence"][2]["result"]["stdout"] == marker
         audits.append(str(path))
 
     evidence = {
-        "schema": "agentmemory_swesmith_resident_endpoint_probe_v1",
+        "schema": "agentmemory_swesmith_resident_endpoint_probe_v2",
         "status": "pass",
         "base_url": args.base_url,
         "indices": indices,
@@ -287,6 +387,15 @@ def main() -> None:
         "metadata_before": metadata_before,
         "metadata_active": metadata_active,
         "metadata_after": metadata_after,
+        "submission_contract_probe": {
+            "horizon_slot_id": horizon_slot,
+            "horizon_grade": None,
+            "non_first_line_done": non_first_line["done"],
+            "nonzero_exit_done": nonzero_submission["done"],
+            "valid_submission_slot_id": valid_submission_slot,
+            "valid_submission_grade_present": valid_detail["grade"] is not None,
+            "valid_submission_reward": valid_reward,
+        },
         "workspace_residue_count": 0,
     }
     args.output.write_text(

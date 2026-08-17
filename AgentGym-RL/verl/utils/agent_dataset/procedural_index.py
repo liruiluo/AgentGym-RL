@@ -1641,9 +1641,15 @@ class WebshopSwesmithFamilyBalancedIndexSource(ProceduralIndexSource):
             )
         expected_contracts = {
             "upstream_repository": "SWE-bench/SWE-smith",
+            "upstream_agent_repository": "SWE-agent/mini-swe-agent",
+            "upstream_agent_revision": (
+                "a83fcae82d2a08f0ee0c688f9d137b3566c097f8"
+            ),
             "tool_contract": "codex_shell_command_apply_patch_v1",
-            "reward_contract": "terminal_full_resolution_binary_v1",
+            "reward_contract": "explicit_submission_full_resolution_binary_v2",
             "context_contract": "one_native_issue_continuous_episode_v1",
+            "submission_contract": "upstream_shell_output_sentinel_v1",
+            "horizon_contract": "unified_policy_step_no_submission_failure_v2",
             "private_audit_contract": (
                 "agentmemory_swesmith_private_episode_audit_v1"
             ),

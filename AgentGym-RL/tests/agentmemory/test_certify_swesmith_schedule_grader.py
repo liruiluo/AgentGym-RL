@@ -6,9 +6,51 @@ import tempfile
 import unittest
 
 from scripts.agentmemory.certify_swesmith_schedule_grader import (
+    SUBMISSION_ACTION,
     load_schedule_indices,
     result_passes,
+    run_arm,
 )
+
+
+class FakeRecord:
+    instance_id = "owner__repo.01234567.issue"
+    instance = {"repo": "swesmith/owner__repo.01234567"}
+
+
+class FakeEndpoint:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, dict[str, object] | None, bool]] = []
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, object] | None = None,
+        *,
+        private: bool = False,
+    ) -> dict[str, object]:
+        self.calls.append((method, path, payload, private))
+        if path == "create":
+            return {"id": 7}
+        if path == "reset":
+            return {"done": False}
+        step_count = len([call for call in self.calls if call[1] == "step"])
+        if path == "step" and step_count == 1:
+            return {"info": {"action_kind": "apply_patch"}}
+        if path == "step":
+            return {
+                "reward": 0.0,
+                "info": {
+                    "action_kind": "final",
+                    "episode_success": False,
+                },
+            }
+        if path.startswith("detail?"):
+            return {"grade": {"resolution_status": "UNRESOLVED"}}
+        if path == "close":
+            return {}
+        raise AssertionError((method, path, payload, private))
 
 
 class CertifySwesmithScheduleGraderTest(unittest.TestCase):
@@ -64,6 +106,8 @@ class CertifySwesmithScheduleGraderTest(unittest.TestCase):
                     "reward": 1.0,
                     "episode_success": True,
                     "resolution_status": "RESOLVED_FULL",
+                    "submission_action": SUBMISSION_ACTION,
+                    "submission_result_action_kind": "final",
                     "grader_error": None,
                     "errors": [],
                 }
@@ -77,6 +121,8 @@ class CertifySwesmithScheduleGraderTest(unittest.TestCase):
                         "reward": 0.0,
                         "episode_success": False,
                         "resolution_status": "UNRESOLVED",
+                        "submission_action": SUBMISSION_ACTION,
+                        "submission_result_action_kind": "final",
                         "grader_error": None,
                         "errors": [],
                     }
@@ -89,6 +135,8 @@ class CertifySwesmithScheduleGraderTest(unittest.TestCase):
                     "reward": 1.0,
                     "episode_success": True,
                     "resolution_status": "RESOLVED_FULL",
+                    "submission_action": SUBMISSION_ACTION,
+                    "submission_result_action_kind": "final",
                     "grader_error": None,
                     "errors": [],
                 }
@@ -101,11 +149,31 @@ class CertifySwesmithScheduleGraderTest(unittest.TestCase):
                     "reward": None,
                     "episode_success": False,
                     "resolution_status": None,
+                    "submission_action": SUBMISSION_ACTION,
+                    "submission_result_action_kind": None,
                     "grader_error": None,
                     "errors": ["reset failed"],
                 }
             )
         )
+
+    def test_run_arm_submits_with_upstream_shell_sentinel(self) -> None:
+        endpoint = FakeEndpoint()
+        result = run_arm(endpoint, [FakeRecord()], data_idx=0, arm="wrong")
+
+        step_payloads = [
+            payload
+            for _, path, payload, _ in endpoint.calls
+            if path == "step"
+        ]
+        self.assertEqual(len(step_payloads), 2)
+        self.assertEqual(step_payloads[1], {"id": 7, "action": SUBMISSION_ACTION})
+        self.assertEqual(
+            SUBMISSION_ACTION,
+            'shell_command {"command":"echo '
+            'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT","workdir":"."}',
+        )
+        self.assertTrue(result_passes(result))
 
 
 if __name__ == "__main__":

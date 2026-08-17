@@ -14,6 +14,7 @@ from typing import Any
 
 STEP_SCHEMA = "task_neutral_policy_step_v1"
 AUDIT_SCHEMA = "agentmemory_swesmith_private_episode_audit_v1"
+ENDPOINT_PROBE_SCHEMA = "agentmemory_swesmith_resident_endpoint_probe_v2"
 NATIVE_EVENT = "native_action"
 COMPACTION_EVENT = "context_compaction"
 
@@ -251,6 +252,30 @@ def parse_endpoint_probe_slots(endpoint_probe: dict[str, Any]) -> list[int]:
     return slots
 
 
+def verify_endpoint_submission_contract_probe(
+    endpoint_probe: dict[str, Any], slots: list[int]
+) -> dict[str, Any]:
+    """Require live evidence for submit, rejection, and horizon semantics."""
+    assert endpoint_probe["schema"] == ENDPOINT_PROBE_SCHEMA
+    probe = endpoint_probe["submission_contract_probe"]
+    assert isinstance(probe, dict)
+    horizon_slot = int(probe["horizon_slot_id"])
+    valid_slot = int(probe["valid_submission_slot_id"])
+    assert horizon_slot in slots
+    assert valid_slot in slots
+    assert horizon_slot != valid_slot
+    assert probe["horizon_grade"] is None
+    assert probe["non_first_line_done"] is False
+    assert probe["nonzero_exit_done"] is False
+    assert probe["valid_submission_grade_present"] is True
+    assert float(probe["valid_submission_reward"]) in {0.0, 1.0}
+    return {
+        "horizon_slot_id": horizon_slot,
+        "valid_submission_slot_id": valid_slot,
+        "valid_submission_reward": float(probe["valid_submission_reward"]),
+    }
+
+
 def verify_endpoint_probe_indices(
     endpoint_probe: dict[str, Any],
     expected_probe_indices: list[int],
@@ -354,7 +379,7 @@ def verify_wrapper_transition(
             )
             horizon_finalization = record.get("horizon_finalization")
             if horizon_finalization is None:
-                # A native final action is graded by env.step itself.
+                # Only an explicit sentinel submission is graded by env.step.
                 assert bool(record["env_info_after"]["episode_success"]) == (
                     immediate_reward == 1.0
                 )
@@ -362,12 +387,11 @@ def verify_wrapper_transition(
                     assert record["env_info_after"]["terminal"] is True
             else:
                 # At the policy-turn boundary the last sampled action is kept
-                # as the trainable terminal row, while the wrapper performs a
-                # separate hidden horizon grading call.  The native receipt
-                # therefore remains non-terminal; the hidden receipt is the
-                # authoritative terminal evidence and must agree with the
-                # reward attributed to that sampled row.
+                # as the trainable terminal row, while the wrapper records a
+                # no-submission horizon failure without invoking the grader.
                 assert isinstance(horizon_finalization, dict)
+                assert immediate_reward == 0.0
+                assert record["outcome"] == "terminal_failure"
                 assert float(horizon_finalization["reward"]) == immediate_reward
                 assert horizon_finalization["done"] is True
                 horizon_info = horizon_finalization["info"]
@@ -381,9 +405,8 @@ def verify_wrapper_transition(
                 terminal_info = horizon_info["env_info"]
                 assert int(terminal_info["step"]) == native_after
                 assert terminal_info["terminal"] is True
-                assert bool(terminal_info["episode_success"]) == (
-                    immediate_reward == 1.0
-                )
+                assert terminal_info["action_kind"] == "policy_turn_horizon"
+                assert bool(terminal_info["episode_success"]) is False
                 assert record["env_info_after"]["terminal"] is False
                 assert bool(record["env_info_after"]["episode_success"]) is False
 
@@ -494,6 +517,7 @@ def verify_audits(
     probe_audit_ids = set(str(value) for value in endpoint_probe["audit_ids"])
     trainer_audits: list[dict[str, Any]] = []
     ungraded_terminal_rejections: list[dict[str, Any]] = []
+    ungraded_horizon_exhaustions: list[dict[str, Any]] = []
     stale_audit_count = 0
     future_distinct_audit_count = 0
     for path in sorted(audit_root.glob("episode-*.json")):
@@ -524,26 +548,48 @@ def verify_audits(
         if payload["grade"] is None:
             assert float(payload["reward"]) == 0.0
             last_event = payload["evidence"][-1]
-            assert last_event["event"] == "policy_step"
-            actor_credit = last_event["actor_credit"]
-            assert actor_credit == {
-                "schema": "task_neutral_actor_credit_v1",
-                "positive_eligible": False,
-                "basis": "executor_rejected",
-            }
-            action_kind = str(last_event["action"]["kind"])
-            assert action_kind in {"shell_command", "apply_patch"}
-            assert str(last_event["observation_after"]).startswith(
-                f"{action_kind} failed:"
-            )
-            ungraded_terminal_rejections.append({
-                "audit_id": str(payload["audit_id"]),
-                "data_idx": int(payload["data_idx"]),
-                "slot_id": int(payload["slot_id"]),
-                "step_count": int(payload["step_count"]),
-                "actor_credit_basis": actor_credit["basis"],
-                "action_kind": action_kind,
-            })
+            if last_event["event"] == "horizon_exhaustion":
+                action_kind = str(last_event["action"]["kind"])
+                assert action_kind in {"horizon", "policy_turn_horizon"}
+                assert last_event["termination_reason"] in {
+                    "max_steps",
+                    "policy_turn_horizon",
+                }
+                assert last_event["terminal_grade"] == {
+                    "reward": 0.0,
+                    "resolved": False,
+                    "grader_error": None,
+                    "graded": False,
+                }
+                ungraded_horizon_exhaustions.append({
+                    "audit_id": str(payload["audit_id"]),
+                    "data_idx": int(payload["data_idx"]),
+                    "slot_id": int(payload["slot_id"]),
+                    "step_count": int(payload["step_count"]),
+                    "action_kind": action_kind,
+                    "termination_reason": last_event["termination_reason"],
+                })
+            else:
+                assert last_event["event"] == "policy_step"
+                actor_credit = last_event["actor_credit"]
+                assert actor_credit == {
+                    "schema": "task_neutral_actor_credit_v1",
+                    "positive_eligible": False,
+                    "basis": "executor_rejected",
+                }
+                action_kind = str(last_event["action"]["kind"])
+                assert action_kind in {"shell_command", "apply_patch"}
+                assert str(last_event["observation_after"]).startswith(
+                    f"{action_kind} failed:"
+                )
+                ungraded_terminal_rejections.append({
+                    "audit_id": str(payload["audit_id"]),
+                    "data_idx": int(payload["data_idx"]),
+                    "slot_id": int(payload["slot_id"]),
+                    "step_count": int(payload["step_count"]),
+                    "actor_credit_basis": actor_credit["basis"],
+                    "action_kind": action_kind,
+                })
         trainer_audits.append(payload)
     if expected_audit_count is None:
         expected_audit_count = len(expected_indices)
@@ -581,6 +627,7 @@ def verify_audits(
         "resolved_count": sum(float(value["reward"]) == 1.0 for value in trainer_audits),
         "graded_audit_count": sum(value["grade"] is not None for value in trainer_audits),
         "ungraded_terminal_rejections": ungraded_terminal_rejections,
+        "ungraded_horizon_exhaustions": ungraded_horizon_exhaustions,
         "audit_ids": sorted(str(value["audit_id"]) for value in trainer_audits),
         "selection": "run-start-time-minus-current-probe",
         "run_started_at": run_started_at.isoformat(),
@@ -637,7 +684,10 @@ def main() -> None:
     assert endpoint_training_indices is not None
     endpoint_probe = load_json(args.endpoint_probe)
     assert endpoint_probe["status"] == "pass"
-    parse_endpoint_probe_slots(endpoint_probe)
+    endpoint_probe_slots = parse_endpoint_probe_slots(endpoint_probe)
+    endpoint_submission_probe = verify_endpoint_submission_contract_probe(
+        endpoint_probe, endpoint_probe_slots
+    )
     verify_endpoint_probe_indices(
         endpoint_probe,
         parse_endpoint_probe_indices(args.endpoint_probe_indices),
@@ -833,6 +883,7 @@ def main() -> None:
         "truncated_rows": truncated_rows,
         "endpoint_nonzero_return_rows": nonzero_return_rows,
         "segment_return_signal": segment_return_signal,
+        "endpoint_submission_contract_probe": endpoint_submission_probe,
         "readback": readback,
         "private_audits": audits,
         "metadata_after": metadata_after,
