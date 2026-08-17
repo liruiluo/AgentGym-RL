@@ -89,6 +89,26 @@ from abc import ABC, abstractmethod
 WorkerType = Type[Worker]
 
 
+def _agentmemory_atomic_json_dump(payload: dict, output_path: str) -> None:
+    """Publish a complete JSON artifact without exposing a partial file."""
+
+    output_path = os.fspath(output_path)
+    output_dir = os.path.dirname(output_path) or "."
+    os.makedirs(output_dir, exist_ok=True)
+    temporary_path = (
+        f"{output_path}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+    )
+    try:
+        with open(temporary_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=True, indent=2)
+        os.replace(temporary_path, output_path)
+    finally:
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+
+
 class Role(Enum):
     """
     To create more roles dynamically, you can subclass Role and add new members
@@ -810,8 +830,10 @@ def _agentmemory_dump_ppo_batch_debug(batch: DataProto, config, global_steps: in
             "suffix_formula_mismatch_count": 0 if suffix_returns is not None else None,
             "rows": rows,
         }
-        with open(os.path.join(out_dir, f"ppo_batch_step{global_steps}_{stage}.json"), "w") as f:
-            json.dump(summary, f, ensure_ascii=True, indent=2)
+        _agentmemory_atomic_json_dump(
+            summary,
+            os.path.join(out_dir, f"ppo_batch_step{global_steps}_{stage}.json"),
+        )
     except Exception as exc:
         print(f"AgentMemory PPO batch debug dump failed: {exc}", flush=True)
 
@@ -1177,8 +1199,7 @@ def _agentmemory_dump_formal_update_readback(
     output_path = os.path.join(
         out_dir, f"formal_update_readback_step{global_steps}.json"
     )
-    with open(output_path, "w") as handle:
-        json.dump(payload, handle, ensure_ascii=True, indent=2)
+    _agentmemory_atomic_json_dump(payload, output_path)
     print(
         "AgentMemory formal PPO update readback: "
         f"actor_max_abs_delta={actor_summary['max_abs_delta']:.8g} "
