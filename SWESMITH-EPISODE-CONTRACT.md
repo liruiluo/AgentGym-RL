@@ -12,11 +12,12 @@ Mini-SWE-Agent supplies the interaction and termination contract.
 | Surface | Pinned upstream | AMG training adapter | Difference classification |
 | --- | --- | --- | --- |
 | Action grammar | A response contains a bash tool action; malformed responses are format errors | One sampled turn is exactly one `shell_command` or `apply_patch`; malformed/plain text is a parser error | RL serialization constraint |
+| Repair workflow | Inspect, reproduce, make a localized non-test source edit, rerun the reproduction, test edge cases, then submit | The same ordered workflow is stated using the one-action Codex grammar; test/config edits remain forbidden | Semantically preserved with adapted action syntax |
 | Submission trigger | A successful shell command whose first stdout line is `COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` raises `Submitted` | The same sentinel and zero-exit/first-line check are applied after the sandbox command | Semantically identical |
 | Submission payload | SWE-bench config emits `echo ... && cat patch.txt`; remaining stdout is the patch | The persistent workspace is graded directly, so the adapter emits the sentinel-only command and records the workspace digest | Deliberate workspace-grade adaptation; not byte-equivalent patch transport |
 | Plain text | No bash action means a format error, never a submission | Plain text, including `final`, is a parser error and leaves the episode running | Semantically equivalent fail-closed behavior |
 | Turn exhaustion | `LimitsExceeded` exits with an empty submission; no workspace grade is requested | Horizon terminates with reward `0`, `grade=None`, and no hidden-grader call | Explicitly preserves upstream no-submission failure |
-| Budget | Pinned SWE-bench config uses `step_limit: 250` | Formal training launcher uses a bounded 30-turn curriculum; endpoint default remains 75; held-out native evaluation uses 250 | Deliberate training compute bound |
+| Budget | Pinned SWE-bench config uses `step_limit: 250` | r4 used a bounded 30-turn curriculum; r5 restores the endpoint's 75-turn training default; held-out native evaluation uses 250 | Deliberate training compute bound |
 | Workspace | Upstream submits a patch from a `.git` worktree | AMG keeps a persistent no-`.git` workspace and grades it once on the sentinel | Deliberate runtime adaptation |
 
 The source and contract identities above are exposed in `/metadata` and are
@@ -36,11 +37,14 @@ is fail-closed before PPO.
 
 ## Interaction budget
 
-- Training uses a bounded policy-turn budget. The current formal launcher uses
-  30 turns; the endpoint default is 75. `shell_command`, `apply_patch`, the
+- Training uses a bounded policy-turn budget. The r4 formal launcher used 30
+  turns; r5 uses the endpoint default of 75. `shell_command`, `apply_patch`, the
   sentinel submission, parser errors, and policy-authored context
   compaction each consume exactly one turn. There are no free compactions or
   parser retries, and a successful submission terminates early.
+- The initial observation states the exact configured turn budget and that
+  compactions consume it, so the policy can verify and submit before an
+  otherwise ungraded horizon.
 - The configured training value is an AgentMemoryGym compute bound. It is not
   the upstream default. Pinned Mini-SWE-Agent commit
   `a83fcae82d2a08f0ee0c688f9d137b3566c097f8` sets `step_limit: 250` for
