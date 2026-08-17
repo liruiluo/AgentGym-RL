@@ -42,7 +42,7 @@ class FakeEndpoint:
             return {
                 "reward": 0.0,
                 "info": {
-                    "action_kind": "shell_command",
+                    "action_kind": "final",
                     "episode_success": False,
                 },
             }
@@ -106,7 +106,8 @@ class CertifySwesmithScheduleGraderTest(unittest.TestCase):
                     "reward": 1.0,
                     "episode_success": True,
                     "resolution_status": "RESOLVED_FULL",
-                    "submission_action_kind": "shell_command",
+                    "submission_action": SUBMISSION_ACTION,
+                    "submission_result_action_kind": "final",
                     "grader_error": None,
                     "errors": [],
                 }
@@ -120,7 +121,8 @@ class CertifySwesmithScheduleGraderTest(unittest.TestCase):
                         "reward": 0.0,
                         "episode_success": False,
                         "resolution_status": "UNRESOLVED",
-                        "submission_action_kind": "shell_command",
+                        "submission_action": SUBMISSION_ACTION,
+                        "submission_result_action_kind": "final",
                         "grader_error": None,
                         "errors": [],
                     }
@@ -133,7 +135,8 @@ class CertifySwesmithScheduleGraderTest(unittest.TestCase):
                     "reward": 1.0,
                     "episode_success": True,
                     "resolution_status": "RESOLVED_FULL",
-                    "submission_action_kind": "shell_command",
+                    "submission_action": SUBMISSION_ACTION,
+                    "submission_result_action_kind": "final",
                     "grader_error": None,
                     "errors": [],
                 }
@@ -146,7 +149,8 @@ class CertifySwesmithScheduleGraderTest(unittest.TestCase):
                     "reward": None,
                     "episode_success": False,
                     "resolution_status": None,
-                    "submission_action_kind": None,
+                    "submission_action": SUBMISSION_ACTION,
+                    "submission_result_action_kind": None,
                     "grader_error": None,
                     "errors": ["reset failed"],
                 }

@@ -185,9 +185,10 @@ def run_arm(
                 "repo": record.instance.get("repo"),
                 "reset_done": reset.get("done"),
                 "action_kind": dict(action.get("info") or {}).get("action_kind"),
-                "submission_action_kind": dict(terminal.get("info") or {}).get(
-                    "action_kind"
-                ),
+                "submission_action": SUBMISSION_ACTION,
+                "submission_result_action_kind": dict(
+                    terminal.get("info") or {}
+                ).get("action_kind"),
                 "reward": terminal.get("reward"),
                 "episode_success": dict(terminal.get("info") or {}).get(
                     "episode_success"
@@ -225,7 +226,9 @@ def result_passes(result: dict[str, Any]) -> bool:
         return False
     if result.get("grader_error") not in (None, ""):
         return False
-    if result.get("submission_action_kind") != "shell_command":
+    if result.get("submission_action") != SUBMISSION_ACTION:
+        return False
+    if result.get("submission_result_action_kind") != "final":
         return False
     if arm == "gold":
         return (
