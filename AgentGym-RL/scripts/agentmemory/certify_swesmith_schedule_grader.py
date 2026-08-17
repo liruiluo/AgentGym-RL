@@ -16,6 +16,10 @@ from typing import Any
 
 ARMS = ("gold", "wrong", "tamper")
 EXPECTED_REWARD = {"gold": 1.0, "wrong": 0.0, "tamper": 0.0}
+SUBMISSION_ACTION = (
+    'shell_command {"command":"echo '
+    'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT","workdir":"."}'
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -169,7 +173,7 @@ def run_arm(
             {"id": slot_id, "action": action_for(dict(record.instance), arm)},
         )
         terminal = endpoint.request(
-            "POST", "step", {"id": slot_id, "action": "Implemented the fix."}
+            "POST", "step", {"id": slot_id, "action": SUBMISSION_ACTION}
         )
         detail = endpoint.request("GET", f"detail?id={slot_id}", private=True)
         grade = dict(detail.get("grade") or {})
@@ -181,6 +185,9 @@ def run_arm(
                 "repo": record.instance.get("repo"),
                 "reset_done": reset.get("done"),
                 "action_kind": dict(action.get("info") or {}).get("action_kind"),
+                "submission_action_kind": dict(terminal.get("info") or {}).get(
+                    "action_kind"
+                ),
                 "reward": terminal.get("reward"),
                 "episode_success": dict(terminal.get("info") or {}).get(
                     "episode_success"
@@ -217,6 +224,8 @@ def result_passes(result: dict[str, Any]) -> bool:
     ):
         return False
     if result.get("grader_error") not in (None, ""):
+        return False
+    if result.get("submission_action_kind") != "shell_command":
         return False
     if arm == "gold":
         return (
