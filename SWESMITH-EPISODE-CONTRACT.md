@@ -11,7 +11,7 @@ Mini-SWE-Agent supplies the interaction and termination contract.
 
 | Surface | Pinned upstream | AMG training adapter | Difference classification |
 | --- | --- | --- | --- |
-| Action grammar | A response contains a bash tool action; malformed responses are format errors | One sampled turn is exactly one `shell_command` or `apply_patch`; malformed/plain text is a parser error | RL serialization constraint |
+| Action grammar | A response contains reasoning followed by exactly one bash tool action; malformed responses are format errors | One sampled turn may contain one concise reasoning prefix followed by exactly one `shell_command` or `apply_patch`; multiple, fenced, truncated, or trailing actions and plain text are parser errors | Upstream response shape preserved with an RL tool-serialization adaptation |
 | Repair workflow | Inspect, reproduce, make a localized non-test source edit, rerun the reproduction, test edge cases, then submit | The same ordered workflow is stated using the one-action Codex grammar; test/config edits remain forbidden | Semantically preserved with adapted action syntax |
 | Submission trigger | A successful shell command whose first stdout line is `COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` raises `Submitted` | The same sentinel and zero-exit/first-line check are applied after the sandbox command | Semantically identical |
 | Submission payload | SWE-bench config emits `echo ... && cat patch.txt`; remaining stdout is the patch | The persistent workspace is graded directly, so the adapter emits the sentinel-only command and records the workspace digest | Deliberate workspace-grade adaptation; not byte-equivalent patch transport |

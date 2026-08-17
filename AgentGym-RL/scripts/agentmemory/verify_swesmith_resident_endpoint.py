@@ -143,7 +143,7 @@ def main() -> None:
     assert metadata_before["schema"] == EXPECTED_SCHEMA
     assert metadata_before["tool_contract"] == "codex_shell_command_apply_patch_v1"
     assert metadata_before["tool_serialization"] == (
-        "qwen35_native_single_function_v1"
+        "codex_single_action_with_upstream_reasoning_v2"
     )
     assert metadata_before["upstream_agent_repository"] == (
         EXPECTED_UPSTREAM_AGENT_REPOSITORY
