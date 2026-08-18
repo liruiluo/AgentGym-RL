@@ -17,9 +17,11 @@ import threading
 import time
 from collections.abc import Mapping, Sequence
 from concurrent.futures import (
+    FIRST_COMPLETED,
     ProcessPoolExecutor,
     ThreadPoolExecutor,
     as_completed,
+    wait,
 )
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +38,7 @@ from .atomic import (
     fsync_directory,
     exclusive_lock,
     read_json,
+    write_immutable_json,
 )
 from .cli import driver_from_config, validate_preflight_snapshot
 from .identity import verify_image_index
@@ -51,8 +54,8 @@ from .state import CellKey, RuntimeLaneToken, sha256_json
 
 INDEX_SCHEMA = "amg_swebench_shared_pool_index_v1"
 ASSIGNMENT_SCHEMA = "amg_swebench_shared_pool_assignment_v1"
-SUMMARY_SCHEMA = "amg_swebench_shared_pool_official_summary_v1"
-WORKERS_COMPLETE_SCHEMA = "amg_swebench_shared_pool_workers_complete_v3"
+SUMMARY_SCHEMA = "amg_swebench_shared_pool_official_summary_v2"
+WORKERS_COMPLETE_SCHEMA = "amg_swebench_shared_pool_workers_complete_v4"
 SHA256_PREFIXED_LENGTH = 71
 TASK_SLOTS_PER_REPLICA = 2
 STARTUP_BARRIER_SCHEMA = "amg_swebench_shared_pool_startup_barrier_v1"
@@ -61,6 +64,13 @@ DIGEST_RECONCILIATION_SCHEMA = "amg_swebench_image_digest_reconciliation_v1"
 TIMING_CONTRACT_SCHEMA = "amg_swebench_c2_timing_contract_v1"
 TIMING_GATE_SCHEMA = "amg_swebench_c2_timing_gate_v1"
 TIMING_BUDGET_SECONDS = 28_800.0
+ETA_STOP_MULTIPLIER = 1.5
+ETA_CHECK_INTERVAL_SECONDS = 1_800.0
+ETA_CHECK_CELL_COUNT = 75
+ETA_POLL_SECONDS = 30.0
+ETA_RECEIPT_SCHEMA = "amg_swebench_full_run_eta_v1"
+FULL_RUN_TIMING_SCHEMA = "amg_swebench_full_run_timing_v1"
+STOP_MARKER_SCHEMA = "amg_swebench_full_run_stop_v1"
 TIMING_REQUIRED_METRICS = (
     "setup_materialization",
     "queue_wait",
@@ -937,6 +947,38 @@ def run_gate(config: CoordinatorConfig) -> Mapping[str, Any]:
     return result
 
 
+def full_run_stop_path(root: Path) -> Path:
+    return root / "control" / "stop-after-publication.json"
+
+
+def full_run_stop_requested(root: Path) -> bool:
+    path = full_run_stop_path(root)
+    if not path.exists():
+        if path.is_symlink():
+            raise RuntimeError("full-run stop marker is a dangling symlink")
+        return False
+    value = load_atomic_object(path, "full-run stop marker")
+    if (
+        set(value)
+        != {
+            "schema",
+            "status",
+            "reason",
+            "consecutive_over_budget_checks",
+            "latest_eta_receipt_sha256",
+        }
+        or value.get("schema") != STOP_MARKER_SCHEMA
+        or value.get("status") != "STOP_AT_PUBLICATION_BOUNDARY"
+        or value.get("reason") != "two_consecutive_eta_checks_above_1_5x_budget"
+        or value.get("consecutive_over_budget_checks") != 2
+    ):
+        raise RuntimeError("full-run stop marker is invalid")
+    _require_sha256_text(
+        value.get("latest_eta_receipt_sha256"), "stop marker ETA receipt"
+    )
+    return True
+
+
 def _worker(
     config_path: str,
     task_indices: tuple[int, ...],
@@ -999,6 +1041,8 @@ def _worker(
             for task_index, image_digest, queued_wall_ns, queued_monotonic_ns in queues[
                 slot_index
             ]:
+                if full_run_stop_requested(root):
+                    break
                 slot_dequeued_wall_ns = time.time_ns()
                 slot_dequeued_monotonic_ns = time.monotonic_ns()
                 with digest_locks[image_digest]:
@@ -1040,6 +1084,8 @@ def _worker(
                             ),
                         },
                     )
+                if full_run_stop_requested(root):
+                    break
             return {
                 "slot_index": slot_index,
                 "completed_task_indices": slot_completed,
@@ -1050,9 +1096,10 @@ def _worker(
             max_workers=TASK_SLOTS_PER_REPLICA
         ) as executor:
             slot_results = list(executor.map(run_slot, range(TASK_SLOTS_PER_REPLICA)))
+        stopped = full_run_stop_requested(root)
         result = {
             "schema": "amg_swebench_shared_pool_worker_v2",
-            "status": "PASS",
+            "status": "STOPPED_AT_PUBLICATION_BOUNDARY" if stopped else "PASS",
             "replica_index": replica_index,
             "task_slots_per_replica": TASK_SLOTS_PER_REPLICA,
             "completed_task_indices": sorted(completed),
@@ -1383,6 +1430,8 @@ def _load_cell_timing(
 def _collect_timing_gate(
     config: CoordinatorConfig,
     contract: Mapping[str, Any],
+    *,
+    publish: bool = True,
 ) -> Mapping[str, Any]:
     panel_rows = contract["panel_tasks"]
     task_rows = []
@@ -1429,13 +1478,20 @@ def _collect_timing_gate(
                 publication = read_json(publication_path)
                 if (
                     publication.get("schema")
-                    != "swebench_triad_task_publication_timing_v1"
+                    != "swebench_triad_task_publication_timing_v2"
                     or publication.get("status") != "PASS"
+                    or type(publication.get("recovered_after_crash")) is not bool
                     or publication.get("task_index") != task_index
                     or publication.get("completion_sha256")
                     != hashlib.sha256(
                         driver.task_completion_path(task_index).read_bytes()
                     ).hexdigest()
+                    or type(publication.get("started_monotonic_ns")) is not int
+                    or type(publication.get("ended_monotonic_ns")) is not int
+                    or publication["started_monotonic_ns"]
+                    < timing["ended_monotonic_ns"]
+                    or publication["ended_monotonic_ns"]
+                    < publication["started_monotonic_ns"]
                 ):
                     raise RuntimeError("timing-panel task publication drifted")
                 setup = phases["oci_stage"]["duration_ns"] / 1e9
@@ -1460,7 +1516,10 @@ def _collect_timing_gate(
                 publication_seconds += sum(
                     row["publication_seconds"] for row in task_cells
                 )
-                task_seconds = timing["duration_ns"] / 1e9 + publication["duration_ns"] / 1e9
+                task_seconds = (
+                    publication["ended_monotonic_ns"]
+                    - timing["started_monotonic_ns"]
+                ) / 1e9
                 task_row = {
                     "replica_index": replica.replica_index,
                     "slot_index": panel["slot_index"],
@@ -1483,7 +1542,10 @@ def _collect_timing_gate(
                 }
                 task_rows.append(task_row)
                 replica_intervals.append(
-                    (timing["started_monotonic_ns"], timing["ended_monotonic_ns"])
+                    (
+                        timing["started_monotonic_ns"],
+                        publication["ended_monotonic_ns"],
+                    )
                 )
                 phase_values["setup_materialization"].append(setup)
                 phase_values["queue_wait"].append(queue_wait)
@@ -1579,8 +1641,9 @@ def _collect_timing_gate(
             "inner_commit": contract["bindings"]["inner_commit"],
         },
     }
-    atomic_write_json(config.root / "control" / "timing-gate.json", result)
-    if status_value != "PASS":
+    if publish:
+        atomic_write_json(config.root / "control" / "timing-gate.json", result)
+    if publish and status_value != "PASS":
         raise RuntimeError(
             f"SWE timing projection exceeds 28800 seconds: {projected:.3f}"
         )
@@ -1742,14 +1805,118 @@ def validated_timing_gate(config: CoordinatorConfig) -> Mapping[str, Any]:
     }
     if dict(bindings) != expected:
         raise RuntimeError("C=2 timing gate binding drifted")
+    recomputed = _collect_timing_gate(config, contract, publish=False)
+    if gate != recomputed:
+        raise RuntimeError("C=2 timing gate evidence recomputation drifted")
     return gate
+
+
+def _progress_completed_tasks(config: CoordinatorConfig) -> set[int]:
+    completed: set[int] = set()
+    for replica in config.replicas:
+        path = config.root / "progress" / f"replica-{replica.replica_index}.json"
+        if not path.exists():
+            if path.is_symlink():
+                raise RuntimeError("full-run progress is a dangling symlink")
+            continue
+        value = load_atomic_object(path, "full-run replica progress")
+        rows = value.get("completed_task_indices")
+        if (
+            value.get("schema")
+            not in {
+                "amg_swebench_shared_pool_progress_v2",
+                "amg_swebench_shared_pool_worker_v2",
+            }
+            or value.get("status")
+            not in {"RUNNING", "PASS", "STOPPED_AT_PUBLICATION_BOUNDARY"}
+            or value.get("replica_index") != replica.replica_index
+            or not isinstance(rows, list)
+            or any(type(task) is not int for task in rows)
+            or len(rows) != len(set(rows))
+            or not set(rows).issubset(replica.task_indices)
+        ):
+            raise RuntimeError("full-run progress identity drifted")
+        completed.update(rows)
+    return completed
+
+
+def _eta_projection(
+    *,
+    elapsed_seconds: float,
+    completed_cells: int,
+    remaining_cells: int,
+) -> float:
+    if (
+        elapsed_seconds < 0
+        or not math.isfinite(elapsed_seconds)
+        or type(completed_cells) is not int
+        or completed_cells < 0
+        or type(remaining_cells) is not int
+        or remaining_cells <= 0
+    ):
+        raise ValueError("ETA projection input is invalid")
+    return elapsed_seconds * remaining_cells / max(1, completed_cells)
+
+
+def _write_eta_check(
+    config: CoordinatorConfig,
+    *,
+    check_index: int,
+    elapsed_seconds: float,
+    baseline_tasks: set[int],
+    completed_tasks: set[int],
+    consecutive_over_budget_checks: int,
+    timing_gate_sha256: str,
+) -> Mapping[str, Any]:
+    new_tasks = completed_tasks - baseline_tasks
+    baseline_cells = len(baseline_tasks) * len(ARMS)
+    new_cells = len(new_tasks) * len(ARMS)
+    remaining_cells = 1500 - baseline_cells
+    projection = _eta_projection(
+        elapsed_seconds=elapsed_seconds,
+        completed_cells=new_cells,
+        remaining_cells=remaining_cells,
+    )
+    value = {
+        "schema": ETA_RECEIPT_SCHEMA,
+        "status": "OVER_STOP_THRESHOLD"
+        if projection > TIMING_BUDGET_SECONDS * ETA_STOP_MULTIPLIER
+        else "WITHIN_STOP_THRESHOLD",
+        "check_index": check_index,
+        "elapsed_seconds": elapsed_seconds,
+        "baseline_completed_tasks": len(baseline_tasks),
+        "baseline_completed_cells": baseline_cells,
+        "new_completed_tasks": len(new_tasks),
+        "new_completed_cells": new_cells,
+        "remaining_cells_at_launch": remaining_cells,
+        "projected_remaining_makespan_seconds": projection,
+        "stop_threshold_seconds": TIMING_BUDGET_SECONDS * ETA_STOP_MULTIPLIER,
+        "consecutive_over_budget_checks": consecutive_over_budget_checks,
+        "timing_gate_sha256": timing_gate_sha256,
+    }
+    path = config.root / "control" / "eta" / f"check-{check_index:06d}.json"
+    write_immutable_json(path, value)
+    return {
+        "path": str(path),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "receipt": value,
+    }
 
 
 def run_full(config: CoordinatorConfig) -> list[dict[str, Any]]:
     _validated_gate(config)
-    validated_timing_gate(config)
+    timing_gate = validated_timing_gate(config)
+    timing_gate_path = config.root / "control" / "timing-gate.json"
+    timing_gate_sha256 = hashlib.sha256(timing_gate_path.read_bytes()).hexdigest()
     barrier_path = config.root / "control" / "preflight-all.json"
     barrier_sha256 = hashlib.sha256(barrier_path.read_bytes()).hexdigest()
+    baseline_tasks = _progress_completed_tasks(config)
+    run_started_monotonic = time.monotonic()
+    run_started_wall_ns = time.time_ns()
+    eta_checks: list[Mapping[str, Any]] = []
+    last_eta_elapsed = 0.0
+    last_eta_cells = 0
+    consecutive_over_budget_checks = 0
     results = []
     with ProcessPoolExecutor(max_workers=8) as executor:
         futures = {
@@ -1771,9 +1938,58 @@ def run_full(config: CoordinatorConfig) -> list[dict[str, Any]]:
             ): replica.replica_index
             for replica in config.replicas
         }
-        for future in as_completed(futures):
-            results.append(future.result())
+        pending = set(futures)
+        while pending:
+            done, pending = wait(
+                pending,
+                timeout=ETA_POLL_SECONDS,
+                return_when=FIRST_COMPLETED,
+            )
+            for future in done:
+                results.append(future.result())
+            completed_tasks = _progress_completed_tasks(config)
+            elapsed = time.monotonic() - run_started_monotonic
+            new_cells = len(completed_tasks - baseline_tasks) * len(ARMS)
+            due = (
+                elapsed - last_eta_elapsed >= ETA_CHECK_INTERVAL_SECONDS
+                or new_cells - last_eta_cells >= ETA_CHECK_CELL_COUNT
+                or not pending
+            )
+            if not due:
+                continue
+            projection = _eta_projection(
+                elapsed_seconds=elapsed,
+                completed_cells=new_cells,
+                remaining_cells=1500 - len(baseline_tasks) * len(ARMS),
+            )
+            if projection > TIMING_BUDGET_SECONDS * ETA_STOP_MULTIPLIER:
+                consecutive_over_budget_checks += 1
+            else:
+                consecutive_over_budget_checks = 0
+            eta = _write_eta_check(
+                config,
+                check_index=len(eta_checks) + 1,
+                elapsed_seconds=elapsed,
+                baseline_tasks=baseline_tasks,
+                completed_tasks=completed_tasks,
+                consecutive_over_budget_checks=consecutive_over_budget_checks,
+                timing_gate_sha256=timing_gate_sha256,
+            )
+            eta_checks.append(eta)
+            last_eta_elapsed = elapsed
+            last_eta_cells = new_cells
+            if consecutive_over_budget_checks >= 2:
+                stop = {
+                    "schema": STOP_MARKER_SCHEMA,
+                    "status": "STOP_AT_PUBLICATION_BOUNDARY",
+                    "reason": "two_consecutive_eta_checks_above_1_5x_budget",
+                    "consecutive_over_budget_checks": 2,
+                    "latest_eta_receipt_sha256": eta["sha256"],
+                }
+                atomic_write_json(full_run_stop_path(config.root), stop)
     results.sort(key=lambda row: row["replica_index"])
+    if full_run_stop_requested(config.root):
+        raise RuntimeError("full run stopped at a clean publication boundary")
     for replica, result in zip(config.replicas, results):
         if (
             result.get("schema") != "amg_swebench_shared_pool_worker_v2"
@@ -1825,6 +2041,29 @@ def run_full(config: CoordinatorConfig) -> list[dict[str, Any]]:
         for _, driver in reversed(audit_drivers):
             release_driver(driver)
 
+    run_ended_monotonic = time.monotonic()
+    run_ended_wall_ns = time.time_ns()
+    full_run_timing = {
+        "schema": FULL_RUN_TIMING_SCHEMA,
+        "status": "PASS",
+        "started_wall_ns": run_started_wall_ns,
+        "ended_wall_ns": run_ended_wall_ns,
+        "actual_wall_seconds": run_ended_monotonic - run_started_monotonic,
+        "initial_projected_full_makespan_seconds": timing_gate["projection"][
+            "projected_full_makespan_seconds"
+        ],
+        "timing_gate_sha256": timing_gate_sha256,
+        "baseline_completed_tasks": len(baseline_tasks),
+        "eta_checks": [
+            {"path": row["path"], "sha256": row["sha256"]}
+            for row in eta_checks
+        ],
+        "final_projected_remaining_makespan_seconds": eta_checks[-1]["receipt"][
+            "projected_remaining_makespan_seconds"
+        ],
+    }
+    full_run_timing_path = config.root / "control" / "full-run-timing.json"
+    atomic_write_json(full_run_timing_path, full_run_timing)
     assignment_path = config.root / "control" / "assignment.json"
     gate_path = config.root / "control" / "gate.json"
     atomic_write_json(
@@ -1840,12 +2079,163 @@ def run_full(config: CoordinatorConfig) -> list[dict[str, Any]]:
             ).hexdigest(),
             "startup_barrier_sha256": barrier_sha256,
             "gate_sha256": hashlib.sha256(gate_path.read_bytes()).hexdigest(),
+            "timing_gate_sha256": timing_gate_sha256,
+            "full_run_timing_sha256": hashlib.sha256(
+                full_run_timing_path.read_bytes()
+            ).hexdigest(),
             "workers": results,
             "final_audits": audits,
         },
     )
     return results
 
+
+
+def _validated_full_run_timing(
+    config: CoordinatorConfig,
+    *,
+    timing_gate: Mapping[str, Any],
+    timing_gate_sha256: str,
+) -> Mapping[str, Any]:
+    path = config.root / "control" / "full-run-timing.json"
+    value = load_atomic_object(path, "full-run timing receipt")
+    expected_fields = {
+        "schema",
+        "status",
+        "started_wall_ns",
+        "ended_wall_ns",
+        "actual_wall_seconds",
+        "initial_projected_full_makespan_seconds",
+        "timing_gate_sha256",
+        "baseline_completed_tasks",
+        "eta_checks",
+        "final_projected_remaining_makespan_seconds",
+    }
+    initial_projection = timing_gate["projection"][
+        "projected_full_makespan_seconds"
+    ]
+    if (
+        set(value) != expected_fields
+        or value.get("schema") != FULL_RUN_TIMING_SCHEMA
+        or value.get("status") != "PASS"
+        or type(value.get("started_wall_ns")) is not int
+        or type(value.get("ended_wall_ns")) is not int
+        or value["ended_wall_ns"] < value["started_wall_ns"]
+        or not isinstance(value.get("actual_wall_seconds"), (int, float))
+        or not math.isfinite(float(value["actual_wall_seconds"]))
+        or value["actual_wall_seconds"] < 0
+        or value["actual_wall_seconds"]
+        > TIMING_BUDGET_SECONDS * ETA_STOP_MULTIPLIER
+        or value.get("initial_projected_full_makespan_seconds")
+        != initial_projection
+        or value.get("timing_gate_sha256") != timing_gate_sha256
+        or type(value.get("baseline_completed_tasks")) is not int
+        or not 0 <= value["baseline_completed_tasks"] <= 500
+        or not isinstance(value.get("eta_checks"), list)
+        or not value["eta_checks"]
+        or not isinstance(
+            value.get("final_projected_remaining_makespan_seconds"),
+            (int, float),
+        )
+    ):
+        raise RuntimeError("full-run timing receipt binding drifted")
+    if full_run_stop_path(config.root).exists() or full_run_stop_path(
+        config.root
+    ).is_symlink():
+        raise RuntimeError("successful full-run timing has a stop marker")
+
+    baseline_tasks = value["baseline_completed_tasks"]
+    baseline_cells = baseline_tasks * len(ARMS)
+    remaining_at_launch = 1500 - baseline_cells
+    prior_elapsed = -1.0
+    prior_cells = -1
+    expected_consecutive = 0
+    receipts: list[Mapping[str, Any]] = []
+    for index, binding in enumerate(value["eta_checks"], start=1):
+        expected_path = (
+            config.root / "control" / "eta" / f"check-{index:06d}.json"
+        )
+        if (
+            not isinstance(binding, Mapping)
+            or set(binding) != {"path", "sha256"}
+            or binding.get("path") != str(expected_path)
+            or binding.get("sha256")
+            != hashlib.sha256(expected_path.read_bytes()).hexdigest()
+        ):
+            raise RuntimeError("full-run ETA receipt binding drifted")
+        receipt = load_atomic_object(expected_path, "full-run ETA receipt")
+        expected_receipt_fields = {
+            "schema",
+            "status",
+            "check_index",
+            "elapsed_seconds",
+            "baseline_completed_tasks",
+            "baseline_completed_cells",
+            "new_completed_tasks",
+            "new_completed_cells",
+            "remaining_cells_at_launch",
+            "projected_remaining_makespan_seconds",
+            "stop_threshold_seconds",
+            "consecutive_over_budget_checks",
+            "timing_gate_sha256",
+        }
+        elapsed = receipt.get("elapsed_seconds")
+        new_tasks = receipt.get("new_completed_tasks")
+        new_cells = receipt.get("new_completed_cells")
+        projection = receipt.get("projected_remaining_makespan_seconds")
+        if (
+            set(receipt) != expected_receipt_fields
+            or receipt.get("schema") != ETA_RECEIPT_SCHEMA
+            or receipt.get("check_index") != index
+            or not isinstance(elapsed, (int, float))
+            or not math.isfinite(float(elapsed))
+            or elapsed < 0
+            or elapsed < prior_elapsed
+            or type(new_tasks) is not int
+            or not 0 <= new_tasks <= 500 - baseline_tasks
+            or type(new_cells) is not int
+            or new_cells != new_tasks * len(ARMS)
+            or new_cells < prior_cells
+            or receipt.get("baseline_completed_tasks") != baseline_tasks
+            or receipt.get("baseline_completed_cells") != baseline_cells
+            or receipt.get("remaining_cells_at_launch") != remaining_at_launch
+            or receipt.get("stop_threshold_seconds")
+            != TIMING_BUDGET_SECONDS * ETA_STOP_MULTIPLIER
+            or receipt.get("timing_gate_sha256") != timing_gate_sha256
+            or not isinstance(projection, (int, float))
+            or not math.isfinite(float(projection))
+        ):
+            raise RuntimeError("full-run ETA receipt identity drifted")
+        expected_projection = _eta_projection(
+            elapsed_seconds=float(elapsed),
+            completed_cells=new_cells,
+            remaining_cells=remaining_at_launch,
+        )
+        if not math.isclose(
+            float(projection), expected_projection, rel_tol=1e-12, abs_tol=1e-9
+        ):
+            raise RuntimeError("full-run ETA projection drifted")
+        over = expected_projection > TIMING_BUDGET_SECONDS * ETA_STOP_MULTIPLIER
+        expected_consecutive = expected_consecutive + 1 if over else 0
+        if (
+            receipt.get("status")
+            != ("OVER_STOP_THRESHOLD" if over else "WITHIN_STOP_THRESHOLD")
+            or receipt.get("consecutive_over_budget_checks")
+            != expected_consecutive
+            or expected_consecutive >= 2
+        ):
+            raise RuntimeError("full-run ETA stop-loss drifted")
+        prior_elapsed = float(elapsed)
+        prior_cells = new_cells
+        receipts.append(receipt)
+    if not math.isclose(
+        float(value["final_projected_remaining_makespan_seconds"]),
+        float(receipts[-1]["projected_remaining_makespan_seconds"]),
+        rel_tol=1e-12,
+        abs_tol=1e-9,
+    ):
+        raise RuntimeError("full-run final ETA binding drifted")
+    return value
 
 def validated_workers_complete(config: CoordinatorConfig) -> Mapping[str, Any]:
     path = config.root / "control" / "workers-complete.json"
@@ -1857,11 +2247,22 @@ def validated_workers_complete(config: CoordinatorConfig) -> Mapping[str, Any]:
         "assignment_sha256",
         "startup_barrier_sha256",
         "gate_sha256",
+        "timing_gate_sha256",
+        "full_run_timing_sha256",
         "workers",
         "final_audits",
     }
     assignment_path = config.root / "control" / "assignment.json"
     gate_path = config.root / "control" / "gate.json"
+    timing_gate_path = config.root / "control" / "timing-gate.json"
+    full_run_timing_path = config.root / "control" / "full-run-timing.json"
+    timing_gate = validated_timing_gate(config)
+    timing_gate_sha256 = hashlib.sha256(timing_gate_path.read_bytes()).hexdigest()
+    _validated_full_run_timing(
+        config,
+        timing_gate=timing_gate,
+        timing_gate_sha256=timing_gate_sha256,
+    )
     if (
         set(value) != expected_fields
         or value.get("schema") != WORKERS_COMPLETE_SCHEMA
@@ -1876,6 +2277,9 @@ def validated_workers_complete(config: CoordinatorConfig) -> Mapping[str, Any]:
         ).hexdigest()
         or value.get("gate_sha256")
         != hashlib.sha256(gate_path.read_bytes()).hexdigest()
+        or value.get("timing_gate_sha256") != timing_gate_sha256
+        or value.get("full_run_timing_sha256")
+        != hashlib.sha256(full_run_timing_path.read_bytes()).hexdigest()
     ):
         raise RuntimeError("workers-complete receipt binding drifted")
     workers = value.get("workers")
@@ -1918,7 +2322,20 @@ def validated_workers_complete(config: CoordinatorConfig) -> Mapping[str, Any]:
 
 
 def aggregate(config: CoordinatorConfig) -> Mapping[str, Any]:
-    validated_workers_complete(config)
+    workers_complete = validated_workers_complete(config)
+    workers_complete_path = config.root / "control" / "workers-complete.json"
+    timing_gate_path = config.root / "control" / "timing-gate.json"
+    full_run_timing_path = config.root / "control" / "full-run-timing.json"
+    full_run_timing = load_atomic_object(
+        full_run_timing_path, "full-run timing receipt"
+    )
+    if (
+        workers_complete.get("timing_gate_sha256")
+        != hashlib.sha256(timing_gate_path.read_bytes()).hexdigest()
+        or workers_complete.get("full_run_timing_sha256")
+        != hashlib.sha256(full_run_timing_path.read_bytes()).hexdigest()
+    ):
+        raise RuntimeError("aggregate timing evidence changed after validation")
     rows = []
     per_arm = {arm: 0 for arm in ARMS}
     drivers = {
@@ -2013,6 +2430,24 @@ def aggregate(config: CoordinatorConfig) -> Mapping[str, Any]:
         },
         "results_path": str(results_path),
         "results_sha256": hashlib.sha256(results_path.read_bytes()).hexdigest(),
+        "timing_gate_sha256": hashlib.sha256(
+            timing_gate_path.read_bytes()
+        ).hexdigest(),
+        "workers_complete_sha256": hashlib.sha256(
+            workers_complete_path.read_bytes()
+        ).hexdigest(),
+        "full_run_timing_sha256": hashlib.sha256(
+            full_run_timing_path.read_bytes()
+        ).hexdigest(),
+        "initial_projected_full_makespan_seconds": full_run_timing[
+            "initial_projected_full_makespan_seconds"
+        ],
+        "actual_full_run_wall_seconds": full_run_timing[
+            "actual_wall_seconds"
+        ],
+        "final_projected_remaining_makespan_seconds": full_run_timing[
+            "final_projected_remaining_makespan_seconds"
+        ],
     }
     atomic_write_json(config.root / "results" / "official-summary.json", summary)
     return summary

@@ -25,12 +25,17 @@ from swebench_triad_eval.state import (
 )
 from swebench_triad_eval.shared_pool_coordinator import (
     INDEX_SCHEMA,
+    ETA_RECEIPT_SCHEMA,
+    FULL_RUN_TIMING_SCHEMA,
+    STOP_MARKER_SCHEMA,
     TIMING_BUDGET_SECONDS,
+    WORKERS_COMPLETE_SCHEMA,
     TIMING_REQUIRED_METRICS,
     CoordinatorConfig,
     ReplicaConfig,
     _collect_timing_gate,
     _extract_startup_reconciliation,
+    _validated_full_run_timing,
     _worker,
     aggregate,
     assigned_replica,
@@ -43,6 +48,7 @@ from swebench_triad_eval.shared_pool_coordinator import (
     preflight_all,
     run_full,
     validated_timing_gate,
+    validated_workers_complete,
     validate_live_pool_snapshot,
 )
 from test_swebench_triad_eval_cli import production_config
@@ -512,12 +518,33 @@ class TimingGateContractTest(unittest.TestCase):
             config = self.load_config(Path(raw))
             contract = write_timing_contract(config)
             gate_path = write_timing_gate(config, contract)
-            accepted = validated_timing_gate(config)
+            expected = json.loads(gate_path.read_text())
+            with patch(
+                "swebench_triad_eval.shared_pool_coordinator._collect_timing_gate",
+                return_value=expected,
+            ):
+                accepted = validated_timing_gate(config)
             self.assertTrue(accepted["projection"]["within_budget"])
             tampered = json.loads(gate_path.read_text())
             tampered["projection"]["projected_full_makespan_seconds"] -= 1
             atomic_write_json(gate_path, tampered)
             with self.assertRaisesRegex(RuntimeError, "arithmetic"):
+                validated_timing_gate(config)
+
+    def test_validated_timing_gate_rejects_nested_evidence_substitution(self):
+        with tempfile.TemporaryDirectory() as raw:
+            config = self.load_config(Path(raw))
+            contract = write_timing_contract(config)
+            gate_path = write_timing_gate(config, contract)
+            expected = json.loads(gate_path.read_text())
+            substituted = copy.deepcopy(expected)
+            substituted["tasks"][0]["task_index"] = 10_000
+            substituted["cells"][0] = {"cell": "fabricated"}
+            atomic_write_json(gate_path, substituted)
+            with patch(
+                "swebench_triad_eval.shared_pool_coordinator._collect_timing_gate",
+                return_value=expected,
+            ), self.assertRaisesRegex(RuntimeError, "evidence recomputation"):
                 validated_timing_gate(config)
 
     def test_synthetic_16_task_panel_collects_all_required_metrics(self):
@@ -609,12 +636,15 @@ class TimingGateContractTest(unittest.TestCase):
                     atomic_write_json(
                         driver.task_publication_path(task_index),
                         {
-                            "schema": "swebench_triad_task_publication_timing_v1",
+                            "schema": "swebench_triad_task_publication_timing_v2",
                             "status": "PASS",
+                            "recovered_after_crash": False,
                             "task_index": task_index,
                             "completion_sha256": hashlib.sha256(
                                 completion.read_bytes()
                             ).hexdigest(),
+                            "started_monotonic_ns": end,
+                            "ended_monotonic_ns": end + 100_000_000,
                             "duration_ns": 100_000_000,
                         },
                     )
@@ -640,15 +670,25 @@ class TimingGateContractTest(unittest.TestCase):
                 side_effect=cell_timing,
             ):
                 receipt = _collect_timing_gate(config, contract)
+                validated = validated_timing_gate(config)
             self.assertEqual(receipt["status"], "PASS")
+            self.assertEqual(validated, receipt)
             self.assertEqual(receipt["panel_task_count"], 16)
             self.assertEqual(receipt["panel_cell_count"], 48)
             self.assertEqual(set(receipt["metrics"]), set(TIMING_REQUIRED_METRICS))
+            self.assertTrue(
+                all(
+                    row["panel_makespan_seconds"] == 110.1
+                    for row in receipt["replicas"]
+                )
+            )
+            self.assertTrue(
+                all(row["task_wall_seconds"] == 100.1 for row in receipt["tasks"])
+            )
             self.assertLessEqual(
                 receipt["projection"]["projected_full_makespan_seconds"],
                 TIMING_BUDGET_SECONDS,
             )
-            validated_timing_gate(config)
 
     def test_over_budget_timing_gate_is_rejected(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -888,6 +928,53 @@ class WorkerTest(unittest.TestCase):
             sorted(calls[2:]), [(4, False, 0), (9, False, 1)]
         )
         self.assertEqual(result["completed_tasks"], 2)
+
+    def test_worker_stops_before_the_next_task_at_publication_boundary(self):
+        calls = []
+
+        class Driver:
+            lease_registry = None
+
+            @staticmethod
+            def ensure_driver_lease():
+                return None
+
+            @staticmethod
+            def _read_validated_preflight():
+                return None
+
+            @staticmethod
+            def run_task(*_args, **_kwargs):
+                calls.append("run")
+
+        with tempfile.TemporaryDirectory() as raw, patch(
+            "swebench_triad_eval.shared_pool_coordinator.driver_from_config",
+            return_value=Driver(),
+        ):
+            root = Path(raw)
+            barrier_sha256 = write_startup_barrier(root)
+            atomic_write_json(
+                root / "control" / "stop-after-publication.json",
+                {
+                    "schema": STOP_MARKER_SCHEMA,
+                    "status": "STOP_AT_PUBLICATION_BOUNDARY",
+                    "reason": "two_consecutive_eta_checks_above_1_5x_budget",
+                    "consecutive_over_budget_checks": 2,
+                    "latest_eta_receipt_sha256": "f" * 64,
+                },
+            )
+            result = _worker(
+                "/tmp/config.json",
+                (4, 9),
+                (IMAGE_DIGEST, IMAGE_DIGEST),
+                (0, 1),
+                3,
+                raw,
+                barrier_sha256,
+            )
+        self.assertEqual(calls, [])
+        self.assertEqual(result["status"], "STOPPED_AT_PUBLICATION_BOUNDARY")
+        self.assertEqual(result["completed_task_indices"], [])
 
     def test_worker_rejects_task_image_lattice_drift(self):
         with self.assertRaisesRegex(ValueError, "lattice"):
@@ -1352,6 +1439,190 @@ class SharedPoolCleanupTest(unittest.TestCase):
             )
             self.assertTrue(receipt["external_model_pool_retained"])
             self.assertTrue(receipt["allocation_retained"])
+
+
+
+class FullRunTimingBindingTest(unittest.TestCase):
+    def _write_receipts(self, root: Path):
+        timing_gate = {"projection": {"projected_full_makespan_seconds": 100.0}}
+        timing_gate_path = root / "control" / "timing-gate.json"
+        atomic_write_json(timing_gate_path, timing_gate)
+        timing_gate_sha256 = hashlib.sha256(
+            timing_gate_path.read_bytes()
+        ).hexdigest()
+        eta_path = root / "control" / "eta" / "check-000001.json"
+        eta = {
+            "schema": ETA_RECEIPT_SCHEMA,
+            "status": "WITHIN_STOP_THRESHOLD",
+            "check_index": 1,
+            "elapsed_seconds": 10.0,
+            "baseline_completed_tasks": 0,
+            "baseline_completed_cells": 0,
+            "new_completed_tasks": 1,
+            "new_completed_cells": 3,
+            "remaining_cells_at_launch": 1500,
+            "projected_remaining_makespan_seconds": 5000.0,
+            "stop_threshold_seconds": TIMING_BUDGET_SECONDS * 1.5,
+            "consecutive_over_budget_checks": 0,
+            "timing_gate_sha256": timing_gate_sha256,
+        }
+        atomic_write_json(eta_path, eta)
+        full = {
+            "schema": FULL_RUN_TIMING_SCHEMA,
+            "status": "PASS",
+            "started_wall_ns": 1,
+            "ended_wall_ns": 10_000_000_001,
+            "actual_wall_seconds": 10.0,
+            "initial_projected_full_makespan_seconds": 100.0,
+            "timing_gate_sha256": timing_gate_sha256,
+            "baseline_completed_tasks": 0,
+            "eta_checks": [
+                {
+                    "path": str(eta_path),
+                    "sha256": hashlib.sha256(eta_path.read_bytes()).hexdigest(),
+                }
+            ],
+            "final_projected_remaining_makespan_seconds": 5000.0,
+        }
+        atomic_write_json(root / "control" / "full-run-timing.json", full)
+        return timing_gate, timing_gate_sha256, eta_path
+
+    def test_full_run_timing_recomputes_eta_and_rejects_nested_tampering(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            timing_gate, digest, eta_path = self._write_receipts(root)
+            config = SimpleNamespace(root=root)
+            receipt = _validated_full_run_timing(
+                config,
+                timing_gate=timing_gate,
+                timing_gate_sha256=digest,
+            )
+            self.assertEqual(receipt["actual_wall_seconds"], 10.0)
+            tampered = json.loads(eta_path.read_text())
+            tampered["new_completed_cells"] = 6
+            atomic_write_json(eta_path, tampered)
+            full_path = root / "control" / "full-run-timing.json"
+            full = json.loads(full_path.read_text())
+            full["eta_checks"][0]["sha256"] = hashlib.sha256(
+                eta_path.read_bytes()
+            ).hexdigest()
+            atomic_write_json(full_path, full)
+            with self.assertRaisesRegex(RuntimeError, "ETA receipt identity"):
+                _validated_full_run_timing(
+                    config,
+                    timing_gate=timing_gate,
+                    timing_gate_sha256=digest,
+                )
+
+
+class WorkersCompleteTimingBindingTest(unittest.TestCase):
+    def test_workers_complete_binds_timing_gate_and_full_run_receipt(self):
+        with tempfile.TemporaryDirectory() as raw, patch(
+            "swebench_triad_eval.shared_pool_coordinator.image_lock_rows",
+            side_effect=fake_image_rows,
+        ):
+            config = CoordinatorConfig.load(make_shared_coordinator(Path(raw)))
+            config.write_assignment()
+            write_startup_barrier(config.root, config)
+            gate_path = config.root / "control" / "gate.json"
+            timing_gate_path = config.root / "control" / "timing-gate.json"
+            full_timing_path = config.root / "control" / "full-run-timing.json"
+            atomic_write_json(gate_path, {"schema": "fixture", "status": "PASS"})
+            atomic_write_json(
+                timing_gate_path,
+                {
+                    "schema": "fixture-timing",
+                    "projection": {"projected_full_makespan_seconds": 1.0},
+                },
+            )
+            atomic_write_json(
+                full_timing_path,
+                {"schema": "fixture-full-timing", "status": "PASS"},
+            )
+            workers = [
+                {
+                    "schema": "amg_swebench_shared_pool_worker_v2",
+                    "status": "PASS",
+                    "replica_index": replica.replica_index,
+                    "completed_tasks": len(replica.task_indices),
+                    "total_tasks": len(replica.task_indices),
+                    "task_slots_per_replica": 2,
+                    "completed_task_indices": list(replica.task_indices),
+                }
+                for replica in config.replicas
+            ]
+            audits = []
+            for replica in config.replicas:
+                receipt = {
+                    "status": "PASS",
+                    "allocation_retained": True,
+                    "residue": {"owned": 0},
+                    "shared_model_pool": {},
+                }
+                audits.append(
+                    {
+                        "replica_index": replica.replica_index,
+                        "receipt": receipt,
+                        "receipt_sha256": sha256_json(receipt),
+                    }
+                )
+            workers_path = config.root / "control" / "workers-complete.json"
+            value = {
+                "schema": WORKERS_COMPLETE_SCHEMA,
+                "status": "PASS",
+                "coordinator_index_sha256": hashlib.sha256(
+                    config.path.read_bytes()
+                ).hexdigest(),
+                "assignment_sha256": hashlib.sha256(
+                    (config.root / "control" / "assignment.json").read_bytes()
+                ).hexdigest(),
+                "startup_barrier_sha256": hashlib.sha256(
+                    (config.root / "control" / "preflight-all.json").read_bytes()
+                ).hexdigest(),
+                "gate_sha256": hashlib.sha256(gate_path.read_bytes()).hexdigest(),
+                "timing_gate_sha256": hashlib.sha256(
+                    timing_gate_path.read_bytes()
+                ).hexdigest(),
+                "full_run_timing_sha256": hashlib.sha256(
+                    full_timing_path.read_bytes()
+                ).hexdigest(),
+                "workers": workers,
+                "final_audits": audits,
+            }
+            atomic_write_json(workers_path, value)
+            timing_gate = {
+                "projection": {"projected_full_makespan_seconds": 1.0}
+            }
+            patches = (
+                patch(
+                    "swebench_triad_eval.shared_pool_coordinator.validated_timing_gate",
+                    return_value=timing_gate,
+                ),
+                patch(
+                    "swebench_triad_eval.shared_pool_coordinator._validated_full_run_timing",
+                    return_value={"status": "PASS"},
+                ),
+                patch(
+                    "swebench_triad_eval.shared_pool_coordinator.validated_preflight_pool_snapshot",
+                    return_value={},
+                ),
+                patch(
+                    "swebench_triad_eval.shared_pool_coordinator.validate_live_pool_snapshot",
+                    return_value={},
+                ),
+            )
+            with patches[0], patches[1], patches[2], patches[3]:
+                self.assertEqual(validated_workers_complete(config), value)
+                tampered = copy.deepcopy(value)
+                tampered["timing_gate_sha256"] = "0" * 64
+                atomic_write_json(workers_path, tampered)
+                with self.assertRaisesRegex(RuntimeError, "binding drifted"):
+                    validated_workers_complete(config)
+                tampered = copy.deepcopy(value)
+                tampered["full_run_timing_sha256"] = "1" * 64
+                atomic_write_json(workers_path, tampered)
+                with self.assertRaisesRegex(RuntimeError, "binding drifted"):
+                    validated_workers_complete(config)
 
 
 class GateBindingTest(unittest.TestCase):

@@ -866,7 +866,37 @@ class LifecycleDriverTest(unittest.TestCase):
             completion["timing_receipt"]["sha256"],
         )
         self.assertGreaterEqual(publication["duration_ns"], 0)
+        self.assertFalse(publication["recovered_after_crash"])
         self.assertEqual(self.driver.load_task_completion(0), completion)
+
+    def test_resume_recovers_missing_task_publication_sidecar(self):
+        completion = self.driver.run_task(0, gate=True)
+        publication_path = self.driver.task_publication_path(0)
+        publication_path.unlink()
+
+        resumed = self.driver.run_task(0, gate=True)
+
+        self.assertEqual(resumed, completion)
+        publication = json.loads(publication_path.read_text())
+        self.assertEqual(
+            publication["schema"], "swebench_triad_task_publication_timing_v2"
+        )
+        self.assertTrue(publication["recovered_after_crash"])
+        timing = json.loads(Path(completion["timing_receipt"]["path"]).read_text())
+        self.assertEqual(
+            publication["started_wall_ns"], timing["ended_wall_ns"]
+        )
+        self.assertEqual(
+            publication["started_monotonic_ns"],
+            timing["ended_monotonic_ns"],
+        )
+        self.assertGreaterEqual(publication["duration_ns"], 0)
+        self.assertEqual(
+            publication["completion_sha256"],
+            hashlib.sha256(
+                self.driver.task_completion_path(0).read_bytes()
+            ).hexdigest(),
+        )
 
     def test_grade_all_rejects_noncanonical_accepted_triad_before_outcomes(self):
         slot = self.driver.acquire_runtime_lane(1, slot_index=0)

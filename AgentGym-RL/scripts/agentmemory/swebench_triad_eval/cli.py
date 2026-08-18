@@ -1273,6 +1273,75 @@ class LifecycleDriver:
             raise ValueError("task index is outside the manifest")
         return self.root / "full" / f"task-{task_index:04d}.publication.json"
 
+    def _task_publication(
+        self,
+        task_index: int,
+        completion: Mapping[str, Any],
+        *,
+        started_wall_ns: int,
+        ended_wall_ns: int,
+        started_monotonic_ns: int,
+        ended_monotonic_ns: int,
+        recovered_after_crash: bool,
+    ) -> dict[str, Any]:
+        completion_path = self.task_completion_path(task_index)
+        return {
+            "schema": "swebench_triad_task_publication_timing_v2",
+            "status": "PASS",
+            "task_index": task_index,
+            "completion_path": str(completion_path),
+            "completion_sha256": hashlib.sha256(
+                completion_path.read_bytes()
+            ).hexdigest(),
+            "timing_receipt_sha256": completion["timing_receipt"]["sha256"],
+            "started_wall_ns": started_wall_ns,
+            "ended_wall_ns": ended_wall_ns,
+            "started_monotonic_ns": started_monotonic_ns,
+            "ended_monotonic_ns": ended_monotonic_ns,
+            "duration_ns": max(0, ended_monotonic_ns - started_monotonic_ns),
+            "recovered_after_crash": recovered_after_crash,
+        }
+
+    def _recover_task_publication(
+        self, task_index: int, completion: Mapping[str, Any]
+    ) -> None:
+        """Roll forward a completion-visible/publication-sidecar crash window.
+
+        The immutable completion is the task commit.  Its bound phase-timing
+        receipt records the instant immediately before publication and the
+        completion inode mtime records the durable content write.  Those two
+        immutable facts reconstruct a conservative publication interval without
+        rerunning a cell or the official grader.  Concurrent resumptions derive
+        identical bytes, so ``write_immutable_json`` remains the final fence.
+        """
+
+        completion_path = self.task_completion_path(task_index)
+        timing_path = Path(completion["timing_receipt"]["path"])
+        timing = read_json(timing_path)
+        started_wall_ns = timing.get("ended_wall_ns")
+        started_monotonic_ns = timing.get("ended_monotonic_ns")
+        ended_wall_ns = completion_path.stat().st_mtime_ns
+        if (
+            timing.get("schema") != "swebench_triad_task_phase_timing_v1"
+            or timing.get("status") != "READY_FOR_PUBLICATION"
+            or timing.get("task_index") != task_index
+            or type(started_wall_ns) is not int
+            or type(started_monotonic_ns) is not int
+            or ended_wall_ns < started_wall_ns
+        ):
+            raise RuntimeError("task publication recovery evidence is invalid")
+        duration_ns = ended_wall_ns - started_wall_ns
+        recovered = self._task_publication(
+            task_index,
+            completion,
+            started_wall_ns=started_wall_ns,
+            ended_wall_ns=ended_wall_ns,
+            started_monotonic_ns=started_monotonic_ns,
+            ended_monotonic_ns=started_monotonic_ns + duration_ns,
+            recovered_after_crash=True,
+        )
+        write_immutable_json(self.task_publication_path(task_index), recovered)
+
     def load_task_completion(
         self,
         task_index: int,
@@ -1322,7 +1391,10 @@ class LifecycleDriver:
             != completion["timing_receipt"]["sha256"]
         ):
             raise RuntimeError("task completion timing binding drifted")
-        publication = read_json(self.task_publication_path(task_index))
+        publication_path = self.task_publication_path(task_index)
+        if not publication_path.exists() and not publication_path.is_symlink():
+            self._recover_task_publication(task_index, completion)
+        publication = read_json(publication_path)
         completion_path = self.task_completion_path(task_index)
         expected_publication_fields = {
             "schema",
@@ -1336,24 +1408,36 @@ class LifecycleDriver:
             "started_monotonic_ns",
             "ended_monotonic_ns",
             "duration_ns",
+            "recovered_after_crash",
         }
         if (
             not isinstance(publication, Mapping)
             or set(publication) != expected_publication_fields
             or publication.get("schema")
-            != "swebench_triad_task_publication_timing_v1"
+            != "swebench_triad_task_publication_timing_v2"
             or publication.get("status") != "PASS"
+            or type(publication.get("recovered_after_crash")) is not bool
             or publication.get("task_index") != task_index
             or publication.get("completion_path") != str(completion_path)
             or publication.get("completion_sha256")
             != hashlib.sha256(completion_path.read_bytes()).hexdigest()
             or publication.get("timing_receipt_sha256")
             != completion["timing_receipt"]["sha256"]
-            or type(publication.get("duration_ns")) is not int
+            or any(
+                type(publication.get(field)) is not int
+                for field in (
+                    "started_wall_ns",
+                    "ended_wall_ns",
+                    "started_monotonic_ns",
+                    "ended_monotonic_ns",
+                    "duration_ns",
+                )
+            )
+            or publication["ended_wall_ns"] < publication["started_wall_ns"]
             or publication["duration_ns"] < 0
             or publication["duration_ns"]
-            != publication.get("ended_monotonic_ns")
-            - publication.get("started_monotonic_ns")
+            != publication["ended_monotonic_ns"]
+            - publication["started_monotonic_ns"]
         ):
             raise RuntimeError("task completion publication binding drifted")
         return dict(completion)
@@ -1416,21 +1500,15 @@ class LifecycleDriver:
         write_immutable_json(completion_path, result)
         ended_wall_ns = time.time_ns()
         ended_monotonic_ns = time.monotonic_ns()
-        publication = {
-            "schema": "swebench_triad_task_publication_timing_v1",
-            "status": "PASS",
-            "task_index": task_index,
-            "completion_path": str(completion_path),
-            "completion_sha256": hashlib.sha256(
-                completion_path.read_bytes()
-            ).hexdigest(),
-            "timing_receipt_sha256": timing_receipt["sha256"],
-            "started_wall_ns": started_wall_ns,
-            "ended_wall_ns": ended_wall_ns,
-            "started_monotonic_ns": started_monotonic_ns,
-            "ended_monotonic_ns": ended_monotonic_ns,
-            "duration_ns": max(0, ended_monotonic_ns - started_monotonic_ns),
-        }
+        publication = self._task_publication(
+            task_index,
+            result,
+            started_wall_ns=started_wall_ns,
+            ended_wall_ns=ended_wall_ns,
+            started_monotonic_ns=started_monotonic_ns,
+            ended_monotonic_ns=ended_monotonic_ns,
+            recovered_after_crash=False,
+        )
         write_immutable_json(self.task_publication_path(task_index), publication)
         return result
 
