@@ -203,7 +203,12 @@ def build_overrides(
         "critic.ppo_epochs=1",
         "critic.shuffle=False",
         "critic.use_dynamic_bsz=True",
-        "critic.ppo_max_token_len_per_gpu=65536",
+        # On four-way FSDP2, the dynamic token target controls the number of
+        # attention-workload-balanced microbatches rather than hard-bounding
+        # each packed microbatch. 65,536 still reached 166--171 GiB on G64 r8;
+        # 49,152 is the next single-variable memory step while retaining the
+        # configured microbatch=8 and no optimizer offload.
+        "critic.ppo_max_token_len_per_gpu=49152",
         "critic.forward_max_token_len_per_gpu=262144",
         "critic.optim.lr=1e-5",
         "critic.optim.weight_decay=0.01",

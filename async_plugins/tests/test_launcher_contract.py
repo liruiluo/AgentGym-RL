@@ -123,7 +123,7 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                 "65536",
             )
             self.assertEqual(
-                values["critic.ppo_max_token_len_per_gpu"], "65536"
+                values["critic.ppo_max_token_len_per_gpu"], "49152"
             )
             self.assertEqual(
                 values["actor_rollout_ref.rollout.multi_turn.enable"], "True"
