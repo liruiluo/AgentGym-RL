@@ -134,6 +134,7 @@ def _config(*, mode: str = "formal") -> dict:
                 "name": "AMGTrajectoryDataset",
             },
             "continuous_token": {"enable": True, "model_family": "qwen35"},
+            "apply_chat_template_kwargs": {"enable_thinking": False},
             "agentgym": {
                 "task_name": "openmle_fast",
                 "env_addr": "http://127.0.0.1:65525",
@@ -254,6 +255,12 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
             "single_turn_agent"
         )
         with self.assertRaisesRegex(ValueError, "Continuous Token"):
+            _verify(config, mode="formal")
+
+    def test_rejects_native_qwen_thinking_that_breaks_bare_action_contract(self):
+        config = _config()
+        config["data"]["apply_chat_template_kwargs"]["enable_thinking"] = True
+        with self.assertRaisesRegex(ValueError, "enable_thinking"):
             _verify(config, mode="formal")
 
     def test_rejects_multi_turn_disabled_before_upstream_stamps_single_turn(self):

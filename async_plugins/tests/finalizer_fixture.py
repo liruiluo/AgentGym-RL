@@ -174,6 +174,7 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
                 "name": "AMGTrajectoryDataset",
             },
             "continuous_token": {"enable": True, "model_family": "qwen35"},
+            "apply_chat_template_kwargs": {"enable_thinking": False},
             "agentgym": dict(agentgym),
         },
         "async_training": {

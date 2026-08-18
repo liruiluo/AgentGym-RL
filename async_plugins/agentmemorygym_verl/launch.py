@@ -154,6 +154,10 @@ def build_overrides(
         "data.custom_cls.name=AMGTrajectoryDataset",
         "data.continuous_token.enable=True",
         "data.continuous_token.model_family=qwen35",
+        # Reuse veRL/Transformers native Qwen3.5 template control. The frozen
+        # synchronous baseline used a closed thinking block so each generation
+        # is the bare three-tool action expected by the environment parser.
+        "+data.apply_chat_template_kwargs.enable_thinking=False",
         f"actor_rollout_ref.model.path={model_path}",
         "actor_rollout_ref.model.trust_remote_code=True",
         "actor_rollout_ref.model.use_remove_padding=True",
@@ -172,7 +176,10 @@ def build_overrides(
         "actor_rollout_ref.actor.ppo_epochs=1",
         "actor_rollout_ref.actor.shuffle=False",
         "actor_rollout_ref.actor.use_dynamic_bsz=True",
-        "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=131072",
+        # Four-way FSDP leaves less activation headroom than the historical
+        # eight-way synchronous trainer. Keep microbatch=8 but bound packed
+        # training tokens; formal tuning may raise these after measured headroom.
+        "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=65536",
         "actor_rollout_ref.actor.use_rollout_log_probs=True",
         "actor_rollout_ref.actor.optim.lr=1e-6",
         "actor_rollout_ref.actor.optim.weight_decay=0.01",
@@ -196,7 +203,7 @@ def build_overrides(
         "critic.ppo_epochs=1",
         "critic.shuffle=False",
         "critic.use_dynamic_bsz=True",
-        "critic.ppo_max_token_len_per_gpu=163840",
+        "critic.ppo_max_token_len_per_gpu=81920",
         "critic.forward_max_token_len_per_gpu=262144",
         "critic.optim.lr=1e-5",
         "critic.optim.weight_decay=0.01",

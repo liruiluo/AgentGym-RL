@@ -116,6 +116,16 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             self.assertEqual(values["trainer.logger"], "[console,file]")
             self.assertEqual(values["actor_rollout_ref.hybrid_engine"], "False")
             self.assertEqual(
+                values["data.apply_chat_template_kwargs.enable_thinking"], "False"
+            )
+            self.assertEqual(
+                values["actor_rollout_ref.actor.ppo_max_token_len_per_gpu"],
+                "65536",
+            )
+            self.assertEqual(
+                values["critic.ppo_max_token_len_per_gpu"], "81920"
+            )
+            self.assertEqual(
                 values["actor_rollout_ref.rollout.multi_turn.enable"], "True"
             )
             self.assertEqual(
