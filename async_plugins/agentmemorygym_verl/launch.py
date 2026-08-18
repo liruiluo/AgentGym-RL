@@ -203,7 +203,7 @@ def build_overrides(
         "critic.ppo_epochs=1",
         "critic.shuffle=False",
         "critic.use_dynamic_bsz=True",
-        "critic.ppo_max_token_len_per_gpu=81920",
+        "critic.ppo_max_token_len_per_gpu=65536",
         "critic.forward_max_token_len_per_gpu=262144",
         "critic.optim.lr=1e-5",
         "critic.optim.weight_decay=0.01",
