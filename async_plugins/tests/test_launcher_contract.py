@@ -213,7 +213,11 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
     def test_runtime_env_is_closed_and_pins_native_artifact_paths(self):
         with tempfile.TemporaryDirectory() as directory:
             inputs = self._inputs(Path(directory), mode="gate")
-            env = build_runtime_env(inputs, base_env={"PATH": "/usr/bin"})
+            env = build_runtime_env(
+                inputs,
+                training_runtime=self.source_lock["training_runtime"],
+                base_env={"PATH": "/usr/bin"},
+            )
             self.assertEqual(
                 env["PYTHONPATH"].split(":"),
                 [
@@ -229,6 +233,10 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                     str(inputs.outer_root / "AgentGym" / "agentenv-openmle-fast"),
                 ],
             )
+            runtime_bin = str(
+                Path(self.source_lock["training_runtime"]["python"]).parent
+            )
+            self.assertEqual(env["PATH"].split(":"), [runtime_bin, "/usr/bin"])
             self.assertEqual(
                 env["VERL_USE_EXTERNAL_MODULES"], "agentmemorygym_verl.action_gae"
             )
@@ -241,7 +249,11 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             )
             self.assertEqual(env["VLLM_USE_V1"], "1")
             with self.assertRaisesRegex(RuntimeError, "PYTHONPATH"):
-                build_runtime_env(inputs, base_env={"PYTHONPATH": "/caller"})
+                build_runtime_env(
+                    inputs,
+                    training_runtime=self.source_lock["training_runtime"],
+                    base_env={"PYTHONPATH": "/caller"},
+                )
 
     def test_cli_has_no_commit_model_or_budget_identity_override(self):
         common = [

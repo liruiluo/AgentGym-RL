@@ -292,7 +292,10 @@ def build_overrides(
 
 
 def build_runtime_env(
-    inputs: LaunchInputs, *, base_env: dict[str, str] | None = None
+    inputs: LaunchInputs,
+    *,
+    training_runtime: Mapping[str, Any],
+    base_env: dict[str, str] | None = None,
 ) -> dict[str, str]:
     env = dict(os.environ if base_env is None else base_env)
     python_entries = [
@@ -311,6 +314,14 @@ def build_runtime_env(
         environment_to_check.pop("PYTHONPATH")
     reject_ambient_identity(environment_to_check)
     env["PYTHONPATH"] = closed_pythonpath
+    runtime_bin = str(Path(_string(training_runtime["python"])).parent)
+    inherited_path = env.get("PATH", "")
+    path_entries = [
+        entry
+        for entry in inherited_path.split(os.pathsep)
+        if entry and entry != runtime_bin
+    ]
+    env["PATH"] = os.pathsep.join([runtime_bin, *path_entries])
     env["VERL_USE_EXTERNAL_MODULES"] = "agentmemorygym_verl.action_gae"
     env["VERL_USE_EXTERNAL_PLUGINS"] = "none"
     env["VERL_FILE_LOGGER_PATH"] = str(inputs.run_dir / "metrics.jsonl")
@@ -993,6 +1004,7 @@ def _runtime_preflight(
         raise FileNotFoundError(f"publication model directory missing: {model_path}")
     code = r"""
 import json
+import shutil
 import trl
 from trl import AutoModelForCausalLMWithValueHead
 from agentmemorygym_verl.agent_loop import AMGTaskNeutralAgentLoop
@@ -1015,11 +1027,15 @@ finally:
     client.close()
 if not isinstance(framing, list) or not framing:
     raise RuntimeError("AMG endpoint returned empty policy framing")
+ninja_path = shutil.which("ninja")
+if ninja_path is None:
+    raise RuntimeError("publication runtime PATH does not provide ninja")
 print(json.dumps({
     "adv_estimator": fn.__name__,
     "agent_loop": AMGTaskNeutralAgentLoop.__name__,
     "dataset": AMGTrajectoryDataset.__name__,
     "policy_framing_messages": len(framing),
+    "ninja_path": ninja_path,
     "trl_version": trl.__version__,
     "value_head_class": AutoModelForCausalLMWithValueHead.__name__,
 }, sort_keys=True))
@@ -1085,7 +1101,7 @@ def prepare_launch(
         require_outer_clean=not resolve_only,
         endpoint_identity=endpoint_identity,
     )
-    env = build_runtime_env(inputs)
+    env = build_runtime_env(inputs, training_runtime=training_runtime)
     env.update(endpoint_identity["environment"])
     env["AMG_ENDPOINT_CLIENT_CONFIG_JSON"] = json.dumps(
         endpoint_identity["client_config"],
