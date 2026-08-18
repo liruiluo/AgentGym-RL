@@ -46,9 +46,9 @@ def common_payload() -> dict[str, object]:
             "stop": [],
         },
         "budgets": {
-            "max_policy_turns": 250,
+            "max_policy_turns": 30,
             "max_total_tokens": 8388608,
-            "max_tool_calls": 250,
+            "max_tool_calls": 30,
             "max_wall_seconds": 1800.0,
             "max_prompt_tokens": 30720,
             "max_model_tokens": 32768,
@@ -234,8 +234,19 @@ class IdentityTest(unittest.TestCase):
             {config.treatment_excluded_config_sha256 for config in configs[:3]},
             {configs[0].treatment_excluded_config_sha256},
         )
-        self.assertEqual(manifest["common"]["budgets"]["max_policy_turns"], 250)
+        self.assertEqual(manifest["common"]["budgets"]["max_policy_turns"], 30)
         self.assertEqual(manifest["common"]["decoding"]["max_output_tokens"], 2048)
+
+        stale_budget = common_payload()
+        stale_budget["budgets"] = dict(stale_budget["budgets"])
+        stale_budget["budgets"]["max_policy_turns"] = 250
+        stale_budget["budgets"]["max_tool_calls"] = 250
+        with self.assertRaisesRegex(ValueError, "policy budgets drifted"):
+            build_manifest(
+                task_ids,
+                common=stale_budget,
+                run_id="swebench-verified-triad-20260816",
+            )
 
         with self.assertRaises(ValueError):
             build_manifest(

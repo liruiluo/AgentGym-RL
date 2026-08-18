@@ -243,9 +243,9 @@ def formal_manifest() -> dict[str, object]:
                 "stop": [],
             },
             "budgets": {
-                "max_policy_turns": 250,
+                "max_policy_turns": 30,
                 "max_total_tokens": 8388608,
-                "max_tool_calls": 250,
+                "max_tool_calls": 30,
                 "max_wall_seconds": 1800.0,
                 "max_prompt_tokens": 30720,
                 "max_model_tokens": 32768,

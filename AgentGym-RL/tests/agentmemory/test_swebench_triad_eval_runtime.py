@@ -360,8 +360,8 @@ class SwebenchRuntimeFactoryTest(unittest.TestCase):
             horizon_cause="policy_turn_limit",
             failure_class=None,
             timed_out=False,
-            policy_turns=250,
-            tool_calls=250,
+            policy_turns=30,
+            tool_calls=30,
         )
 
         artifact = finalize_swebench_artifact(
