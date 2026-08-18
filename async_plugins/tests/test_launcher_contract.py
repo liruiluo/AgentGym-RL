@@ -1,0 +1,254 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from agentmemorygym_verl.config_contract import inspect_schedule
+from agentmemorygym_verl.identity import EXPECTED_VERL_COMMIT
+from agentmemorygym_verl.launch import (
+    LaunchInputs,
+    _load_endpoint_identity,
+    _parse_args,
+    build_overrides,
+    build_runtime_env,
+)
+
+FIXTURES = Path("/tmp/openmle-v8-launch-fixtures-20260818")
+
+
+class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
+    def setUp(self) -> None:
+        required = (
+            "source-lock.json",
+            "publication-receipt.json",
+            "formal100-schedule-certificate.json",
+            "launcher_contract.py",
+            "g64-gate-single-pass.jsonl",
+            "formal100-schedule.jsonl",
+        )
+        for filename in required:
+            self.assertTrue((FIXTURES / filename).is_file(), filename)
+        self.source_lock = json.loads(
+            (FIXTURES / "source-lock.json").read_text(encoding="utf-8")
+        )
+
+    def _inputs(self, root: Path, mode: str = "formal") -> LaunchInputs:
+        schedule = (
+            FIXTURES / "formal100-schedule.jsonl"
+            if mode == "formal"
+            else FIXTURES / "g64-gate-single-pass.jsonl"
+        )
+        return LaunchInputs(
+            mode=mode,
+            verl_root=root / "verl",
+            outer_root=root / "AgentGym-RL",
+            schedule=schedule,
+            env_addr="http://127.0.0.1:65525",
+            run_dir=root / "run",
+            experiment_name=f"current-publication-{mode}",
+            endpoint_source_lock=FIXTURES / "source-lock.json",
+            endpoint_contract_tool=FIXTURES / "launcher_contract.py",
+            publication_receipt=FIXTURES / "publication-receipt.json",
+            formal_schedule_certificate=FIXTURES
+            / "formal100-schedule-certificate.json",
+        )
+
+    @staticmethod
+    def _values(overrides: list[str]) -> dict[str, str]:
+        return {
+            key.lstrip("+"): value
+            for key, value in (item.split("=", 1) for item in overrides)
+        }
+
+    def _identity(self, root: Path, mode: str) -> tuple[LaunchInputs, dict]:
+        inputs = self._inputs(root, mode=mode)
+        role = "gate_only" if mode == "gate" else "train_pool"
+        schedule = inspect_schedule(inputs.schedule, expected_role=role)
+        return inputs, _load_endpoint_identity(inputs, schedule_report=schedule)
+
+    def test_formal_overrides_reuse_upstream_fully_async_ppo_ownership(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inputs, identity = self._identity(Path(directory), "formal")
+            budget = identity["budget_contract"]
+            values = self._values(
+                build_overrides(
+                    inputs,
+                    effective_schedule=inputs.schedule,
+                    endpoint_client_config=identity["client_config"],
+                    budget_contract=budget,
+                    training_runtime=identity["training_runtime"],
+                )
+            )
+
+            self.assertEqual(values["algorithm.adv_estimator"], "amg_action_axis_gae")
+            self.assertEqual(
+                values["algorithm.rollout_correction.loss_type"], "ppo_clip"
+            )
+            self.assertEqual(values["actor_rollout_ref.rollout.n"], "1")
+            self.assertEqual(values["critic.enable"], "True")
+            self.assertEqual(
+                values["trainer.total_training_steps"],
+                str(budget["publication_cycles"]),
+            )
+            self.assertEqual(
+                values["rollout.total_rollout_steps"], str(budget["episodes"])
+            )
+            self.assertEqual(
+                values["async_training.trigger_parameter_sync_step"],
+                str(budget["trigger_parameter_sync_step"]),
+            )
+            self.assertEqual(
+                float(values["async_training.require_batches"]),
+                budget["samples_per_update"] / 512,
+            )
+            self.assertEqual(values["trainer.val_before_train"], "False")
+            self.assertEqual(values["trainer.test_freq"], "-1")
+            self.assertEqual(values["trainer.resume_mode"], "disable")
+            self.assertEqual(values["trainer.logger"], "[console,file]")
+            self.assertEqual(values["actor_rollout_ref.hybrid_engine"], "False")
+            self.assertEqual(
+                values["actor_rollout_ref.rollout.agent.default_agent_loop"],
+                "amg_task_neutral_async",
+            )
+            self.assertEqual(
+                json.loads(values["data.agentgym.expected_role"]), "train_pool"
+            )
+
+    def test_gate_role_and_budget_are_derived_from_publication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inputs, identity = self._identity(Path(directory), "gate")
+            budget = identity["budget_contract"]
+            values = self._values(
+                build_overrides(
+                    inputs,
+                    effective_schedule=inputs.schedule,
+                    endpoint_client_config=identity["client_config"],
+                    budget_contract=budget,
+                    training_runtime=identity["training_runtime"],
+                )
+            )
+            manifest = self.source_lock["integration"]["manifests"]["gate_only"]
+            self.assertEqual(identity["task_count"], manifest["task_count"])
+            self.assertEqual(
+                identity["source_family_count"], manifest["source_family_count"]
+            )
+            self.assertEqual(identity["schedule_count"], budget["episodes"])
+            self.assertEqual(identity["client_config"]["expected_role"], "gate_only")
+            self.assertEqual(values["trainer.total_training_steps"], "1")
+            self.assertEqual(values["async_training.trigger_parameter_sync_step"], "1")
+            self.assertEqual(
+                values["rollout.total_rollout_steps"], str(budget["episodes"])
+            )
+
+    def test_formal_identity_matches_selected_publication_without_dated_literals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inputs, identity = self._identity(Path(directory), "formal")
+            manifest = self.source_lock["integration"]["manifests"]["train_pool"]
+            routing = self.source_lock["integration"]["routing"]["train_pool"]
+            self.assertEqual(identity["task_count"], manifest["task_count"])
+            self.assertEqual(
+                identity["source_family_count"], manifest["source_family_count"]
+            )
+            self.assertEqual(identity["manifest_sha256"], manifest["sha256"])
+            self.assertEqual(identity["routing_sha256"], routing["sha256"])
+            self.assertEqual(
+                identity["training_runtime"], self.source_lock["training_runtime"]
+            )
+            self.assertEqual(
+                identity["schedule_sha256"], inspect_schedule(inputs.schedule)["sha256"]
+            )
+
+    def test_publication_identity_rejects_role_or_schedule_substitution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inputs = self._inputs(Path(directory), mode="gate")
+            formal = inspect_schedule(
+                FIXTURES / "formal100-schedule.jsonl", expected_role="train_pool"
+            )
+            with self.assertRaisesRegex(ValueError, "schedule role mismatch"):
+                _load_endpoint_identity(inputs, schedule_report=formal)
+
+            gate = inspect_schedule(inputs.schedule, expected_role="gate_only")
+            gate["sha256"] = "0" * 64
+            with self.assertRaisesRegex(ValueError, "schedule digest"):
+                _load_endpoint_identity(inputs, schedule_report=gate)
+
+    def test_runtime_env_is_closed_and_pins_native_artifact_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inputs = self._inputs(Path(directory), mode="gate")
+            env = build_runtime_env(inputs, base_env={"PATH": "/usr/bin"})
+            self.assertEqual(
+                env["PYTHONPATH"].split(":"),
+                [
+                    str(inputs.outer_root / "async_plugins"),
+                    str(inputs.verl_root),
+                    str(inputs.outer_root / "AgentGym" / "agentenv"),
+                    str(inputs.outer_root / "AgentGym" / "agentenv-openmle-fast"),
+                ],
+            )
+            self.assertEqual(
+                env["VERL_USE_EXTERNAL_MODULES"], "agentmemorygym_verl.action_gae"
+            )
+            self.assertEqual(
+                env["VERL_FILE_LOGGER_PATH"], str(inputs.run_dir / "metrics.jsonl")
+            )
+            self.assertEqual(
+                env["VERL_FULLY_ASYNC_RUNTIME_RECEIPT_PATH"],
+                str(inputs.run_dir / "native-runtime-receipt.json"),
+            )
+            self.assertEqual(env["VLLM_USE_V1"], "1")
+            with self.assertRaisesRegex(RuntimeError, "PYTHONPATH"):
+                build_runtime_env(inputs, base_env={"PYTHONPATH": "/caller"})
+
+    def test_cli_has_no_commit_model_or_budget_identity_override(self):
+        common = [
+            "--mode",
+            "gate",
+            "--verl-root",
+            "/verl",
+            "--schedule",
+            str(FIXTURES / "g64-gate-single-pass.jsonl"),
+            "--env-addr",
+            "http://127.0.0.1:65525",
+            "--run-dir",
+            "/run",
+            "--experiment-name",
+            "gate",
+            "--endpoint-source-lock",
+            str(FIXTURES / "source-lock.json"),
+            "--endpoint-contract-tool",
+            str(FIXTURES / "launcher_contract.py"),
+            "--publication-receipt",
+            str(FIXTURES / "publication-receipt.json"),
+            "--formal-schedule-certificate",
+            str(FIXTURES / "formal100-schedule-certificate.json"),
+        ]
+        parsed = _parse_args(common)
+        for name in ("expected_verl_commit", "model_path", "episodes", "task_count"):
+            self.assertFalse(hasattr(parsed, name))
+        for forbidden in (
+            ["--expected-verl-commit", "0" * 40],
+            ["--model-path", "/tmp/model"],
+            ["--episodes", "64"],
+        ):
+            with self.subTest(forbidden=forbidden), self.assertRaises(SystemExit):
+                _parse_args(common + forbidden)
+
+    def test_shell_launcher_selects_python_from_publication(self):
+        script = (
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "launch_amg_fully_async.sh"
+        )
+        text = script.read_text(encoding="utf-8")
+        self.assertIn(".training_runtime.python", text)
+        self.assertIn("--endpoint-source-lock", text)
+        self.assertIn("PYTHONPATH is an identity conflict", text)
+        self.assertNotIn("/dev/shm/qwen35-runtime", text)
+        self.assertNotIn("${PYTHONPATH:+", text)
+        self.assertIn(EXPECTED_VERL_COMMIT, EXPECTED_VERL_COMMIT)
+
+
+if __name__ == "__main__":
+    unittest.main()

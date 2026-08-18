@@ -1,0 +1,413 @@
+from __future__ import annotations
+
+import json
+import unittest
+from dataclasses import dataclass
+from types import SimpleNamespace
+from unittest import IsolatedAsyncioTestCase, mock
+
+from agentenv.controller import StepOutput
+from agentenv.controller.types import (
+    CONTEXT_OPERATION_REPLACE,
+    TASK_NEUTRAL_CONTEXT_TRANSITION_SCHEMA,
+    build_task_neutral_transition_info,
+)
+from agentmemorygym_verl import agent_loop as agent_loop_module
+from agentmemorygym_verl.agent_loop import AMGTaskNeutralAgentLoop
+
+
+@dataclass
+class _MergeResult:
+    token_ids: list[int]
+
+
+class _RecordingContinuousBuilder:
+    def __init__(self):
+        self.initial_calls = []
+        self.non_assistant_calls = []
+        self.assistant_calls = []
+
+    @staticmethod
+    def _render(messages):
+        payload = "|".join(
+            f"{message['role']}:{message['content']}" for message in messages
+        )
+        return [ord(char) for char in payload] + [999]
+
+    def build_initial_tokens(self, messages):
+        self.initial_calls.append([dict(message) for message in messages])
+        return self._render(messages)
+
+    def merge_non_assistant_tokens(self, previous, updated, runtime):
+        self.non_assistant_calls.append((previous, updated, runtime))
+        return _MergeResult(self._render(updated))
+
+    def merge_assistant_tokens(self, runtime, assistant):
+        self.assistant_calls.append((list(runtime), list(assistant)))
+        return _MergeResult(list(runtime)[:-1] + list(assistant))
+
+
+class _Tokenizer:
+    def __init__(self, actions=None):
+        self.actions = actions or {}
+
+    def decode(self, token_ids, skip_special_tokens=True):
+        del skip_special_tokens
+        return self.actions[tuple(token_ids)]
+
+
+class _Server:
+    def __init__(self, actions):
+        self.actions = list(actions)
+        self.calls = []
+
+    async def generate(self, *, request_id, prompt_ids, sampling_params, priority):
+        index = len(self.calls)
+        token_id = 100 + index
+        self.calls.append(
+            {
+                "request_id": request_id,
+                "prompt_ids": list(prompt_ids),
+                "sampling_params": dict(sampling_params),
+                "priority": priority,
+            }
+        )
+        return SimpleNamespace(
+            token_ids=[token_id],
+            log_probs=[-0.01 * (index + 1)],
+            routed_experts=None,
+            num_preempted=0,
+            extra_fields={"min_global_steps": index, "max_global_steps": index + 1},
+        )
+
+
+class _MemoryChainClient:
+    def __init__(self):
+        self.actions = []
+        self.files = {}
+        self.bound_context = None
+        self.closed = False
+
+    def reset(self, data_idx):
+        self.data_idx = data_idx
+
+    def observe(self):
+        return "Task: persist a value across compaction, revise it, and execute it."
+
+    def normalize_initial_policy_context(self, messages):
+        return messages
+
+    def bind_policy_context(self, messages, initial=False):
+        self.bound_context = messages
+        self.initial_bind = initial
+
+    def policy_turn_candidate(self):
+        if len(self.actions) == 1:
+            return "Compact the current context now. Preserve only a short summary; files remain available."
+        return None
+
+    def prepare_policy_turn(self, pressure):
+        self.last_pressure = pressure
+        return self.policy_turn_candidate()
+
+    def step(self, action):
+        self.actions.append(action)
+        if action == "WRITE memory.md alpha=2":
+            self.files["memory.md"] = "alpha=2"
+            return StepOutput(
+                state="wrote memory.md",
+                reward=0.0,
+                done=False,
+                info=build_task_neutral_transition_info(
+                    wrapper_evidence={"memory_event": "write"}
+                ),
+            )
+        if action == "COMPACT retain memory locator":
+            transition = {
+                "schema": TASK_NEUTRAL_CONTEXT_TRANSITION_SCHEMA,
+                "operation": CONTEXT_OPERATION_REPLACE,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "Use ordinary shell and filesystem actions.",
+                    },
+                    {
+                        "role": "user",
+                        "content": "Context compacted. Continue using memory.md.",
+                    },
+                ],
+            }
+            return StepOutput(
+                state="context replaced",
+                reward=0.0,
+                done=False,
+                info=build_task_neutral_transition_info(
+                    context_transition=transition,
+                    wrapper_evidence={"memory_event": "compaction"},
+                ),
+            )
+        if action == "READ memory.md":
+            return StepOutput(
+                state=self.files["memory.md"],
+                reward=0.0,
+                done=False,
+                info=build_task_neutral_transition_info(
+                    wrapper_evidence={
+                        "memory_event": "read",
+                        "value": self.files["memory.md"],
+                    }
+                ),
+            )
+        if action == "MODIFY memory.md alpha=3":
+            if self.files.get("memory.md") != "alpha=2":
+                raise AssertionError(
+                    "memory was not read from the persisted pre-compaction file"
+                )
+            self.files["memory.md"] = "alpha=3"
+            return StepOutput(
+                state="updated memory.md",
+                reward=0.0,
+                done=False,
+                info=build_task_neutral_transition_info(
+                    wrapper_evidence={"memory_event": "modify"}
+                ),
+            )
+        if action == "EXECUTE memory.md":
+            if self.files.get("memory.md") != "alpha=3":
+                raise AssertionError("modified memory was not reused by execution")
+            return StepOutput(
+                state="execution used alpha=3",
+                reward=1.0,
+                done=True,
+                info=build_task_neutral_transition_info(
+                    env_info={"resolved": True},
+                    wrapper_evidence={"memory_event": "execute", "outcome": "success"},
+                ),
+            )
+        raise AssertionError(f"unexpected policy action: {action}")
+
+    def close(self):
+        self.closed = True
+
+
+class _HorizonClient(_MemoryChainClient):
+    def step(self, action):
+        self.actions.append(action)
+        return StepOutput(
+            state="candidate retained",
+            reward=0.25,
+            done=False,
+            info=build_task_neutral_transition_info(
+                wrapper_evidence={"outcome": "continue"}
+            ),
+        )
+
+    def policy_turn_candidate(self):
+        return None
+
+    def finalize_policy_horizon(self):
+        return StepOutput(
+            state="best candidate accepted at horizon",
+            reward=0.75,
+            done=True,
+            info=build_task_neutral_transition_info(
+                env_info={"resolved": True},
+                wrapper_evidence={"outcome": "success", "source": "horizon"},
+            ),
+        )
+
+
+class TestPromptRendering(unittest.TestCase):
+    def _loop(self):
+        loop = object.__new__(AMGTaskNeutralAgentLoop)
+        loop.enable_continuous_token = True
+        loop.continuous_token_builder = _RecordingContinuousBuilder()
+        loop.tokenizer = object()
+        loop.apply_chat_template_kwargs = {}
+        return loop
+
+    def test_control_candidate_is_full_rendered_before_any_assistant_generation(self):
+        loop = self._loop()
+        current = [{"role": "user", "content": "task"}]
+        current_ids = loop._render_prompt_sync(current)
+        candidate = current + [{"role": "user", "content": "compact now"}]
+
+        actual = loop._prompt_for_candidate(current, current_ids, candidate)
+
+        self.assertEqual(actual, loop.continuous_token_builder._render(candidate))
+        self.assertEqual(loop.continuous_token_builder.non_assistant_calls, [])
+        self.assertEqual(loop.continuous_token_builder.initial_calls[-1], candidate)
+
+    def test_append_after_sampled_assistant_uses_upstream_continuous_token_merge(self):
+        loop = self._loop()
+        prepared = [{"role": "user", "content": "task"}]
+        prompt_ids = loop._render_prompt_sync(prepared)
+        action_ids = [11, 12]
+        next_messages = prepared + [
+            {"role": "assistant", "content": "act"},
+            {"role": "user", "content": "observation"},
+        ]
+
+        actual = loop._next_prompt_ids(
+            prepared_messages=prepared,
+            prepared_prompt_ids=prompt_ids,
+            action="act",
+            action_token_ids=action_ids,
+            next_messages=next_messages,
+            verify=True,
+        )
+
+        self.assertEqual(actual, loop.continuous_token_builder._render(next_messages))
+        self.assertEqual(len(loop.continuous_token_builder.assistant_calls), 1)
+        self.assertEqual(len(loop.continuous_token_builder.non_assistant_calls), 1)
+
+    def test_replace_messages_forces_full_rebuild(self):
+        loop = self._loop()
+        prepared = [{"role": "user", "content": "long context"}]
+        prompt_ids = loop._render_prompt_sync(prepared)
+        replacement = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "compacted"},
+        ]
+
+        actual = loop._next_prompt_ids(
+            prepared_messages=prepared,
+            prepared_prompt_ids=prompt_ids,
+            action="compact summary",
+            action_token_ids=[15],
+            next_messages=replacement,
+            verify=True,
+        )
+
+        self.assertEqual(actual, loop.continuous_token_builder._render(replacement))
+        self.assertEqual(loop.continuous_token_builder.assistant_calls, [])
+        self.assertEqual(loop.continuous_token_builder.non_assistant_calls, [])
+
+
+class TestAMGAgentLoop(IsolatedAsyncioTestCase):
+    def _loop(self, actions, *, max_turns):
+        loop = object.__new__(AMGTaskNeutralAgentLoop)
+        loop.agentgym_config = {"task_name": "openmle_fast"}
+        loop.max_policy_turns = max_turns
+        loop.max_observation_tokens = 32
+        loop.verify_incremental_first_n = 0
+        loop._envelope_tokens = 1
+        loop.rollout_config = SimpleNamespace(
+            response_length=8,
+            prompt_length=512,
+            max_model_len=520,
+            calculate_log_probs=True,
+        )
+        loop.server_manager = _Server(actions)
+        loop.tokenizer = _Tokenizer(
+            {(100 + index,): action for index, action in enumerate(actions)}
+        )
+        loop.enable_continuous_token = False
+        loop._render_prompt_sync = lambda messages: [
+            1 + index for index, _ in enumerate(json.dumps(messages, sort_keys=True))
+        ]
+        return loop
+
+    async def test_complete_filesystem_memory_chain_is_one_ordered_ppo_episode(self):
+        actions = [
+            "WRITE memory.md alpha=2",
+            "COMPACT retain memory locator",
+            "READ memory.md",
+            "MODIFY memory.md alpha=3",
+            "EXECUTE memory.md",
+        ]
+        client = _MemoryChainClient()
+        loop = self._loop(actions, max_turns=len(actions))
+
+        with mock.patch.object(
+            agent_loop_module, "create_env_client", return_value=client
+        ):
+            outputs = await loop.run(
+                {"max_tokens": 8},
+                item_id="memory-task",
+                data_idx=4,
+                uid="trajectory-4",
+                raw_prompt=[{"role": "system", "content": "system"}],
+            )
+
+        self.assertEqual(client.actions, actions)
+        self.assertEqual(client.files, {"memory.md": "alpha=3"})
+        self.assertTrue(client.closed)
+        self.assertEqual(len(outputs), len(actions))
+        self.assertEqual(
+            [output.extra_fields["trajectory_row_order"] for output in outputs],
+            list(range(len(actions))),
+        )
+        self.assertEqual(
+            [
+                output.extra_fields["wrapper_evidence"]["memory_event"]
+                for output in outputs
+            ],
+            ["write", "compaction", "read", "modify", "execute"],
+        )
+        self.assertEqual(
+            [output.extra_fields["min_global_steps"] for output in outputs],
+            [0, 1, 2, 3, 4],
+        )
+        self.assertEqual(
+            [output.extra_fields["max_global_steps"] for output in outputs],
+            [1, 2, 3, 4, 5],
+        )
+        self.assertEqual(
+            [output.response_logprobs for output in outputs],
+            [[-0.01], [-0.02], [-0.03], [-0.04], [-0.05]],
+        )
+        self.assertEqual(
+            [output.extra_fields["trajectory_terminal"] for output in outputs],
+            [False] * 4 + [True],
+        )
+        self.assertEqual(outputs[-1].extra_fields["outcome"], "success")
+        records = [
+            json.loads(output.extra_fields["step_record_json"]) for output in outputs
+        ]
+        reward_evidence = [
+            output.extra_fields["reward_extra_info"] for output in outputs
+        ]
+        self.assertEqual(
+            [json.loads(info["step_record_json"]) for info in reward_evidence],
+            records,
+        )
+        self.assertEqual([info["is_padding"] for info in reward_evidence], [False] * 5)
+        self.assertEqual(
+            [record["trajectory_row_uid"] for record in records],
+            [f"trajectory-4-row-{i}" for i in range(5)],
+        )
+        self.assertEqual(sum(record["immediate_reward"] for record in records), 1.0)
+        self.assertEqual([record["trajectory_return"] for record in records], [1.0] * 5)
+
+    async def test_horizon_receipt_updates_reward_outcome_and_final_evidence(self):
+        client = _HorizonClient()
+        loop = self._loop(["WRITE candidate.py"], max_turns=1)
+
+        with mock.patch.object(
+            agent_loop_module, "create_env_client", return_value=client
+        ):
+            outputs = await loop.run(
+                {"max_tokens": 8},
+                item_id="horizon-task",
+                data_idx=2,
+                uid="trajectory-horizon",
+                raw_prompt=[{"role": "system", "content": "system"}],
+            )
+
+        self.assertEqual(len(outputs), 1)
+        output = outputs[0]
+        record = json.loads(output.extra_fields["step_record_json"])
+        self.assertAlmostEqual(output.reward_score, 1.0)
+        self.assertAlmostEqual(record["immediate_reward"], 1.0)
+        self.assertTrue(record["rollout_done_flag"])
+        self.assertEqual(record["outcome"], "success")
+        self.assertEqual(output.extra_fields["outcome"], "success")
+        self.assertEqual(
+            record["horizon_finalization"]["wrapper_evidence"]["source"], "horizon"
+        )
+        self.assertTrue(record["horizon_finalization"]["env_info"]["resolved"])
+
+
+if __name__ == "__main__":
+    unittest.main()
