@@ -16,7 +16,7 @@ from typing import Any
 
 # Updated only after the generic veRL runtime-evidence patch is reviewed and
 # committed.  It is intentionally not caller-selectable.
-EXPECTED_VERL_COMMIT = "13fb82c699d19b38af0a91202272d8d6f9863844"
+EXPECTED_VERL_COMMIT = "6830af416503c4b732a77416fabf8af9c33c9fb8"
 
 # Files needed to load the exact Qwen3.5-4B text model and tokenizer.  The model
 # root itself comes from the publication's training_runtime section, so a newer
