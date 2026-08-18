@@ -1994,6 +1994,97 @@ class FullRunTransactionRestartTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "reordered"):
             _validate_eta_cadence(duplicate, prior_elapsed=20.0, prior_cells=100)
 
+    def test_polling_overshoot_is_published_and_restart_consistent(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            config = SimpleNamespace(root=root)
+            journal = self.journal(root)
+            self.assertEqual(
+                _eta_trigger_reasons(
+                    elapsed_seconds=9.0,
+                    prior_elapsed_seconds=0.0,
+                    completed_cells=72,
+                    prior_completed_cells=0,
+                    remaining_cells_at_launch=1500,
+                    workers_pending=True,
+                ),
+                [],
+            )
+            reasons = _eta_trigger_reasons(
+                elapsed_seconds=10.0,
+                prior_elapsed_seconds=0.0,
+                completed_cells=78,
+                prior_completed_cells=0,
+                remaining_cells_at_launch=1500,
+                workers_pending=True,
+            )
+            self.assertEqual(reasons, ["cell_interval"])
+            published = _publish_eta_check(
+                config,
+                journal=journal,
+                check_index=1,
+                observed_wall_ns=11_000_000_000,
+                completed_tasks=set(range(26)),
+                trigger_reasons=reasons,
+                prior_consecutive=0,
+            )
+            self.assertEqual(published["progress"]["new_completed_cells"], 78)
+            rows, elapsed, cells, consecutive = _reconcile_eta_history(
+                config, journal
+            )
+            self.assertEqual((len(rows), elapsed, cells, consecutive), (1, 10.0, 78, 0))
+
+    def test_final_coverage_is_durable_while_workers_are_pending(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            config = SimpleNamespace(root=root)
+            journal = self.journal(root)
+            journal["baseline_task_indices"] = list(range(475))
+            journal["remaining_cells_at_launch"] = 75
+            reasons = _eta_trigger_reasons(
+                elapsed_seconds=10.0,
+                prior_elapsed_seconds=0.0,
+                completed_cells=75,
+                prior_completed_cells=0,
+                remaining_cells_at_launch=75,
+                workers_pending=True,
+            )
+            self.assertEqual(reasons, ["cell_interval", "final_completion"])
+            published = _publish_eta_check(
+                config,
+                journal=journal,
+                check_index=1,
+                observed_wall_ns=11_000_000_000,
+                completed_tasks=set(range(500)),
+                trigger_reasons=reasons,
+                prior_consecutive=0,
+            )
+            self.assertEqual(
+                published["progress"]["trigger_reasons"],
+                ["cell_interval", "final_completion"],
+            )
+            rows, elapsed, cells, consecutive = _reconcile_eta_history(
+                config, journal
+            )
+            self.assertEqual((len(rows), elapsed, cells, consecutive), (1, 10.0, 75, 0))
+
+    def test_publisher_rejects_omitted_cadence_before_immutable_write(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            config = SimpleNamespace(root=root)
+            journal = self.journal(root)
+            with self.assertRaisesRegex(RuntimeError, "mandatory cadence"):
+                _publish_eta_check(
+                    config,
+                    journal=journal,
+                    check_index=1,
+                    observed_wall_ns=11_000_000_000,
+                    completed_tasks=set(range(100)),
+                    trigger_reasons=["cell_interval"],
+                    prior_consecutive=0,
+                )
+            self.assertFalse(_eta_progress_path(root, 1).exists())
+
     def test_partial_stop_boundary_is_never_labeled_final_completion(self):
         partial = _eta_trigger_reasons(
             elapsed_seconds=1810.0,

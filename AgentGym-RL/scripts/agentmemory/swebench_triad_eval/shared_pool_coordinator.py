@@ -71,6 +71,9 @@ ETA_CHECK_INTERVAL_SECONDS = 1_800.0
 ETA_CHECK_CELL_COUNT = 75
 ETA_POLL_SECONDS = 30.0
 ETA_CADENCE_TOLERANCE_SECONDS = ETA_POLL_SECONDS * 2
+# After the task that crosses a cadence boundary, every other admitted C=2
+# slot may publish before the coordinator observes the next polling snapshot.
+ETA_CADENCE_TOLERANCE_CELLS = (8 * TASK_SLOTS_PER_REPLICA - 1) * len(ARMS)
 ETA_PROGRESS_SCHEMA = "amg_swebench_full_run_progress_v1"
 ETA_RECEIPT_SCHEMA = "amg_swebench_full_run_eta_v2"
 FULL_RUN_JOURNAL_SCHEMA = "amg_swebench_full_run_transaction_v1"
@@ -2534,7 +2537,8 @@ def _publish_eta_check(
     prior_consecutive: int,
 ) -> Mapping[str, Any]:
     progress_path = _eta_progress_path(config.root, check_index)
-    if progress_path.exists() or progress_path.is_symlink():
+    progress_exists = progress_path.exists() or progress_path.is_symlink()
+    if progress_exists:
         progress = load_atomic_object(progress_path, "full-run ETA progress")
     else:
         baseline = journal["baseline_task_indices"]
@@ -2557,8 +2561,14 @@ def _publish_eta_check(
             "trigger_reasons": list(trigger_reasons),
             "timing_gate_sha256": journal["timing_gate_sha256"],
         }
-        write_immutable_json(progress_path, progress)
     _validate_eta_progress(progress, journal=journal, check_index=check_index)
+    _validate_eta_cadence(
+        progress,
+        prior_elapsed=float(journal["last_elapsed_seconds"]),
+        prior_cells=journal["last_completed_cells"],
+    )
+    if not progress_exists:
+        write_immutable_json(progress_path, progress)
     receipt_path = _eta_receipt_path(config.root, check_index)
     expected = _eta_receipt_from_progress(
         progress,
@@ -2608,7 +2618,7 @@ def _eta_trigger_reasons(
         reasons.append("elapsed_interval")
     if completed_cells - prior_completed_cells >= ETA_CHECK_CELL_COUNT:
         reasons.append("cell_interval")
-    if not workers_pending and completed_cells == remaining_cells_at_launch:
+    if completed_cells == remaining_cells_at_launch:
         reasons.append("final_completion")
     return reasons
 
@@ -2636,7 +2646,7 @@ def _validate_eta_cadence(
         raise RuntimeError("full-run ETA trigger binding drifted")
     if (
         elapsed_gap > ETA_CHECK_INTERVAL_SECONDS + ETA_CADENCE_TOLERANCE_SECONDS
-        or cell_gap > ETA_CHECK_CELL_COUNT
+        or cell_gap > ETA_CHECK_CELL_COUNT + ETA_CADENCE_TOLERANCE_CELLS
     ):
         raise RuntimeError("full-run ETA mandatory cadence was omitted")
     if not expected_reasons:
