@@ -21,6 +21,12 @@ EXPECTED_VERL_COMMIT = "13fb82c699d19b38af0a91202272d8d6f9863844"
 # Files needed to load the exact Qwen3.5-4B text model and tokenizer.  The model
 # root itself comes from the publication's training_runtime section, so a newer
 # publication may relocate the same immutable model without a plugin edit.
+TRL_WHEEL_RELATIVE_PATH = "async_plugins/vendor/trl-0.9.6-py3-none-any.whl"
+TRL_WHEEL_SHA256 = (
+    "4753f190c94c11488fcc46ec74b2128e53fbc61d51f0887b7204ec4dc333af4b"
+)
+
+
 LOCKED_MODEL_FILE_SHA256 = {
     "model-00001-of-00002.safetensors": (
         "26a93f066e1916adb13453dae5a0c707c0fbc71299ed98779571a907b8e74c61"
@@ -209,6 +215,8 @@ def verify_hash_manifest(
 __all__ = [
     "EXPECTED_VERL_COMMIT",
     "LOCKED_MODEL_FILE_SHA256",
+    "TRL_WHEEL_RELATIVE_PATH",
+    "TRL_WHEEL_SHA256",
     "reject_ambient_identity",
     "sha256_file",
     "validate_outer_change_paths",

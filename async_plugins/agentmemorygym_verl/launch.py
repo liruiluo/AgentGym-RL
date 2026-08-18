@@ -18,6 +18,8 @@ from .finalizer import finalize_run
 from .identity import (
     EXPECTED_VERL_COMMIT,
     LOCKED_MODEL_FILE_SHA256,
+    TRL_WHEEL_RELATIVE_PATH,
+    TRL_WHEEL_SHA256,
     reject_ambient_identity,
     validate_outer_change_paths,
     validate_training_runtime_lock,
@@ -294,6 +296,7 @@ def build_runtime_env(
 ) -> dict[str, str]:
     env = dict(os.environ if base_env is None else base_env)
     python_entries = [
+        inputs.outer_root / TRL_WHEEL_RELATIVE_PATH,
         inputs.outer_root / "async_plugins",
         inputs.verl_root,
         inputs.outer_root / "AgentGym" / "agentenv",
@@ -903,6 +906,10 @@ def _verify_source(
     bundle_tokens = bundle_sha256_file.read_text(encoding="utf-8").split()
     if not bundle_tokens or bundle_tokens[0] != training_runtime["bundle_sha256"]:
         raise RuntimeError("publication runtime bundle sha256 file content mismatch")
+    trl_wheel = verify_hash_manifest(
+        inputs.outer_root,
+        {TRL_WHEEL_RELATIVE_PATH: TRL_WHEEL_SHA256},
+    )
     model_path = Path(training_runtime["base_model"])
     model_files = verify_hash_manifest(model_path, LOCKED_MODEL_FILE_SHA256)
 
@@ -920,6 +927,7 @@ def _verify_source(
         "selected_outer_files_sha256": verified_outer_files,
         "selected_inner_files_sha256": verified_inner_files,
         "training_runtime": training_runtime,
+        "trl_wheel_sha256": trl_wheel,
         "model_files_sha256": model_files,
     }
 
@@ -929,6 +937,7 @@ def _production_manifest(outer_root: Path) -> dict[str, str]:
         outer_root / "async_plugins" / "agentmemorygym_verl",
         outer_root / "async_plugins" / "config",
         outer_root / "async_plugins" / "scripts",
+        outer_root / "async_plugins" / "vendor",
     ]
     manifest: dict[str, str] = {}
     for root in roots:
@@ -984,6 +993,8 @@ def _runtime_preflight(
         raise FileNotFoundError(f"publication model directory missing: {model_path}")
     code = r"""
 import json
+import trl
+from trl import AutoModelForCausalLMWithValueHead
 from agentmemorygym_verl.agent_loop import AMGTaskNeutralAgentLoop
 from agentmemorygym_verl.dataset import AMGTrajectoryDataset
 from agentmemorygym_verl.env_client import create_env_client
@@ -1009,6 +1020,8 @@ print(json.dumps({
     "agent_loop": AMGTaskNeutralAgentLoop.__name__,
     "dataset": AMGTrajectoryDataset.__name__,
     "policy_framing_messages": len(framing),
+    "trl_version": trl.__version__,
+    "value_head_class": AutoModelForCausalLMWithValueHead.__name__,
 }, sort_keys=True))
 """
     probe_env = dict(env)

@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 from agentmemorygym_verl.config_contract import inspect_schedule
-from agentmemorygym_verl.identity import EXPECTED_VERL_COMMIT
+from agentmemorygym_verl.identity import (
+    EXPECTED_VERL_COMMIT,
+    TRL_WHEEL_RELATIVE_PATH,
+    TRL_WHEEL_SHA256,
+)
 from agentmemorygym_verl.launch import (
     LaunchInputs,
     _load_endpoint_identity,
@@ -193,6 +199,17 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
         for relative in inner_manifest:
             self.assertTrue((checkout / "AgentGym" / relative).is_file(), relative)
 
+    def test_locked_trl_wheel_is_exact_upstream_verl_extra(self):
+        checkout = Path(__file__).resolve().parents[2]
+        wheel = checkout / TRL_WHEEL_RELATIVE_PATH
+        self.assertTrue(wheel.is_file())
+        self.assertFalse(wheel.is_symlink())
+        self.assertEqual(hashlib.sha256(wheel.read_bytes()).hexdigest(), TRL_WHEEL_SHA256)
+        with zipfile.ZipFile(wheel) as archive:
+            metadata = archive.read("trl-0.9.6.dist-info/METADATA").decode("utf-8")
+        self.assertIn("Name: trl\n", metadata)
+        self.assertIn("Version: 0.9.6\n", metadata)
+
     def test_runtime_env_is_closed_and_pins_native_artifact_paths(self):
         with tempfile.TemporaryDirectory() as directory:
             inputs = self._inputs(Path(directory), mode="gate")
@@ -200,6 +217,12 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             self.assertEqual(
                 env["PYTHONPATH"].split(":"),
                 [
+                    str(
+                        inputs.outer_root
+                        / "async_plugins"
+                        / "vendor"
+                        / "trl-0.9.6-py3-none-any.whl"
+                    ),
                     str(inputs.outer_root / "async_plugins"),
                     str(inputs.verl_root),
                     str(inputs.outer_root / "AgentGym" / "agentenv"),
@@ -264,6 +287,7 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
         self.assertIn(".training_runtime.python", text)
         self.assertIn("--endpoint-source-lock", text)
         self.assertIn("PYTHONPATH is an identity conflict", text)
+        self.assertIn("trl-0.9.6-py3-none-any.whl", text)
         self.assertNotIn("/dev/shm/qwen35-runtime", text)
         self.assertNotIn("${PYTHONPATH:+", text)
         self.assertIn(EXPECTED_VERL_COMMIT, EXPECTED_VERL_COMMIT)

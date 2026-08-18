@@ -65,5 +65,10 @@ if [[ ! -x ${PUBLICATION_PYTHON} ]]; then
   exit 66
 fi
 
-export PYTHONPATH="${OUTER_ROOT}/async_plugins:${VERL_ROOT}:${OUTER_ROOT}/AgentGym/agentenv:${OUTER_ROOT}/AgentGym/agentenv-openmle-fast"
+TRL_WHEEL="${OUTER_ROOT}/async_plugins/vendor/trl-0.9.6-py3-none-any.whl"
+if [[ ! -f ${TRL_WHEEL} || -L ${TRL_WHEEL} ]]; then
+  echo "launch_amg_fully_async.sh: locked veRL TRL wheel is missing" >&2
+  exit 66
+fi
+export PYTHONPATH="${TRL_WHEEL}:${OUTER_ROOT}/async_plugins:${VERL_ROOT}:${OUTER_ROOT}/AgentGym/agentenv:${OUTER_ROOT}/AgentGym/agentenv-openmle-fast"
 exec "${PUBLICATION_PYTHON}" -m agentmemorygym_verl.launch --outer-root "${OUTER_ROOT}" "$@"
