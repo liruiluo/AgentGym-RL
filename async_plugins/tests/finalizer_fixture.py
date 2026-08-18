@@ -134,6 +134,7 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
                 "calculate_log_probs": True,
                 "gpu_memory_utilization": 0.35,
                 "standalone_gpu_memory_utilization": 0.8,
+                "multi_turn": {"enable": True},
                 "agent": {
                     "default_agent_loop": "amg_task_neutral_async",
                     "agent_loop_config_path": "/plugin/amg_task_neutral_agent_loop.yaml",

@@ -216,6 +216,10 @@ def build_overrides(
         "+actor_rollout_ref.rollout.enable_sleep_mode=True",
         "actor_rollout_ref.rollout.free_cache_engine=True",
         "actor_rollout_ref.rollout.disable_log_stats=False",
+        # Upstream fully-async prepare_single_generation_data() selects the
+        # configured AgentLoop only when multi_turn is enabled; otherwise it
+        # deliberately stamps every sample as single_turn_agent.
+        "actor_rollout_ref.rollout.multi_turn.enable=True",
         "actor_rollout_ref.rollout.calculate_log_probs=True",
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8",
         "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True",

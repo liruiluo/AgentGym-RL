@@ -165,6 +165,10 @@ def verify_resolved_config(
         or _at(config, "data.continuous_token.model_family") != "qwen35"
     ):
         raise ValueError("AMG Qwen3.5 multi-action rollout requires Continuous Token")
+    # veRL fully async stamps ``single_turn_agent`` when multi_turn is false.
+    # AMG therefore needs the native multi-turn switch even though lifecycle
+    # semantics stay inside the task-neutral custom AgentLoop.
+    _require_equal(config, "actor_rollout_ref.rollout.multi_turn.enable", True)
     _require_equal(
         config,
         "actor_rollout_ref.rollout.agent.default_agent_loop",

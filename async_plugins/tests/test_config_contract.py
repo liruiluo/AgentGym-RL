@@ -91,6 +91,7 @@ def _config(*, mode: str = "formal") -> dict:
                 "calculate_log_probs": True,
                 "gpu_memory_utilization": 0.35,
                 "standalone_gpu_memory_utilization": 0.8,
+                "multi_turn": {"enable": True},
                 "agent": {
                     "default_agent_loop": "amg_task_neutral_async",
                     "agent_loop_config_path": "/plugin/amg_task_neutral_agent_loop.yaml",
@@ -253,6 +254,12 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
             "single_turn_agent"
         )
         with self.assertRaisesRegex(ValueError, "Continuous Token"):
+            _verify(config, mode="formal")
+
+    def test_rejects_multi_turn_disabled_before_upstream_stamps_single_turn(self):
+        config = _config()
+        config["actor_rollout_ref"]["rollout"]["multi_turn"]["enable"] = False
+        with self.assertRaisesRegex(ValueError, "multi_turn.enable"):
             _verify(config, mode="formal")
 
     def test_rejects_actor_data_agentgym_drift(self):

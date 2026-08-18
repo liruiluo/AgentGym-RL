@@ -116,6 +116,9 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             self.assertEqual(values["trainer.logger"], "[console,file]")
             self.assertEqual(values["actor_rollout_ref.hybrid_engine"], "False")
             self.assertEqual(
+                values["actor_rollout_ref.rollout.multi_turn.enable"], "True"
+            )
+            self.assertEqual(
                 values["actor_rollout_ref.rollout.agent.default_agent_loop"],
                 "amg_task_neutral_async",
             )
