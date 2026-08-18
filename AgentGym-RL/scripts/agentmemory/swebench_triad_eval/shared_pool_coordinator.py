@@ -62,6 +62,7 @@ TASK_SLOTS_PER_REPLICA = 2
 STARTUP_BARRIER_SCHEMA = "amg_swebench_shared_pool_startup_barrier_v1"
 DIGEST_OCCUPANT_SCHEMA = "amg_swebench_image_digest_occupant_v1"
 DIGEST_RECONCILIATION_SCHEMA = "amg_swebench_image_digest_reconciliation_v1"
+WORKER_RECONCILIATION_SCHEMA = "amg_swebench_worker_reconciliation_v1"
 TIMING_CONTRACT_SCHEMA = "amg_swebench_c2_timing_contract_v1"
 TIMING_GATE_SCHEMA = "amg_swebench_c2_timing_gate_v1"
 TIMING_BUDGET_SECONDS = 28_800.0
@@ -812,6 +813,15 @@ def preflight_all(config: CoordinatorConfig) -> list[dict[str, Any]]:
         ):
             raise RuntimeError("shared Docker image reconciliation failed")
         digest_lease_reconciliation = reconcile_digest_occupants(config.root)
+        if (
+            not isinstance(digest_lease_reconciliation, Mapping)
+            or digest_lease_reconciliation.get("schema")
+            != DIGEST_RECONCILIATION_SCHEMA
+            or digest_lease_reconciliation.get("status") != "PASS"
+            or digest_lease_reconciliation.get("all_eight_replica_lanes_held")
+            is not True
+        ):
+            raise RuntimeError("durable digest-occupant reconciliation failed")
         for replica, driver in drivers:
             receipt = driver.preflight()
             receipts.append(
@@ -951,6 +961,85 @@ def run_gate(config: CoordinatorConfig) -> Mapping[str, Any]:
     return result
 
 
+def reconcile_all_eight_before_workers(
+    config: CoordinatorConfig,
+    *,
+    phase: str,
+    startup_barrier_sha256: str,
+) -> Mapping[str, Any]:
+    """Recover dead timing/full workers without replacing the startup barrier.
+
+    A SIGKILL can release the kernel flock while intentionally leaving the
+    durable image-digest occupant behind.  Clearing that occupant is safe only
+    while all sixteen runtime lanes are held.  The original preflight receipt
+    is immutable execution identity, so retries use this separate all-eight
+    reconciliation transaction rather than rewriting ``preflight-all.json``.
+    """
+
+    if phase not in {"timing", "full"}:
+        raise ValueError("worker reconciliation phase is invalid")
+    validated_startup_barrier(config, expected_sha256=startup_barrier_sha256)
+    drivers = []
+    reconciliations = []
+    try:
+        for replica in config.replicas:
+            driver = driver_from_config(
+                replica.path, assigned_task_indices=replica.task_indices
+            )
+            drivers.append((replica, driver))
+            for slot_index in range(TASK_SLOTS_PER_REPLICA):
+                driver.acquire_runtime_lane(None, slot_index=slot_index)
+        startup_reconciliations = []
+        for replica, driver in drivers:
+            receipt = driver.reconcile_dead_work(
+                allow_foreign_loaded_images=True
+            )
+            startup = _extract_startup_reconciliation(
+                receipt, replica.task_indices
+            )
+            startup_reconciliations.append(startup)
+            reconciliations.append(
+                {
+                    "replica_index": replica.replica_index,
+                    "receipt": receipt,
+                    "receipt_sha256": sha256_json(receipt),
+                }
+            )
+        if any(startup["foreign_staged_tasks"] for startup in startup_reconciliations):
+            raise RuntimeError("cross-replica durable stage binding drifted")
+        shared_image_reconciliation = (
+            drivers[0][1].operations.reconcile_unbound_loaded_images()
+        )
+        if (
+            not isinstance(shared_image_reconciliation, Mapping)
+            or shared_image_reconciliation.get("status") != "PASS"
+            or shared_image_reconciliation.get("remaining_images") != 0
+        ):
+            raise RuntimeError("shared Docker image reconciliation failed")
+        digest_lease_reconciliation = reconcile_digest_occupants(config.root)
+    finally:
+        for _, driver in reversed(drivers):
+            release_driver(driver)
+    validated_startup_barrier(config, expected_sha256=startup_barrier_sha256)
+    receipt = {
+        "schema": WORKER_RECONCILIATION_SCHEMA,
+        "status": "PASS",
+        "phase": phase,
+        "replica_count": 8,
+        "task_slots_per_replica": TASK_SLOTS_PER_REPLICA,
+        "all_slots_held_during_reconciliation": True,
+        "startup_barrier_sha256": startup_barrier_sha256,
+        "reconciliations": reconciliations,
+        "shared_image_reconciliation": shared_image_reconciliation,
+        "digest_lease_reconciliation": digest_lease_reconciliation,
+    }
+    atomic_write_json(
+        config.root / "control" / f"{phase}-worker-reconciliation.json",
+        receipt,
+    )
+    return receipt
+
+
 def full_run_stop_path(root: Path) -> Path:
     return root / "control" / "stop-after-publication.json"
 
@@ -991,6 +1080,7 @@ def _worker(
     replica_index: int,
     coordinator_root: str,
     startup_barrier_sha256: str,
+    replica_task_indices: tuple[int, ...] | None = None,
 ) -> dict[str, Any]:
     if not (
         len(task_indices)
@@ -1004,19 +1094,41 @@ def _worker(
     ):
         raise ValueError("worker deterministic slot lattice drifted")
     root = Path(coordinator_root)
+    replica_tasks = (
+        task_indices
+        if replica_task_indices is None
+        else replica_task_indices
+    )
+    if (
+        tuple(sorted(set(replica_tasks))) != replica_tasks
+        or not set(task_indices).issubset(replica_tasks)
+    ):
+        raise ValueError("worker replica task lattice drifted")
     require_startup_barrier(
         root,
         expected_sha256=startup_barrier_sha256,
     )
-    driver = driver_from_config(Path(config_path), assigned_task_indices=task_indices)
+    driver = driver_from_config(
+        Path(config_path), assigned_task_indices=replica_tasks
+    )
     progress_path = root / "progress" / f"replica-{replica_index}.json"
     started = time.monotonic()
     completed: set[int] = set()
+    invocation_completed: set[int] = set()
     progress_lock = threading.Lock()
     digest_locks: dict[str, Any] = {}
     try:
         driver.ensure_driver_lease()
         driver._read_validated_preflight()
+        for task_index in replica_tasks:
+            completion_path = driver.task_completion_path(task_index)
+            if completion_path.is_symlink():
+                raise RuntimeError("durable task completion is a symlink")
+            if completion_path.exists():
+                if not completion_path.is_file():
+                    raise RuntimeError("durable task completion is not a file")
+                driver.load_task_completion(task_index)
+                completed.add(task_index)
         ensure_private_directory(root / "control" / "image-leases")
         queues: list[list[tuple[int, str, int, int]]] = [
             [] for _ in range(TASK_SLOTS_PER_REPLICA)
@@ -1070,6 +1182,7 @@ def _worker(
                 slot_completed.append(task_index)
                 with progress_lock:
                     completed.add(task_index)
+                    invocation_completed.add(task_index)
                     atomic_write_json(
                         progress_path,
                         {
@@ -1079,7 +1192,7 @@ def _worker(
                             "task_slots_per_replica": TASK_SLOTS_PER_REPLICA,
                             "completed_task_indices": sorted(completed),
                             "completed_tasks": len(completed),
-                            "total_tasks": len(task_indices),
+                            "total_tasks": len(replica_tasks),
                             "last_task_index": task_index,
                             "last_slot_index": slot_index,
                             "last_image_config_digest": image_digest,
@@ -1106,13 +1219,25 @@ def _worker(
             "status": "STOPPED_AT_PUBLICATION_BOUNDARY" if stopped else "PASS",
             "replica_index": replica_index,
             "task_slots_per_replica": TASK_SLOTS_PER_REPLICA,
-            "completed_task_indices": sorted(completed),
-            "completed_tasks": len(completed),
+            "completed_task_indices": sorted(invocation_completed),
+            "completed_tasks": len(invocation_completed),
             "total_tasks": len(task_indices),
             "slots": slot_results,
             "wall_seconds": round(time.monotonic() - started, 6),
         }
-        atomic_write_json(progress_path, result)
+        atomic_write_json(
+            progress_path,
+            {
+                "schema": "amg_swebench_shared_pool_progress_v2",
+                "status": result["status"],
+                "replica_index": replica_index,
+                "task_slots_per_replica": TASK_SLOTS_PER_REPLICA,
+                "completed_task_indices": sorted(completed),
+                "completed_tasks": len(completed),
+                "total_tasks": len(replica_tasks),
+                "wall_seconds": result["wall_seconds"],
+            },
+        )
         return result
     finally:
         release_driver(driver)
@@ -1941,6 +2066,11 @@ def run_timing(config: CoordinatorConfig) -> Mapping[str, Any]:
     contract = load_timing_contract(config)
     barrier_path = config.root / "control" / "preflight-all.json"
     barrier_sha256 = hashlib.sha256(barrier_path.read_bytes()).hexdigest()
+    reconcile_all_eight_before_workers(
+        config,
+        phase="timing",
+        startup_barrier_sha256=barrier_sha256,
+    )
     panel_rows = contract["panel_tasks"]
     results = []
     with ProcessPoolExecutor(max_workers=8) as executor:
@@ -1964,6 +2094,7 @@ def run_timing(config: CoordinatorConfig) -> Mapping[str, Any]:
                     replica.replica_index,
                     str(config.root),
                     barrier_sha256,
+                    replica.task_indices,
                 )
             ] = replica.replica_index
         for future in as_completed(futures):
@@ -2463,6 +2594,25 @@ def _eta_indices(root: Path, prefix: str) -> list[int]:
     return sorted(result)
 
 
+def _eta_trigger_reasons(
+    *,
+    elapsed_seconds: float,
+    prior_elapsed_seconds: float,
+    completed_cells: int,
+    prior_completed_cells: int,
+    remaining_cells_at_launch: int,
+    workers_pending: bool,
+) -> list[str]:
+    reasons = []
+    if elapsed_seconds - prior_elapsed_seconds >= ETA_CHECK_INTERVAL_SECONDS:
+        reasons.append("elapsed_interval")
+    if completed_cells - prior_completed_cells >= ETA_CHECK_CELL_COUNT:
+        reasons.append("cell_interval")
+    if not workers_pending and completed_cells == remaining_cells_at_launch:
+        reasons.append("final_completion")
+    return reasons
+
+
 def _validate_eta_cadence(
     progress: Mapping[str, Any],
     *,
@@ -2486,7 +2636,7 @@ def _validate_eta_cadence(
         raise RuntimeError("full-run ETA trigger binding drifted")
     if (
         elapsed_gap > ETA_CHECK_INTERVAL_SECONDS + ETA_CADENCE_TOLERANCE_SECONDS
-        and cell_gap > ETA_CHECK_CELL_COUNT
+        or cell_gap > ETA_CHECK_CELL_COUNT
     ):
         raise RuntimeError("full-run ETA mandatory cadence was omitted")
     if not expected_reasons:
@@ -2621,22 +2771,30 @@ def _run_full_locked(config: CoordinatorConfig) -> list[dict[str, Any]]:
     barrier_sha256 = hashlib.sha256(barrier_path.read_bytes()).hexdigest()
     workers_path = config.root / "control" / "workers-complete.json"
     if workers_path.exists() or workers_path.is_symlink():
-        workers = validated_workers_complete(config)
         journal_path = full_run_journal_path(config.root)
-        if journal_path.exists() or journal_path.is_symlink():
-            journal = _load_or_create_full_run_journal(
-                config, timing_gate_sha256=timing_gate_sha256
+        if not journal_path.is_file() or journal_path.is_symlink():
+            raise RuntimeError(
+                "workers-complete receipt lacks its full-run transaction journal"
             )
-            full_timing_path = config.root / "control" / "full-run-timing.json"
-            journal["status"] = "COMPLETE"
-            journal["full_run_timing_sha256"] = hashlib.sha256(
-                full_timing_path.read_bytes()
-            ).hexdigest()
-            journal["workers_complete_sha256"] = hashlib.sha256(
-                workers_path.read_bytes()
-            ).hexdigest()
-            _persist_full_run_journal(config, journal)
+        workers = validated_workers_complete(config)
+        journal = _load_or_create_full_run_journal(
+            config, timing_gate_sha256=timing_gate_sha256
+        )
+        full_timing_path = config.root / "control" / "full-run-timing.json"
+        journal["status"] = "COMPLETE"
+        journal["full_run_timing_sha256"] = hashlib.sha256(
+            full_timing_path.read_bytes()
+        ).hexdigest()
+        journal["workers_complete_sha256"] = hashlib.sha256(
+            workers_path.read_bytes()
+        ).hexdigest()
+        _persist_full_run_journal(config, journal)
         return [dict(row) for row in workers["workers"]]
+    reconcile_all_eight_before_workers(
+        config,
+        phase="full",
+        startup_barrier_sha256=barrier_sha256,
+    )
     journal = _load_or_create_full_run_journal(
         config, timing_gate_sha256=timing_gate_sha256
     )
@@ -2668,6 +2826,7 @@ def _run_full_locked(config: CoordinatorConfig) -> list[dict[str, Any]]:
                     replica.replica_index,
                     str(config.root),
                     barrier_sha256,
+                    replica.task_indices,
                 ): replica.replica_index
                 for replica in config.replicas
             }
@@ -2686,13 +2845,14 @@ def _run_full_locked(config: CoordinatorConfig) -> list[dict[str, Any]]:
                 new_cells = len(
                     completed_tasks - set(journal["baseline_task_indices"])
                 ) * len(ARMS)
-                reasons = []
-                if elapsed - last_eta_elapsed >= ETA_CHECK_INTERVAL_SECONDS:
-                    reasons.append("elapsed_interval")
-                if new_cells - last_eta_cells >= ETA_CHECK_CELL_COUNT:
-                    reasons.append("cell_interval")
-                if not pending:
-                    reasons.append("final_completion")
+                reasons = _eta_trigger_reasons(
+                    elapsed_seconds=elapsed,
+                    prior_elapsed_seconds=last_eta_elapsed,
+                    completed_cells=new_cells,
+                    prior_completed_cells=last_eta_cells,
+                    remaining_cells_at_launch=journal["remaining_cells_at_launch"],
+                    workers_pending=bool(pending),
+                )
                 if not reasons:
                     continue
                 eta = _publish_eta_check(
@@ -2720,6 +2880,20 @@ def _run_full_locked(config: CoordinatorConfig) -> list[dict[str, Any]]:
         if full_run_stop_requested(config.root):
             raise RuntimeError("full run stopped at a clean publication boundary")
         results.sort(key=lambda row: row["replica_index"])
+        for replica, result in zip(config.replicas, results):
+            if (
+                result.get("status") != "PASS"
+                or result.get("replica_index") != replica.replica_index
+                or result.get("completed_task_indices")
+                != list(replica.task_indices)
+            ):
+                raise RuntimeError("shared-pool worker result coverage drifted")
+            atomic_write_json(
+                config.root
+                / "progress"
+                / f"replica-{replica.replica_index}.json",
+                result,
+            )
         _completed_worker_results(config)
     else:
         results = _completed_worker_results(config)
@@ -2735,12 +2909,18 @@ def _run_full_locked(config: CoordinatorConfig) -> list[dict[str, Any]]:
         new_cells = len(completed_tasks - set(journal["baseline_task_indices"])) * len(
             ARMS
         )
-        reasons = []
-        if elapsed - last_eta_elapsed >= ETA_CHECK_INTERVAL_SECONDS:
-            reasons.append("elapsed_interval")
-        if new_cells - last_eta_cells >= ETA_CHECK_CELL_COUNT:
-            reasons.append("cell_interval")
-        reasons.append("final_completion")
+        if new_cells != journal["remaining_cells_at_launch"]:
+            raise RuntimeError(
+                "full-run workers returned without complete publication coverage"
+            )
+        reasons = _eta_trigger_reasons(
+            elapsed_seconds=elapsed,
+            prior_elapsed_seconds=last_eta_elapsed,
+            completed_cells=new_cells,
+            prior_completed_cells=last_eta_cells,
+            remaining_cells_at_launch=journal["remaining_cells_at_launch"],
+            workers_pending=False,
+        )
         eta = _publish_eta_check(
             config,
             journal=journal,
@@ -3003,6 +3183,11 @@ def validated_workers_complete(config: CoordinatorConfig) -> Mapping[str, Any]:
     gate_path = config.root / "control" / "gate.json"
     timing_gate_path = config.root / "control" / "timing-gate.json"
     full_run_timing_path = config.root / "control" / "full-run-timing.json"
+    journal_path = full_run_journal_path(config.root)
+    if not journal_path.is_file() or journal_path.is_symlink():
+        raise RuntimeError(
+            "workers-complete receipt lacks its full-run transaction journal"
+        )
     timing_gate = validated_timing_gate(config)
     timing_gate_sha256 = hashlib.sha256(timing_gate_path.read_bytes()).hexdigest()
     _validated_full_run_timing(
@@ -3029,6 +3214,24 @@ def validated_workers_complete(config: CoordinatorConfig) -> Mapping[str, Any]:
         != hashlib.sha256(full_run_timing_path.read_bytes()).hexdigest()
     ):
         raise RuntimeError("workers-complete receipt binding drifted")
+    journal = _load_or_create_full_run_journal(
+        config, timing_gate_sha256=timing_gate_sha256
+    )
+    workers_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+    full_timing_sha256 = hashlib.sha256(full_run_timing_path.read_bytes()).hexdigest()
+    if (
+        journal.get("status") not in {"CLOSING", "COMPLETE"}
+        or journal.get("full_run_timing_sha256") != full_timing_sha256
+        or (
+            journal["status"] == "CLOSING"
+            and journal.get("workers_complete_sha256") is not None
+        )
+        or (
+            journal["status"] == "COMPLETE"
+            and journal.get("workers_complete_sha256") != workers_sha256
+        )
+    ):
+        raise RuntimeError("workers-complete transaction journal binding drifted")
     workers = value.get("workers")
     audits = value.get("final_audits")
     if not isinstance(workers, list) or not isinstance(audits, list):

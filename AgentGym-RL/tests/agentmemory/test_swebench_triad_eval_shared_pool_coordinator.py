@@ -39,6 +39,7 @@ from swebench_triad_eval.shared_pool_coordinator import (
     _eta_progress_path,
     _eta_receipt_from_progress,
     _eta_receipt_path,
+    _eta_trigger_reasons,
     _extract_startup_reconciliation,
     _load_cell_timing,
     _publish_eta_check,
@@ -55,6 +56,7 @@ from swebench_triad_eval.shared_pool_coordinator import (
     load_timing_contract,
     reconcile_digest_occupants,
     preflight_all,
+    reconcile_all_eight_before_workers,
     run_full,
     validated_timing_gate,
     validated_workers_complete,
@@ -1152,11 +1154,75 @@ with digest_lease_admission(
 
 
 class WorkerTest(unittest.TestCase):
+    def test_worker_progress_is_monotonic_over_prior_durable_completions(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            completion_root = root / "replica-run" / "full"
+            completion_root.mkdir(parents=True)
+            (completion_root / "task-0000.json").write_text("{}")
+            loaded = []
+
+            class Driver:
+                lease_registry = None
+
+                @staticmethod
+                def ensure_driver_lease():
+                    return None
+
+                @staticmethod
+                def _read_validated_preflight():
+                    return None
+
+                @staticmethod
+                def task_completion_path(task_index):
+                    return completion_root / f"task-{task_index:04d}.json"
+
+                @staticmethod
+                def load_task_completion(task_index):
+                    loaded.append(task_index)
+                    return {"task_index": task_index}
+
+                @staticmethod
+                def run_task(task_index, *, slot_index, admission, **_kwargs):
+                    with admission(fake_runtime_slot(task_index, slot_index)):
+                        return {"task_index": task_index}
+
+            barrier_sha256 = write_startup_barrier(root)
+            with patch(
+                "swebench_triad_eval.shared_pool_coordinator.driver_from_config",
+                return_value=Driver(),
+            ):
+                result = _worker(
+                    "/tmp/config.json",
+                    (4, 9),
+                    ("sha256:" + "4" * 64, "sha256:" + "9" * 64),
+                    (0, 1),
+                    3,
+                    raw,
+                    barrier_sha256,
+                    (0, 4, 9),
+                )
+            progress = load_atomic_object(
+                root / "progress" / "replica-3.json", "worker progress"
+            )
+            self.assertEqual(loaded, [0])
+            self.assertEqual(result["completed_task_indices"], [4, 9])
+            self.assertEqual(progress["completed_task_indices"], [0, 4, 9])
+            self.assertEqual(progress["total_tasks"], 3)
+
     def test_worker_uses_digest_lock_and_does_not_repeat_startup_reconciliation(self):
         calls = []
 
         class Driver:
             lease_registry = None
+
+            @staticmethod
+            def task_completion_path(task_index):
+                return Path(f"/nonexistent-amg-worker-fixture-{task_index}")
+
+            @staticmethod
+            def load_task_completion(_task_index):
+                raise AssertionError("nonexistent completion was loaded")
 
             def ensure_driver_lease(self):
                 calls.append("lease")
@@ -1198,6 +1264,14 @@ class WorkerTest(unittest.TestCase):
 
         class Driver:
             lease_registry = None
+
+            @staticmethod
+            def task_completion_path(task_index):
+                return Path(f"/nonexistent-amg-worker-stop-{task_index}")
+
+            @staticmethod
+            def load_task_completion(_task_index):
+                raise AssertionError("nonexistent completion was loaded")
 
             @staticmethod
             def ensure_driver_lease():
@@ -1264,6 +1338,14 @@ class WorkerTest(unittest.TestCase):
             lease_registry = None
 
             @staticmethod
+            def task_completion_path(task_index):
+                return Path(f"/nonexistent-amg-worker-c2-{task_index}")
+
+            @staticmethod
+            def load_task_completion(_task_index):
+                raise AssertionError("nonexistent completion was loaded")
+
+            @staticmethod
             def ensure_driver_lease():
                 return None
 
@@ -1327,6 +1409,14 @@ class WorkerTest(unittest.TestCase):
 
         class Driver:
             lease_registry = None
+
+            @staticmethod
+            def task_completion_path(task_index):
+                return Path(f"/nonexistent-amg-worker-digest-{task_index}")
+
+            @staticmethod
+            def load_task_completion(_task_index):
+                raise AssertionError("nonexistent completion was loaded")
 
             @staticmethod
             def ensure_driver_lease():
@@ -1499,6 +1589,101 @@ class SharedPoolPreflightTest(unittest.TestCase):
         self.assertEqual([row[0] for row in events[16:24]], ["reconcile"] * 8)
         self.assertEqual(events[24], ("shared-images", 0))
         self.assertEqual([row[0] for row in events[25:33]], ["preflight"] * 8)
+
+    def test_worker_retry_reconciles_all_eight_without_rewriting_preflight(self):
+        events = []
+        drivers = {}
+
+        class Registry:
+            def __init__(self, index):
+                self.index = index
+
+            def release(self):
+                events.append(("release", self.index))
+
+        class Driver:
+            def __init__(self, index):
+                self.index = index
+                self.lease_registry = Registry(index)
+                self.operations = self
+
+            def acquire_runtime_lane(self, task_index, *, slot_index):
+                self.assertIsNone(task_index)
+                events.append(("acquire", self.index, slot_index))
+
+            @staticmethod
+            def assertIsNone(value):
+                if value is not None:
+                    raise AssertionError("retry reconciliation must fence whole lanes")
+
+            def reconcile_dead_work(self, *, allow_foreign_loaded_images):
+                if len([row for row in events if row[0] == "acquire"]) != 16:
+                    raise AssertionError("retry reconciled before all lanes were held")
+                if allow_foreign_loaded_images is not True:
+                    raise AssertionError("cross-root images must be deferred")
+                events.append(("reconcile", self.index))
+                return startup_reconciliation(self.index)
+
+            def reconcile_unbound_loaded_images(self):
+                if len([row for row in events if row[0] == "reconcile"]) != 8:
+                    raise AssertionError("shared images reconciled too early")
+                events.append(("shared-images", self.index))
+                return {"status": "PASS", "remaining_images": 0}
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (root / "control").mkdir()
+            index_path = root / "index.json"
+            index_path.write_text("index")
+            replicas = tuple(
+                ReplicaConfig(
+                    replica_index=index,
+                    gpu_uuid=f"GPU-{index}",
+                    path=root / f"config-{index}.json",
+                    production=SimpleNamespace(),
+                    task_indices=(index,),
+                )
+                for index in range(8)
+            )
+            for replica in replicas:
+                replica.path.write_text("config")
+                drivers[str(replica.path)] = Driver(replica.replica_index)
+            config = CoordinatorConfig(index_path, root, replicas, ())
+
+            def reconcile_digest(_root):
+                events.append(("digest-occupants", 0))
+                return {
+                    "schema": "amg_swebench_image_digest_reconciliation_v1",
+                    "status": "PASS",
+                    "all_eight_replica_lanes_held": True,
+                    "stale_occupants": 1,
+                    "cleared": [],
+                }
+
+            with patch(
+                "swebench_triad_eval.shared_pool_coordinator.validated_startup_barrier",
+                return_value={"status": "PASS"},
+            ) as barrier, patch(
+                "swebench_triad_eval.shared_pool_coordinator.driver_from_config",
+                side_effect=lambda path, **_kwargs: drivers[str(path)],
+            ), patch(
+                "swebench_triad_eval.shared_pool_coordinator.reconcile_digest_occupants",
+                side_effect=reconcile_digest,
+            ):
+                receipt = reconcile_all_eight_before_workers(
+                    config,
+                    phase="full",
+                    startup_barrier_sha256="b" * 64,
+                )
+            self.assertEqual(barrier.call_count, 2)
+            self.assertEqual([row[0] for row in events[:16]], ["acquire"] * 16)
+            self.assertEqual([row[0] for row in events[16:24]], ["reconcile"] * 8)
+            self.assertEqual(events[24:26], [("shared-images", 0), ("digest-occupants", 0)])
+            self.assertEqual(receipt["status"], "PASS")
+            self.assertEqual(receipt["digest_lease_reconciliation"]["stale_occupants"], 1)
+            self.assertTrue(
+                (root / "control" / "full-worker-reconciliation.json").is_file()
+            )
 
     def test_lane_acquisition_failure_releases_the_failing_driver_too(self):
         released = []
@@ -1775,6 +1960,26 @@ class FullRunTransactionRestartTest(unittest.TestCase):
         }
         with self.assertRaisesRegex(RuntimeError, "cadence"):
             _validate_eta_cadence(base, prior_elapsed=0.0, prior_cells=0)
+        elapsed_only = dict(base)
+        elapsed_only.update(
+            {
+                "new_completed_cells": 3,
+                "elapsed_seconds": 8000.0,
+                "trigger_reasons": ["elapsed_interval"],
+            }
+        )
+        with self.assertRaisesRegex(RuntimeError, "cadence"):
+            _validate_eta_cadence(elapsed_only, prior_elapsed=0.0, prior_cells=0)
+        cells_only = dict(base)
+        cells_only.update(
+            {
+                "new_completed_cells": 300,
+                "elapsed_seconds": 10.0,
+                "trigger_reasons": ["cell_interval"],
+            }
+        )
+        with self.assertRaisesRegex(RuntimeError, "cadence"):
+            _validate_eta_cadence(cells_only, prior_elapsed=0.0, prior_cells=0)
         duplicate = dict(base)
         duplicate.update(
             {
@@ -1788,6 +1993,29 @@ class FullRunTransactionRestartTest(unittest.TestCase):
             _validate_eta_cadence(duplicate, prior_elapsed=10.0, prior_cells=75)
         with self.assertRaisesRegex(RuntimeError, "reordered"):
             _validate_eta_cadence(duplicate, prior_elapsed=20.0, prior_cells=100)
+
+    def test_partial_stop_boundary_is_never_labeled_final_completion(self):
+        partial = _eta_trigger_reasons(
+            elapsed_seconds=1810.0,
+            prior_elapsed_seconds=0.0,
+            completed_cells=75,
+            prior_completed_cells=0,
+            remaining_cells_at_launch=150,
+            workers_pending=False,
+        )
+        self.assertEqual(partial, ["elapsed_interval", "cell_interval"])
+        complete = _eta_trigger_reasons(
+            elapsed_seconds=1810.0,
+            prior_elapsed_seconds=0.0,
+            completed_cells=150,
+            prior_completed_cells=75,
+            remaining_cells_at_launch=150,
+            workers_pending=False,
+        )
+        self.assertEqual(
+            complete,
+            ["elapsed_interval", "cell_interval", "final_completion"],
+        )
 
 
 class FullRunTimingBindingTest(unittest.TestCase):
@@ -1803,14 +2031,16 @@ class FullRunTimingBindingTest(unittest.TestCase):
             "check_index": 1,
             "observed_wall_ns": 10_000_000_001,
             "elapsed_seconds": 10.0,
-            "baseline_task_indices_sha256": sha256_json({"baseline_task_indices": []}),
+            "baseline_task_indices_sha256": sha256_json(
+                {"baseline_task_indices": list(range(475))}
+            ),
             "completed_task_indices": list(range(500)),
-            "new_completed_task_indices": list(range(500)),
-            "baseline_completed_tasks": 0,
-            "baseline_completed_cells": 0,
-            "new_completed_tasks": 500,
-            "new_completed_cells": 1500,
-            "remaining_cells_at_launch": 1500,
+            "new_completed_task_indices": list(range(475, 500)),
+            "baseline_completed_tasks": 475,
+            "baseline_completed_cells": 1425,
+            "new_completed_tasks": 25,
+            "new_completed_cells": 75,
+            "remaining_cells_at_launch": 75,
             "trigger_reasons": ["cell_interval", "final_completion"],
             "timing_gate_sha256": timing_gate_sha256,
         }
@@ -1826,11 +2056,11 @@ class FullRunTimingBindingTest(unittest.TestCase):
             ).hexdigest(),
             "observed_wall_ns": 10_000_000_001,
             "elapsed_seconds": 10.0,
-            "baseline_completed_tasks": 0,
-            "baseline_completed_cells": 0,
-            "new_completed_tasks": 500,
-            "new_completed_cells": 1500,
-            "remaining_cells_at_launch": 1500,
+            "baseline_completed_tasks": 475,
+            "baseline_completed_cells": 1425,
+            "new_completed_tasks": 25,
+            "new_completed_cells": 75,
+            "remaining_cells_at_launch": 75,
             "trigger_reasons": ["cell_interval", "final_completion"],
             "projected_remaining_makespan_seconds": 10.0,
             "stop_threshold_seconds": TIMING_BUDGET_SECONDS * 1.5,
@@ -1846,7 +2076,7 @@ class FullRunTimingBindingTest(unittest.TestCase):
             "actual_wall_seconds": 10.0,
             "initial_projected_full_makespan_seconds": 100.0,
             "timing_gate_sha256": timing_gate_sha256,
-            "baseline_task_indices": [],
+            "baseline_task_indices": list(range(475)),
             "eta_checks": [
                 {
                     "path": str(eta_path),
@@ -2001,6 +2231,17 @@ class WorkersCompleteTimingBindingTest(unittest.TestCase):
                 "final_audits": audits,
             }
             atomic_write_json(workers_path, value)
+            with self.assertRaisesRegex(RuntimeError, "transaction journal"):
+                validated_workers_complete(config)
+            journal_path = config.root / "control" / "full-run-transaction.json"
+            atomic_write_json(journal_path, {"schema": "fixture-journal"})
+            journal = {
+                "status": "CLOSING",
+                "full_run_timing_sha256": hashlib.sha256(
+                    full_timing_path.read_bytes()
+                ).hexdigest(),
+                "workers_complete_sha256": None,
+            }
             timing_gate = {
                 "projection": {"projected_full_makespan_seconds": 1.0}
             }
@@ -2021,8 +2262,12 @@ class WorkersCompleteTimingBindingTest(unittest.TestCase):
                     "swebench_triad_eval.shared_pool_coordinator.validate_live_pool_snapshot",
                     return_value={},
                 ),
+                patch(
+                    "swebench_triad_eval.shared_pool_coordinator._load_or_create_full_run_journal",
+                    return_value=journal,
+                ),
             )
-            with patches[0], patches[1], patches[2], patches[3]:
+            with patches[0], patches[1], patches[2], patches[3], patches[4]:
                 self.assertEqual(validated_workers_complete(config), value)
                 tampered = copy.deepcopy(value)
                 tampered["timing_gate_sha256"] = "0" * 64
