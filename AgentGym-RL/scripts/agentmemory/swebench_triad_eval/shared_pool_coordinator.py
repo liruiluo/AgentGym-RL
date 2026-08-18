@@ -30,9 +30,12 @@ from .atomic import (
 from .cli import driver_from_config
 from .identity import verify_image_index
 from .production import (
-    SHARED_MODEL_POOL_ASSIGNMENT,
     SHARED_POOL_RUN_CONFIG_SCHEMA,
     ProductionRunConfig,
+)
+from .shared_pool_contract import (
+    SHARED_MODEL_POOL_ASSIGNMENT,
+    validate_shared_model_pool_snapshot,
 )
 from .state import CellKey, sha256_json
 
@@ -314,21 +317,16 @@ def release_driver(driver: Any) -> None:
         registry.release()
 
 
-def _sha256(value: Any) -> bool:
-    return (
-        isinstance(value, str)
-        and len(value) == 64
-        and all(character in "0123456789abcdef" for character in value)
-    )
-
-
 def validate_live_pool_snapshot(
     value: Any, replica: ReplicaConfig, label: str
 ) -> Mapping[str, Any]:
     expected = replica.production.shared_model_pool
     serving = replica.production.section("serving")
-    if expected is None or not isinstance(value, Mapping):
+    if expected is None:
         raise RuntimeError(f"{label} shared-model pool snapshot is missing")
+    value = validate_shared_model_pool_snapshot(
+        value, f"{label} shared-model pool snapshot"
+    )
     exact = {
         "status": "PASS",
         "owner": expected["owner"],
@@ -351,52 +349,118 @@ def validate_live_pool_snapshot(
     }
     if any(value.get(name) != expected_value for name, expected_value in exact.items()):
         raise RuntimeError(f"{label} shared-model pool identity drifted")
-    positive_pid_fields = (
-        "server_target_pids",
-        "server_listener_pids",
-        "proxy_target_pids",
-        "proxy_listener_pids",
-        "assigned_gpu_process_pids",
-    )
-    for name in positive_pid_fields:
-        rows = value.get(name)
-        if (
-            not isinstance(rows, list)
-            or not rows
-            or rows != sorted(set(rows))
-            or any(type(pid) is not int or pid <= 0 for pid in rows)
-        ):
-            raise RuntimeError(f"{label} {name} drifted")
-    if not set(value["server_listener_pids"]).issubset(value["server_target_pids"]):
-        raise RuntimeError(f"{label} server listener binding drifted")
-    if not set(value["proxy_listener_pids"]).issubset(value["proxy_target_pids"]):
-        raise RuntimeError(f"{label} proxy listener binding drifted")
-    if type(value.get("proxy_pid")) is not int or value["proxy_pid"] <= 0:
-        raise RuntimeError(f"{label} proxy PID drifted")
-    if (
-        type(value.get("proxy_start_ticks")) is not int
-        or value["proxy_start_ticks"] <= 0
-    ):
-        raise RuntimeError(f"{label} proxy start ticks drifted")
-    route = value.get("proxy_route")
+    route = value["proxy_route"]
     expected_upstream = f"http://127.0.0.1:{expected['model_port']}"
     if (
-        not isinstance(route, Mapping)
-        or route.get("upstream_base_url") != expected_upstream
+        route.get("upstream_base_url") != expected_upstream
         or route.get("upstream_base_url_sha256")
         != hashlib.sha256(expected_upstream.encode("utf-8")).hexdigest()
-        or any(
-            not _sha256(route.get(name))
-            for name in (
-                "config_sha256",
-                "proxy_source_sha256",
-                "runtime_sha256",
-                "tokenizer_sha256",
-            )
-        )
     ):
         raise RuntimeError(f"{label} proxy route binding drifted")
     return value
+
+
+def _reconciliation_cell(value: Any, expected_tasks: set[int]) -> None:
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"task_index", "arm"}
+        or type(value.get("task_index")) is not int
+        or value["task_index"] not in expected_tasks
+        or value.get("arm") not in ARMS
+    ):
+        raise RuntimeError("reconciliation cell identity drifted")
+
+
+def _task_index_list(value: Any, label: str) -> list[int]:
+    if (
+        not isinstance(value, list)
+        or any(type(task_index) is not int or task_index < 0 for task_index in value)
+        or value != sorted(set(value))
+    ):
+        raise RuntimeError(f"{label} drifted")
+    return value
+
+
+def _extract_startup_reconciliation(
+    value: Any, expected_task_indices: Sequence[int]
+) -> Mapping[str, Any]:
+    """Validate every lifecycle receipt and return its one startup receipt."""
+
+    if type(value) is not list or not value:
+        raise RuntimeError("lifecycle reconciliation is not a complete list")
+    expected_tasks = set(expected_task_indices)
+    startup: Mapping[str, Any] | None = None
+    for position, raw_row in enumerate(value):
+        if not isinstance(raw_row, Mapping):
+            raise RuntimeError("lifecycle reconciliation row is not an object")
+        fields = set(raw_row)
+        if fields == {"startup"}:
+            if startup is not None or position != len(value) - 1:
+                raise RuntimeError("lifecycle reconciliation must end in one startup receipt")
+            raw_startup = raw_row["startup"]
+            startup_fields = {
+                "schema",
+                "task_indices",
+                "reconciled_graders",
+                "evicted_images",
+                "removed_task_roots",
+                "foreign_staged_tasks",
+                "foreign_loaded_images",
+                "residue",
+            }
+            if not isinstance(raw_startup, Mapping) or set(raw_startup) != startup_fields:
+                raise RuntimeError("startup reconciliation receipt fields drifted")
+            if raw_startup.get("schema") != "swebench_triad_startup_reconciliation_v1":
+                raise RuntimeError("startup reconciliation schema drifted")
+            task_indices = _task_index_list(
+                raw_startup["task_indices"], "startup reconciliation task indices"
+            )
+            if task_indices != list(expected_task_indices):
+                raise RuntimeError("startup reconciliation task shard drifted")
+            for name in (
+                "reconciled_graders",
+                "evicted_images",
+                "foreign_loaded_images",
+            ):
+                if not isinstance(raw_startup[name], list):
+                    raise RuntimeError(f"startup reconciliation {name} drifted")
+            removed = _task_index_list(
+                raw_startup["removed_task_roots"],
+                "startup reconciliation removed task roots",
+            )
+            if not set(removed).issubset(expected_tasks):
+                raise RuntimeError("startup reconciliation removed a foreign task root")
+            _task_index_list(
+                raw_startup["foreign_staged_tasks"],
+                "startup reconciliation foreign staged tasks",
+            )
+            if not isinstance(raw_startup["residue"], Mapping):
+                raise RuntimeError("startup reconciliation residue drifted")
+            startup = raw_startup
+            continue
+        if fields == {"cell", "generation", "accepted_recovered", "runtime"}:
+            _reconciliation_cell(raw_row["cell"], expected_tasks)
+            if type(raw_row["generation"]) is not int or raw_row["generation"] <= 0:
+                raise RuntimeError("cell reconciliation generation drifted")
+            if type(raw_row["accepted_recovered"]) is not bool:
+                raise RuntimeError("cell reconciliation acceptance drifted")
+            if not isinstance(raw_row["runtime"], Mapping):
+                raise RuntimeError("cell reconciliation runtime receipt drifted")
+            continue
+        if fields == {"cell", "grade_claim_generation", "grader"}:
+            _reconciliation_cell(raw_row["cell"], expected_tasks)
+            if (
+                type(raw_row["grade_claim_generation"]) is not int
+                or raw_row["grade_claim_generation"] <= 0
+            ):
+                raise RuntimeError("grader reconciliation generation drifted")
+            if not isinstance(raw_row["grader"], Mapping):
+                raise RuntimeError("grader reconciliation receipt drifted")
+            continue
+        raise RuntimeError("lifecycle reconciliation row fields drifted")
+    if startup is None:
+        raise RuntimeError("lifecycle reconciliation startup receipt is missing")
+    return startup
 
 
 def preflight_all(config: CoordinatorConfig) -> list[dict[str, Any]]:
@@ -419,10 +483,15 @@ def preflight_all(config: CoordinatorConfig) -> list[dict[str, Any]]:
             drivers.append((replica, driver))
             driver.acquire_runtime_lane(None)
         reconciliations = []
+        startup_reconciliations = []
         for replica, driver in drivers:
             receipt = driver.reconcile_dead_work(
                 allow_foreign_loaded_images=True
             )
+            startup = _extract_startup_reconciliation(
+                receipt, replica.task_indices
+            )
+            startup_reconciliations.append(startup)
             reconciliations.append(
                 {
                     "replica_index": replica.replica_index,
@@ -430,13 +499,8 @@ def preflight_all(config: CoordinatorConfig) -> list[dict[str, Any]]:
                     "receipt_sha256": sha256_json(receipt),
                 }
             )
-        for row in reconciliations:
-            receipt = row["receipt"]
-            foreign_staged = (
-                receipt.get("foreign_staged_tasks")
-                if isinstance(receipt, Mapping)
-                else None
-            )
+        for startup in startup_reconciliations:
+            foreign_staged = startup["foreign_staged_tasks"]
             if not isinstance(foreign_staged, list) or foreign_staged:
                 raise RuntimeError("cross-replica durable stage binding drifted")
         shared_image_reconciliation = (

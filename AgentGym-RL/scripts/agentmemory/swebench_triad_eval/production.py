@@ -79,6 +79,11 @@ from .runtime_factory import (
     SwebenchRuntimeEndpoint,
     make_swebench_runtime_factory,
 )
+from .shared_pool_contract import (
+    SHARED_MODEL_POOL_ASSIGNMENT,
+    SHARED_MODEL_POOL_CLEANUP,
+    validate_shared_model_pool_snapshot,
+)
 from .state import CellKey, OwnerIdentity, sha256_json
 
 
@@ -182,10 +187,6 @@ SHARED_MODEL_POOL_FIELDS = {
     "assignment_algorithm",
     "cleanup_policy",
 }
-SHARED_MODEL_POOL_ASSIGNMENT = "uint64_be(sha256(task_id)[:8]) % 8"
-SHARED_MODEL_POOL_CLEANUP = "retain_external_pool"
-
-
 @dataclass(frozen=True)
 class ProductionTaskStage:
     task_index: int
@@ -480,6 +481,51 @@ def validate_exact_token_proxy_config(
             expected_upstream.encode("utf-8")
         ).hexdigest(),
     }
+
+
+def shared_model_pool_snapshot_receipt(
+    shared: Mapping[str, Any],
+    *,
+    readiness_sha256: str,
+    marker_lease_sha256: str,
+    selected: Mapping[str, Any],
+    selected_live: Mapping[str, Any],
+    assigned_gpu_process_pids: Sequence[int],
+    live_replica_count: int,
+) -> dict[str, Any]:
+    """Build the one exact pool snapshot embedded at every durable boundary."""
+
+    server = object_value(selected.get("server"), "selected model server")
+    proxy = object_value(selected.get("proxy"), "selected token proxy")
+    snapshot = {
+        "status": "PASS",
+        "owner": shared["owner"],
+        "readiness_sha256": readiness_sha256,
+        "marker_lease_sha256": marker_lease_sha256,
+        "replica_index": shared["replica_index"],
+        "replica_count": shared["replica_count"],
+        "gpu_index": shared["gpu_index"],
+        "gpu_uuid": shared["gpu_uuid"],
+        "model_id": shared["model_id"],
+        "model_revision": shared["model_revision"],
+        "model_port": shared["model_port"],
+        "proxy_port": shared["proxy_port"],
+        "server_pid": server["pid"],
+        "server_start_ticks": server["start_ticks"],
+        "proxy_pid": proxy["pid"],
+        "proxy_start_ticks": proxy["start_ticks"],
+        "server_target_pids": selected_live["server_target_pids"],
+        "server_listener_pids": selected_live["server_listener_pids"],
+        "proxy_target_pids": selected_live["proxy_target_pids"],
+        "proxy_listener_pids": selected_live["proxy_listener_pids"],
+        "proxy_route": selected_live["proxy_route"],
+        "assigned_gpu_process_pids": list(assigned_gpu_process_pids),
+        "all_replicas_alive": live_replica_count == shared["replica_count"],
+        "all_endpoints_healthy": True,
+        "assignment_algorithm": SHARED_MODEL_POOL_ASSIGNMENT,
+        "cleanup_policy": SHARED_MODEL_POOL_CLEANUP,
+    }
+    return dict(validate_shared_model_pool_snapshot(snapshot))
 
 
 def mount_filesystem_type(path: Path) -> str:
@@ -1370,21 +1416,41 @@ class LinuxProductionRuntime:
         return inodes
 
     @staticmethod
-    def process_socket_inodes(pid: int) -> set[int]:
-        values: set[int] = set()
+    def listener_inode_owners(listener_inodes: set[int]) -> dict[int, set[int]]:
+        if (
+            not listener_inodes
+            or any(type(inode) is not int or inode <= 0 for inode in listener_inodes)
+        ):
+            raise RuntimeError("listener inode census is invalid")
+        owners = {inode: set() for inode in listener_inodes}
         try:
-            descriptors = list(Path(f"/proc/{pid}/fd").iterdir())
-        except OSError:
-            return values
-        for descriptor in descriptors:
-            try:
-                target = os.readlink(descriptor)
-            except OSError:
+            processes = list(Path("/proc").iterdir())
+        except OSError as error:
+            raise RuntimeError("listener owner census is unavailable") from error
+        for process in processes:
+            if not process.name.isdigit():
                 continue
-            match = re.fullmatch(r"socket:\[([0-9]+)\]", target)
-            if match is not None:
-                values.add(int(match.group(1)))
-        return values
+            pid = int(process.name)
+            try:
+                descriptors = list((process / "fd").iterdir())
+            except OSError as error:
+                if error.errno in (errno.ENOENT, errno.ESRCH):
+                    continue
+                raise RuntimeError("listener owner census is incomplete") from error
+            for descriptor in descriptors:
+                try:
+                    target = os.readlink(descriptor)
+                except OSError as error:
+                    if error.errno in (errno.ENOENT, errno.ESRCH):
+                        continue
+                    raise RuntimeError("listener owner census is incomplete") from error
+                match = re.fullmatch(r"socket:\[([0-9]+)\]", target)
+                if match is None:
+                    continue
+                inode = int(match.group(1))
+                if inode in owners:
+                    owners[inode].add(pid)
+        return owners
 
     def target_process_pids(
         self, root_pid: int, target: Sequence[str], label: str
@@ -1410,14 +1476,24 @@ class LinuxProductionRuntime:
         if not candidate_pids or any(type(pid) is not int or pid <= 0 for pid in candidate_pids):
             raise RuntimeError(f"{label} process tree is invalid")
         listener_inodes = self.tcp_listener_inodes(port)
-        owners = sorted(
-            pid
-            for pid in candidate_pids
-            if self.process_socket_inodes(pid) & listener_inodes
-        )
-        if not owners:
-            raise RuntimeError(f"{label} listener escaped its process tree")
-        return owners
+        owners_by_inode = self.listener_inode_owners(listener_inodes)
+        if (
+            not isinstance(owners_by_inode, Mapping)
+            or set(owners_by_inode) != listener_inodes
+            or any(
+                not isinstance(owners, set)
+                or not owners
+                or any(type(pid) is not int or pid <= 0 for pid in owners)
+                for owners in owners_by_inode.values()
+            )
+        ):
+            raise RuntimeError(f"{label} listener owner census is incomplete")
+        owners = set().union(*owners_by_inode.values())
+        if not owners.issubset(candidate_pids):
+            raise RuntimeError(
+                f"{label} listener escaped its process tree through a foreign owner"
+            )
+        return sorted(owners)
 
     @staticmethod
     def gpu_compute_bindings() -> dict[int, str]:
@@ -1648,34 +1724,15 @@ class LinuxProductionRuntime:
             gpu_bindings[pid] != shared["gpu_uuid"] for pid in assigned_gpu_pids
         ):
             raise RuntimeError("assigned model process tree is not GPU-bound")
-        return {
-            "status": "PASS",
-            "owner": shared["owner"],
-            "readiness_sha256": readiness_sha,
-            "marker_lease_sha256": marker_sha,
-            "replica_index": shared["replica_index"],
-            "replica_count": shared["replica_count"],
-            "gpu_index": shared["gpu_index"],
-            "gpu_uuid": shared["gpu_uuid"],
-            "model_id": shared["model_id"],
-            "model_revision": shared["model_revision"],
-            "model_port": shared["model_port"],
-            "proxy_port": shared["proxy_port"],
-            "server_pid": selected["server"]["pid"],
-            "server_start_ticks": selected["server"]["start_ticks"],
-            "proxy_pid": selected["proxy"]["pid"],
-            "proxy_start_ticks": selected["proxy"]["start_ticks"],
-            "server_target_pids": selected_live["server_target_pids"],
-            "server_listener_pids": selected_live["server_listener_pids"],
-            "proxy_target_pids": selected_live["proxy_target_pids"],
-            "proxy_listener_pids": selected_live["proxy_listener_pids"],
-            "proxy_route": selected_live["proxy_route"],
-            "assigned_gpu_process_pids": assigned_gpu_pids,
-            "all_replicas_alive": len(live_processes) == shared["replica_count"],
-            "all_endpoints_healthy": True,
-            "assignment_algorithm": SHARED_MODEL_POOL_ASSIGNMENT,
-            "cleanup_policy": SHARED_MODEL_POOL_CLEANUP,
-        }
+        return shared_model_pool_snapshot_receipt(
+            shared,
+            readiness_sha256=readiness_sha,
+            marker_lease_sha256=marker_sha,
+            selected=selected,
+            selected_live=selected_live,
+            assigned_gpu_process_pids=assigned_gpu_pids,
+            live_replica_count=len(live_processes),
+        )
 
     def model_process_snapshot(
         self, shared_pool: Mapping[str, Any] | None = None
@@ -2665,7 +2722,10 @@ class LinuxProductionRuntime:
                 raise RuntimeError(
                     "task was routed to the wrong shared-model replica"
                 )
-            live_pool = self.shared_model_pool_snapshot()
+            live_pool = validate_shared_model_pool_snapshot(
+                self.shared_model_pool_snapshot(),
+                "cell runtime shared model pool snapshot",
+            )
             if live_pool.get("replica_index") != expected_replica:
                 raise RuntimeError("live shared-model replica binding drifted")
             record["shared_model_pool"] = dict(live_pool)
@@ -3022,16 +3082,22 @@ class LinuxProductionRuntime:
         loaded_by_id = {image_id: (image, image_id) for image, image_id in loaded}
         if len(loaded_by_id) != len(loaded):
             raise RuntimeError("loaded task image ID has multiple census identities")
+        retired = set(self.retired_task_indices())
         loaded_by_task: dict[int, tuple[str, str]] = {}
-        for task_index in staged:
+        loaded_claims: dict[str, list[tuple[int, tuple[str, str]]]] = {}
+        for task_index in staged - retired:
             identity = self.task_image_identity(task_index)
             if identity is not None and identity[1] in loaded_by_id:
-                if any(
-                    previous[1] == identity[1]
-                    for previous in loaded_by_task.values()
-                ):
-                    raise RuntimeError("loaded task image maps to multiple task leases")
-                loaded_by_task[task_index] = identity
+                loaded_claims.setdefault(identity[1], []).append(
+                    (task_index, identity)
+                )
+        for claims in loaded_claims.values():
+            if len(claims) != 1:
+                raise RuntimeError(
+                    "loaded task image maps to multiple active task leases"
+                )
+            task_index, identity = claims[0]
+            loaded_by_task[task_index] = identity
         bound_image_ids = {identity[1] for identity in loaded_by_task.values()}
         foreign_loaded_images = {
             loaded_by_id[image_id]
@@ -3116,6 +3182,47 @@ class LinuxProductionRuntime:
             or value.get("task_index") != task_index
         ):
             raise RuntimeError("task stage receipt is invalid")
+        return value
+
+    def eviction_receipt_path(self, task_index: int) -> Path:
+        if type(task_index) is not int or task_index not in self.by_task:
+            raise ValueError("task index is outside the production manifest")
+        return (
+            self.config.run_root
+            / "control"
+            / "evictions"
+            / f"task-{task_index:04d}.json"
+        )
+
+    def eviction_receipt(self, task_index: int) -> Mapping[str, Any] | None:
+        path = self.eviction_receipt_path(task_index)
+        if not path.exists():
+            return None
+        value = read_json(path)
+        fields = {
+            "schema",
+            "task_index",
+            "instance_id",
+            "readiness",
+            "image",
+            "task_root_removed",
+            "certified_blobs_retained",
+            "repository_mirror_retained",
+        }
+        expected_instance = self.by_task[task_index][0].task.task_id
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != fields
+            or value.get("schema") != "swebench_triad_task_eviction_v1"
+            or value.get("task_index") != task_index
+            or value.get("instance_id") != expected_instance
+            or not isinstance(value.get("readiness"), Mapping)
+            or not isinstance(value.get("image"), Mapping)
+            or type(value.get("task_root_removed")) is not bool
+            or value.get("certified_blobs_retained") is not True
+            or value.get("repository_mirror_retained") is not True
+        ):
+            raise RuntimeError("task eviction receipt is invalid")
         return value
 
     def task_image_identity(self, task_index: int) -> tuple[str, str] | None:
@@ -3334,6 +3441,22 @@ class LinuxProductionRuntime:
                 raise RuntimeError("stage receipt directory contains an unknown file")
             index = int(match.group(1))
             self.stage_receipt(index)
+            indices.append(index)
+        return indices
+
+    def retired_task_indices(self) -> list[int]:
+        root = self.config.run_root / "control" / "evictions"
+        if not root.exists():
+            return []
+        indices = []
+        for path in sorted(root.glob("task-*.json")):
+            match = re.fullmatch(r"task-([0-9]{4})\.json", path.name)
+            if match is None:
+                raise RuntimeError(
+                    "eviction receipt directory contains an unknown file"
+                )
+            index = int(match.group(1))
+            self.eviction_receipt(index)
             indices.append(index)
         return indices
 
@@ -4298,11 +4421,14 @@ class LinuxProductionRuntime:
         residue = self.global_residue_snapshot()
         if any(residue.values()):
             raise RuntimeError("final owned runtime residue is nonzero")
-        shared_pool = (
-            self.shared_model_pool_snapshot()
-            if self.config.shared_model_pool is not None
-            else None
-        )
+        shared_pool = None
+        if self.config.shared_model_pool is not None:
+            shared_pool = dict(
+                validate_shared_model_pool_snapshot(
+                    self.shared_model_pool_snapshot(),
+                    "final audit shared model pool snapshot",
+                )
+            )
         pod = self.pod_snapshot()
         allocation_retained = (
             pod["job"] == self.section("pod")["job"]
@@ -4467,5 +4593,6 @@ __all__ = [
     "current_owner_identity",
     "linux_process_start_ticks",
     "owner_is_alive",
+    "shared_model_pool_snapshot_receipt",
     "summarize_task4_receipt",
 ]

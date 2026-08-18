@@ -30,6 +30,10 @@ from .atomic import (
     write_immutable_json,
 )
 from .identity import PRODUCTION_DATASET_PINS, PRODUCTION_IMAGE_INDEX_PINS
+from .shared_pool_contract import (
+    SharedModelPoolSnapshotError,
+    validate_shared_model_pool_snapshot,
+)
 from .state import (
     AlreadyAcceptedError,
     AlreadyGradedError,
@@ -267,33 +271,12 @@ def validate_preflight_snapshot(
     _equal(pod["gpu_count"], expected.get("gpu_count", 1), "pod GPU count")
 
     if expected_shared_pool is not None:
-        shared = _exact_fields(
-            _mapping(root["shared_model_pool"], "shared model pool snapshot"),
-            {
-                "status",
-                "owner",
-                "readiness_sha256",
-                "marker_lease_sha256",
-                "replica_index",
-                "replica_count",
-                "gpu_index",
-                "gpu_uuid",
-                "model_id",
-                "model_revision",
-                "model_port",
-                "proxy_port",
-                "server_pid",
-                "server_start_ticks",
-                "proxy_pid",
-                "proxy_start_ticks",
-                "assigned_gpu_process_pids",
-                "all_replicas_alive",
-                "all_endpoints_healthy",
-                "assignment_algorithm",
-                "cleanup_policy",
-            },
-            "shared model pool snapshot",
-        )
+        try:
+            shared = validate_shared_model_pool_snapshot(
+                root["shared_model_pool"], "shared model pool snapshot"
+            )
+        except SharedModelPoolSnapshotError as error:
+            _fail(str(error))
         expected_pool = _mapping(
             expected_shared_pool, "shared model pool expectations"
         )

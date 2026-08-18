@@ -626,6 +626,16 @@ class LifecycleDriverTest(unittest.TestCase):
         self.assertEqual(resumed["denominator_per_arm"], 2)
         self.assertGreaterEqual(self.operations.preflight_calls, 3)
 
+    def test_reconcile_dead_work_returns_the_complete_production_list_shape(self):
+        receipts = self.driver.reconcile_dead_work()
+
+        self.assertIs(type(receipts), list)
+        self.assertEqual(receipts, [{"startup": {"status": "reconciled"}}])
+        persisted = json.loads(
+            (self.root / "run/control/latest-reconciliation.json").read_text()
+        )
+        self.assertEqual(persisted["receipts"], receipts)
+
     def test_existing_gate_is_exactly_bound_to_current_canonical_state(self):
         self.driver.gate(auto_run_full=False)
         gate_path = self.root / "run/gate/PASS.json"
@@ -1075,8 +1085,23 @@ class SharedModelPoolPreflightTest(unittest.TestCase):
             "proxy_port": 16383,
             "server_pid": 303,
             "server_start_ticks": 3003,
+            "server_target_pids": [303],
+            "server_listener_pids": [303],
             "proxy_pid": 403,
             "proxy_start_ticks": 4003,
+            "proxy_target_pids": [403],
+            "proxy_listener_pids": [403],
+            "proxy_route": {
+                "config_path": "/tmp/proxy-config.json",
+                "config_sha256": "4" * 64,
+                "proxy_source_sha256": "5" * 64,
+                "runtime_sha256": "6" * 64,
+                "tokenizer_sha256": "7" * 64,
+                "upstream_base_url": "http://127.0.0.1:18021",
+                "upstream_base_url_sha256": hashlib.sha256(
+                    b"http://127.0.0.1:18021"
+                ).hexdigest(),
+            },
             "assigned_gpu_process_pids": [503],
             "all_replicas_alive": True,
             "all_endpoints_healthy": True,
@@ -1095,6 +1120,7 @@ class SharedModelPoolPreflightTest(unittest.TestCase):
             ("all_replicas_alive", False),
             ("cleanup_policy", "stop_external_pool"),
             ("assigned_gpu_process_pids", []),
+            ("server_listener_pids", [999]),
         ):
             with self.subTest(field=field):
                 broken = dict(snapshot)
@@ -1102,6 +1128,14 @@ class SharedModelPoolPreflightTest(unittest.TestCase):
                 broken["shared_model_pool"][field] = value
                 with self.assertRaises(PreflightContractError):
                     validate_preflight_snapshot(broken, expectations)
+
+        extra = dict(snapshot)
+        extra["shared_model_pool"] = {
+            **snapshot["shared_model_pool"],
+            "unexpected": True,
+        }
+        with self.assertRaises(PreflightContractError):
+            validate_preflight_snapshot(extra, expectations)
 
 
 if __name__ == "__main__":

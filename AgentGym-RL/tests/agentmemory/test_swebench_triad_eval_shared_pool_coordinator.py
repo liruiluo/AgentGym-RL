@@ -15,6 +15,7 @@ from swebench_triad_eval.shared_pool_coordinator import (
     INDEX_SCHEMA,
     CoordinatorConfig,
     ReplicaConfig,
+    _extract_startup_reconciliation,
     _worker,
     aggregate,
     assigned_replica,
@@ -31,6 +32,23 @@ MODEL_REVISION = "3" * 40
 READINESS_SHA = "1" * 64
 MARKER_SHA = "2" * 64
 IMAGE_DIGEST = "sha256:" + "a" * 64
+
+
+def startup_reconciliation(task_index: int) -> list[dict[str, object]]:
+    return [
+        {
+            "startup": {
+                "schema": "swebench_triad_startup_reconciliation_v1",
+                "task_indices": [task_index],
+                "reconciled_graders": [],
+                "evicted_images": [],
+                "removed_task_roots": [],
+                "foreign_staged_tasks": [],
+                "foreign_loaded_images": [],
+                "residue": {},
+            }
+        }
+    ]
 
 
 def make_shared_coordinator(root: Path) -> Path:
@@ -294,6 +312,34 @@ class WorkerTest(unittest.TestCase):
 
 
 class SharedPoolPreflightTest(unittest.TestCase):
+    def test_complete_reconciliation_list_has_exactly_one_final_startup(self):
+        startup = startup_reconciliation(0)[0]
+        receipts = [
+            {
+                "cell": {"task_index": 0, "arm": "native"},
+                "generation": 2,
+                "accepted_recovered": True,
+                "runtime": {"status": "PASS"},
+            },
+            {
+                "cell": {"task_index": 0, "arm": "amg_memory"},
+                "grade_claim_generation": 3,
+                "grader": {"status": "PASS"},
+            },
+            startup,
+        ]
+        self.assertIs(
+            _extract_startup_reconciliation(receipts, (0,)), startup["startup"]
+        )
+        for invalid in (
+            receipts[:-1],
+            [startup, startup],
+            [{"unknown": True}, startup],
+            [startup, receipts[0]],
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(RuntimeError):
+                _extract_startup_reconciliation(invalid, (0,))
+
     def test_all_lanes_are_acquired_before_cross_replica_reconciliation(self):
         events = []
         drivers = {}
@@ -325,7 +371,7 @@ class SharedPoolPreflightTest(unittest.TestCase):
                 if allow_foreign_loaded_images is not True:
                     raise AssertionError("foreign images must be deferred across roots")
                 events.append(("reconcile", self.index))
-                return {"foreign_staged_tasks": [], "replica_index": self.index}
+                return startup_reconciliation(self.index)
 
             @staticmethod
             def assertEqual_all_acquired():
@@ -456,6 +502,7 @@ class LivePoolSnapshotValidationTest(unittest.TestCase):
             "proxy_target_pids": [403],
             "proxy_listener_pids": [403],
             "proxy_route": {
+                "config_path": "/tmp/proxy-config.json",
                 "config_sha256": "4" * 64,
                 "proxy_source_sha256": "5" * 64,
                 "runtime_sha256": "6" * 64,
@@ -483,6 +530,13 @@ class LivePoolSnapshotValidationTest(unittest.TestCase):
         failed = {**snapshot, "status": "FAIL"}
         with self.assertRaisesRegex(RuntimeError, "identity"):
             validate_live_pool_snapshot(failed, replica, "test")
+        extra = {**snapshot, "unexpected": True}
+        with self.assertRaisesRegex(RuntimeError, "fields"):
+            validate_live_pool_snapshot(extra, replica, "test")
+        extra_route = copy.deepcopy(snapshot)
+        extra_route["proxy_route"]["unexpected"] = True
+        with self.assertRaisesRegex(RuntimeError, "proxy route fields"):
+            validate_live_pool_snapshot(extra_route, replica, "test")
 
 
 class SharedPoolCleanupTest(unittest.TestCase):

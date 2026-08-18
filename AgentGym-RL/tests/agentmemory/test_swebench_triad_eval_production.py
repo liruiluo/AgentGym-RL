@@ -14,7 +14,11 @@ import unittest
 from typing import Any
 from unittest.mock import Mock, patch
 
-from test_swebench_triad_eval_cli import production_config
+from test_swebench_triad_eval_cli import (
+    preflight_expectations,
+    production_config,
+    valid_preflight_snapshot,
+)
 
 from paired_eval.serialization import canonical_json_bytes
 from swebench_triad_eval.official_grader import (
@@ -32,9 +36,11 @@ from swebench_triad_eval.production import (
     ProductionRunConfig,
     accepted_rows_for_eviction,
     exact_token_proxy_target,
+    shared_model_pool_snapshot_receipt,
     summarize_task4_receipt,
     validate_exact_token_proxy_config,
 )
+from swebench_triad_eval.cli import validate_preflight_snapshot
 from swebench_triad_eval.state import CellKey, sha256_json
 
 
@@ -691,6 +697,96 @@ class LinuxProductionRuntimeTest(unittest.TestCase):
             evict.assert_called_once_with(*staged)
             self.assertEqual(receipt["foreign_loaded_images"], [])
 
+    def test_startup_reconciliation_ignores_retired_duplicate_digest_history(self):
+        with tempfile.TemporaryDirectory() as raw:
+            runtime = self.make_runtime(Path(raw))
+            image_id = "sha256:" + "d" * 64
+            stages = runtime.config.run_root / "control" / "stages"
+            evictions = runtime.config.run_root / "control" / "evictions"
+            stages.mkdir(parents=True)
+            evictions.mkdir(parents=True)
+            for task_index, image in (
+                (0, "swebench/retired:latest"),
+                (1, "swebench/resuming:latest"),
+            ):
+                (stages / f"task-{task_index:04d}.json").write_bytes(
+                    canonical_json_bytes(
+                        {
+                            "schema": "swebench_triad_task_stage_v1",
+                            "task_index": task_index,
+                            "binding": {
+                                "image": image,
+                                "config_digest": image_id,
+                            },
+                        }
+                    )
+                )
+            (evictions / "task-0000.json").write_bytes(
+                canonical_json_bytes(
+                    {
+                        "schema": "swebench_triad_task_eviction_v1",
+                        "task_index": 0,
+                        "instance_id": runtime.by_task[0][0].task.task_id,
+                        "readiness": {"status": "ready"},
+                        "image": {"status": "evicted"},
+                        "task_root_removed": True,
+                        "certified_blobs_retained": True,
+                        "repository_mirror_retained": True,
+                    }
+                )
+            )
+            with patch.object(
+                runtime, "owned_container_ids", return_value=[]
+            ), patch.object(runtime, "cgroup_paths", return_value=[]), patch.object(
+                runtime, "cgroup_process_ids", return_value=[]
+            ), patch.object(runtime, "mount_records_under", return_value=[]), patch.object(
+                runtime, "task_root_indices", return_value=[1]
+            ), patch.object(
+                runtime,
+                "loaded_task_image_identities",
+                return_value=[("swebench/retired:latest", image_id)],
+            ), patch.object(
+                runtime, "evict_image", return_value={"status": "evicted"}
+            ) as evict, patch.object(
+                runtime, "remove_inactive_task_root", return_value=True
+            ), patch.object(
+                runtime,
+                "global_residue_snapshot",
+                return_value={"owned_containers": 0},
+            ):
+                receipt = runtime.reconcile_startup(task_indices=(0, 1))
+
+            evict.assert_called_once_with("swebench/resuming:latest", image_id)
+            self.assertEqual(receipt["removed_task_roots"], [1])
+            self.assertEqual(receipt["foreign_loaded_images"], [])
+
+    def test_startup_reconciliation_rejects_two_active_duplicate_digest_claims(self):
+        with tempfile.TemporaryDirectory() as raw:
+            runtime = self.make_runtime(Path(raw))
+            image_id = "sha256:" + "e" * 64
+            identities = {
+                0: ("swebench/active-a:latest", image_id),
+                1: ("swebench/active-b:latest", image_id),
+            }
+            with patch.object(
+                runtime, "owned_container_ids", return_value=[]
+            ), patch.object(runtime, "cgroup_paths", return_value=[]), patch.object(
+                runtime, "cgroup_process_ids", return_value=[]
+            ), patch.object(runtime, "mount_records_under", return_value=[]), patch.object(
+                runtime, "staged_task_indices", return_value=[0, 1]
+            ), patch.object(
+                runtime, "retired_task_indices", return_value=[]
+            ), patch.object(runtime, "task_root_indices", return_value=[0, 1]), patch.object(
+                runtime,
+                "loaded_task_image_identities",
+                return_value=[identities[0]],
+            ), patch.object(
+                runtime,
+                "task_image_identity",
+                side_effect=lambda task_index: identities[task_index],
+            ), self.assertRaisesRegex(RuntimeError, "multiple active task leases"):
+                runtime.reconcile_startup(task_indices=(0, 1))
+
     def test_loaded_image_census_does_not_depend_on_a_stage_receipt(self):
         with tempfile.TemporaryDirectory() as raw:
             runtime = self.make_runtime(Path(raw))
@@ -1239,8 +1335,8 @@ class SharedModelPoolProductionTest(unittest.TestCase):
                 runtime, "tcp_listener_inodes", return_value={99}
             ), patch.object(
                 runtime,
-                "process_socket_inodes",
-                side_effect=lambda pid: {99} if pid == 202 else {17},
+                "listener_inode_owners",
+                return_value={99: {202}},
             ):
                 self.assertEqual(
                     runtime.listener_pids(18021, {101, 202}, "model server"),
@@ -1249,7 +1345,128 @@ class SharedModelPoolProductionTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "escaped"):
                     runtime.listener_pids(18021, {101}, "model server")
 
-    def test_each_shared_pool_cell_requires_a_fresh_live_pool_snapshot(self):
+    def test_listener_owner_census_scans_every_process_descriptor(self):
+        descriptors = {
+            Path("/proc/202/fd"): [
+                Path("/proc/202/fd/3"),
+                Path("/proc/202/fd/5"),
+            ],
+            Path("/proc/999/fd"): [Path("/proc/999/fd/4")],
+        }
+
+        def iterdir(path):
+            if path == Path("/proc"):
+                return iter((Path("/proc/202"), Path("/proc/999"), Path("/proc/sys")))
+            return iter(descriptors[path])
+
+        links = {
+            Path("/proc/202/fd/3"): "socket:[99]",
+            Path("/proc/202/fd/5"): "socket:[100]",
+            Path("/proc/999/fd/4"): "socket:[99]",
+        }
+        with patch.object(
+            Path, "iterdir", autospec=True, side_effect=iterdir
+        ), patch(
+            "swebench_triad_eval.production.os.readlink",
+            side_effect=lambda path: links[path],
+        ):
+            self.assertEqual(
+                LinuxProductionRuntime.listener_inode_owners({99, 100}),
+                {99: {202, 999}, 100: {202}},
+            )
+
+    def test_listener_census_rejects_foreign_owner_and_omitted_inode(self):
+        with tempfile.TemporaryDirectory() as raw:
+            config, _ = self.shared_config(Path(raw))
+            runtime = LinuxProductionRuntime(config, config.configs)
+            with patch.object(
+                runtime, "tcp_listener_inodes", return_value={99, 100}
+            ), patch.object(
+                runtime,
+                "listener_inode_owners",
+                return_value={99: {202, 999}, 100: {202}},
+            ), self.assertRaisesRegex(RuntimeError, "foreign owner"):
+                runtime.listener_pids(18021, {202}, "model server")
+
+            with patch.object(
+                runtime, "tcp_listener_inodes", return_value={99, 100}
+            ), patch.object(
+                runtime,
+                "listener_inode_owners",
+                return_value={99: {202}},
+            ), self.assertRaisesRegex(RuntimeError, "incomplete"):
+                runtime.listener_pids(18021, {202}, "model server")
+
+    def test_shared_pool_producer_output_passes_the_exact_preflight_validator(self):
+        with tempfile.TemporaryDirectory() as raw:
+            config, _ = self.shared_config(Path(raw))
+            shared = config.shared_model_pool
+            assert shared is not None
+            upstream = "http://127.0.0.1:18021"
+            pool = shared_model_pool_snapshot_receipt(
+                shared,
+                readiness_sha256=shared["readiness_sha256"],
+                marker_lease_sha256=shared["marker_lease_sha256"],
+                selected={
+                    "server": {"pid": 303, "start_ticks": 3003},
+                    "proxy": {"pid": 403, "start_ticks": 4003},
+                },
+                selected_live={
+                    "server_target_pids": [303],
+                    "server_listener_pids": [303],
+                    "proxy_target_pids": [403],
+                    "proxy_listener_pids": [403],
+                    "proxy_route": {
+                        "config_path": "/tmp/proxy-config.json",
+                        "config_sha256": "4" * 64,
+                        "proxy_source_sha256": "5" * 64,
+                        "runtime_sha256": "6" * 64,
+                        "tokenizer_sha256": "7" * 64,
+                        "upstream_base_url": upstream,
+                        "upstream_base_url_sha256": hashlib.sha256(
+                            upstream.encode("utf-8")
+                        ).hexdigest(),
+                    },
+                },
+                assigned_gpu_process_pids=[503],
+                live_replica_count=8,
+            )
+
+            snapshot = valid_preflight_snapshot()
+            expectations = preflight_expectations()
+            expectations.update(
+                {
+                    "gpu_count": 8,
+                    "gpu_uuid": shared["gpu_uuid"],
+                    "model_id": shared["model_id"],
+                    "model_pid": 303,
+                    "model_start_ticks": 3003,
+                    "shared_model_pool": config.preflight_expectations[
+                        "shared_model_pool"
+                    ],
+                }
+            )
+            snapshot["pod"] = {
+                **snapshot["pod"],
+                "gpu_uuid": shared["gpu_uuid"],
+                "gpu_count": 8,
+            }
+            snapshot["model_process"] = {
+                **snapshot["model_process"],
+                "pid": 303,
+                "start_ticks": 3003,
+            }
+            snapshot["vllm"] = {
+                **snapshot["vllm"],
+                "model_id": shared["model_id"],
+            }
+            snapshot["shared_model_pool"] = pool
+            self.assertEqual(
+                validate_preflight_snapshot(snapshot, expectations)["status"],
+                "PASS",
+            )
+
+    def test_each_shared_pool_cell_requires_a_fresh_exact_pool_snapshot(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             config, _ = self.shared_config(root)
@@ -1278,9 +1495,9 @@ class SharedModelPoolProductionTest(unittest.TestCase):
             ), patch.object(
                 runtime,
                 "shared_model_pool_snapshot",
-                side_effect=RuntimeError("live pool probe sentinel"),
+                return_value={"status": "PASS"},
             ) as live_probe, self.assertRaisesRegex(
-                RuntimeError, "live pool probe sentinel"
+                RuntimeError, "fields drifted"
             ):
                 runtime.run_cell(runtime.by_task[task_index][0], stage, generation=1)
             live_probe.assert_called_once_with()
@@ -1303,7 +1520,10 @@ class SharedModelPoolProductionTest(unittest.TestCase):
                 runtime, "global_residue_snapshot", return_value=residue
             ), patch.object(
                 runtime, "shared_model_pool_snapshot", return_value=pool
-            ) as live_probe, patch.object(
+            ) as live_probe, patch(
+                "swebench_triad_eval.production.validate_shared_model_pool_snapshot",
+                return_value=pool,
+            ) as exact_contract, patch.object(
                 runtime,
                 "pod_snapshot",
                 return_value={
@@ -1317,6 +1537,9 @@ class SharedModelPoolProductionTest(unittest.TestCase):
             ):
                 receipt = runtime.final_audit()
             live_probe.assert_called_once_with()
+            exact_contract.assert_called_once_with(
+                pool, "final audit shared model pool snapshot"
+            )
             self.assertEqual(receipt["shared_model_pool"], pool)
 
     def test_shared_pool_config_is_strict_and_exposes_eight_gpu_expectation(self):
