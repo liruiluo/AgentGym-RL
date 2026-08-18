@@ -205,10 +205,11 @@ def build_overrides(
         "critic.use_dynamic_bsz=True",
         # On four-way FSDP2, the dynamic token target controls the number of
         # attention-workload-balanced microbatches rather than hard-bounding
-        # each packed microbatch. 65,536 still reached 166--171 GiB on G64 r8;
-        # 49,152 is the next single-variable memory step while retaining the
-        # configured microbatch=8 and no optimizer offload.
-        "critic.ppo_max_token_len_per_gpu=49152",
+        # each packed microbatch. G64 r6/r8/r9 showed 81,920, 65,536, and 49,152
+        # all stayed in the same ~166--171 GiB peak regime, consistent with the
+        # same ceil(total_tokens / target) split count. 32,768 crosses the next
+        # split threshold while retaining microbatch=8 and no optimizer offload.
+        "critic.ppo_max_token_len_per_gpu=32768",
         "critic.forward_max_token_len_per_gpu=262144",
         "critic.optim.lr=1e-5",
         "critic.optim.weight_decay=0.01",
