@@ -749,6 +749,30 @@ def _git(root: Path, *args: str) -> str:
     return completed.stdout.strip()
 
 
+def _partition_selected_file_hashes(
+    selected_files: Mapping[str, str],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Map publication identities to their repository-relative runtime paths."""
+
+    outer_manifest: dict[str, str] = {}
+    inner_manifest: dict[str, str] = {}
+    for identity_path, digest in selected_files.items():
+        if not isinstance(identity_path, str) or not isinstance(digest, str):
+            raise TypeError("OpenMLE selected file manifest is malformed")
+        if identity_path.startswith("inner:"):
+            inner_manifest[identity_path.removeprefix("inner:")] = digest
+        elif identity_path.startswith("outer:AgentGym-RL/"):
+            # ``outer_root`` is the checkout root. AgentGym-RL is a tracked
+            # subdirectory in that repository, so preserve it in the relative
+            # path instead of treating it as a display-only identity prefix.
+            outer_manifest[identity_path.removeprefix("outer:")] = digest
+        else:
+            raise RuntimeError(
+                f"unsupported OpenMLE selected file identity: {identity_path!r}"
+            )
+    return outer_manifest, inner_manifest
+
+
 def _verify_source(
     inputs: LaunchInputs,
     *,
@@ -851,19 +875,7 @@ def _verify_source(
     selected_files = endpoint_identity.get("selected_files")
     if not isinstance(selected_files, Mapping) or not selected_files:
         raise RuntimeError("selected OpenMLE publication omitted selected file hashes")
-    outer_manifest: dict[str, str] = {}
-    inner_manifest: dict[str, str] = {}
-    for identity_path, digest in selected_files.items():
-        if not isinstance(identity_path, str) or not isinstance(digest, str):
-            raise TypeError("OpenMLE selected file manifest is malformed")
-        if identity_path.startswith("inner:"):
-            inner_manifest[identity_path.removeprefix("inner:")] = digest
-        elif identity_path.startswith("outer:AgentGym-RL/"):
-            outer_manifest[identity_path.removeprefix("outer:AgentGym-RL/")] = digest
-        else:
-            raise RuntimeError(
-                f"unsupported OpenMLE selected file identity: {identity_path!r}"
-            )
+    outer_manifest, inner_manifest = _partition_selected_file_hashes(selected_files)
     verified_outer_files = verify_hash_manifest(inputs.outer_root, outer_manifest)
     verified_inner_files = verify_hash_manifest(agentgym_root, inner_manifest)
 

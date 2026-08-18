@@ -11,6 +11,7 @@ from agentmemorygym_verl.launch import (
     LaunchInputs,
     _load_endpoint_identity,
     _parse_args,
+    _partition_selected_file_hashes,
     build_overrides,
     build_runtime_env,
 )
@@ -173,6 +174,24 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             gate["sha256"] = "0" * 64
             with self.assertRaisesRegex(ValueError, "schedule digest"):
                 _load_endpoint_identity(inputs, schedule_report=gate)
+
+    def test_selected_file_identities_map_to_real_checkout_roots(self):
+        selected = self.source_lock["runtime_source"]["selected_files"]
+        outer_manifest, inner_manifest = _partition_selected_file_hashes(selected)
+
+        self.assertIn(
+            "AgentGym-RL/scripts/agentmemory/analyze_openmle_local_iteration.py",
+            outer_manifest,
+        )
+        self.assertNotIn(
+            "scripts/agentmemory/analyze_openmle_local_iteration.py",
+            outer_manifest,
+        )
+        checkout = Path(__file__).resolve().parents[2]
+        for relative in outer_manifest:
+            self.assertTrue((checkout / relative).is_file(), relative)
+        for relative in inner_manifest:
+            self.assertTrue((checkout / "AgentGym" / relative).is_file(), relative)
 
     def test_runtime_env_is_closed_and_pins_native_artifact_paths(self):
         with tempfile.TemporaryDirectory() as directory:
