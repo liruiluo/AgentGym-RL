@@ -119,6 +119,13 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                 values["data.apply_chat_template_kwargs.enable_thinking"], "False"
             )
             self.assertEqual(
+                values["actor_rollout_ref.model.enable_gradient_checkpointing"],
+                "True",
+            )
+            self.assertEqual(
+                values["critic.model.enable_gradient_checkpointing"], "True"
+            )
+            self.assertEqual(
                 values["actor_rollout_ref.actor.ppo_max_token_len_per_gpu"],
                 "65536",
             )

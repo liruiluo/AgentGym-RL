@@ -67,7 +67,10 @@ def _config(*, mode: str = "formal") -> dict:
                 "max_retries": 2,
                 **endpoint_identity,
             },
-            "model": {"path": "/models/Qwen3.5-4B"},
+            "model": {
+                "path": "/models/Qwen3.5-4B",
+                "enable_gradient_checkpointing": True,
+            },
             "actor": {
                 "ppo_mini_batch_size": 512,
                 "ppo_micro_batch_size_per_gpu": 8,
@@ -107,7 +110,10 @@ def _config(*, mode: str = "formal") -> dict:
             "shuffle": False,
             "use_dynamic_bsz": True,
             "optim": {"lr": 1e-5},
-            "model": {"path": "/models/Qwen3.5-4B"},
+            "model": {
+                "path": "/models/Qwen3.5-4B",
+                "enable_gradient_checkpointing": True,
+            },
         },
         "algorithm": {
             "adv_estimator": "amg_action_axis_gae",
@@ -222,6 +228,9 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         self.assertEqual(report["samples_per_update"], 64)
         self.assertEqual(report["trainer_gpus"], 4)
         self.assertEqual(report["standalone_rollout_gpus"], 4)
+        self.assertEqual(
+            report["gradient_checkpointing"], {"actor": True, "critic": True}
+        )
 
     def test_one_update_budget(self):
         report = _verify(_config(mode="gate"), mode="gate")
@@ -256,6 +265,16 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "Continuous Token"):
             _verify(config, mode="formal")
+
+    def test_rejects_disabling_upstream_gradient_checkpointing(self):
+        for role in ("actor_rollout_ref", "critic"):
+            with self.subTest(role=role):
+                config = _config()
+                config[role]["model"]["enable_gradient_checkpointing"] = False
+                with self.assertRaisesRegex(
+                    ValueError, "enable_gradient_checkpointing"
+                ):
+                    _verify(config, mode="formal")
 
     def test_rejects_native_qwen_thinking_that_breaks_bare_action_contract(self):
         config = _config()

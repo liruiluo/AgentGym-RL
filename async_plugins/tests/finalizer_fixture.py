@@ -110,7 +110,10 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
         "actor_rollout_ref": {
             "hybrid_engine": False,
             "agentgym": dict(agentgym),
-            "model": {"path": PUBLICATION_TRAINING_RUNTIME["base_model"]},
+            "model": {
+                "path": PUBLICATION_TRAINING_RUNTIME["base_model"],
+                "enable_gradient_checkpointing": True,
+            },
             "actor": {
                 "ppo_mini_batch_size": 512,
                 "ppo_micro_batch_size_per_gpu": 8,
@@ -150,7 +153,10 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
             "shuffle": False,
             "use_dynamic_bsz": True,
             "optim": {"lr": 1e-5},
-            "model": {"path": PUBLICATION_TRAINING_RUNTIME["base_model"]},
+            "model": {
+                "path": PUBLICATION_TRAINING_RUNTIME["base_model"],
+                "enable_gradient_checkpointing": True,
+            },
         },
         "algorithm": {
             "adv_estimator": "amg_action_axis_gae",

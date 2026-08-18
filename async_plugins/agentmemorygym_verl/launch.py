@@ -161,12 +161,15 @@ def build_overrides(
         f"actor_rollout_ref.model.path={model_path}",
         "actor_rollout_ref.model.trust_remote_code=True",
         "actor_rollout_ref.model.use_remove_padding=True",
-        "actor_rollout_ref.model.enable_gradient_checkpointing=False",
+        # Keep veRL's native HF/FSDP gradient checkpointing enabled. The
+        # synchronous comparator used the upstream default successfully;
+        # disabling it made the four-way async critic retain full activations.
+        "actor_rollout_ref.model.enable_gradient_checkpointing=True",
         f"critic.model.path={model_path}",
         f"critic.model.tokenizer_path={model_path}",
         "critic.model.trust_remote_code=True",
         "critic.model.use_remove_padding=True",
-        "critic.model.enable_gradient_checkpointing=False",
+        "critic.model.enable_gradient_checkpointing=True",
         "actor_rollout_ref.actor.strategy=fsdp2",
         "actor_rollout_ref.actor.fsdp_config.strategy=fsdp2",
         "actor_rollout_ref.actor.fsdp_config.param_offload=False",
@@ -203,12 +206,10 @@ def build_overrides(
         "critic.ppo_epochs=1",
         "critic.shuffle=False",
         "critic.use_dynamic_bsz=True",
-        # On four-way FSDP2, the dynamic token target controls the number of
-        # attention-workload-balanced microbatches rather than hard-bounding
-        # each packed microbatch. G64 r6/r8/r9 showed 81,920, 65,536, and 49,152
-        # all stayed in the same ~166--171 GiB peak regime, consistent with the
-        # same ceil(total_tokens / target) split count. 32,768 crosses the next
-        # split threshold while retaining microbatch=8 and no optimizer offload.
+        # G64 r6/r8/r9/r11 showed that mechanically lowering this target while
+        # gradient checkpointing was disabled did not control the activation
+        # peak. Retain the conservative 32,768 target for the first gate with
+        # upstream checkpointing restored; tune only from measured headroom.
         "critic.ppo_max_token_len_per_gpu=32768",
         "critic.forward_max_token_len_per_gpu=262144",
         "critic.optim.lr=1e-5",
