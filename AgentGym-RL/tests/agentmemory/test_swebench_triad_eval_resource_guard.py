@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -362,6 +365,69 @@ class FakeCgroupBackend:
             "pids_tasks_empty": True,
             "removed": True,
         }
+
+
+class CgroupV1StructureLockTest(unittest.TestCase):
+    def test_mount_namespace_requests_serialize_helper_invocations(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            backend = resource_guard.MountNamespaceCgroupV1Backend(
+                namespace_pid=os.getpid(),
+            )
+            start = threading.Barrier(3)
+            counter_lock = threading.Lock()
+            active = 0
+            max_active = 0
+            errors: list[BaseException] = []
+
+            def run_helper(*args, **kwargs):
+                nonlocal active, max_active
+                with counter_lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                time.sleep(0.05)
+                with counter_lock:
+                    active -= 1
+                return subprocess.CompletedProcess(
+                    args[0],
+                    0,
+                    '{"schema":"swebench_cgroup_v1_snapshot_v1"}',
+                    "",
+                )
+
+            def request() -> None:
+                try:
+                    start.wait(timeout=2)
+                    backend.snapshot(
+                        resource_guard.CGROUP_RELATIVE_PREFIX + "/0000-native"
+                    )
+                except BaseException as error:  # propagate worker failures below
+                    errors.append(error)
+
+            with (
+                mock.patch.object(
+                    resource_guard,
+                    "CGROUP_STRUCTURE_LOCK_PATH",
+                    Path(raw) / "cgroup-structure.lock",
+                ),
+                mock.patch.object(Path, "exists", return_value=True),
+                mock.patch.object(
+                    resource_guard.subprocess,
+                    "run",
+                    side_effect=run_helper,
+                ) as helper,
+            ):
+                threads = [threading.Thread(target=request) for _ in range(2)]
+                for thread in threads:
+                    thread.start()
+                start.wait(timeout=2)
+                for thread in threads:
+                    thread.join(timeout=2)
+
+            self.assertFalse(any(thread.is_alive() for thread in threads))
+            self.assertEqual(errors, [])
+            self.assertEqual(helper.call_count, 2)
+            self.assertEqual(max_active, 1)
+
 
 
 class CgroupV1CellEnvelopeTest(unittest.TestCase):

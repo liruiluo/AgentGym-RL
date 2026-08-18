@@ -73,6 +73,7 @@ from .resource_guard import (
     CgroupV1CellEnvelope,
     CgroupV1Limits,
     MountNamespaceCgroupV1Backend,
+    cgroup_structure_lock,
 )
 from .runtime_factory import (
     SwebenchRuntimeEndpoint,
@@ -82,6 +83,7 @@ from .state import CellKey, OwnerIdentity, sha256_json
 
 
 RUN_CONFIG_SCHEMA = "amg_swebench_triad_run_config_v1"
+SHARED_POOL_RUN_CONFIG_SCHEMA = "amg_swebench_triad_run_config_shared_pool_v2"
 OWNER_LABEL = "amg-swebench-triad-eval-0816"
 CONTAINER_NAME_PREFIX = "amg-sbv-triad-"
 SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
@@ -163,6 +165,25 @@ RUNTIME_FIELDS = {
     "external_memory_inodes",
 }
 GRADER_FIELDS = {"python_executable", "output_root", "max_attempts"}
+SHARED_MODEL_POOL_FIELDS = {
+    "owner",
+    "readiness_path",
+    "readiness_sha256",
+    "marker_lease_path",
+    "marker_lease_sha256",
+    "replica_index",
+    "replica_count",
+    "gpu_index",
+    "gpu_uuid",
+    "model_id",
+    "model_revision",
+    "model_port",
+    "proxy_port",
+    "assignment_algorithm",
+    "cleanup_policy",
+}
+SHARED_MODEL_POOL_ASSIGNMENT = "uint64_be(sha256(task_id)[:8]) % 8"
+SHARED_MODEL_POOL_CLEANUP = "retain_external_pool"
 
 
 @dataclass(frozen=True)
@@ -232,6 +253,16 @@ def path_value(value: Any, label: str) -> Path:
 def integer_value(value: Any, label: str, *, maximum: int | None = None) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{label} must be a positive integer")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{label} exceeds its maximum")
+    return value
+
+
+def nonnegative_integer_value(
+    value: Any, label: str, *, maximum: int | None = None
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{label} must be a nonnegative integer")
     if maximum is not None and value > maximum:
         raise ValueError(f"{label} exceeds its maximum")
     return value
@@ -320,18 +351,135 @@ def http_json(
     return value
 
 
+def process_command_argv(pid: int, label: str) -> list[str]:
+    try:
+        payload = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError as error:
+        raise RuntimeError(f"{label} command is unavailable") from error
+    fields = payload.split(b"\0")
+    if fields and fields[-1] == b"":
+        fields.pop()
+    if not fields or any(not field for field in fields):
+        raise RuntimeError(f"{label} command is empty or malformed")
+    try:
+        return [field.decode("utf-8") for field in fields]
+    except UnicodeError as error:
+        raise RuntimeError(f"{label} command is not UTF-8") from error
+
+
+def command_argv_sha256(arguments: Sequence[str]) -> str:
+    if not arguments or any(not isinstance(value, str) or not value for value in arguments):
+        raise ValueError("process command arguments are invalid")
+    return hashlib.sha256(b"\0".join(value.encode("utf-8") for value in arguments)).hexdigest()
+
+
 def require_process_identity(pid: int, start_ticks: int, label: str) -> str:
     if linux_process_start_ticks(pid) != start_ticks:
         raise RuntimeError(f"{label} PID start ticks drifted")
+    return " ".join(process_command_argv(pid, label))
+
+
+def require_recorded_process_identity(
+    value: Mapping[str, Any], label: str
+) -> tuple[int, int, list[str]]:
+    pid = integer_value(value.get("pid"), f"{label} PID")
+    start_ticks = integer_value(value.get("start_ticks"), f"{label} start ticks")
+    if linux_process_start_ticks(pid) != start_ticks:
+        raise RuntimeError(f"{label} PID start ticks drifted")
+    live = process_command_argv(pid, label)
+    recorded = value.get("command")
+    if (
+        not isinstance(recorded, list)
+        or any(not isinstance(item, str) or not item for item in recorded)
+        or value.get("command_sha256") != command_argv_sha256(recorded)
+    ):
+        raise RuntimeError(f"{label} recorded command identity drifted")
+    target = supervised_target_command(recorded, label)
+    if live not in (recorded, target):
+        raise RuntimeError(f"{label} exact command identity drifted")
+    return pid, start_ticks, live
+
+
+def command_option(arguments: Sequence[str], name: str, label: str) -> str:
+    positions = [index for index, value in enumerate(arguments) if value == name]
+    if len(positions) != 1 or positions[0] + 1 >= len(arguments):
+        raise RuntimeError(f"{label} option {name} drifted")
+    return arguments[positions[0] + 1]
+
+
+def supervised_target_command(
+    arguments: Sequence[str], label: str
+) -> list[str]:
+    if "--command-json" not in arguments:
+        return list(arguments)
     try:
-        command = Path(f"/proc/{pid}/cmdline").read_bytes().replace(
-            b"\0", b" "
-        ).decode("utf-8", errors="replace").strip()
-    except OSError as error:
-        raise RuntimeError(f"{label} command is unavailable") from error
-    if not command:
-        raise RuntimeError(f"{label} command is empty")
-    return command
+        nested = json.loads(command_option(arguments, "--command-json", label))
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"{label} nested command is invalid JSON") from error
+    if (
+        not isinstance(nested, list)
+        or any(not isinstance(item, str) or not item for item in nested)
+    ):
+        raise RuntimeError(f"{label} nested command is invalid")
+    return nested
+
+
+def exact_token_proxy_target(arguments: Sequence[str]) -> list[str]:
+    target = supervised_target_command(arguments, "proxy")
+    scripts = [
+        value for value in target if Path(value).name == "gaia_vllm_token_proxy.py"
+    ]
+    if len(scripts) != 1:
+        raise RuntimeError("exact-token proxy script identity drifted")
+    return target
+
+
+def validate_exact_token_proxy_config(
+    target: Sequence[str],
+    *,
+    model_port: int,
+    proxy_port: int,
+    model_id: str,
+    model_revision: str,
+    proxy_source_sha256: str,
+) -> Mapping[str, Any]:
+    config_path = Path(command_option(target, "--config", "exact-token proxy"))
+    if not config_path.is_absolute():
+        raise RuntimeError("exact-token proxy config path is not absolute")
+    config = read_json_object(config_path, "exact-token proxy config")
+    expected_upstream = f"http://127.0.0.1:{model_port}"
+    if (
+        config.get("schema") != "gaia_vllm_exact_token_proxy_config_v1"
+        or config.get("listen_host") != "127.0.0.1"
+        or config.get("listen_port") != proxy_port
+        or config.get("upstream_base_url") != expected_upstream
+        or config.get("upstream_model_id") != model_id
+        or config.get("upstream_model_revision") != model_revision
+        or config.get("proxy_source_sha256") != proxy_source_sha256
+    ):
+        raise RuntimeError("exact-token proxy route config drifted")
+    source_paths = [
+        Path(value)
+        for value in target
+        if Path(value).name == "gaia_vllm_token_proxy.py"
+    ]
+    if len(source_paths) != 1 or sha256_file(source_paths[0]) != proxy_source_sha256:
+        raise RuntimeError("exact-token proxy source identity drifted")
+    return {
+        "config_path": str(config_path),
+        "config_sha256": sha256_file(config_path),
+        "proxy_source_sha256": proxy_source_sha256,
+        "runtime_sha256": sha256_value(
+            config.get("runtime_sha256"), "proxy runtime SHA-256"
+        ),
+        "tokenizer_sha256": sha256_value(
+            config.get("tokenizer_sha256"), "proxy tokenizer SHA-256"
+        ),
+        "upstream_base_url": expected_upstream,
+        "upstream_base_url_sha256": hashlib.sha256(
+            expected_upstream.encode("utf-8")
+        ).hexdigest(),
+    }
 
 
 def mount_filesystem_type(path: Path) -> str:
@@ -406,8 +554,14 @@ class ProductionRunConfig:
 
     @staticmethod
     def validate_payload(payload: Mapping[str, Any]) -> None:
-        exact_fields(payload, TOP_LEVEL_FIELDS, "run config")
-        if payload["schema"] != RUN_CONFIG_SCHEMA:
+        schema = payload.get("schema")
+        if schema == RUN_CONFIG_SCHEMA:
+            exact_fields(payload, TOP_LEVEL_FIELDS, "run config")
+        elif schema == SHARED_POOL_RUN_CONFIG_SCHEMA:
+            exact_fields(
+                payload, TOP_LEVEL_FIELDS | {"shared_model_pool"}, "run config"
+            )
+        else:
             raise ValueError("run config schema drifted")
         for name in ("run_root", "manifest_path", "evidence_root"):
             path_value(payload[name], name)
@@ -478,6 +632,61 @@ class ProductionRunConfig:
         integer_value(serving["start_ticks"], "serving start ticks")
         sha256_value(serving["receipt_sha256"], "serving receipt SHA-256")
 
+        if schema == SHARED_POOL_RUN_CONFIG_SCHEMA:
+            shared = object_value(
+                payload["shared_model_pool"], "shared model pool config"
+            )
+            exact_fields(
+                shared, SHARED_MODEL_POOL_FIELDS, "shared model pool config"
+            )
+            text_value(shared["owner"], "shared model pool owner")
+            for name in ("readiness_path", "marker_lease_path"):
+                path_value(shared[name], f"shared model pool {name}")
+            for name in ("readiness_sha256", "marker_lease_sha256"):
+                sha256_value(shared[name], f"shared model pool {name}")
+            replica_index = nonnegative_integer_value(
+                shared["replica_index"],
+                "shared model pool replica index",
+                maximum=7,
+            )
+            replica_count = integer_value(
+                shared["replica_count"],
+                "shared model pool replica count",
+                maximum=8,
+            )
+            gpu_index = nonnegative_integer_value(
+                shared["gpu_index"], "shared model pool GPU index", maximum=7
+            )
+            if replica_count != 8 or replica_index != gpu_index:
+                raise ValueError("shared model pool replica lattice drifted")
+            text_value(shared["gpu_uuid"], "shared model pool GPU UUID")
+            text_value(shared["model_id"], "shared model pool model ID")
+            commit_value(
+                shared["model_revision"], "shared model pool model revision"
+            )
+            integer_value(
+                shared["model_port"],
+                "shared model pool model port",
+                maximum=65535,
+            )
+            integer_value(
+                shared["proxy_port"],
+                "shared model pool proxy port",
+                maximum=65535,
+            )
+            if shared["assignment_algorithm"] != SHARED_MODEL_POOL_ASSIGNMENT:
+                raise ValueError("shared model pool assignment drifted")
+            if shared["cleanup_policy"] != SHARED_MODEL_POOL_CLEANUP:
+                raise ValueError("shared model pool cleanup policy drifted")
+            if pod["gpu_uuid"] != shared["gpu_uuid"]:
+                raise ValueError("pod and shared-pool GPU UUIDs differ")
+            if serving["model_id"] != shared["model_id"]:
+                raise ValueError("serving and shared-pool model IDs differ")
+            if base_url != f"http://127.0.0.1:{shared['proxy_port']}/v1":
+                raise ValueError(
+                    "serving URL is not the assigned exact-token proxy"
+                )
+
         runtime = object_value(payload["runtime"], "runtime config")
         exact_fields(runtime, RUNTIME_FIELDS, "runtime config")
         path_value(runtime["pod_local_root"], "pod-local root")
@@ -523,6 +732,14 @@ class ProductionRunConfig:
         return object_value(self.payload[name], f"{name} config")
 
     @property
+    def shared_model_pool(self) -> Mapping[str, Any] | None:
+        if self.payload["schema"] != SHARED_POOL_RUN_CONFIG_SCHEMA:
+            return None
+        return object_value(
+            self.payload["shared_model_pool"], "shared model pool config"
+        )
+
+    @property
     def run_root(self) -> Path:
         return path_value(self.payload["run_root"], "run root")
 
@@ -547,6 +764,31 @@ class ProductionRunConfig:
             "hostname": pod["hostname"],
             "boot_id": pod["boot_id"],
             "gpu_uuid": pod["gpu_uuid"],
+            "gpu_count": (
+                self.shared_model_pool["replica_count"]
+                if self.shared_model_pool is not None
+                else 1
+            ),
+            "shared_model_pool": (
+                {
+                    "owner": self.shared_model_pool["owner"],
+                    "readiness_sha256": self.shared_model_pool[
+                        "readiness_sha256"
+                    ],
+                    "marker_lease_sha256": self.shared_model_pool[
+                        "marker_lease_sha256"
+                    ],
+                    "replica_index": self.shared_model_pool["replica_index"],
+                    "replica_count": self.shared_model_pool["replica_count"],
+                    "gpu_index": self.shared_model_pool["gpu_index"],
+                    "gpu_uuid": self.shared_model_pool["gpu_uuid"],
+                    "model_revision": self.shared_model_pool["model_revision"],
+                    "model_port": self.shared_model_pool["model_port"],
+                    "proxy_port": self.shared_model_pool["proxy_port"],
+                }
+                if self.shared_model_pool is not None
+                else None
+            ),
             "docker_daemon_id": docker["daemon_id"],
             "docker_pid": docker["pid"],
             "docker_start_ticks": docker["start_ticks"],
@@ -728,8 +970,13 @@ class ProductionRuntime(Protocol):
     def reconcile_grade(self, **kwargs: Any) -> Mapping[str, Any]: ...
 
     def reconcile_startup(
-        self, *, task_indices: Sequence[int]
+        self,
+        *,
+        task_indices: Sequence[int],
+        allow_foreign_loaded_images: bool = False,
     ) -> Mapping[str, Any]: ...
+
+    def reconcile_unbound_loaded_images(self) -> Mapping[str, Any]: ...
 
     def run_cell(
         self,
@@ -837,7 +1084,12 @@ class LinuxProductionRuntime:
         filesystem_type = mount_filesystem_type(pod_local_root)
         if filesystem_type in {"nfs", "nfs4"}:
             raise RuntimeError("active per-task rootfs is on shared NFS")
-        return {
+        shared_pool = (
+            self.shared_model_pool_snapshot()
+            if self.config.shared_model_pool is not None
+            else None
+        )
+        snapshot = {
             "source": self.source_snapshot(),
             "dataset": self.dataset_snapshot(),
             "image_index": self.image_index_snapshot(),
@@ -846,7 +1098,7 @@ class LinuxProductionRuntime:
             "pod": self.pod_snapshot(),
             "docker": self.docker_snapshot(),
             "task4_negative_probes": self.task4_snapshot(),
-            "model_process": self.model_process_snapshot(),
+            "model_process": self.model_process_snapshot(shared_pool),
             "vllm": self.vllm_snapshot(),
             "swe_metadata": self.swe_metadata_snapshot(),
             "residue": self.global_residue_snapshot(),
@@ -855,6 +1107,9 @@ class LinuxProductionRuntime:
                 "pod_local": True,
             },
         }
+        if shared_pool is not None:
+            snapshot["shared_model_pool"] = shared_pool
+        return snapshot
 
     def source_snapshot(self) -> dict[str, Any]:
         source = self.section("source")
@@ -1000,15 +1255,28 @@ class LinuxProductionRuntime:
         ]
         if hostname != pod["hostname"] or boot_id != pod["boot_id"]:
             raise RuntimeError("pod hostname or boot identity drifted")
-        if gpu_values != [pod["gpu_uuid"]]:
-            raise RuntimeError("assigned GPU identity drifted")
+        shared = self.config.shared_model_pool
+        expected_count = shared["replica_count"] if shared is not None else 1
+        if len(gpu_values) != expected_count:
+            raise RuntimeError("assigned GPU count drifted")
+        if shared is None:
+            if gpu_values != [pod["gpu_uuid"]]:
+                raise RuntimeError("assigned GPU identity drifted")
+            selected_uuid = gpu_values[0]
+        else:
+            gpu_index = shared["gpu_index"]
+            if gpu_values[gpu_index] != pod["gpu_uuid"]:
+                raise RuntimeError("shared-pool replica GPU identity drifted")
+            if len(set(gpu_values)) != len(gpu_values):
+                raise RuntimeError("shared-pool GPU UUIDs are not unique")
+            selected_uuid = gpu_values[gpu_index]
         return {
             "job": pod["job"],
             "pod": pod["pod"],
             "hostname": hostname,
             "boot_id": boot_id,
-            "gpu_uuid": gpu_values[0],
-            "gpu_count": 1,
+            "gpu_uuid": selected_uuid,
+            "gpu_count": len(gpu_values),
         }
 
     def docker_snapshot(self) -> dict[str, Any]:
@@ -1075,7 +1343,343 @@ class LinuxProductionRuntime:
             receipt_sha256=digest,
         )
 
-    def model_process_snapshot(self) -> dict[str, Any]:
+    @staticmethod
+    def tcp_listener_inodes(port: int) -> set[int]:
+        if type(port) is not int or not 1 <= port <= 65535:
+            raise ValueError("TCP listener port is invalid")
+        inodes: set[int] = set()
+        for table in (Path("/proc/net/tcp"), Path("/proc/net/tcp6")):
+            try:
+                rows = table.read_text(encoding="ascii").splitlines()[1:]
+            except OSError as error:
+                raise RuntimeError("TCP listener census is unavailable") from error
+            for row in rows:
+                fields = row.split()
+                if len(fields) < 10:
+                    raise RuntimeError("TCP listener census row is malformed")
+                local = fields[1]
+                try:
+                    local_port = int(local.rsplit(":", 1)[1], 16)
+                    inode = int(fields[9])
+                except (IndexError, ValueError) as error:
+                    raise RuntimeError("TCP listener census row is invalid") from error
+                if fields[3] == "0A" and local_port == port and inode > 0:
+                    inodes.add(inode)
+        if not inodes:
+            raise RuntimeError("expected TCP listener is absent")
+        return inodes
+
+    @staticmethod
+    def process_socket_inodes(pid: int) -> set[int]:
+        values: set[int] = set()
+        try:
+            descriptors = list(Path(f"/proc/{pid}/fd").iterdir())
+        except OSError:
+            return values
+        for descriptor in descriptors:
+            try:
+                target = os.readlink(descriptor)
+            except OSError:
+                continue
+            match = re.fullmatch(r"socket:\[([0-9]+)\]", target)
+            if match is not None:
+                values.add(int(match.group(1)))
+        return values
+
+    def target_process_pids(
+        self, root_pid: int, target: Sequence[str], label: str
+    ) -> tuple[set[int], set[int]]:
+        tree = self.process_descendants(root_pid) | {root_pid}
+        matches: set[int] = set()
+        for pid in tree:
+            try:
+                arguments = process_command_argv(pid, f"{label} process")
+            except RuntimeError:
+                if pid == root_pid:
+                    raise
+                continue
+            if arguments == list(target):
+                matches.add(pid)
+        if not matches:
+            raise RuntimeError(f"{label} target process is absent")
+        return matches, tree
+
+    def listener_pids(
+        self, port: int, candidate_pids: set[int], label: str
+    ) -> list[int]:
+        if not candidate_pids or any(type(pid) is not int or pid <= 0 for pid in candidate_pids):
+            raise RuntimeError(f"{label} process tree is invalid")
+        listener_inodes = self.tcp_listener_inodes(port)
+        owners = sorted(
+            pid
+            for pid in candidate_pids
+            if self.process_socket_inodes(pid) & listener_inodes
+        )
+        if not owners:
+            raise RuntimeError(f"{label} listener escaped its process tree")
+        return owners
+
+    @staticmethod
+    def gpu_compute_bindings() -> dict[int, str]:
+        output = command_output(
+            [
+                "nvidia-smi",
+                "--query-compute-apps=gpu_uuid,pid",
+                "--format=csv,noheader,nounits",
+            ],
+            label="GPU process binding probe",
+        )
+        bindings: dict[int, str] = {}
+        for line in output.splitlines():
+            if not line.strip():
+                continue
+            fields = [field.strip() for field in line.split(",")]
+            if len(fields) != 2 or not fields[1].isdigit():
+                raise RuntimeError("GPU process binding row is malformed")
+            pid = int(fields[1])
+            previous = bindings.setdefault(pid, fields[0])
+            if previous != fields[0]:
+                raise RuntimeError("GPU process appeared on multiple GPUs")
+        return bindings
+
+    def shared_model_pool_snapshot(self) -> dict[str, Any]:
+        shared = self.config.shared_model_pool
+        if shared is None:
+            raise RuntimeError("shared model pool was not configured")
+        readiness_path = path_value(
+            shared["readiness_path"], "shared model pool readiness"
+        )
+        marker_path = path_value(
+            shared["marker_lease_path"], "shared model pool marker lease"
+        )
+        readiness_sha = sha256_file(readiness_path)
+        marker_sha = sha256_file(marker_path)
+        if readiness_sha != shared["readiness_sha256"]:
+            raise RuntimeError("shared model pool readiness SHA-256 drifted")
+        if marker_sha != shared["marker_lease_sha256"]:
+            raise RuntimeError("shared model pool marker lease SHA-256 drifted")
+        readiness = read_json_object(readiness_path, "shared model pool readiness")
+        marker = read_json_object(marker_path, "shared model pool marker lease")
+        assignment = object_value(
+            readiness.get("assignment"), "shared model pool assignment"
+        )
+        expected = {
+            "schema": "amg_g_qwen35_dp8_pool_readiness_v1",
+            "status": "PASS",
+            "owner": shared["owner"],
+            "boot_id": self.section("pod")["boot_id"],
+            "model_id": shared["model_id"],
+            "model_revision": shared["model_revision"],
+            "replica_count": shared["replica_count"],
+        }
+        for name, value in expected.items():
+            if readiness.get(name) != value:
+                raise RuntimeError(f"shared model pool {name} drifted")
+        if (
+            assignment.get("algorithm") != SHARED_MODEL_POOL_ASSIGNMENT
+            or assignment.get("paired_arms_same_replica") is not True
+            or assignment.get("arms") != ["00", "10", "11"]
+        ):
+            raise RuntimeError("shared model pool assignment contract drifted")
+        if readiness.get("marker_lease_sha256") != marker_sha:
+            raise RuntimeError("shared model pool marker binding drifted")
+
+        parent = object_value(marker.get("parent"), "marker lease parent")
+        parent_pid = integer_value(parent.get("pid"), "marker parent PID")
+        parent_ticks = integer_value(
+            parent.get("start_ticks"), "marker parent start ticks"
+        )
+        require_process_identity(parent_pid, parent_ticks, "marker lease parent")
+        markers = marker.get("markers")
+        if not isinstance(markers, list) or len(markers) != 2:
+            raise RuntimeError("shared model pool marker lattice drifted")
+        expected_marker_paths = {
+            "/tmp/crg-holder-yield",
+            "/tmp/agentmemory-formal-cpu-active",
+        }
+        observed_marker_paths = set()
+        for row in markers:
+            value = object_value(row, "marker lease row")
+            current_path = path_value(value.get("path"), "marker lease path")
+            observed_marker_paths.add(str(current_path))
+            info = current_path.lstat()
+            if (
+                current_path.is_symlink()
+                or not stat.S_ISREG(info.st_mode)
+                or info.st_dev != value.get("device")
+                or info.st_ino != value.get("inode")
+                or sha256_file(current_path) != value.get("sha256")
+            ):
+                raise RuntimeError("shared model pool marker identity drifted")
+        if observed_marker_paths != expected_marker_paths:
+            raise RuntimeError("shared model pool marker paths drifted")
+
+        replicas = readiness.get("replicas")
+        if not isinstance(replicas, list) or len(replicas) != shared["replica_count"]:
+            raise RuntimeError("shared model pool replica records drifted")
+        seen_gpu_uuids: set[str] = set()
+        seen_ports: set[int] = set()
+        selected: Mapping[str, Any] | None = None
+        selected_live: Mapping[str, Any] | None = None
+        live_processes: list[dict[str, Any]] = []
+        proxy_source_sha = sha256_value(
+            readiness.get("proxy_source_sha256"), "pool proxy source SHA-256"
+        )
+        for expected_replica, raw_replica in enumerate(replicas):
+            replica = object_value(raw_replica, "shared model pool replica")
+            if replica.get("replica") != expected_replica:
+                raise RuntimeError("shared model pool replica order drifted")
+            gpu_uuid = text_value(replica.get("gpu_uuid"), "replica GPU UUID")
+            model_port = integer_value(replica.get("model_port"), "replica model port")
+            proxy_port = integer_value(replica.get("proxy_port"), "replica proxy port")
+            if (
+                gpu_uuid in seen_gpu_uuids
+                or model_port in seen_ports
+                or proxy_port in seen_ports
+                or model_port == proxy_port
+            ):
+                raise RuntimeError("shared model pool replica identities are not unique")
+            seen_gpu_uuids.add(gpu_uuid)
+            seen_ports.update((model_port, proxy_port))
+            server = object_value(replica.get("server"), "replica model server")
+            proxy = object_value(replica.get("proxy"), "replica token proxy")
+            server_pid, server_ticks, server_argv = require_recorded_process_identity(
+                server, "replica model server"
+            )
+            proxy_pid, proxy_ticks, proxy_argv = require_recorded_process_identity(
+                proxy, "replica token proxy"
+            )
+            server_target = supervised_target_command(server_argv, "model server")
+            if (
+                command_option(server_target, "--host", "model server")
+                != "127.0.0.1"
+                or command_option(server_target, "--port", "model server")
+                != str(model_port)
+                or command_option(
+                    server_target, "--served-model-name", "model server"
+                )
+                != shared["model_id"]
+            ):
+                raise RuntimeError("shared model pool server route drifted")
+            server_target_pids, server_tree = self.target_process_pids(
+                server_pid, server_target, "model server"
+            )
+            server_listener_pids = self.listener_pids(
+                model_port, server_target_pids, "model server"
+            )
+
+            proxy_target = exact_token_proxy_target(proxy_argv)
+            proxy_route = validate_exact_token_proxy_config(
+                proxy_target,
+                model_port=model_port,
+                proxy_port=proxy_port,
+                model_id=shared["model_id"],
+                model_revision=shared["model_revision"],
+                proxy_source_sha256=proxy_source_sha,
+            )
+            proxy_target_pids, proxy_tree = self.target_process_pids(
+                proxy_pid, proxy_target, "exact-token proxy"
+            )
+            proxy_listener_pids = self.listener_pids(
+                proxy_port, proxy_target_pids, "exact-token proxy"
+            )
+
+            registry = http_json(f"http://127.0.0.1:{model_port}/v1/models")
+            data = registry.get("data")
+            if (
+                not isinstance(data, list)
+                or len(data) != 1
+                or not isinstance(data[0], Mapping)
+                or data[0].get("id") != shared["model_id"]
+            ):
+                raise RuntimeError("shared model pool registry drifted")
+            proxy_health = http_json(f"http://127.0.0.1:{proxy_port}/health")
+            if (
+                proxy_health.get("schema")
+                != "gaia_vllm_exact_token_proxy_identity_v1"
+                or proxy_health.get("upstream_model_id") != shared["model_id"]
+                or proxy_health.get("upstream_model_revision")
+                != shared["model_revision"]
+                or proxy_health.get("upstream_base_url_sha256")
+                != proxy_route["upstream_base_url_sha256"]
+                or proxy_health.get("proxy_source_sha256") != proxy_source_sha
+                or proxy_health.get("runtime_sha256")
+                != proxy_route["runtime_sha256"]
+                or proxy_health.get("tokenizer_sha256")
+                != proxy_route["tokenizer_sha256"]
+                or proxy_health.get("return_token_ids_forced") is not True
+                or proxy_health.get("routes")
+                != ["/tokenize", "/v1/tokenize", "/v1/chat/completions"]
+            ):
+                raise RuntimeError("shared model pool proxy health drifted")
+            live = {
+                "replica": expected_replica,
+                "server_pid": server_pid,
+                "server_start_ticks": server_ticks,
+                "server_target_pids": sorted(server_target_pids),
+                "server_listener_pids": server_listener_pids,
+                "proxy_pid": proxy_pid,
+                "proxy_start_ticks": proxy_ticks,
+                "proxy_target_pids": sorted(proxy_target_pids),
+                "proxy_listener_pids": proxy_listener_pids,
+                "proxy_route": dict(proxy_route),
+            }
+            live_processes.append(live)
+            if expected_replica == shared["replica_index"]:
+                selected = replica
+                selected_live = live
+        if selected is None or selected_live is None:
+            raise RuntimeError("assigned shared model pool replica is absent")
+        for name in ("gpu_index", "gpu_uuid", "model_port", "proxy_port"):
+            if selected.get(name) != shared[name]:
+                raise RuntimeError(f"assigned shared model pool {name} drifted")
+        if (
+            selected["server"].get("pid") != self.section("serving")["pid"]
+            or selected["server"].get("start_ticks")
+            != self.section("serving")["start_ticks"]
+        ):
+            raise RuntimeError("serving process is not the assigned pool replica")
+
+        gpu_bindings = self.gpu_compute_bindings()
+        server_pid = selected["server"]["pid"]
+        server_tree = self.process_descendants(server_pid) | {server_pid}
+        assigned_gpu_pids = sorted(server_tree & set(gpu_bindings))
+        if not assigned_gpu_pids or any(
+            gpu_bindings[pid] != shared["gpu_uuid"] for pid in assigned_gpu_pids
+        ):
+            raise RuntimeError("assigned model process tree is not GPU-bound")
+        return {
+            "status": "PASS",
+            "owner": shared["owner"],
+            "readiness_sha256": readiness_sha,
+            "marker_lease_sha256": marker_sha,
+            "replica_index": shared["replica_index"],
+            "replica_count": shared["replica_count"],
+            "gpu_index": shared["gpu_index"],
+            "gpu_uuid": shared["gpu_uuid"],
+            "model_id": shared["model_id"],
+            "model_revision": shared["model_revision"],
+            "model_port": shared["model_port"],
+            "proxy_port": shared["proxy_port"],
+            "server_pid": selected["server"]["pid"],
+            "server_start_ticks": selected["server"]["start_ticks"],
+            "proxy_pid": selected["proxy"]["pid"],
+            "proxy_start_ticks": selected["proxy"]["start_ticks"],
+            "server_target_pids": selected_live["server_target_pids"],
+            "server_listener_pids": selected_live["server_listener_pids"],
+            "proxy_target_pids": selected_live["proxy_target_pids"],
+            "proxy_listener_pids": selected_live["proxy_listener_pids"],
+            "proxy_route": selected_live["proxy_route"],
+            "assigned_gpu_process_pids": assigned_gpu_pids,
+            "all_replicas_alive": len(live_processes) == shared["replica_count"],
+            "all_endpoints_healthy": True,
+            "assignment_algorithm": SHARED_MODEL_POOL_ASSIGNMENT,
+            "cleanup_policy": SHARED_MODEL_POOL_CLEANUP,
+        }
+
+    def model_process_snapshot(
+        self, shared_pool: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
         serving = self.section("serving")
         receipt_path = path_value(serving["receipt_path"], "serving receipt")
         if sha256_file(receipt_path) != serving["receipt_sha256"]:
@@ -1089,6 +1693,11 @@ class LinuxProductionRuntime:
         matches = model_root in command and str(serving["model_id"]) in command
         if not matches:
             raise RuntimeError("model server command identity drifted")
+        if shared_pool is not None and (
+            shared_pool.get("server_pid") != serving["pid"]
+            or shared_pool.get("server_start_ticks") != serving["start_ticks"]
+        ):
+            raise RuntimeError("shared-pool model process binding drifted")
         return {
             "pid": serving["pid"],
             "start_ticks": serving["start_ticks"],
@@ -1100,7 +1709,14 @@ class LinuxProductionRuntime:
         serving = self.section("serving")
         base_url = text_value(serving["base_url"], "serving base URL").rstrip("/")
         root_url = base_url[:-3] if base_url.endswith("/v1") else base_url
-        models = http_json(base_url + "/models")
+        shared = self.config.shared_model_pool
+        registry_url = base_url
+        if shared is not None:
+            # The exact-token proxy deliberately exposes only tokenization and
+            # generation.  Its frozen upstream vLLM endpoint remains the
+            # authoritative model registry.
+            registry_url = f"http://127.0.0.1:{shared['model_port']}/v1"
+        models = http_json(registry_url + "/models")
         data = models.get("data")
         if not isinstance(data, list) or len(data) != 1:
             raise RuntimeError("vLLM model registry shape drifted")
@@ -1305,7 +1921,7 @@ class LinuxProductionRuntime:
             raise RuntimeError("container identity is not an object")
         return value
 
-    def cgroup_paths(self, task_index: int | None = None) -> list[str]:
+    def _cgroup_paths_unlocked(self, task_index: int | None = None) -> list[str]:
         docker = self.section("docker")
         controller_values: list[set[str]] = []
         for controller in ("memory", "pids"):
@@ -1337,6 +1953,10 @@ class LinuxProductionRuntime:
             prefix = f"{task_index:04d}-"
             values = {value for value in values if value.startswith(prefix)}
         return sorted(values)
+
+    def cgroup_paths(self, task_index: int | None = None) -> list[str]:
+        with cgroup_structure_lock():
+            return self._cgroup_paths_unlocked(task_index)
 
     def task_root_path(self, task_index: int) -> Path:
         if type(task_index) is not int or task_index not in self.by_task:
@@ -1413,30 +2033,37 @@ class LinuxProductionRuntime:
         )
 
     def cgroup_process_ids(self, task_index: int | None = None) -> list[int]:
-        docker = self.section("docker")
-        values_by_controller: list[set[int]] = []
-        selected = set(self.cgroup_paths(task_index))
-        for controller in ("memory", "pids"):
-            parent = (
-                Path(f"/proc/{docker['pid']}/root/sys/fs/cgroup")
-                / controller
-                / CGROUP_RELATIVE_PREFIX
-            )
-            values: set[int] = set()
-            for name in selected:
-                root = parent / name
-                if not root.is_dir():
-                    raise RuntimeError("owned cgroup disappeared during process census")
-                for path in sorted(root.rglob("cgroup.procs")):
-                    try:
-                        lines = path.read_text(encoding="ascii").splitlines()
-                    except OSError as error:
-                        raise RuntimeError("cannot read owned cgroup processes") from error
-                    for line in lines:
-                        if not line.isdigit() or int(line) <= 0:
-                            raise RuntimeError("owned cgroup contains an invalid PID")
-                        values.add(int(line))
-            values_by_controller.append(values)
+        with cgroup_structure_lock():
+            docker = self.section("docker")
+            values_by_controller: list[set[int]] = []
+            selected = set(self._cgroup_paths_unlocked(task_index))
+            for controller in ("memory", "pids"):
+                parent = (
+                    Path(f"/proc/{docker['pid']}/root/sys/fs/cgroup")
+                    / controller
+                    / CGROUP_RELATIVE_PREFIX
+                )
+                values: set[int] = set()
+                for name in selected:
+                    root = parent / name
+                    if not root.is_dir():
+                        raise RuntimeError(
+                            "owned cgroup disappeared during process census"
+                        )
+                    for path in sorted(root.rglob("cgroup.procs")):
+                        try:
+                            lines = path.read_text(encoding="ascii").splitlines()
+                        except OSError as error:
+                            raise RuntimeError(
+                                "cannot read owned cgroup processes"
+                            ) from error
+                        for line in lines:
+                            if not line.isdigit() or int(line) <= 0:
+                                raise RuntimeError(
+                                    "owned cgroup contains an invalid PID"
+                                )
+                            values.add(int(line))
+                values_by_controller.append(values)
         if values_by_controller[0] != values_by_controller[1]:
             raise RuntimeError("memory/pids cgroup process census disagreed")
         return sorted(values_by_controller[0])
@@ -1496,6 +2123,21 @@ class LinuxProductionRuntime:
             image
             for image, _ in self.loaded_task_image_identities(task_index)
         ]
+
+    def reconcile_unbound_loaded_images(self) -> Mapping[str, Any]:
+        """Evict certified images left unbound after every shard reconciles."""
+
+        loaded = self.loaded_task_image_identities()
+        evicted = [self.evict_image(image, image_id) for image, image_id in loaded]
+        remaining = self.loaded_task_image_identities()
+        if remaining:
+            raise RuntimeError("unbound certified Docker images survived reconciliation")
+        return {
+            "schema": "swebench_triad_unbound_image_reconciliation_v1",
+            "status": "PASS",
+            "evicted_images": evicted,
+            "remaining_images": 0,
+        }
 
     def task_root_indices(self) -> list[int]:
         tasks_root = (
@@ -2013,6 +2655,20 @@ class LinuxProductionRuntime:
                 run_capability.encode("ascii")
             ).hexdigest(),
         }
+        if self.config.shared_model_pool is not None:
+            shared = self.config.shared_model_pool
+            expected_replica = int.from_bytes(
+                hashlib.sha256(config.task.task_id.encode("utf-8")).digest()[:8],
+                "big",
+            ) % shared["replica_count"]
+            if expected_replica != shared["replica_index"]:
+                raise RuntimeError(
+                    "task was routed to the wrong shared-model replica"
+                )
+            live_pool = self.shared_model_pool_snapshot()
+            if live_pool.get("replica_index") != expected_replica:
+                raise RuntimeError("live shared-model replica binding drifted")
+            record["shared_model_pool"] = dict(live_pool)
         prepared = False
         container_created = False
         try:
@@ -2305,8 +2961,13 @@ class LinuxProductionRuntime:
         }
 
     def reconcile_startup(
-        self, *, task_indices: Sequence[int]
+        self,
+        *,
+        task_indices: Sequence[int],
+        allow_foreign_loaded_images: bool = False,
     ) -> Mapping[str, Any]:
+        if type(allow_foreign_loaded_images) is not bool:
+            raise TypeError("foreign loaded-image policy must be boolean")
         selected = tuple(task_indices)
         if (
             not selected
@@ -2358,14 +3019,25 @@ class LinuxProductionRuntime:
                 raise RuntimeError("leased task mounts require cell reconciliation")
 
         loaded = set(self.loaded_task_image_identities())
+        loaded_by_id = {image_id: (image, image_id) for image, image_id in loaded}
+        if len(loaded_by_id) != len(loaded):
+            raise RuntimeError("loaded task image ID has multiple census identities")
         loaded_by_task: dict[int, tuple[str, str]] = {}
         for task_index in staged:
             identity = self.task_image_identity(task_index)
-            if identity is not None and identity in loaded:
-                if identity in loaded_by_task.values():
+            if identity is not None and identity[1] in loaded_by_id:
+                if any(
+                    previous[1] == identity[1]
+                    for previous in loaded_by_task.values()
+                ):
                     raise RuntimeError("loaded task image maps to multiple task leases")
                 loaded_by_task[task_index] = identity
-        if loaded - set(loaded_by_task.values()):
+        bound_image_ids = {identity[1] for identity in loaded_by_task.values()}
+        foreign_loaded_images = {
+            loaded_by_id[image_id]
+            for image_id in set(loaded_by_id) - bound_image_ids
+        }
+        if foreign_loaded_images and not allow_foreign_loaded_images:
             raise RuntimeError("loaded task image has no durable task-stage binding")
 
         active_tasks = roots | set(loaded_by_task)
@@ -2382,6 +3054,10 @@ class LinuxProductionRuntime:
             "evicted_images": evicted_images,
             "removed_task_roots": removed_task_roots,
             "foreign_staged_tasks": sorted(active_tasks - selected_set),
+            "foreign_loaded_images": [
+                {"image": image, "image_id": image_id}
+                for image, image_id in sorted(foreign_loaded_images)
+            ],
             "residue": self.global_residue_snapshot(),
         }
 
@@ -2518,44 +3194,51 @@ class LinuxProductionRuntime:
         return accepted, outcomes
 
     def evict_image(self, image: str, config_digest: str) -> dict[str, Any]:
-        inspected = self.docker().inspect(image)
-        if inspected.returncode != 0:
-            if self.docker().is_missing_image(inspected):
-                return {
-                    "schema": "swebench_verified_docker_eviction_v1",
-                    "status": "already_absent",
-                    "image": image,
-                }
+        certified = self.certified_image_identities()
+        aliases = sorted(
+            alias for alias, digest in certified.items() if digest == config_digest
+        )
+        if image not in aliases or not aliases:
+            raise RuntimeError("refusing to evict an uncertified task image")
+        inspected_alias = self.docker().inspect(image)
+        if inspected_alias.returncode == 0:
+            alias_id = self.docker().output_text(inspected_alias.stdout).strip()
+            if alias_id != config_digest:
+                raise RuntimeError("refusing to evict a mismatched task image")
+        elif not self.docker().is_missing_image(inspected_alias):
             raise RuntimeError("Docker image inspection failed during eviction")
-        image_id = self.docker().output_text(inspected.stdout).strip()
+
+        inspected_id = self.docker().inspect(config_digest)
+        if self.docker().is_missing_image(inspected_id):
+            if inspected_alias.returncode == 0:
+                raise RuntimeError("task image alias survived without its image ID")
+            return {
+                "schema": "swebench_verified_docker_eviction_v1",
+                "status": "already_absent",
+                "image": image,
+                "image_id": config_digest,
+            }
+        image_id = self.require_docker_result(
+            inspected_id, "task image ID inspection"
+        )
         if image_id != config_digest:
-            raise RuntimeError("refusing to evict a mismatched task image")
-        containers = self.image_container_ids(image)
-        if containers:
-            raise RuntimeError("task image still has containers")
-        removed = self.docker().run("image", "rm", image)
-        self.require_docker_result(removed, "task image eviction")
-        after = self.docker().inspect(image)
-        if not self.docker().is_missing_image(after):
-            raise RuntimeError("task image survived eviction")
-        by_id = self.docker().inspect(config_digest)
-        if not self.docker().is_missing_image(by_id):
-            surviving_id = self.docker().output_text(by_id.stdout).strip()
-            if surviving_id != config_digest:
-                raise RuntimeError("task image ID drifted after alias eviction")
-            if self.image_container_ids(config_digest):
-                raise RuntimeError("task image ID still has containers")
-            removed_id = self.docker().run("image", "rm", config_digest)
-            self.require_docker_result(removed_id, "task image ID eviction")
-            if not self.docker().is_missing_image(
-                self.docker().inspect(config_digest)
-            ):
-                raise RuntimeError("task image ID survived eviction")
+            raise RuntimeError("task image ID drifted before eviction")
+        if self.image_container_ids(config_digest):
+            raise RuntimeError("task image ID still has containers")
+
+        removed = self.docker().run("image", "rm", "--force", config_digest)
+        self.require_docker_result(removed, "task image ID eviction")
+        if not self.docker().is_missing_image(self.docker().inspect(config_digest)):
+            raise RuntimeError("task image ID survived eviction")
+        for alias in aliases:
+            if not self.docker().is_missing_image(self.docker().inspect(alias)):
+                raise RuntimeError("certified task image alias survived eviction")
         return {
             "schema": "swebench_verified_docker_eviction_v1",
             "status": "evicted",
             "image": image,
             "image_id": config_digest,
+            "certified_aliases_removed": aliases,
         }
 
     def evict_task(self, task_index: int, stage: Any) -> Mapping[str, Any]:
@@ -3615,6 +4298,11 @@ class LinuxProductionRuntime:
         residue = self.global_residue_snapshot()
         if any(residue.values()):
             raise RuntimeError("final owned runtime residue is nonzero")
+        shared_pool = (
+            self.shared_model_pool_snapshot()
+            if self.config.shared_model_pool is not None
+            else None
+        )
         pod = self.pod_snapshot()
         allocation_retained = (
             pod["job"] == self.section("pod")["job"]
@@ -3628,9 +4316,14 @@ class LinuxProductionRuntime:
             "residue": residue,
             "command_ledger": self.command_ledger_audit(),
             "allocation_retained": allocation_retained,
+            "shared_model_pool": shared_pool,
         }
 
     def cleanup(self) -> Mapping[str, Any]:
+        if self.config.shared_model_pool is not None:
+            raise RuntimeError(
+                "shared-model pool cleanup requires the eight-replica coordinator"
+            )
         removed_containers = []
         container_ids = set(self.owned_container_ids())
         for container_id in sorted(container_ids):
@@ -3668,6 +4361,7 @@ class LinuxProductionRuntime:
             "model_process": model,
             "holders": holders,
             "holders_restored": True,
+            "external_pool_retained": False,
             "residue": residue,
             "docker_daemon_retained": True,
             "certified_blobs_retained": True,
@@ -3719,9 +4413,20 @@ class ProductionLifecycleOperations:
         return self.runtime.reconcile_grade(**kwargs)
 
     def reconcile_startup(
-        self, *, task_indices: Sequence[int]
+        self,
+        *,
+        task_indices: Sequence[int],
+        allow_foreign_loaded_images: bool = False,
     ) -> Mapping[str, Any]:
+        if allow_foreign_loaded_images:
+            return self.runtime.reconcile_startup(
+                task_indices=task_indices,
+                allow_foreign_loaded_images=True,
+            )
         return self.runtime.reconcile_startup(task_indices=task_indices)
+
+    def reconcile_unbound_loaded_images(self) -> Mapping[str, Any]:
+        return self.runtime.reconcile_unbound_loaded_images()
 
     def run_cell(
         self,

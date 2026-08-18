@@ -1029,5 +1029,80 @@ class ProductionBindingTest(unittest.TestCase):
             self.build_driver()
 
 
+class SharedModelPoolPreflightTest(unittest.TestCase):
+    @staticmethod
+    def fixture():
+        expectations = preflight_expectations()
+        expectations["gpu_count"] = 8
+        expectations["model_id"] = "Qwen/Qwen3.5-4B"
+        expectations["model_pid"] = 303
+        expectations["model_start_ticks"] = 3003
+        expectations["shared_model_pool"] = {
+            "owner": "amg-external-eval-g-dp8-swe-0818",
+            "readiness_sha256": SHA_A,
+            "marker_lease_sha256": SHA_B,
+            "replica_index": 3,
+            "replica_count": 8,
+            "gpu_index": 3,
+            "gpu_uuid": "GPU-expected",
+            "model_revision": "3" * 40,
+            "model_port": 18021,
+            "proxy_port": 16383,
+        }
+        snapshot = valid_preflight_snapshot()
+        snapshot["pod"] = {**snapshot["pod"], "gpu_count": 8}
+        snapshot["model_process"] = {
+            **snapshot["model_process"],
+            "pid": 303,
+            "start_ticks": 3003,
+        }
+        snapshot["vllm"] = {
+            **snapshot["vllm"],
+            "model_id": "Qwen/Qwen3.5-4B",
+        }
+        snapshot["shared_model_pool"] = {
+            "status": "PASS",
+            "owner": "amg-external-eval-g-dp8-swe-0818",
+            "readiness_sha256": SHA_A,
+            "marker_lease_sha256": SHA_B,
+            "replica_index": 3,
+            "replica_count": 8,
+            "gpu_index": 3,
+            "gpu_uuid": "GPU-expected",
+            "model_id": "Qwen/Qwen3.5-4B",
+            "model_revision": "3" * 40,
+            "model_port": 18021,
+            "proxy_port": 16383,
+            "server_pid": 303,
+            "server_start_ticks": 3003,
+            "proxy_pid": 403,
+            "proxy_start_ticks": 4003,
+            "assigned_gpu_process_pids": [503],
+            "all_replicas_alive": True,
+            "all_endpoints_healthy": True,
+            "assignment_algorithm": "uint64_be(sha256(task_id)[:8]) % 8",
+            "cleanup_policy": "retain_external_pool",
+        }
+        return snapshot, expectations
+
+    def test_shared_pool_preflight_is_exact_and_fail_closed(self):
+        snapshot, expectations = self.fixture()
+        self.assertEqual(
+            validate_preflight_snapshot(snapshot, expectations)["status"], "PASS"
+        )
+        for field, value in (
+            ("replica_index", 2),
+            ("all_replicas_alive", False),
+            ("cleanup_policy", "stop_external_pool"),
+            ("assigned_gpu_process_pids", []),
+        ):
+            with self.subTest(field=field):
+                broken = dict(snapshot)
+                broken["shared_model_pool"] = dict(snapshot["shared_model_pool"])
+                broken["shared_model_pool"][field] = value
+                with self.assertRaises(PreflightContractError):
+                    validate_preflight_snapshot(broken, expectations)
+
+
 if __name__ == "__main__":
     unittest.main()

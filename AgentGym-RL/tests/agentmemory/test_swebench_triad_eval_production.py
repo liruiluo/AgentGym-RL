@@ -5,11 +5,13 @@ import json
 import os
 from pathlib import Path
 import signal
+from types import SimpleNamespace
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from typing import Any
 from unittest.mock import Mock, patch
 
 from test_swebench_triad_eval_cli import production_config
@@ -29,7 +31,9 @@ from swebench_triad_eval.production import (
     ProductionLifecycleOperations,
     ProductionRunConfig,
     accepted_rows_for_eviction,
+    exact_token_proxy_target,
     summarize_task4_receipt,
+    validate_exact_token_proxy_config,
 )
 from swebench_triad_eval.state import CellKey, sha256_json
 
@@ -65,6 +69,10 @@ class RecordingProductionRuntime:
     def reconcile_startup(self, *, task_indices):
         self.calls.append(("reconcile_startup", tuple(task_indices)))
         return {"reconciled": True}
+
+    def reconcile_unbound_loaded_images(self):
+        self.calls.append(("reconcile_unbound_loaded_images",))
+        return {"status": "PASS", "remaining_images": 0}
 
     def run_cell(self, config, stage, *, generation):
         self.calls.append(
@@ -211,6 +219,108 @@ class LinuxProductionRuntimeTest(unittest.TestCase):
         config_path, _ = production_config(root)
         config = ProductionRunConfig.load(config_path)
         return LinuxProductionRuntime(config, config.configs)
+
+    def test_cgroup_path_census_holds_the_shared_structure_lock(self):
+        with tempfile.TemporaryDirectory() as raw:
+            runtime = self.make_runtime(Path(raw))
+            with patch(
+                "swebench_triad_eval.production.cgroup_structure_lock"
+            ) as structure_lock, patch.object(
+                runtime,
+                "_cgroup_paths_unlocked",
+                return_value=["0000-native"],
+            ) as census:
+                self.assertEqual(runtime.cgroup_paths(0), ["0000-native"])
+            structure_lock.assert_called_once_with()
+            census.assert_called_once_with(0)
+
+    def test_cgroup_process_census_holds_the_shared_structure_lock(self):
+        with tempfile.TemporaryDirectory() as raw:
+            runtime = self.make_runtime(Path(raw))
+            with patch(
+                "swebench_triad_eval.production.cgroup_structure_lock"
+            ) as structure_lock, patch.object(
+                runtime,
+                "_cgroup_paths_unlocked",
+                return_value=[],
+            ) as paths:
+                self.assertEqual(runtime.cgroup_process_ids(0), [])
+            structure_lock.assert_called_once_with()
+            paths.assert_called_once_with(0)
+
+    def test_image_eviction_uses_certified_id_when_census_alias_is_missing(self):
+        with tempfile.TemporaryDirectory() as raw:
+            runtime = self.make_runtime(Path(raw))
+            image_id = "sha256:" + "c" * 64
+            aliases = {
+                "swebench/task-a:latest": image_id,
+                "swebench/task-b:latest": image_id,
+            }
+            present = True
+            docker = Mock()
+            docker.output_text.side_effect = lambda value: value
+            docker.is_missing_image.side_effect = lambda result: result.returncode != 0
+
+            def inspect(reference):
+                if reference == image_id and present:
+                    return subprocess.CompletedProcess(
+                        ["docker", "inspect", reference], 0, image_id, ""
+                    )
+                return subprocess.CompletedProcess(
+                    ["docker", "inspect", reference],
+                    1,
+                    "",
+                    "No such image",
+                )
+
+            def run(*arguments):
+                nonlocal present
+                self.assertEqual(arguments, ("image", "rm", "--force", image_id))
+                present = False
+                return subprocess.CompletedProcess(["docker", *arguments], 0, image_id, "")
+
+            docker.inspect.side_effect = inspect
+            docker.run.side_effect = run
+            with patch.object(
+                runtime, "certified_image_identities", return_value=aliases
+            ), patch.object(runtime, "docker", return_value=docker), patch.object(
+                runtime, "image_container_ids", return_value=[]
+            ):
+                receipt = runtime.evict_image("swebench/task-a:latest", image_id)
+            self.assertEqual(receipt["status"], "evicted")
+            self.assertEqual(receipt["certified_aliases_removed"], sorted(aliases))
+            docker.run.assert_called_once_with("image", "rm", "--force", image_id)
+
+    def test_unbound_loaded_image_reconciliation_evicts_every_orphan(self):
+        with tempfile.TemporaryDirectory() as raw:
+            runtime = self.make_runtime(Path(raw))
+            identities = [
+                ("swebench/image-a:latest", "sha256:" + "a" * 64),
+                ("swebench/image-b:latest", "sha256:" + "b" * 64),
+            ]
+            with patch.object(
+                runtime,
+                "loaded_task_image_identities",
+                side_effect=[identities, []],
+            ), patch.object(
+                runtime,
+                "evict_image",
+                side_effect=lambda image, image_id: {
+                    "status": "evicted",
+                    "image": image,
+                    "image_id": image_id,
+                },
+            ) as evict:
+                receipt = runtime.reconcile_unbound_loaded_images()
+            self.assertEqual(receipt["status"], "PASS")
+            self.assertEqual(receipt["remaining_images"], 0)
+            self.assertEqual(
+                evict.call_args_list,
+                [
+                    unittest.mock.call(*identities[0]),
+                    unittest.mock.call(*identities[1]),
+                ],
+            )
 
     def test_model_snapshot_uses_the_canonical_file_ledger_digest(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -516,6 +626,70 @@ class LinuxProductionRuntimeTest(unittest.TestCase):
                 receipt = runtime.reconcile_startup(task_indices=(0,))
             evict.assert_called_once()
             self.assertEqual(receipt["removed_task_roots"], [0])
+
+    def test_shared_pool_startup_defers_only_foreign_loaded_images(self):
+        with tempfile.TemporaryDirectory() as raw:
+            runtime = self.make_runtime(Path(raw))
+            foreign = ("swebench/foreign:task", "sha256:" + "b" * 64)
+            patches = (
+                patch.object(runtime, "owned_container_ids", return_value=[]),
+                patch.object(runtime, "cgroup_paths", return_value=[]),
+                patch.object(runtime, "cgroup_process_ids", return_value=[]),
+                patch.object(runtime, "mount_records_under", return_value=[]),
+                patch.object(runtime, "staged_task_indices", return_value=[]),
+                patch.object(runtime, "task_root_indices", return_value=[]),
+                patch.object(
+                    runtime, "loaded_task_image_identities", return_value=[foreign]
+                ),
+                patch.object(
+                    runtime,
+                    "global_residue_snapshot",
+                    return_value={"loaded_task_images": 1},
+                ),
+            )
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[
+                5
+            ], patches[6], patches[7]:
+                with self.assertRaisesRegex(RuntimeError, "no durable task-stage"):
+                    runtime.reconcile_startup(task_indices=(0,))
+                receipt = runtime.reconcile_startup(
+                    task_indices=(0,), allow_foreign_loaded_images=True
+                )
+            self.assertEqual(
+                receipt["foreign_loaded_images"],
+                [{"image": foreign[0], "image_id": foreign[1]}],
+            )
+
+    def test_startup_reconciliation_matches_duplicate_aliases_by_config_digest(self):
+        with tempfile.TemporaryDirectory() as raw:
+            runtime = self.make_runtime(Path(raw))
+            image_id = "sha256:" + "c" * 64
+            staged = ("swebench/task-b:latest", image_id)
+            canonical_census = ("swebench/task-a:latest", image_id)
+            with patch.object(
+                runtime, "owned_container_ids", return_value=[]
+            ), patch.object(runtime, "cgroup_paths", return_value=[]), patch.object(
+                runtime, "cgroup_process_ids", return_value=[]
+            ), patch.object(runtime, "mount_records_under", return_value=[]), patch.object(
+                runtime, "staged_task_indices", return_value=[0]
+            ), patch.object(runtime, "task_root_indices", return_value=[0]), patch.object(
+                runtime,
+                "loaded_task_image_identities",
+                return_value=[canonical_census],
+            ), patch.object(
+                runtime, "task_image_identity", return_value=staged
+            ), patch.object(
+                runtime, "evict_image", return_value={"status": "evicted"}
+            ) as evict, patch.object(
+                runtime, "remove_inactive_task_root", return_value=True
+            ), patch.object(
+                runtime,
+                "global_residue_snapshot",
+                return_value={"owned_containers": 0},
+            ):
+                receipt = runtime.reconcile_startup(task_indices=(0,))
+            evict.assert_called_once_with(*staged)
+            self.assertEqual(receipt["foreign_loaded_images"], [])
 
     def test_loaded_image_census_does_not_depend_on_a_stage_receipt(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -969,6 +1143,288 @@ class LinuxProductionRuntimeTest(unittest.TestCase):
                 {0},
             )
 
+
+class SharedModelPoolProductionTest(unittest.TestCase):
+    @staticmethod
+    def shared_config(root: Path) -> tuple[ProductionRunConfig, dict[str, Any]]:
+        config_path, payload = production_config(root)
+        payload["schema"] = "amg_swebench_triad_run_config_shared_pool_v2"
+        payload["pod"] = {
+            **payload["pod"],
+            "gpu_uuid": "GPU-shared-3",
+        }
+        payload["serving"] = {
+            **payload["serving"],
+            "base_url": "http://127.0.0.1:16383/v1",
+            "model_id": "Qwen/Qwen3.5-4B",
+            "pid": 303,
+            "start_ticks": 3003,
+        }
+        payload["shared_model_pool"] = {
+            "owner": "amg-external-eval-g-dp8-swe-0818",
+            "readiness_path": str(root / "pool-readiness.json"),
+            "readiness_sha256": "1" * 64,
+            "marker_lease_path": str(root / "marker-lease.json"),
+            "marker_lease_sha256": "2" * 64,
+            "replica_index": 3,
+            "replica_count": 8,
+            "gpu_index": 3,
+            "gpu_uuid": "GPU-shared-3",
+            "model_id": "Qwen/Qwen3.5-4B",
+            "model_revision": "3" * 40,
+            "model_port": 18021,
+            "proxy_port": 16383,
+            "assignment_algorithm": "uint64_be(sha256(task_id)[:8]) % 8",
+            "cleanup_policy": "retain_external_pool",
+        }
+        config_path.write_bytes(canonical_json_bytes(payload))
+        return ProductionRunConfig.load(config_path), payload
+
+    def test_exact_token_proxy_config_binds_listen_and_upstream_ports(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "gaia_vllm_token_proxy.py"
+            source.write_text("print('proxy')\n", encoding="utf-8")
+            source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+            config_path = root / "proxy-config.json"
+            config = {
+                "schema": "gaia_vllm_exact_token_proxy_config_v1",
+                "listen_host": "127.0.0.1",
+                "listen_port": 16383,
+                "upstream_base_url": "http://127.0.0.1:18021",
+                "upstream_model_id": "Qwen/Qwen3.5-4B",
+                "upstream_model_revision": "3" * 40,
+                "proxy_source_sha256": source_sha,
+                "runtime_sha256": "4" * 64,
+                "tokenizer_sha256": "5" * 64,
+            }
+            config_path.write_bytes(canonical_json_bytes(config))
+            target = [sys.executable, str(source), "--config", str(config_path)]
+            supervisor = [
+                sys.executable,
+                "/tmp/supervisor.py",
+                "park-exec",
+                "--command-json",
+                json.dumps(target, separators=(",", ":")),
+            ]
+            self.assertEqual(exact_token_proxy_target(supervisor), target)
+            receipt = validate_exact_token_proxy_config(
+                target,
+                model_port=18021,
+                proxy_port=16383,
+                model_id="Qwen/Qwen3.5-4B",
+                model_revision="3" * 40,
+                proxy_source_sha256=source_sha,
+            )
+            self.assertEqual(
+                receipt["upstream_base_url"], "http://127.0.0.1:18021"
+            )
+            config["upstream_base_url"] = "http://127.0.0.1:18020"
+            config_path.write_bytes(canonical_json_bytes(config))
+            with self.assertRaisesRegex(RuntimeError, "route config"):
+                validate_exact_token_proxy_config(
+                    target,
+                    model_port=18021,
+                    proxy_port=16383,
+                    model_id="Qwen/Qwen3.5-4B",
+                    model_revision="3" * 40,
+                    proxy_source_sha256=source_sha,
+                )
+
+    def test_listener_owner_must_belong_to_the_expected_process_tree(self):
+        with tempfile.TemporaryDirectory() as raw:
+            config, _ = self.shared_config(Path(raw))
+            runtime = LinuxProductionRuntime(config, config.configs)
+            with patch.object(
+                runtime, "tcp_listener_inodes", return_value={99}
+            ), patch.object(
+                runtime,
+                "process_socket_inodes",
+                side_effect=lambda pid: {99} if pid == 202 else {17},
+            ):
+                self.assertEqual(
+                    runtime.listener_pids(18021, {101, 202}, "model server"),
+                    [202],
+                )
+                with self.assertRaisesRegex(RuntimeError, "escaped"):
+                    runtime.listener_pids(18021, {101}, "model server")
+
+    def test_each_shared_pool_cell_requires_a_fresh_live_pool_snapshot(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            config, _ = self.shared_config(root)
+            runtime = LinuxProductionRuntime(config, config.configs)
+            shared = config.shared_model_pool
+            assert shared is not None
+            task_index = next(
+                index
+                for index, rows in runtime.by_task.items()
+                if int.from_bytes(
+                    hashlib.sha256(rows[0].task.task_id.encode("utf-8")).digest()[:8],
+                    "big",
+                )
+                % shared["replica_count"]
+                == shared["replica_index"]
+            )
+            task_root = root / "pod-task"
+            task_root.mkdir()
+            stage = SimpleNamespace(task_root=task_root)
+            with patch.object(
+                runtime, "require_stage", return_value=stage
+            ), patch.object(
+                runtime, "owned_container_ids", return_value=[]
+            ), patch.object(
+                runtime, "cgroup_paths", return_value=[]
+            ), patch.object(
+                runtime,
+                "shared_model_pool_snapshot",
+                side_effect=RuntimeError("live pool probe sentinel"),
+            ) as live_probe, self.assertRaisesRegex(
+                RuntimeError, "live pool probe sentinel"
+            ):
+                runtime.run_cell(runtime.by_task[task_index][0], stage, generation=1)
+            live_probe.assert_called_once_with()
+
+    def test_final_audit_reprobes_and_embeds_the_live_shared_pool(self):
+        with tempfile.TemporaryDirectory() as raw:
+            config, _ = self.shared_config(Path(raw))
+            runtime = LinuxProductionRuntime(config, config.configs)
+            pool = {"status": "PASS", "replica_index": 3}
+            residue = {
+                "active_owned_processes": 0,
+                "active_cgroups": 0,
+                "active_tmpfs_mounts": 0,
+                "active_mounts": 0,
+                "active_scratch_paths": 0,
+                "loaded_task_images": 0,
+                "owned_containers": 0,
+            }
+            with patch.object(
+                runtime, "global_residue_snapshot", return_value=residue
+            ), patch.object(
+                runtime, "shared_model_pool_snapshot", return_value=pool
+            ) as live_probe, patch.object(
+                runtime,
+                "pod_snapshot",
+                return_value={
+                    "job": config.section("pod")["job"],
+                    "boot_id": config.section("pod")["boot_id"],
+                },
+            ), patch.object(
+                runtime,
+                "command_ledger_audit",
+                return_value={"status": "PASS"},
+            ):
+                receipt = runtime.final_audit()
+            live_probe.assert_called_once_with()
+            self.assertEqual(receipt["shared_model_pool"], pool)
+
+    def test_shared_pool_config_is_strict_and_exposes_eight_gpu_expectation(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            config, payload = self.shared_config(root)
+            self.assertEqual(config.preflight_expectations["gpu_count"], 8)
+            self.assertEqual(
+                config.preflight_expectations["shared_model_pool"]["replica_index"],
+                3,
+            )
+            payload["serving"]["base_url"] = "http://127.0.0.1:16382/v1"
+            (root / "run-config.json").write_bytes(canonical_json_bytes(payload))
+            with self.assertRaisesRegex(ValueError, "exact-token proxy"):
+                ProductionRunConfig.load(root / "run-config.json")
+
+    def test_pod_snapshot_requires_all_eight_unique_gpus_and_selected_uuid(self):
+        with tempfile.TemporaryDirectory() as raw:
+            config, _ = self.shared_config(Path(raw))
+            runtime = LinuxProductionRuntime(config, config.configs)
+            values = [f"GPU-shared-{index}" for index in range(8)]
+            with patch(
+                "swebench_triad_eval.production.socket.gethostname",
+                return_value="pod-host",
+            ), patch(
+                "swebench_triad_eval.production.Path.read_text",
+                return_value="pod-boot\n",
+            ), patch(
+                "swebench_triad_eval.production.command_output",
+                return_value="\n".join(values),
+            ):
+                snapshot = runtime.pod_snapshot()
+            self.assertEqual(snapshot["gpu_count"], 8)
+            self.assertEqual(snapshot["gpu_uuid"], "GPU-shared-3")
+
+            values[3] = "GPU-wrong"
+            with patch(
+                "swebench_triad_eval.production.socket.gethostname",
+                return_value="pod-host",
+            ), patch(
+                "swebench_triad_eval.production.Path.read_text",
+                return_value="pod-boot\n",
+            ), patch(
+                "swebench_triad_eval.production.command_output",
+                return_value="\n".join(values),
+            ), self.assertRaisesRegex(RuntimeError, "replica GPU"):
+                runtime.pod_snapshot()
+
+    def test_shared_pool_vllm_probe_reads_registry_from_upstream_model_port(self):
+        with tempfile.TemporaryDirectory() as raw:
+            config, _ = self.shared_config(Path(raw))
+            runtime = LinuxProductionRuntime(config, config.configs)
+            chat = {
+                "prompt_token_ids": [1, 2],
+                "choices": [
+                    {
+                        "token_ids": [3, 4],
+                        "message": {"content": "AMG_OK"},
+                    }
+                ],
+            }
+            with patch(
+                "swebench_triad_eval.production.http_json",
+                side_effect=[
+                    {"data": [{"id": "Qwen/Qwen3.5-4B"}]},
+                    {"tokens": [1, 2]},
+                    chat,
+                    chat,
+                ],
+            ) as probe:
+                snapshot = runtime.vllm_snapshot()
+            self.assertEqual(
+                probe.call_args_list[0].args[0],
+                "http://127.0.0.1:18021/v1/models",
+            )
+            self.assertEqual(
+                probe.call_args_list[1].args[0],
+                "http://127.0.0.1:16383/tokenize",
+            )
+            self.assertEqual(
+                probe.call_args_list[2].args[0],
+                "http://127.0.0.1:16383/v1/chat/completions",
+            )
+            self.assertTrue(snapshot["repeat_text_equal"])
+
+    def test_shared_pool_cleanup_fails_before_any_global_mutation(self):
+        with tempfile.TemporaryDirectory() as raw:
+            config, _ = self.shared_config(Path(raw))
+            runtime = LinuxProductionRuntime(config, config.configs)
+            with patch.object(
+                runtime, "owned_container_ids"
+            ) as containers, patch.object(
+                runtime, "cgroup_paths"
+            ) as cgroups, patch.object(
+                runtime, "reconcile_startup"
+            ) as reconcile, patch.object(
+                runtime, "stop_model_process"
+            ) as stop_model, patch.object(
+                runtime, "restore_holders"
+            ) as restore_holders, self.assertRaisesRegex(
+                RuntimeError, "eight-replica coordinator"
+            ):
+                runtime.cleanup()
+            containers.assert_not_called()
+            cgroups.assert_not_called()
+            reconcile.assert_not_called()
+            stop_model.assert_not_called()
+            restore_holders.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

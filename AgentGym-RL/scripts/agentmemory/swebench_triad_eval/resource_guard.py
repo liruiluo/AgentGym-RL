@@ -8,8 +8,10 @@ episode state, and full-tree rootfs re-attestation before every policy command.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import ctypes
 from dataclasses import dataclass
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -31,8 +33,34 @@ CGROUP_EVALUATION_PARENT = "swebench-triad-v1"
 CGROUP_RELATIVE_PREFIX = (
     f"{CGROUP_RUNTIME_PARENT}/{CGROUP_EVALUATION_PARENT}"
 )
+CGROUP_STRUCTURE_LOCK_PATH = Path(
+    "/tmp/amg-swebench-triad-cgroup-v1-structure.lock"
+)
 _CELL_NAME_RE = re.compile(r"\A[0-9]{4}-(?:native|amg_compaction_only|amg_memory)\Z")
 _PAGE_BYTES = 4096
+
+
+@contextmanager
+def cgroup_structure_lock():
+    """Serialize cgroup-v1 two-controller structure changes and censuses."""
+
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(CGROUP_STRUCTURE_LOCK_PATH, flags, 0o600)
+    except OSError as error:
+        raise ResourceGuardError("cannot open the cgroup structure lock") from error
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise ResourceGuardError("cgroup structure lock is not a regular file")
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 def _positive_integer(value: Any, label: str) -> int:
@@ -331,23 +359,26 @@ class MountNamespaceCgroupV1Backend:
     def _request(self, value: Mapping[str, Any]) -> Mapping[str, Any]:
         if not Path(f"/proc/{self.namespace_pid}/ns/mnt").exists():
             raise ResourceGuardError("Docker daemon mount namespace is unavailable")
-        try:
-            completed = subprocess.run(
-                [
-                    self.python_executable,
-                    "-m",
-                    "swebench_triad_eval.resource_guard",
-                    "_cgroup_helper",
-                    str(self.namespace_pid),
-                ],
-                input=json.dumps(value, sort_keys=True),
-                text=True,
-                capture_output=True,
-                timeout=self.timeout_seconds,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise ResourceGuardError("cgroup namespace helper could not run") from error
+        with cgroup_structure_lock():
+            try:
+                completed = subprocess.run(
+                    [
+                        self.python_executable,
+                        "-m",
+                        "swebench_triad_eval.resource_guard",
+                        "_cgroup_helper",
+                        str(self.namespace_pid),
+                    ],
+                    input=json.dumps(value, sort_keys=True),
+                    text=True,
+                    capture_output=True,
+                    timeout=self.timeout_seconds,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                raise ResourceGuardError(
+                    "cgroup namespace helper could not run"
+                ) from error
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout).strip()[-2000:]
             raise ResourceGuardError(f"cgroup namespace helper failed: {detail}")

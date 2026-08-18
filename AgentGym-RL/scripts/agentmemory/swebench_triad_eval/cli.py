@@ -80,7 +80,10 @@ class LifecycleOperations(Protocol):
     ) -> Mapping[str, Any]: ...
 
     def reconcile_startup(
-        self, *, task_indices: Sequence[int]
+        self,
+        *,
+        task_indices: Sequence[int],
+        allow_foreign_loaded_images: bool = False,
     ) -> Mapping[str, Any]: ...
 
     def run_cell(
@@ -151,9 +154,8 @@ def validate_preflight_snapshot(
     boundary can be tested without weakening the production probes.
     """
 
-    root = _exact_fields(
-        _mapping(snapshot, "preflight snapshot"),
-        {
+    expected_shared_pool = expectations.get("shared_model_pool")
+    root_fields = {
             "source",
             "dataset",
             "image_index",
@@ -167,7 +169,12 @@ def validate_preflight_snapshot(
             "swe_metadata",
             "residue",
             "rootfs",
-        },
+    }
+    if expected_shared_pool is not None:
+        root_fields.add("shared_model_pool")
+    root = _exact_fields(
+        _mapping(snapshot, "preflight snapshot"),
+        root_fields,
         "preflight snapshot",
     )
     expected = _mapping(expectations, "preflight expectations")
@@ -257,7 +264,85 @@ def validate_preflight_snapshot(
     )
     for name in ("job", "pod", "hostname", "boot_id", "gpu_uuid"):
         _equal(pod[name], expected.get(name), f"pod {name}")
-    _equal(pod["gpu_count"], 1, "pod GPU count")
+    _equal(pod["gpu_count"], expected.get("gpu_count", 1), "pod GPU count")
+
+    if expected_shared_pool is not None:
+        shared = _exact_fields(
+            _mapping(root["shared_model_pool"], "shared model pool snapshot"),
+            {
+                "status",
+                "owner",
+                "readiness_sha256",
+                "marker_lease_sha256",
+                "replica_index",
+                "replica_count",
+                "gpu_index",
+                "gpu_uuid",
+                "model_id",
+                "model_revision",
+                "model_port",
+                "proxy_port",
+                "server_pid",
+                "server_start_ticks",
+                "proxy_pid",
+                "proxy_start_ticks",
+                "assigned_gpu_process_pids",
+                "all_replicas_alive",
+                "all_endpoints_healthy",
+                "assignment_algorithm",
+                "cleanup_policy",
+            },
+            "shared model pool snapshot",
+        )
+        expected_pool = _mapping(
+            expected_shared_pool, "shared model pool expectations"
+        )
+        _equal(shared["status"], "PASS", "shared model pool status")
+        for name in (
+            "owner",
+            "readiness_sha256",
+            "marker_lease_sha256",
+            "replica_index",
+            "replica_count",
+            "gpu_index",
+            "gpu_uuid",
+            "model_revision",
+            "model_port",
+            "proxy_port",
+        ):
+            _equal(
+                shared[name], expected_pool.get(name), f"shared model pool {name}"
+            )
+        _equal(
+            shared["model_id"], expected.get("model_id"), "shared model pool model ID"
+        )
+        _equal(
+            shared["server_pid"], expected.get("model_pid"), "shared model server PID"
+        )
+        _equal(
+            shared["server_start_ticks"],
+            expected.get("model_start_ticks"),
+            "shared model server start ticks",
+        )
+        for name in ("all_replicas_alive", "all_endpoints_healthy"):
+            _true(shared[name], f"shared model pool {name}")
+        gpu_pids = shared["assigned_gpu_process_pids"]
+        if (
+            not isinstance(gpu_pids, list)
+            or not gpu_pids
+            or any(type(pid) is not int or pid <= 0 for pid in gpu_pids)
+        ):
+            _fail("shared model pool GPU process binding is malformed")
+        _equal(
+            shared["assignment_algorithm"],
+            "uint64_be(sha256(task_id)[:8]) % 8",
+            "shared model pool assignment algorithm",
+        )
+        _equal(
+            shared["cleanup_policy"],
+            "retain_external_pool",
+            "shared model pool cleanup policy",
+        )
 
     docker = _exact_fields(
         _mapping(root["docker"], "Docker snapshot"),
@@ -673,8 +758,13 @@ class LifecycleDriver:
             raise RuntimeError("validated preflight receipt drifted")
         return expected
 
-    def reconcile_dead_work(self) -> list[dict[str, Any]]:
+    def reconcile_dead_work(
+        self, *, allow_foreign_loaded_images: bool = False
+    ) -> list[dict[str, Any]]:
         """Fence dead drivers and reconcile their exact physical namespaces."""
+
+        if type(allow_foreign_loaded_images) is not bool:
+            raise TypeError("foreign loaded-image policy must be boolean")
 
         receipts: list[dict[str, Any]] = []
         for cell in self.store.manifest:
@@ -739,9 +829,15 @@ class LifecycleDriver:
                     "grader": dict(receipt),
                 }
             )
-        startup = self.operations.reconcile_startup(
-            task_indices=self.assigned_task_indices
-        )
+        if allow_foreign_loaded_images:
+            startup = self.operations.reconcile_startup(
+                task_indices=self.assigned_task_indices,
+                allow_foreign_loaded_images=True,
+            )
+        else:
+            startup = self.operations.reconcile_startup(
+                task_indices=self.assigned_task_indices
+            )
         if not isinstance(startup, Mapping):
             raise RuntimeError("startup reconciliation receipt is invalid")
         receipts.append({"startup": dict(startup)})
