@@ -27,7 +27,7 @@ from .atomic import (
     exclusive_lock,
     read_json,
 )
-from .cli import driver_from_config
+from .cli import driver_from_config, validate_preflight_snapshot
 from .identity import verify_image_index
 from .production import (
     SHARED_POOL_RUN_CONFIG_SCHEMA,
@@ -318,14 +318,20 @@ def release_driver(driver: Any) -> None:
 
 
 def validate_live_pool_snapshot(
-    value: Any, replica: ReplicaConfig, label: str
+    value: Any,
+    replica: ReplicaConfig,
+    label: str,
+    *,
+    listener_reference: Any = None,
 ) -> Mapping[str, Any]:
     expected = replica.production.shared_model_pool
     serving = replica.production.section("serving")
     if expected is None:
         raise RuntimeError(f"{label} shared-model pool snapshot is missing")
     value = validate_shared_model_pool_snapshot(
-        value, f"{label} shared-model pool snapshot"
+        value,
+        f"{label} shared-model pool snapshot",
+        listener_reference=listener_reference,
     )
     exact = {
         "status": "PASS",
@@ -358,6 +364,30 @@ def validate_live_pool_snapshot(
     ):
         raise RuntimeError(f"{label} proxy route binding drifted")
     return value
+
+
+def validated_preflight_pool_snapshot(
+    replica: ReplicaConfig,
+) -> Mapping[str, Any]:
+    snapshot_path = (
+        replica.production.run_root / "control" / "preflight-snapshot.json"
+    )
+    receipt_path = replica.production.run_root / "control" / "preflight-PASS.json"
+    try:
+        snapshot = read_json(snapshot_path)
+        receipt = read_json(receipt_path)
+        expected_receipt = validate_preflight_snapshot(
+            snapshot, replica.production.preflight_expectations
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            "coordinator preflight pool reference is invalid"
+        ) from error
+    if receipt != expected_receipt:
+        raise RuntimeError("coordinator preflight pool reference drifted")
+    return validate_live_pool_snapshot(
+        snapshot.get("shared_model_pool"), replica, "preflight"
+    )
 
 
 def _reconciliation_cell(value: Any, expected_tasks: set[int]) -> None:
@@ -705,6 +735,12 @@ def run_full(config: CoordinatorConfig) -> list[dict[str, Any]]:
                 or any(audit["residue"].values())
             ):
                 raise RuntimeError("shared-pool final runtime audit failed")
+            validate_live_pool_snapshot(
+                audit.get("shared_model_pool"),
+                replica,
+                "final audit",
+                listener_reference=validated_preflight_pool_snapshot(replica),
+            )
             audits.append(
                 {
                     "replica_index": replica.replica_index,
@@ -793,6 +829,7 @@ def validated_workers_complete(config: CoordinatorConfig) -> Mapping[str, Any]:
             audit_row["receipt"].get("shared_model_pool"),
             replica,
             "final audit",
+            listener_reference=validated_preflight_pool_snapshot(replica),
         )
     return value
 
@@ -808,6 +845,10 @@ def aggregate(config: CoordinatorConfig) -> Mapping[str, Any]:
         for replica in config.replicas
     }
     try:
+        listener_references = {
+            replica.replica_index: validated_preflight_pool_snapshot(replica)
+            for replica in config.replicas
+        }
         for task in config.assignment:
             replica = config.replicas[task["replica_index"]]
             driver = drivers[replica.replica_index]
@@ -836,7 +877,12 @@ def aggregate(config: CoordinatorConfig) -> Mapping[str, Any]:
                 ):
                     raise RuntimeError("cell runtime receipt identity drifted")
                 validate_live_pool_snapshot(
-                    runtime.get("shared_model_pool"), replica, "cell runtime"
+                    runtime.get("shared_model_pool"),
+                    replica,
+                    "cell runtime",
+                    listener_reference=listener_references[
+                        replica.replica_index
+                    ],
                 )
                 resolved = outcome["resolved"]
                 per_arm[arm] += int(resolved)

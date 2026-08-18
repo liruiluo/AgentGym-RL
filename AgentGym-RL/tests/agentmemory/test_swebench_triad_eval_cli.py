@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import replace
 import hashlib
 import json
@@ -1087,10 +1088,26 @@ class SharedModelPoolPreflightTest(unittest.TestCase):
             "server_start_ticks": 3003,
             "server_target_pids": [303],
             "server_listener_pids": [303],
+            "server_listener_census": {
+                "source": "/proc/net/tcp",
+                "family": "ipv4",
+                "address": "127.0.0.1",
+                "port": 18021,
+                "inode": 99,
+                "owner_pids": [303],
+            },
             "proxy_pid": 403,
             "proxy_start_ticks": 4003,
             "proxy_target_pids": [403],
             "proxy_listener_pids": [403],
+            "proxy_listener_census": {
+                "source": "/proc/net/tcp",
+                "family": "ipv4",
+                "address": "127.0.0.1",
+                "port": 16383,
+                "inode": 100,
+                "owner_pids": [403],
+            },
             "proxy_route": {
                 "config_path": "/tmp/proxy-config.json",
                 "config_sha256": "4" * 64,
@@ -1136,6 +1153,42 @@ class SharedModelPoolPreflightTest(unittest.TestCase):
         }
         with self.assertRaises(PreflightContractError):
             validate_preflight_snapshot(extra, expectations)
+
+    def test_shared_pool_listener_census_is_exact_and_fail_closed(self):
+        snapshot, expectations = self.fixture()
+        self.assertEqual(
+            validate_preflight_snapshot(snapshot, expectations)["status"],
+            "PASS",
+        )
+        mutations = (
+            ("source", "/proc/net/tcp6"),
+            ("family", "ipv6"),
+            ("address", "0.0.0.0"),
+            ("port", 18022),
+            ("inode", 0),
+            ("owner_pids", [999]),
+        )
+        for field, value in mutations:
+            with self.subTest(field=field):
+                broken = copy.deepcopy(snapshot)
+                broken["shared_model_pool"]["server_listener_census"][
+                    field
+                ] = value
+                with self.assertRaises(PreflightContractError):
+                    validate_preflight_snapshot(broken, expectations)
+
+        for change in ("missing", "extra"):
+            with self.subTest(change=change):
+                broken = copy.deepcopy(snapshot)
+                census = broken["shared_model_pool"][
+                    "server_listener_census"
+                ]
+                if change == "missing":
+                    census.pop("inode")
+                else:
+                    census["unexpected"] = True
+                with self.assertRaises(PreflightContractError):
+                    validate_preflight_snapshot(broken, expectations)
 
 
 if __name__ == "__main__":

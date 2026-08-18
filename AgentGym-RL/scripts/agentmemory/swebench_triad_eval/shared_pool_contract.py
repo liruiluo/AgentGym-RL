@@ -10,6 +10,12 @@ from typing import Any
 
 SHARED_MODEL_POOL_ASSIGNMENT = "uint64_be(sha256(task_id)[:8]) % 8"
 SHARED_MODEL_POOL_CLEANUP = "retain_external_pool"
+SHARED_MODEL_POOL_LISTENER_CENSUS_FIELDS = frozenset(
+    {"source", "family", "address", "port", "inode", "owner_pids"}
+)
+SHARED_MODEL_POOL_LISTENER_SOURCE = "/proc/net/tcp"
+SHARED_MODEL_POOL_LISTENER_FAMILY = "ipv4"
+SHARED_MODEL_POOL_LISTENER_ADDRESS = "127.0.0.1"
 SHARED_MODEL_POOL_SNAPSHOT_FIELDS = frozenset(
     {
         "status",
@@ -28,10 +34,12 @@ SHARED_MODEL_POOL_SNAPSHOT_FIELDS = frozenset(
         "server_start_ticks",
         "server_target_pids",
         "server_listener_pids",
+        "server_listener_census",
         "proxy_pid",
         "proxy_start_ticks",
         "proxy_target_pids",
         "proxy_listener_pids",
+        "proxy_listener_census",
         "proxy_route",
         "assigned_gpu_process_pids",
         "all_replicas_alive",
@@ -80,8 +88,41 @@ def _positive_pid_list(value: Any, label: str, field: str) -> list[int]:
     return value
 
 
+def _listener_census(
+    value: Any,
+    label: str,
+    field: str,
+    *,
+    expected_port: int,
+    expected_owner_pids: list[int],
+) -> Mapping[str, Any]:
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != SHARED_MODEL_POOL_LISTENER_CENSUS_FIELDS
+    ):
+        _fail(label, f"{field} listener census fields drifted")
+    if (
+        value["source"] != SHARED_MODEL_POOL_LISTENER_SOURCE
+        or value["family"] != SHARED_MODEL_POOL_LISTENER_FAMILY
+        or value["address"] != SHARED_MODEL_POOL_LISTENER_ADDRESS
+        or value["port"] != expected_port
+        or type(value["inode"]) is not int
+        or value["inode"] <= 0
+    ):
+        _fail(label, f"{field} listener census endpoint drifted")
+    owners = _positive_pid_list(
+        value["owner_pids"], label, f"{field} listener census owner PIDs"
+    )
+    if owners != expected_owner_pids:
+        _fail(label, f"{field} listener census ownership drifted")
+    return value
+
+
 def validate_shared_model_pool_snapshot(
-    value: Any, label: str = "shared model pool snapshot"
+    value: Any,
+    label: str = "shared model pool snapshot",
+    *,
+    listener_reference: Any = None,
 ) -> Mapping[str, Any]:
     """Validate the one exact shape emitted into all durable receipts."""
 
@@ -149,6 +190,26 @@ def validate_shared_model_pool_snapshot(
         _fail(label, "server listener binding drifted")
     if not set(proxy_listeners).issubset(proxy_targets):
         _fail(label, "proxy listener binding drifted")
+    _listener_census(
+        value["server_listener_census"],
+        label,
+        "server",
+        expected_port=value["model_port"],
+        expected_owner_pids=server_listeners,
+    )
+    _listener_census(
+        value["proxy_listener_census"],
+        label,
+        "proxy",
+        expected_port=value["proxy_port"],
+        expected_owner_pids=proxy_listeners,
+    )
+    if listener_reference is not None:
+        if not isinstance(listener_reference, Mapping):
+            _fail(label, "listener census reference is missing")
+        for field in ("server_listener_census", "proxy_listener_census"):
+            if value[field] != listener_reference.get(field):
+                _fail(label, "listener census drifted")
 
     route = value["proxy_route"]
     if (
@@ -183,6 +244,10 @@ def validate_shared_model_pool_snapshot(
 __all__ = [
     "SHARED_MODEL_POOL_ASSIGNMENT",
     "SHARED_MODEL_POOL_CLEANUP",
+    "SHARED_MODEL_POOL_LISTENER_ADDRESS",
+    "SHARED_MODEL_POOL_LISTENER_CENSUS_FIELDS",
+    "SHARED_MODEL_POOL_LISTENER_FAMILY",
+    "SHARED_MODEL_POOL_LISTENER_SOURCE",
     "SHARED_MODEL_POOL_PROXY_ROUTE_FIELDS",
     "SHARED_MODEL_POOL_SNAPSHOT_FIELDS",
     "SharedModelPoolSnapshotError",

@@ -14,6 +14,7 @@ import unittest
 from typing import Any
 from unittest.mock import Mock, patch
 
+import test_swebench_triad_eval_cli as cli_test_support
 from test_swebench_triad_eval_cli import (
     preflight_expectations,
     production_config,
@@ -1241,6 +1242,50 @@ class LinuxProductionRuntimeTest(unittest.TestCase):
 
 
 class SharedModelPoolProductionTest(unittest.TestCase):
+    PROC_TCP_HEADER = (
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when "
+        "retrnsmt   uid  timeout inode"
+    )
+
+    @classmethod
+    def proc_tcp_row(
+        cls,
+        address: str,
+        *,
+        port: str = "4665",
+        inode: int = 99,
+        state: str = "0A",
+    ) -> str:
+        remote_address = "0" * len(address)
+        return (
+            f"   0: {address}:{port} {remote_address}:0000 {state} "
+            "00000000:00000000 00:00000000 00000000 1000 0 "
+            f"{inode} 1 0000000000000000 100 0 0 10 0"
+        )
+
+    @classmethod
+    def proc_table_reader(
+        cls,
+        *,
+        tcp_rows: tuple[str, ...] = (),
+        tcp6_rows: tuple[str, ...] = (),
+    ):
+        tables = {
+            Path("/proc/net/tcp"): "\n".join(
+                (cls.PROC_TCP_HEADER, *tcp_rows, "")
+            ),
+            Path("/proc/net/tcp6"): "\n".join(
+                (cls.PROC_TCP_HEADER, *tcp6_rows, "")
+            ),
+        }
+
+        def read_text(path, *, encoding=None, errors=None):
+            if encoding != "ascii" or errors is not None:
+                raise AssertionError("proc TCP tables require strict ASCII reads")
+            return tables[path]
+
+        return read_text
+
     @staticmethod
     def shared_config(root: Path) -> tuple[ProductionRunConfig, dict[str, Any]]:
         config_path, payload = production_config(root)
@@ -1332,18 +1377,99 @@ class SharedModelPoolProductionTest(unittest.TestCase):
             config, _ = self.shared_config(Path(raw))
             runtime = LinuxProductionRuntime(config, config.configs)
             with patch.object(
-                runtime, "tcp_listener_inodes", return_value={99}
+                runtime,
+                "tcp_listener_census",
+                return_value={
+                    "source": "/proc/net/tcp",
+                    "family": "ipv4",
+                    "address": "127.0.0.1",
+                    "port": 18021,
+                    "inode": 99,
+                },
             ), patch.object(
                 runtime,
                 "listener_inode_owners",
                 return_value={99: {202}},
             ):
                 self.assertEqual(
-                    runtime.listener_pids(18021, {101, 202}, "model server"),
+                    runtime.listener_census(
+                        18021, {101, 202}, "model server"
+                    )["owner_pids"],
                     [202],
                 )
                 with self.assertRaisesRegex(RuntimeError, "escaped"):
-                    runtime.listener_pids(18021, {101}, "model server")
+                    runtime.listener_census(18021, {101}, "model server")
+
+    def test_tcp_listener_census_decodes_exact_ipv4_loopback(self):
+        row = self.proc_tcp_row("0100007F")
+        with patch.object(
+            Path,
+            "read_text",
+            autospec=True,
+            side_effect=self.proc_table_reader(tcp_rows=(row,)),
+        ):
+            self.assertEqual(
+                LinuxProductionRuntime.tcp_listener_census(18021),
+                {
+                    "source": "/proc/net/tcp",
+                    "family": "ipv4",
+                    "address": "127.0.0.1",
+                    "port": 18021,
+                    "inode": 99,
+                },
+            )
+
+    def test_tcp_listener_census_rejects_nonexact_endpoint_rows(self):
+        cases = {
+            "wildcard IPv4": ((self.proc_tcp_row("00000000"),), ()),
+            "non-loopback IPv4": ((self.proc_tcp_row("0200000A"),), ()),
+            "wildcard IPv6": ((), (self.proc_tcp_row("0" * 32),)),
+            "loopback IPv6": (
+                (),
+                (self.proc_tcp_row("00000000000000000000000001000000"),),
+            ),
+            "IPv4-mapped IPv6": (
+                (),
+                (self.proc_tcp_row("0000000000000000FFFF00000100007F"),),
+            ),
+            "other IPv6": (
+                (),
+                (self.proc_tcp_row("B80D0120000000000000000001000000"),),
+            ),
+            "wrong port": (
+                (self.proc_tcp_row("0100007F", port="4666"),),
+                (),
+            ),
+            "duplicate row": (
+                (
+                    self.proc_tcp_row("0100007F"),
+                    self.proc_tcp_row("0100007F"),
+                ),
+                (),
+            ),
+            "conflicting row": (
+                (
+                    self.proc_tcp_row("0100007F"),
+                    self.proc_tcp_row("00000000", inode=100),
+                ),
+                (),
+            ),
+            "dual-stack conflicting row": (
+                (self.proc_tcp_row("0100007F"),),
+                (self.proc_tcp_row("00000000000000000000000001000000"),),
+            ),
+            "zero inode": ((self.proc_tcp_row("0100007F", inode=0),), ()),
+        }
+        for name, (tcp_rows, tcp6_rows) in cases.items():
+            with self.subTest(name=name), patch.object(
+                Path,
+                "read_text",
+                autospec=True,
+                side_effect=self.proc_table_reader(
+                    tcp_rows=tcp_rows, tcp6_rows=tcp6_rows
+                ),
+            ), self.assertRaises(RuntimeError):
+                LinuxProductionRuntime.tcp_listener_census(18021)
 
     def test_listener_owner_census_scans_every_process_descriptor(self):
         descriptors = {
@@ -1380,22 +1506,55 @@ class SharedModelPoolProductionTest(unittest.TestCase):
             config, _ = self.shared_config(Path(raw))
             runtime = LinuxProductionRuntime(config, config.configs)
             with patch.object(
-                runtime, "tcp_listener_inodes", return_value={99, 100}
+                runtime,
+                "tcp_listener_census",
+                return_value={
+                    "source": "/proc/net/tcp",
+                    "family": "ipv4",
+                    "address": "127.0.0.1",
+                    "port": 18021,
+                    "inode": 99,
+                },
             ), patch.object(
                 runtime,
                 "listener_inode_owners",
-                return_value={99: {202, 999}, 100: {202}},
+                return_value={99: {202, 999}},
             ), self.assertRaisesRegex(RuntimeError, "foreign owner"):
-                runtime.listener_pids(18021, {202}, "model server")
+                runtime.listener_census(18021, {202}, "model server")
 
             with patch.object(
-                runtime, "tcp_listener_inodes", return_value={99, 100}
+                runtime,
+                "tcp_listener_census",
+                return_value={
+                    "source": "/proc/net/tcp",
+                    "family": "ipv4",
+                    "address": "127.0.0.1",
+                    "port": 18021,
+                    "inode": 99,
+                },
             ), patch.object(
                 runtime,
                 "listener_inode_owners",
-                return_value={99: {202}},
+                return_value={},
             ), self.assertRaisesRegex(RuntimeError, "incomplete"):
-                runtime.listener_pids(18021, {202}, "model server")
+                runtime.listener_census(18021, {202}, "model server")
+
+            with patch.object(
+                runtime,
+                "tcp_listener_census",
+                return_value={
+                    "source": "/proc/net/tcp",
+                    "family": "ipv4",
+                    "address": "127.0.0.1",
+                    "port": 18021,
+                    "inode": 99,
+                },
+            ), patch.object(
+                runtime,
+                "listener_inode_owners",
+                return_value={99: set()},
+            ), self.assertRaisesRegex(RuntimeError, "incomplete"):
+                runtime.listener_census(18021, {202}, "model server")
 
     def test_shared_pool_producer_output_passes_the_exact_preflight_validator(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -1414,8 +1573,24 @@ class SharedModelPoolProductionTest(unittest.TestCase):
                 selected_live={
                     "server_target_pids": [303],
                     "server_listener_pids": [303],
+                    "server_listener_census": {
+                        "source": "/proc/net/tcp",
+                        "family": "ipv4",
+                        "address": "127.0.0.1",
+                        "port": 18021,
+                        "inode": 99,
+                        "owner_pids": [303],
+                    },
                     "proxy_target_pids": [403],
                     "proxy_listener_pids": [403],
+                    "proxy_listener_census": {
+                        "source": "/proc/net/tcp",
+                        "family": "ipv4",
+                        "address": "127.0.0.1",
+                        "port": 16383,
+                        "inode": 100,
+                        "owner_pids": [403],
+                    },
                     "proxy_route": {
                         "config_path": "/tmp/proxy-config.json",
                         "config_sha256": "4" * 64,
@@ -1466,6 +1641,39 @@ class SharedModelPoolProductionTest(unittest.TestCase):
                 "PASS",
             )
 
+    def test_preflight_listener_reference_is_receipt_hash_bound(self):
+        with tempfile.TemporaryDirectory() as raw:
+            config, _ = self.shared_config(Path(raw))
+            runtime = LinuxProductionRuntime(config, config.configs)
+            snapshot, _ = cli_test_support.SharedModelPoolPreflightTest.fixture()
+            control = config.run_root / "control"
+            control.mkdir(parents=True)
+            (control / "preflight-snapshot.json").write_bytes(
+                canonical_json_bytes(snapshot)
+            )
+            receipt = {
+                "schema": "swebench_triad_preflight_pass_v1",
+                "status": "PASS",
+                "snapshot_sha256": sha256_json(snapshot),
+                "deployment_commit": "d" * 40,
+                "inner_commit": "a" * 40,
+                "boot_id": "boot-id",
+                "gpu_uuid": "GPU-expected",
+                "docker_daemon_id": "docker-daemon-id",
+                "model_id": "Qwen/Qwen3.5-4B",
+            }
+            receipt_path = control / "preflight-PASS.json"
+            receipt_path.write_bytes(canonical_json_bytes(receipt))
+            reference = runtime.preflight_shared_model_pool_snapshot()
+            self.assertEqual(
+                reference["server_listener_census"]["inode"], 99
+            )
+
+            receipt["snapshot_sha256"] = "0" * 64
+            receipt_path.write_bytes(canonical_json_bytes(receipt))
+            with self.assertRaisesRegex(RuntimeError, "reference drifted"):
+                runtime.preflight_shared_model_pool_snapshot()
+
     def test_each_shared_pool_cell_requires_a_fresh_exact_pool_snapshot(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -1500,7 +1708,7 @@ class SharedModelPoolProductionTest(unittest.TestCase):
                 RuntimeError, "fields drifted"
             ):
                 runtime.run_cell(runtime.by_task[task_index][0], stage, generation=1)
-            live_probe.assert_called_once_with()
+            live_probe.assert_called_once_with(require_preflight_binding=True)
 
     def test_final_audit_reprobes_and_embeds_the_live_shared_pool(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -1536,7 +1744,7 @@ class SharedModelPoolProductionTest(unittest.TestCase):
                 return_value={"status": "PASS"},
             ):
                 receipt = runtime.final_audit()
-            live_probe.assert_called_once_with()
+            live_probe.assert_called_once_with(require_preflight_binding=True)
             exact_contract.assert_called_once_with(
                 pool, "final audit shared model pool snapshot"
             )

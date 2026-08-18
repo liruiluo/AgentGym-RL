@@ -497,10 +497,26 @@ class LivePoolSnapshotValidationTest(unittest.TestCase):
             "server_start_ticks": 3003,
             "server_target_pids": [303],
             "server_listener_pids": [303],
+            "server_listener_census": {
+                "source": "/proc/net/tcp",
+                "family": "ipv4",
+                "address": "127.0.0.1",
+                "port": 18021,
+                "inode": 99,
+                "owner_pids": [303],
+            },
             "proxy_pid": 403,
             "proxy_start_ticks": 4003,
             "proxy_target_pids": [403],
             "proxy_listener_pids": [403],
+            "proxy_listener_census": {
+                "source": "/proc/net/tcp",
+                "family": "ipv4",
+                "address": "127.0.0.1",
+                "port": 16383,
+                "inode": 100,
+                "owner_pids": [403],
+            },
             "proxy_route": {
                 "config_path": "/tmp/proxy-config.json",
                 "config_sha256": "4" * 64,
@@ -537,6 +553,39 @@ class LivePoolSnapshotValidationTest(unittest.TestCase):
         extra_route["proxy_route"]["unexpected"] = True
         with self.assertRaisesRegex(RuntimeError, "proxy route fields"):
             validate_live_pool_snapshot(extra_route, replica, "test")
+
+        for field, value in (
+            ("source", "/proc/net/tcp6"),
+            ("family", "ipv6"),
+            ("address", "::1"),
+            ("port", 18022),
+        ):
+            with self.subTest(field=field):
+                forged = copy.deepcopy(snapshot)
+                forged["server_listener_census"][field] = value
+                with self.assertRaisesRegex(RuntimeError, "listener census"):
+                    validate_live_pool_snapshot(forged, replica, "test")
+
+        inode_drift = copy.deepcopy(snapshot)
+        inode_drift["server_listener_census"]["inode"] = 101
+        with self.assertRaisesRegex(RuntimeError, "listener census drifted"):
+            validate_live_pool_snapshot(
+                inode_drift,
+                replica,
+                "test",
+                listener_reference=snapshot,
+            )
+
+        for change in ("missing", "extra"):
+            with self.subTest(change=change):
+                malformed = copy.deepcopy(snapshot)
+                census = malformed["proxy_listener_census"]
+                if change == "missing":
+                    census.pop("inode")
+                else:
+                    census["unexpected"] = True
+                with self.assertRaisesRegex(RuntimeError, "listener census fields"):
+                    validate_live_pool_snapshot(malformed, replica, "test")
 
 
 class SharedPoolCleanupTest(unittest.TestCase):

@@ -82,6 +82,9 @@ from .runtime_factory import (
 from .shared_pool_contract import (
     SHARED_MODEL_POOL_ASSIGNMENT,
     SHARED_MODEL_POOL_CLEANUP,
+    SHARED_MODEL_POOL_LISTENER_ADDRESS,
+    SHARED_MODEL_POOL_LISTENER_FAMILY,
+    SHARED_MODEL_POOL_LISTENER_SOURCE,
     validate_shared_model_pool_snapshot,
 )
 from .state import CellKey, OwnerIdentity, sha256_json
@@ -516,8 +519,10 @@ def shared_model_pool_snapshot_receipt(
         "proxy_start_ticks": proxy["start_ticks"],
         "server_target_pids": selected_live["server_target_pids"],
         "server_listener_pids": selected_live["server_listener_pids"],
+        "server_listener_census": selected_live["server_listener_census"],
         "proxy_target_pids": selected_live["proxy_target_pids"],
         "proxy_listener_pids": selected_live["proxy_listener_pids"],
+        "proxy_listener_census": selected_live["proxy_listener_census"],
         "proxy_route": selected_live["proxy_route"],
         "assigned_gpu_process_pids": list(assigned_gpu_process_pids),
         "all_replicas_alive": live_replica_count == shared["replica_count"],
@@ -1390,30 +1395,78 @@ class LinuxProductionRuntime:
         )
 
     @staticmethod
-    def tcp_listener_inodes(port: int) -> set[int]:
+    def tcp_listener_census(port: int) -> dict[str, Any]:
         if type(port) is not int or not 1 <= port <= 65535:
             raise ValueError("TCP listener port is invalid")
-        inodes: set[int] = set()
-        for table in (Path("/proc/net/tcp"), Path("/proc/net/tcp6")):
+        listeners: list[dict[str, Any]] = []
+        tables = (
+            (
+                Path(SHARED_MODEL_POOL_LISTENER_SOURCE),
+                SHARED_MODEL_POOL_LISTENER_FAMILY,
+                socket.AF_INET,
+            ),
+            (Path("/proc/net/tcp6"), "ipv6", socket.AF_INET6),
+        )
+        for table, family, address_family in tables:
             try:
-                rows = table.read_text(encoding="ascii").splitlines()[1:]
+                rows = table.read_text(encoding="ascii").splitlines()
             except OSError as error:
                 raise RuntimeError("TCP listener census is unavailable") from error
-            for row in rows:
+            if not rows or rows[0].split()[:2] != ["sl", "local_address"]:
+                raise RuntimeError("TCP listener census header is malformed")
+            for row in rows[1:]:
+                if not row.strip():
+                    continue
                 fields = row.split()
                 if len(fields) < 10:
                     raise RuntimeError("TCP listener census row is malformed")
                 local = fields[1]
                 try:
-                    local_port = int(local.rsplit(":", 1)[1], 16)
+                    raw_address, separator, raw_port = local.partition(":")
+                    if not separator or ":" in raw_port:
+                        raise ValueError("invalid local endpoint")
+                    packed = bytes.fromhex(raw_address)
+                    if family == SHARED_MODEL_POOL_LISTENER_FAMILY:
+                        if len(packed) != 4:
+                            raise ValueError("invalid IPv4 address")
+                        packed = packed[::-1]
+                    else:
+                        if len(packed) != 16:
+                            raise ValueError("invalid IPv6 address")
+                        packed = b"".join(
+                            packed[index : index + 4][::-1]
+                            for index in range(0, 16, 4)
+                        )
+                    address = socket.inet_ntop(address_family, packed)
+                    local_port = int(raw_port, 16)
                     inode = int(fields[9])
-                except (IndexError, ValueError) as error:
+                except (OSError, ValueError) as error:
                     raise RuntimeError("TCP listener census row is invalid") from error
-                if fields[3] == "0A" and local_port == port and inode > 0:
-                    inodes.add(inode)
-        if not inodes:
+                if fields[3] == "0A" and local_port == port:
+                    listeners.append(
+                        {
+                            "source": str(table),
+                            "family": family,
+                            "address": address,
+                            "port": local_port,
+                            "inode": inode,
+                        }
+                    )
+        if not listeners:
             raise RuntimeError("expected TCP listener is absent")
-        return inodes
+        if len(listeners) != 1:
+            raise RuntimeError("expected TCP listener census is ambiguous")
+        listener = listeners[0]
+        if (
+            listener["source"] != SHARED_MODEL_POOL_LISTENER_SOURCE
+            or listener["family"] != SHARED_MODEL_POOL_LISTENER_FAMILY
+            or listener["address"] != SHARED_MODEL_POOL_LISTENER_ADDRESS
+            or listener["port"] != port
+            or type(listener["inode"]) is not int
+            or listener["inode"] <= 0
+        ):
+            raise RuntimeError("expected TCP listener is not exact IPv4 loopback")
+        return listener
 
     @staticmethod
     def listener_inode_owners(listener_inodes: set[int]) -> dict[int, set[int]]:
@@ -1470,12 +1523,15 @@ class LinuxProductionRuntime:
             raise RuntimeError(f"{label} target process is absent")
         return matches, tree
 
-    def listener_pids(
+    def listener_census(
         self, port: int, candidate_pids: set[int], label: str
-    ) -> list[int]:
-        if not candidate_pids or any(type(pid) is not int or pid <= 0 for pid in candidate_pids):
+    ) -> dict[str, Any]:
+        if not candidate_pids or any(
+            type(pid) is not int or pid <= 0 for pid in candidate_pids
+        ):
             raise RuntimeError(f"{label} process tree is invalid")
-        listener_inodes = self.tcp_listener_inodes(port)
+        listener = self.tcp_listener_census(port)
+        listener_inodes = {listener["inode"]}
         owners_by_inode = self.listener_inode_owners(listener_inodes)
         if (
             not isinstance(owners_by_inode, Mapping)
@@ -1493,7 +1549,12 @@ class LinuxProductionRuntime:
             raise RuntimeError(
                 f"{label} listener escaped its process tree through a foreign owner"
             )
-        return sorted(owners)
+        return {**listener, "owner_pids": sorted(owners)}
+
+    def listener_pids(
+        self, port: int, candidate_pids: set[int], label: str
+    ) -> list[int]:
+        return self.listener_census(port, candidate_pids, label)["owner_pids"]
 
     @staticmethod
     def gpu_compute_bindings() -> dict[int, str]:
@@ -1518,7 +1579,46 @@ class LinuxProductionRuntime:
                 raise RuntimeError("GPU process appeared on multiple GPUs")
         return bindings
 
-    def shared_model_pool_snapshot(self) -> dict[str, Any]:
+    def preflight_shared_model_pool_snapshot(self) -> Mapping[str, Any]:
+        snapshot_path = self.config.run_root / "control" / "preflight-snapshot.json"
+        receipt_path = self.config.run_root / "control" / "preflight-PASS.json"
+        try:
+            snapshot = read_json(snapshot_path)
+            receipt = read_json(receipt_path)
+        except (OSError, RuntimeError) as error:
+            raise RuntimeError(
+                "shared model pool preflight reference is unavailable"
+            ) from error
+        receipt_fields = {
+            "schema",
+            "status",
+            "snapshot_sha256",
+            "deployment_commit",
+            "inner_commit",
+            "boot_id",
+            "gpu_uuid",
+            "docker_daemon_id",
+            "model_id",
+        }
+        if (
+            not isinstance(snapshot, Mapping)
+            or not isinstance(receipt, Mapping)
+            or set(receipt) != receipt_fields
+            or receipt.get("schema") != "swebench_triad_preflight_pass_v1"
+            or receipt.get("status") != "PASS"
+            or receipt.get("snapshot_sha256") != sha256_json(snapshot)
+        ):
+            raise RuntimeError("shared model pool preflight reference drifted")
+        return validate_shared_model_pool_snapshot(
+            snapshot.get("shared_model_pool"),
+            "preflight shared model pool snapshot",
+        )
+
+    def shared_model_pool_snapshot(
+        self, *, require_preflight_binding: bool = False
+    ) -> dict[str, Any]:
+        if type(require_preflight_binding) is not bool:
+            raise TypeError("preflight listener binding policy must be boolean")
         shared = self.config.shared_model_pool
         if shared is None:
             raise RuntimeError("shared model pool was not configured")
@@ -1640,9 +1740,10 @@ class LinuxProductionRuntime:
             server_target_pids, server_tree = self.target_process_pids(
                 server_pid, server_target, "model server"
             )
-            server_listener_pids = self.listener_pids(
+            server_listener_census = self.listener_census(
                 model_port, server_target_pids, "model server"
             )
+            server_listener_pids = server_listener_census["owner_pids"]
 
             proxy_target = exact_token_proxy_target(proxy_argv)
             proxy_route = validate_exact_token_proxy_config(
@@ -1656,9 +1757,10 @@ class LinuxProductionRuntime:
             proxy_target_pids, proxy_tree = self.target_process_pids(
                 proxy_pid, proxy_target, "exact-token proxy"
             )
-            proxy_listener_pids = self.listener_pids(
+            proxy_listener_census = self.listener_census(
                 proxy_port, proxy_target_pids, "exact-token proxy"
             )
+            proxy_listener_pids = proxy_listener_census["owner_pids"]
 
             registry = http_json(f"http://127.0.0.1:{model_port}/v1/models")
             data = registry.get("data")
@@ -1694,10 +1796,12 @@ class LinuxProductionRuntime:
                 "server_start_ticks": server_ticks,
                 "server_target_pids": sorted(server_target_pids),
                 "server_listener_pids": server_listener_pids,
+                "server_listener_census": server_listener_census,
                 "proxy_pid": proxy_pid,
                 "proxy_start_ticks": proxy_ticks,
                 "proxy_target_pids": sorted(proxy_target_pids),
                 "proxy_listener_pids": proxy_listener_pids,
+                "proxy_listener_census": proxy_listener_census,
                 "proxy_route": dict(proxy_route),
             }
             live_processes.append(live)
@@ -1724,7 +1828,7 @@ class LinuxProductionRuntime:
             gpu_bindings[pid] != shared["gpu_uuid"] for pid in assigned_gpu_pids
         ):
             raise RuntimeError("assigned model process tree is not GPU-bound")
-        return shared_model_pool_snapshot_receipt(
+        snapshot = shared_model_pool_snapshot_receipt(
             shared,
             readiness_sha256=readiness_sha,
             marker_lease_sha256=marker_sha,
@@ -1733,6 +1837,15 @@ class LinuxProductionRuntime:
             assigned_gpu_process_pids=assigned_gpu_pids,
             live_replica_count=len(live_processes),
         )
+        if require_preflight_binding:
+            snapshot = dict(
+                validate_shared_model_pool_snapshot(
+                    snapshot,
+                    "live shared model pool snapshot",
+                    listener_reference=self.preflight_shared_model_pool_snapshot(),
+                )
+            )
+        return snapshot
 
     def model_process_snapshot(
         self, shared_pool: Mapping[str, Any] | None = None
@@ -2723,7 +2836,7 @@ class LinuxProductionRuntime:
                     "task was routed to the wrong shared-model replica"
                 )
             live_pool = validate_shared_model_pool_snapshot(
-                self.shared_model_pool_snapshot(),
+                self.shared_model_pool_snapshot(require_preflight_binding=True),
                 "cell runtime shared model pool snapshot",
             )
             if live_pool.get("replica_index") != expected_replica:
@@ -4425,7 +4538,7 @@ class LinuxProductionRuntime:
         if self.config.shared_model_pool is not None:
             shared_pool = dict(
                 validate_shared_model_pool_snapshot(
-                    self.shared_model_pool_snapshot(),
+                    self.shared_model_pool_snapshot(require_preflight_binding=True),
                     "final audit shared model pool snapshot",
                 )
             )
