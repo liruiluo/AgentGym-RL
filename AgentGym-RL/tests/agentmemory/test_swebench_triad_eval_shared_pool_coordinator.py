@@ -25,11 +25,13 @@ from swebench_triad_eval.state import (
     sha256_json,
 )
 from swebench_triad_eval.shared_pool_coordinator import (
+    DIGEST_RECONCILIATION_SCHEMA,
     INDEX_SCHEMA,
     ETA_PROGRESS_SCHEMA,
     ETA_RECEIPT_SCHEMA,
     FULL_RUN_TIMING_SCHEMA,
     STOP_MARKER_SCHEMA,
+    STARTUP_BARRIER_SCHEMA,
     TIMING_BUDGET_SECONDS,
     WORKERS_COMPLETE_SCHEMA,
     TIMING_REQUIRED_METRICS,
@@ -42,6 +44,7 @@ from swebench_triad_eval.shared_pool_coordinator import (
     _eta_trigger_reasons,
     _extract_startup_reconciliation,
     _load_cell_timing,
+    _load_or_create_full_run_journal,
     _publish_eta_check,
     _reconcile_eta_history,
     _validate_eta_cadence,
@@ -1043,6 +1046,49 @@ class AtomicReceiptContractTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "canonical atomic"):
                 load_atomic_object(path, "fixture")
 
+    def test_atomic_loader_rejects_traversal_symlink_parent_and_nonregular(self):
+        with tempfile.TemporaryDirectory() as raw:
+            parent = Path(raw)
+            root = parent / "attempt"
+            eta = root / "control" / "eta"
+            eta.mkdir(parents=True)
+            outside = parent / "outside.json"
+            atomic_write_json(outside, {"status": "PASS"})
+            traversal = eta / ".." / ".." / ".." / "outside.json"
+            with self.assertRaisesRegex(RuntimeError, "escapes"):
+                load_atomic_object(
+                    traversal,
+                    "full-run ETA progress",
+                    root=root,
+                )
+
+            linked_parent = root / "control" / "linked-eta"
+            linked_parent.symlink_to(parent, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "real regular file"):
+                load_atomic_object(
+                    linked_parent / outside.name,
+                    "full-run ETA receipt",
+                    root=root,
+                )
+
+            directory = eta / "progress-000001.json"
+            directory.mkdir()
+            with self.assertRaisesRegex(RuntimeError, "real regular file"):
+                load_atomic_object(
+                    directory,
+                    "full-run ETA progress",
+                    root=root,
+                )
+
+            fifo = eta / "check-000001.json"
+            os.mkfifo(fifo)
+            with self.assertRaisesRegex(RuntimeError, "real regular file"):
+                load_atomic_object(
+                    fifo,
+                    "full-run ETA receipt",
+                    root=root,
+                )
+
 
 def fake_runtime_slot(task_index: int, slot_index: int) -> RuntimeLaneToken:
     return RuntimeLaneToken(
@@ -1147,6 +1193,191 @@ with digest_lease_admission(
                         self.fail("post-SIGKILL waiter was admitted")
                 receipt = reconcile_digest_occupants(root)
                 self.assertEqual(receipt["stale_occupants"], 1)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+
+    def test_real_sigkill_all_eight_recovery_preserves_barrier_and_reopens(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            control = root / "control"
+            control.mkdir()
+            index_path = root / "index.json"
+            index_path.write_text("fixture-index")
+            replicas = tuple(
+                ReplicaConfig(
+                    replica_index=index,
+                    gpu_uuid=f"GPU-{index}",
+                    path=root / f"config-{index}.json",
+                    production=SimpleNamespace(),
+                    task_indices=(200 + index,),
+                )
+                for index in range(8)
+            )
+            for replica in replicas:
+                replica.path.write_text(f"config-{replica.replica_index}")
+            config = CoordinatorConfig(index_path, root, replicas, ())
+            barrier = {
+                "schema": STARTUP_BARRIER_SCHEMA,
+                "status": "PASS",
+                "replica_count": 8,
+                "task_slots_per_replica": 2,
+                "all_slots_held_during_reconciliation": True,
+                "startup_reconciliation_complete": True,
+                "coordinator_index_sha256": hashlib.sha256(
+                    index_path.read_bytes()
+                ).hexdigest(),
+                "replica_config_sha256s": [
+                    hashlib.sha256(replica.path.read_bytes()).hexdigest()
+                    for replica in replicas
+                ],
+                "reconciliations": [{} for _ in replicas],
+                "shared_image_reconciliation": {
+                    "status": "PASS",
+                    "remaining_images": 0,
+                },
+                "digest_lease_reconciliation": {
+                    "schema": DIGEST_RECONCILIATION_SCHEMA,
+                    "status": "PASS",
+                    "all_eight_replica_lanes_held": True,
+                },
+                "replicas": [{} for _ in replicas],
+            }
+            barrier_path = control / "preflight-all.json"
+            atomic_write_json(barrier_path, barrier)
+            barrier_before = barrier_path.read_bytes()
+            barrier_sha256 = hashlib.sha256(barrier_before).hexdigest()
+            ready = root / "sigkill-ready"
+            child = f"""
+import os
+from pathlib import Path
+import signal
+from swebench_triad_eval.shared_pool_coordinator import digest_lease_admission
+from swebench_triad_eval.state import OwnerIdentity, RuntimeLaneToken
+root = Path({raw!r})
+slot = RuntimeLaneToken(
+    driver_key='1' * 64,
+    lease_id='2' * 64,
+    owner=OwnerIdentity('host', 'boot', os.getpid(), 1),
+    task_index=183,
+    slot_index=0,
+    server_port=18100,
+    generation=1,
+    fencing_token='3' * 64,
+)
+with digest_lease_admission(
+    coordinator_root=root,
+    image_digest={'sha256:' + 'd' * 64!r},
+    task_index=183,
+    replica_index=4,
+    startup_barrier_sha256={barrier_sha256!r},
+    slot=slot,
+):
+    Path({str(ready)!r}).write_text('ready')
+    signal.pause()
+"""
+            process = subprocess.Popen([sys.executable, "-c", child])
+            try:
+                deadline = time.monotonic() + 5
+                while not ready.exists() and process.poll() is None:
+                    if time.monotonic() >= deadline:
+                        self.fail("SIGKILL fixture did not acquire its occupant")
+                    time.sleep(0.01)
+                os.kill(process.pid, signal.SIGKILL)
+                self.assertEqual(process.wait(timeout=5), -signal.SIGKILL)
+                occupant = (
+                    root
+                    / "control"
+                    / "image-leases"
+                    / ("d" * 64 + ".occupant.json")
+                )
+                self.assertTrue(occupant.is_file())
+
+                events = []
+                drivers = {}
+
+                class Registry:
+                    def __init__(self, index):
+                        self.index = index
+
+                    def release(self):
+                        events.append(("release", self.index))
+
+                class Driver:
+                    def __init__(self, replica):
+                        self.replica = replica
+                        self.index = replica.replica_index
+                        self.lease_registry = Registry(self.index)
+                        self.operations = self
+
+                    def acquire_runtime_lane(self, task_index, *, slot_index):
+                        self.assert_no_task(task_index)
+                        events.append(("acquire", self.index, slot_index))
+
+                    @staticmethod
+                    def assert_no_task(task_index):
+                        if task_index is not None:
+                            raise AssertionError("recovery did not fence a whole lane")
+
+                    def reconcile_dead_work(self, *, allow_foreign_loaded_images):
+                        if len([event for event in events if event[0] == "acquire"]) != 16:
+                            raise AssertionError("reconciled before all lanes were held")
+                        if allow_foreign_loaded_images is not True:
+                            raise AssertionError("cross-root images were not deferred")
+                        events.append(("reconcile", self.index))
+                        return startup_reconciliation(
+                            self.replica.task_indices[0]
+                        )
+
+                    def reconcile_unbound_loaded_images(self):
+                        if self.index != 0:
+                            raise AssertionError("shared image owner drifted")
+                        if len([event for event in events if event[0] == "reconcile"]) != 8:
+                            raise AssertionError("shared images reconciled too early")
+                        events.append(("shared-images", self.index))
+                        return {"status": "PASS", "remaining_images": 0}
+
+                for replica in replicas:
+                    drivers[str(replica.path)] = Driver(replica)
+                with patch(
+                    "swebench_triad_eval.shared_pool_coordinator.driver_from_config",
+                    side_effect=lambda path, **_kwargs: drivers[str(path)],
+                ):
+                    receipt = reconcile_all_eight_before_workers(
+                        config,
+                        phase="full",
+                        startup_barrier_sha256=barrier_sha256,
+                    )
+                self.assertEqual(
+                    receipt["digest_lease_reconciliation"]["stale_occupants"],
+                    1,
+                )
+                self.assertEqual(
+                    [event[0] for event in events[:16]],
+                    ["acquire"] * 16,
+                )
+                self.assertEqual(barrier_path.read_bytes(), barrier_before)
+                self.assertFalse(occupant.exists())
+                successor = RuntimeLaneToken(
+                    driver_key="4" * 64,
+                    lease_id="5" * 64,
+                    owner=OwnerIdentity("host", "boot", os.getpid(), 2),
+                    task_index=184,
+                    slot_index=1,
+                    server_port=18101,
+                    generation=2,
+                    fencing_token="6" * 64,
+                )
+                with digest_lease_admission(
+                    coordinator_root=root,
+                    image_digest="sha256:" + "d" * 64,
+                    task_index=184,
+                    replica_index=5,
+                    startup_barrier_sha256=barrier_sha256,
+                    slot=successor,
+                ):
+                    self.assertTrue(occupant.is_file())
             finally:
                 if process.poll() is None:
                     process.kill()
@@ -1951,6 +2182,110 @@ class FullRunTransactionRestartTest(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertNotEqual(rows[0]["path"], second["path"])
 
+    def test_progress_receipt_and_journal_bound_restart_states_are_stable(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            config = SimpleNamespace(root=root)
+            journal = self.journal(root)
+            published = _publish_eta_check(
+                config,
+                journal=journal,
+                check_index=1,
+                observed_wall_ns=11_000_000_000,
+                completed_tasks=set(range(25)),
+                trigger_reasons=["cell_interval"],
+                prior_consecutive=0,
+            )
+            progress_before = _eta_progress_path(root, 1).read_bytes()
+            receipt_before = _eta_receipt_path(root, 1).read_bytes()
+            self.assertEqual(journal["eta_checks"], [])
+            rows, elapsed, cells, consecutive = _reconcile_eta_history(
+                config,
+                journal,
+            )
+            self.assertEqual((len(rows), elapsed, cells, consecutive), (1, 10.0, 75, 0))
+            self.assertEqual(
+                journal["eta_checks"],
+                [{"path": published["path"], "sha256": published["sha256"]}],
+            )
+            rows, elapsed, cells, consecutive = _reconcile_eta_history(
+                config,
+                journal,
+            )
+            self.assertEqual((len(rows), elapsed, cells, consecutive), (1, 10.0, 75, 0))
+            self.assertEqual(_eta_progress_path(root, 1).read_bytes(), progress_before)
+            self.assertEqual(_eta_receipt_path(root, 1).read_bytes(), receipt_before)
+
+    def test_restart_rejects_symlink_backed_eta_evidence_and_journal(self):
+        with tempfile.TemporaryDirectory() as raw:
+            parent = Path(raw)
+            root = parent / "attempt"
+            config = SimpleNamespace(root=root)
+            journal = self.journal(root)
+            outside = parent / "outside-progress.json"
+            progress = {
+                "schema": ETA_PROGRESS_SCHEMA,
+                "status": "PASS",
+                "check_index": 1,
+                "observed_wall_ns": 11_000_000_000,
+                "elapsed_seconds": 10.0,
+                "baseline_task_indices_sha256": sha256_json(
+                    {"baseline_task_indices": []}
+                ),
+                "completed_task_indices": list(range(25)),
+                "new_completed_task_indices": list(range(25)),
+                "baseline_completed_tasks": 0,
+                "baseline_completed_cells": 0,
+                "new_completed_tasks": 25,
+                "new_completed_cells": 75,
+                "remaining_cells_at_launch": 1500,
+                "trigger_reasons": ["cell_interval"],
+                "timing_gate_sha256": "a" * 64,
+            }
+            atomic_write_json(outside, progress)
+            progress_path = _eta_progress_path(root, 1)
+            progress_path.parent.mkdir(parents=True)
+            progress_path.symlink_to(outside)
+            with self.assertRaisesRegex(RuntimeError, "real regular file"):
+                _reconcile_eta_history(config, journal)
+
+        with tempfile.TemporaryDirectory() as raw:
+            parent = Path(raw)
+            root = parent / "attempt"
+            config = SimpleNamespace(root=root)
+            journal = self.journal(root)
+            progress_path = _eta_progress_path(root, 1)
+            atomic_write_json(progress_path, progress)
+            outside = parent / "outside-receipt.json"
+            receipt = _eta_receipt_from_progress(
+                progress,
+                progress_path=progress_path,
+                root=root,
+                prior_consecutive=0,
+            )
+            atomic_write_json(outside, receipt)
+            receipt_path = _eta_receipt_path(root, 1)
+            receipt_path.symlink_to(outside)
+            with self.assertRaisesRegex(RuntimeError, "real regular file"):
+                _reconcile_eta_history(config, journal)
+
+        with tempfile.TemporaryDirectory() as raw:
+            parent = Path(raw)
+            root = parent / "attempt"
+            root.mkdir()
+            outside = parent / "outside-journal.json"
+            journal = self.journal(root)
+            atomic_write_json(outside, journal)
+            journal_path = root / "control" / "full-run-transaction.json"
+            journal_path.parent.mkdir()
+            journal_path.symlink_to(outside)
+            config = SimpleNamespace(root=root, replicas=())
+            with self.assertRaisesRegex(RuntimeError, "real regular file"):
+                _load_or_create_full_run_journal(
+                    config,
+                    timing_gate_sha256="a" * 64,
+                )
+
     def test_gap_duplicate_and_reordered_progress_are_rejected(self):
         base = {
             "new_completed_cells": 300,
@@ -1994,7 +2329,136 @@ class FullRunTransactionRestartTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "reordered"):
             _validate_eta_cadence(duplicate, prior_elapsed=20.0, prior_cells=100)
 
-    def test_polling_overshoot_is_published_and_restart_consistent(self):
+    def test_event_boundary_cadence_edges_fail_closed(self):
+        for cells in (74, 75, 76, 119, 120, 121):
+            with self.subTest(cells=cells, final=False):
+                row = {
+                    "new_completed_cells": cells,
+                    "remaining_cells_at_launch": 1500,
+                    "elapsed_seconds": 10.0,
+                    "trigger_reasons": ["cell_interval"] if cells >= 75 else [],
+                }
+                if cells == 75:
+                    _validate_eta_cadence(
+                        row,
+                        prior_elapsed=0.0,
+                        prior_cells=0,
+                    )
+                elif cells == 74:
+                    with self.assertRaisesRegex(RuntimeError, "no threshold"):
+                        _validate_eta_cadence(
+                            row,
+                            prior_elapsed=0.0,
+                            prior_cells=0,
+                        )
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "mandatory cadence"):
+                        _validate_eta_cadence(
+                            row,
+                            prior_elapsed=0.0,
+                            prior_cells=0,
+                        )
+            with self.subTest(cells=cells, final=True):
+                final_row = {
+                    "new_completed_cells": cells,
+                    "remaining_cells_at_launch": cells,
+                    "elapsed_seconds": 10.0,
+                    "trigger_reasons": (
+                        ["cell_interval", "final_completion"]
+                        if cells >= 75
+                        else ["final_completion"]
+                    ),
+                }
+                if cells <= 75:
+                    _validate_eta_cadence(
+                        final_row,
+                        prior_elapsed=0.0,
+                        prior_cells=0,
+                        require_final=True,
+                    )
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "mandatory cadence"):
+                        _validate_eta_cadence(
+                            final_row,
+                            prior_elapsed=0.0,
+                            prior_cells=0,
+                            require_final=True,
+                        )
+
+    def test_receipt_without_progress_and_nonregular_eta_entries_fail_closed(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            atomic_write_json(_eta_receipt_path(root, 1), {"invalid": True})
+            with self.assertRaisesRegex(RuntimeError, "lacks its progress"):
+                _reconcile_eta_history(
+                    SimpleNamespace(root=root),
+                    self.journal(root),
+                )
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            progress_path = _eta_progress_path(root, 1)
+            progress_path.mkdir(parents=True)
+            with self.assertRaisesRegex(RuntimeError, "real regular file"):
+                _reconcile_eta_history(
+                    SimpleNamespace(root=root),
+                    self.journal(root),
+                )
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            journal_path = root / "control" / "full-run-transaction.json"
+            journal_path.mkdir(parents=True)
+            with self.assertRaisesRegex(RuntimeError, "real regular file"):
+                _load_or_create_full_run_journal(
+                    SimpleNamespace(root=root, replicas=()),
+                    timing_gate_sha256="a" * 64,
+                )
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            journal = self.journal(root)
+            progress = {
+                "schema": ETA_PROGRESS_SCHEMA,
+                "status": "PASS",
+                "check_index": 1,
+                "observed_wall_ns": 11_000_000_000,
+                "elapsed_seconds": 10.0,
+                "baseline_task_indices_sha256": sha256_json(
+                    {"baseline_task_indices": []}
+                ),
+                "completed_task_indices": list(range(25)),
+                "new_completed_task_indices": list(range(25)),
+                "baseline_completed_tasks": 0,
+                "baseline_completed_cells": 0,
+                "new_completed_tasks": 25,
+                "new_completed_cells": 75,
+                "remaining_cells_at_launch": 1500,
+                "trigger_reasons": ["cell_interval"],
+                "timing_gate_sha256": "a" * 64,
+            }
+            progress_path = _eta_progress_path(root, 1)
+            atomic_write_json(progress_path, progress)
+            receipt = _eta_receipt_from_progress(
+                progress,
+                progress_path=progress_path,
+                root=root,
+                prior_consecutive=0,
+            )
+            receipt["progress_snapshot_path"] = str(
+                root / "control" / "eta" / ".." / ".." / "outside.json"
+            )
+            atomic_write_json(_eta_receipt_path(root, 1), receipt)
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "immutable state|identity drifted",
+            ):
+                _reconcile_eta_history(
+                    SimpleNamespace(root=root),
+                    journal,
+                )
+
+    def test_72_to_78_crossing_publishes_at_the_serialized_event_boundary(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             config = SimpleNamespace(root=root)
@@ -2013,7 +2477,7 @@ class FullRunTransactionRestartTest(unittest.TestCase):
             reasons = _eta_trigger_reasons(
                 elapsed_seconds=10.0,
                 prior_elapsed_seconds=0.0,
-                completed_cells=78,
+                completed_cells=75,
                 prior_completed_cells=0,
                 remaining_cells_at_launch=1500,
                 workers_pending=True,
@@ -2024,15 +2488,26 @@ class FullRunTransactionRestartTest(unittest.TestCase):
                 journal=journal,
                 check_index=1,
                 observed_wall_ns=11_000_000_000,
-                completed_tasks=set(range(26)),
+                completed_tasks=set(range(25)),
                 trigger_reasons=reasons,
                 prior_consecutive=0,
             )
-            self.assertEqual(published["progress"]["new_completed_cells"], 78)
+            self.assertEqual(published["progress"]["new_completed_cells"], 75)
+            self.assertEqual(
+                _eta_trigger_reasons(
+                    elapsed_seconds=10.1,
+                    prior_elapsed_seconds=10.0,
+                    completed_cells=78,
+                    prior_completed_cells=75,
+                    remaining_cells_at_launch=1500,
+                    workers_pending=True,
+                ),
+                [],
+            )
             rows, elapsed, cells, consecutive = _reconcile_eta_history(
                 config, journal
             )
-            self.assertEqual((len(rows), elapsed, cells, consecutive), (1, 10.0, 78, 0))
+            self.assertEqual((len(rows), elapsed, cells, consecutive), (1, 10.0, 75, 0))
 
     def test_final_coverage_is_durable_while_workers_are_pending(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -2084,6 +2559,148 @@ class FullRunTransactionRestartTest(unittest.TestCase):
                     prior_consecutive=0,
                 )
             self.assertFalse(_eta_progress_path(root, 1).exists())
+
+    def test_all_eight_c2_multiwave_publishes_before_the_coordinator_poll(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            progress_root = root / "progress"
+            progress_root.mkdir()
+            baseline = list(range(452))
+            replicas = []
+            drivers = {}
+            worker_args = []
+
+            class Driver:
+                lease_registry = None
+
+                def __init__(self, completion_root, replica_tasks):
+                    self.completion_root = completion_root
+                    self.completion_root.mkdir()
+                    for task_index in replica_tasks:
+                        if task_index < 452:
+                            atomic_write_json(
+                                self.task_completion_path(task_index),
+                                {"task_index": task_index},
+                            )
+
+                @staticmethod
+                def ensure_driver_lease():
+                    return None
+
+                @staticmethod
+                def _read_validated_preflight():
+                    return None
+
+                def task_completion_path(self, task_index):
+                    return self.completion_root / f"task-{task_index:04d}.json"
+
+                def load_task_completion(self, task_index):
+                    return json.loads(
+                        self.task_completion_path(task_index).read_text()
+                    )
+
+                def run_task(self, task_index, **_kwargs):
+                    atomic_write_json(
+                        self.task_completion_path(task_index),
+                        {"task_index": task_index},
+                    )
+
+            for replica_index in range(8):
+                replica_tasks = tuple(range(replica_index, 500, 8))
+                new_tasks = tuple(task for task in replica_tasks if task >= 452)
+                replica = SimpleNamespace(
+                    replica_index=replica_index,
+                    task_indices=replica_tasks,
+                )
+                replicas.append(replica)
+                config_path = root / f"replica-{replica_index}.json"
+                config_path.write_text("fixture")
+                drivers[str(config_path)] = Driver(
+                    root / f"completions-{replica_index}",
+                    replica_tasks,
+                )
+                replica_baseline = [
+                    task for task in replica_tasks if task < 452
+                ]
+                atomic_write_json(
+                    progress_root / f"replica-{replica_index}.json",
+                    {
+                        "schema": "amg_swebench_shared_pool_progress_v2",
+                        "status": "RUNNING",
+                        "replica_index": replica_index,
+                        "completed_task_indices": replica_baseline,
+                    },
+                )
+                worker_args.append(
+                    (
+                        str(config_path),
+                        new_tasks,
+                        tuple(
+                            "sha256:" + f"{task:064x}" for task in new_tasks
+                        ),
+                        tuple(index % 2 for index, _ in enumerate(new_tasks)),
+                        replica_index,
+                        raw,
+                        "b" * 64,
+                        replica_tasks,
+                    )
+                )
+
+            coordinator_config = SimpleNamespace(
+                path=root / "coordinator-index.json",
+                root=root,
+                replicas=tuple(replicas),
+            )
+            journal = self.journal(root)
+            journal["started_wall_ns"] = time.time_ns()
+            journal["updated_wall_ns"] = journal["started_wall_ns"]
+            journal["baseline_task_indices"] = baseline
+            journal["remaining_cells_at_launch"] = 144
+            atomic_write_json(
+                root / "control" / "full-run-transaction.json",
+                journal,
+            )
+
+            started = time.monotonic()
+            with patch(
+                "swebench_triad_eval.shared_pool_coordinator.require_startup_barrier",
+                return_value={},
+            ), patch(
+                "swebench_triad_eval.shared_pool_coordinator.driver_from_config",
+                side_effect=lambda path, **_kwargs: drivers[str(path)],
+            ), patch.object(
+                CoordinatorConfig,
+                "load",
+                return_value=coordinator_config,
+            ):
+                with ThreadPoolExecutor(max_workers=8) as executor:
+                    futures = [
+                        executor.submit(
+                            _worker,
+                            *args,
+                            coordinator_index_path=str(
+                                coordinator_config.path
+                            ),
+                        )
+                        for args in worker_args
+                    ]
+                    results = [future.result() for future in futures]
+            self.assertLess(time.monotonic() - started, 30.0)
+            self.assertTrue(
+                all(result["completed_tasks"] == 6 for result in results)
+            )
+            persisted_journal = json.loads(
+                (root / "control" / "full-run-transaction.json").read_text()
+            )
+            rows, elapsed, cells, consecutive = _reconcile_eta_history(
+                coordinator_config,
+                persisted_journal,
+            )
+            self.assertEqual([row["progress"]["new_completed_cells"] for row in rows], [75, 144])
+            self.assertEqual(rows[0]["progress"]["trigger_reasons"], ["cell_interval"])
+            self.assertEqual(rows[1]["progress"]["trigger_reasons"], ["final_completion"])
+            self.assertEqual((cells, consecutive), (144, 0))
+            self.assertGreaterEqual(elapsed, 0.0)
 
     def test_partial_stop_boundary_is_never_labeled_final_completion(self):
         partial = _eta_trigger_reasons(
@@ -2223,6 +2840,7 @@ class FullRunTimingBindingTest(unittest.TestCase):
             receipt = _eta_receipt_from_progress(
                 progress,
                 progress_path=progress_path,
+                root=root,
                 prior_consecutive=0,
             )
             atomic_write_json(eta_path, receipt)

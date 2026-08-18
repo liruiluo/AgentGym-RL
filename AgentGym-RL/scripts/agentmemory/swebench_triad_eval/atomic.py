@@ -76,10 +76,39 @@ def write_temp(path: Path, payload: bytes) -> Path:
     return temp
 
 
+def read_regular_bytes(path: Path, label: str) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise RuntimeError(f"cannot read {label}: {path}") from error
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise RuntimeError(f"{label} is not a real regular file: {path}")
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+    finally:
+        os.close(descriptor)
+
+
 def atomic_write_bytes(path: Path | str, payload: bytes) -> Path:
     target = Path(path)
     parent = ensure_private_directory(target.parent)
     target = parent / target.name
+    try:
+        existing = target.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode):
+            raise RuntimeError(
+                f"state target is not a real regular file: {target}"
+            )
     temp = write_temp(target, payload)
     try:
         os.replace(temp, target)
@@ -104,8 +133,18 @@ def write_immutable_bytes(path: Path | str, payload: bytes) -> Path:
             os.link(temp, target, follow_symlinks=False)
         except FileExistsError:
             try:
-                existing = target.read_bytes()
+                info = target.lstat()
             except OSError as error:
+                raise ImmutableConflictError(
+                    f"cannot verify immutable state: {target}"
+                ) from error
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                raise ImmutableConflictError(
+                    f"immutable state is not a real regular file: {target}"
+                )
+            try:
+                existing = read_regular_bytes(target, "immutable state")
+            except RuntimeError as error:
                 raise ImmutableConflictError(
                     f"cannot verify immutable state: {target}"
                 ) from error

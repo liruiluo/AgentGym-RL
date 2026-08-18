@@ -8,10 +8,12 @@ gate before full work, and aggregates exactly 500 x 3 official outcomes.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import hashlib
 import json
 import math
+import os
+import stat
 import statistics
 import threading
 import time
@@ -71,9 +73,6 @@ ETA_CHECK_INTERVAL_SECONDS = 1_800.0
 ETA_CHECK_CELL_COUNT = 75
 ETA_POLL_SECONDS = 30.0
 ETA_CADENCE_TOLERANCE_SECONDS = ETA_POLL_SECONDS * 2
-# After the task that crosses a cadence boundary, every other admitted C=2
-# slot may publish before the coordinator observes the next polling snapshot.
-ETA_CADENCE_TOLERANCE_CELLS = (8 * TASK_SLOTS_PER_REPLICA - 1) * len(ARMS)
 ETA_PROGRESS_SCHEMA = "amg_swebench_full_run_progress_v1"
 ETA_RECEIPT_SCHEMA = "amg_swebench_full_run_eta_v2"
 FULL_RUN_JOURNAL_SCHEMA = "amg_swebench_full_run_transaction_v1"
@@ -114,17 +113,95 @@ def load_canonical_object(path: Path, label: str) -> Mapping[str, Any]:
     return value
 
 
-def load_atomic_object(path: Path, label: str) -> Mapping[str, Any]:
+def _require_real_path_in_root(
+    path: Path,
+    *,
+    root: Path,
+    label: str,
+    regular_file: bool,
+) -> Path:
+    candidate = Path(path)
+    boundary = Path(root)
+    if ".." in candidate.parts:
+        raise RuntimeError(f"{label} escapes its attempt root")
+    candidate_absolute = Path(os.path.abspath(candidate))
+    boundary_absolute = Path(os.path.abspath(boundary))
+    try:
+        relative = candidate_absolute.relative_to(boundary_absolute)
+    except ValueError as error:
+        raise RuntimeError(f"{label} escapes its attempt root") from error
+    try:
+        boundary_info = boundary_absolute.lstat()
+    except OSError as error:
+        raise RuntimeError(f"cannot inspect {label} attempt root") from error
+    if stat.S_ISLNK(boundary_info.st_mode) or not stat.S_ISDIR(
+        boundary_info.st_mode
+    ):
+        raise RuntimeError(f"{label} attempt root is not a real directory")
+    current = boundary_absolute
+    try:
+        for index, component in enumerate(relative.parts):
+            current = current / component
+            info = current.lstat()
+            final = index == len(relative.parts) - 1
+            if stat.S_ISLNK(info.st_mode):
+                raise RuntimeError(f"{label} is not a real regular file")
+            if final:
+                expected = stat.S_ISREG(info.st_mode) if regular_file else stat.S_ISDIR(
+                    info.st_mode
+                )
+                if not expected:
+                    kind = "regular file" if regular_file else "directory"
+                    raise RuntimeError(f"{label} is not a real {kind}")
+            elif not stat.S_ISDIR(info.st_mode):
+                raise RuntimeError(f"{label} parent is not a real directory")
+        resolved = candidate_absolute.resolve(strict=True)
+        boundary_resolved = boundary_absolute.resolve(strict=True)
+        resolved.relative_to(boundary_resolved)
+    except FileNotFoundError as error:
+        raise RuntimeError(f"cannot load {label}") from error
+    except ValueError as error:
+        raise RuntimeError(f"{label} escapes its real attempt root") from error
+    return candidate_absolute
+
+
+def load_atomic_object(
+    path: Path,
+    label: str,
+    *,
+    root: Path | None = None,
+) -> Mapping[str, Any]:
     """Load JSON written by :func:`atomic_write_json` (canonical plus LF)."""
 
+    target = Path(path)
+    if root is not None:
+        target = _require_real_path_in_root(
+            target,
+            root=root,
+            label=label,
+            regular_file=True,
+        )
     try:
-        payload = path.read_bytes()
+        payload = target.read_bytes()
         value = json.loads(payload.decode("utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise RuntimeError(f"cannot load {label}") from error
     if not isinstance(value, Mapping) or atomic_json_bytes(value) != payload:
         raise RuntimeError(f"{label} is not a canonical atomic object")
     return value
+
+
+def _read_real_bytes_in_root(path: Path, *, root: Path, label: str) -> bytes:
+    target = _require_real_path_in_root(
+        path,
+        root=root,
+        label=label,
+        regular_file=True,
+    )
+    try:
+        return target.read_bytes()
+    except OSError as error:
+        raise RuntimeError(f"cannot load {label}") from error
 
 
 def _digest_paths(root: Path, image_digest: str) -> tuple[Path, Path]:
@@ -1084,6 +1161,7 @@ def _worker(
     coordinator_root: str,
     startup_barrier_sha256: str,
     replica_task_indices: tuple[int, ...] | None = None,
+    coordinator_index_path: str | None = None,
 ) -> dict[str, Any]:
     if not (
         len(task_indices)
@@ -1097,6 +1175,11 @@ def _worker(
     ):
         raise ValueError("worker deterministic slot lattice drifted")
     root = Path(coordinator_root)
+    eta_config = None
+    if coordinator_index_path is not None:
+        eta_config = CoordinatorConfig.load(Path(coordinator_index_path))
+        if eta_config.root != root:
+            raise ValueError("worker ETA coordinator root drifted")
     replica_tasks = (
         task_indices
         if replica_task_indices is None
@@ -1183,27 +1266,38 @@ def _worker(
                         slot_dequeued_monotonic_ns=slot_dequeued_monotonic_ns,
                     )
                 slot_completed.append(task_index)
-                with progress_lock:
-                    completed.add(task_index)
-                    invocation_completed.add(task_index)
-                    atomic_write_json(
-                        progress_path,
-                        {
-                            "schema": "amg_swebench_shared_pool_progress_v2",
-                            "status": "RUNNING",
-                            "replica_index": replica_index,
-                            "task_slots_per_replica": TASK_SLOTS_PER_REPLICA,
-                            "completed_task_indices": sorted(completed),
-                            "completed_tasks": len(completed),
-                            "total_tasks": len(replica_tasks),
-                            "last_task_index": task_index,
-                            "last_slot_index": slot_index,
-                            "last_image_config_digest": image_digest,
-                            "wall_seconds": round(
-                                time.monotonic() - started, 6
-                            ),
-                        },
-                    )
+                producer = (
+                    exclusive_lock(_eta_producer_lock_path(root))
+                    if eta_config is not None
+                    else nullcontext()
+                )
+                with producer:
+                    with progress_lock:
+                        completed.add(task_index)
+                        invocation_completed.add(task_index)
+                        atomic_write_json(
+                            progress_path,
+                            {
+                                "schema": "amg_swebench_shared_pool_progress_v2",
+                                "status": "RUNNING",
+                                "replica_index": replica_index,
+                                "task_slots_per_replica": TASK_SLOTS_PER_REPLICA,
+                                "completed_task_indices": sorted(completed),
+                                "completed_tasks": len(completed),
+                                "total_tasks": len(replica_tasks),
+                                "last_task_index": task_index,
+                                "last_slot_index": slot_index,
+                                "last_image_config_digest": image_digest,
+                                "wall_seconds": round(
+                                    time.monotonic() - started, 6
+                                ),
+                            },
+                        )
+                    if eta_config is not None:
+                        _publish_due_eta_locked(
+                            eta_config,
+                            observed_wall_ns=time.time_ns(),
+                        )
                 if full_run_stop_requested(root):
                     break
             return {
@@ -2239,7 +2333,11 @@ def _progress_completed_tasks(config: CoordinatorConfig) -> set[int]:
             if path.is_symlink():
                 raise RuntimeError("full-run progress is a dangling symlink")
             continue
-        value = load_atomic_object(path, "full-run replica progress")
+        value = load_atomic_object(
+            path,
+            "full-run replica progress",
+            root=config.root,
+        )
         rows = value.get("completed_task_indices")
         if (
             value.get("schema")
@@ -2282,6 +2380,10 @@ def full_run_journal_path(root: Path) -> Path:
     return root / "control" / "full-run-transaction.json"
 
 
+def _eta_producer_lock_path(root: Path) -> Path:
+    return root / "control" / "eta-producer.lock"
+
+
 def _eta_progress_path(root: Path, check_index: int) -> Path:
     return root / "control" / "eta" / f"progress-{check_index:06d}.json"
 
@@ -2315,8 +2417,20 @@ def _load_or_create_full_run_journal(
         "full_run_timing_sha256",
         "workers_complete_sha256",
     }
-    if path.exists() or path.is_symlink():
-        value = dict(load_atomic_object(path, "full-run transaction journal"))
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        journal_exists = False
+    else:
+        journal_exists = True
+    if journal_exists:
+        value = dict(
+            load_atomic_object(
+                path,
+                "full-run transaction journal",
+                root=config.root,
+            )
+        )
     else:
         baseline = sorted(_progress_completed_tasks(config))
         if len(baseline) >= 500:
@@ -2478,6 +2592,7 @@ def _eta_receipt_from_progress(
     progress: Mapping[str, Any],
     *,
     progress_path: Path,
+    root: Path,
     prior_consecutive: int,
 ) -> dict[str, Any]:
     projection = _eta_projection(
@@ -2493,7 +2608,11 @@ def _eta_receipt_from_progress(
         "check_index": progress["check_index"],
         "progress_snapshot_path": str(progress_path),
         "progress_snapshot_sha256": hashlib.sha256(
-            progress_path.read_bytes()
+            _read_real_bytes_in_root(
+                progress_path,
+                root=root,
+                label="full-run ETA progress",
+            )
         ).hexdigest(),
         "observed_wall_ns": progress["observed_wall_ns"],
         "elapsed_seconds": progress["elapsed_seconds"],
@@ -2515,11 +2634,13 @@ def _validate_eta_receipt(
     *,
     progress: Mapping[str, Any],
     progress_path: Path,
+    root: Path,
     prior_consecutive: int,
 ) -> None:
     expected = _eta_receipt_from_progress(
         progress,
         progress_path=progress_path,
+        root=root,
         prior_consecutive=prior_consecutive,
     )
     if receipt != expected:
@@ -2537,9 +2658,18 @@ def _publish_eta_check(
     prior_consecutive: int,
 ) -> Mapping[str, Any]:
     progress_path = _eta_progress_path(config.root, check_index)
-    progress_exists = progress_path.exists() or progress_path.is_symlink()
+    try:
+        progress_path.lstat()
+    except FileNotFoundError:
+        progress_exists = False
+    else:
+        progress_exists = True
     if progress_exists:
-        progress = load_atomic_object(progress_path, "full-run ETA progress")
+        progress = load_atomic_object(
+            progress_path,
+            "full-run ETA progress",
+            root=config.root,
+        )
     else:
         baseline = journal["baseline_task_indices"]
         completed = sorted(completed_tasks)
@@ -2573,19 +2703,31 @@ def _publish_eta_check(
     expected = _eta_receipt_from_progress(
         progress,
         progress_path=progress_path,
+        root=config.root,
         prior_consecutive=prior_consecutive,
     )
     write_immutable_json(receipt_path, expected)
-    receipt = load_atomic_object(receipt_path, "full-run ETA receipt")
+    receipt = load_atomic_object(
+        receipt_path,
+        "full-run ETA receipt",
+        root=config.root,
+    )
     _validate_eta_receipt(
         receipt,
         progress=progress,
         progress_path=progress_path,
+        root=config.root,
         prior_consecutive=prior_consecutive,
     )
     return {
         "path": str(receipt_path),
-        "sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+        "sha256": hashlib.sha256(
+            _read_real_bytes_in_root(
+                receipt_path,
+                root=config.root,
+                label="full-run ETA receipt",
+            )
+        ).hexdigest(),
         "receipt": receipt,
         "progress": progress,
     }
@@ -2593,10 +2735,24 @@ def _publish_eta_check(
 
 def _eta_indices(root: Path, prefix: str) -> list[int]:
     directory = root / "control" / "eta"
-    if not directory.exists():
+    try:
+        directory.lstat()
+    except FileNotFoundError:
         return []
+    _require_real_path_in_root(
+        directory,
+        root=root,
+        label="full-run ETA evidence directory",
+        regular_file=False,
+    )
     result = []
     for path in directory.glob(f"{prefix}-*.json"):
+        _require_real_path_in_root(
+            path,
+            root=root,
+            label="full-run ETA evidence",
+            regular_file=True,
+        )
         suffix = path.stem.removeprefix(prefix + "-")
         if len(suffix) != 6 or not suffix.isdigit():
             raise RuntimeError("full-run ETA evidence filename drifted")
@@ -2646,7 +2802,7 @@ def _validate_eta_cadence(
         raise RuntimeError("full-run ETA trigger binding drifted")
     if (
         elapsed_gap > ETA_CHECK_INTERVAL_SECONDS + ETA_CADENCE_TOLERANCE_SECONDS
-        or cell_gap > ETA_CHECK_CELL_COUNT + ETA_CADENCE_TOLERANCE_CELLS
+        or cell_gap > ETA_CHECK_CELL_COUNT
     ):
         raise RuntimeError("full-run ETA mandatory cadence was omitted")
     if not expected_reasons:
@@ -2675,20 +2831,30 @@ def _reconcile_eta_history(
     rows = []
     for index in progress_indices:
         progress_path = _eta_progress_path(config.root, index)
-        progress = load_atomic_object(progress_path, "full-run ETA progress")
+        progress = load_atomic_object(
+            progress_path,
+            "full-run ETA progress",
+            root=config.root,
+        )
         _validate_eta_progress(progress, journal=journal, check_index=index)
         receipt_path = _eta_receipt_path(config.root, index)
         expected = _eta_receipt_from_progress(
             progress,
             progress_path=progress_path,
+            root=config.root,
             prior_consecutive=prior_consecutive,
         )
         write_immutable_json(receipt_path, expected)
-        receipt = load_atomic_object(receipt_path, "full-run ETA receipt")
+        receipt = load_atomic_object(
+            receipt_path,
+            "full-run ETA receipt",
+            root=config.root,
+        )
         _validate_eta_receipt(
             receipt,
             progress=progress,
             progress_path=progress_path,
+            root=config.root,
             prior_consecutive=prior_consecutive,
         )
         _validate_eta_cadence(
@@ -2699,7 +2865,13 @@ def _reconcile_eta_history(
         rows.append(
             {
                 "path": str(receipt_path),
-                "sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+                "sha256": hashlib.sha256(
+                    _read_real_bytes_in_root(
+                        receipt_path,
+                        root=config.root,
+                        label="full-run ETA receipt",
+                    )
+                ).hexdigest(),
                 "receipt": receipt,
                 "progress": progress,
             }
@@ -2740,6 +2912,97 @@ def _reconcile_eta_history(
     return rows, prior_elapsed, prior_cells, prior_consecutive
 
 
+def _publish_due_eta_locked(
+    config: CoordinatorConfig,
+    *,
+    observed_wall_ns: int | None = None,
+    require_final: bool = False,
+) -> dict[str, Any]:
+    journal_path = full_run_journal_path(config.root)
+    journal_seed = load_atomic_object(
+        journal_path,
+        "full-run transaction journal",
+        root=config.root,
+    )
+    timing_gate_sha256 = journal_seed.get("timing_gate_sha256")
+    _require_sha256_text(timing_gate_sha256, "journal timing gate")
+    journal = _load_or_create_full_run_journal(
+        config,
+        timing_gate_sha256=timing_gate_sha256,
+    )
+    eta_rows, last_elapsed, last_cells, consecutive = _reconcile_eta_history(
+        config,
+        journal,
+    )
+    completed_tasks = _progress_completed_tasks(config)
+    observed = time.time_ns() if observed_wall_ns is None else observed_wall_ns
+    elapsed = (observed - journal["started_wall_ns"]) / 1e9
+    new_cells = len(completed_tasks - set(journal["baseline_task_indices"])) * len(
+        ARMS
+    )
+    reasons = _eta_trigger_reasons(
+        elapsed_seconds=elapsed,
+        prior_elapsed_seconds=last_elapsed,
+        completed_cells=new_cells,
+        prior_completed_cells=last_cells,
+        remaining_cells_at_launch=journal["remaining_cells_at_launch"],
+        workers_pending=new_cells < journal["remaining_cells_at_launch"],
+    )
+    if reasons:
+        eta = _publish_eta_check(
+            config,
+            journal=journal,
+            check_index=len(eta_rows) + 1,
+            observed_wall_ns=observed,
+            completed_tasks=completed_tasks,
+            trigger_reasons=reasons,
+            prior_consecutive=consecutive,
+        )
+        eta_rows.append(eta)
+        last_elapsed = float(eta["progress"]["elapsed_seconds"])
+        last_cells = eta["progress"]["new_completed_cells"]
+        consecutive = eta["receipt"]["consecutive_over_budget_checks"]
+        journal["eta_checks"] = [
+            {"path": row["path"], "sha256": row["sha256"]} for row in eta_rows
+        ]
+        journal["last_elapsed_seconds"] = last_elapsed
+        journal["last_completed_cells"] = last_cells
+        journal["consecutive_over_budget_checks"] = consecutive
+        _persist_full_run_journal(config, journal)
+        if consecutive >= 2:
+            _publish_stop_marker(config, eta)
+    final = bool(
+        eta_rows
+        and eta_rows[-1]["progress"]["new_completed_cells"]
+        == journal["remaining_cells_at_launch"]
+        and "final_completion" in eta_rows[-1]["progress"]["trigger_reasons"]
+    )
+    if require_final and not final:
+        raise RuntimeError("full-run ETA chain lacks final coverage")
+    return {
+        "journal": journal,
+        "rows": eta_rows,
+        "last_elapsed_seconds": last_elapsed,
+        "last_completed_cells": last_cells,
+        "consecutive_over_budget_checks": consecutive,
+        "final": final,
+    }
+
+
+def _publish_due_eta(
+    config: CoordinatorConfig,
+    *,
+    observed_wall_ns: int | None = None,
+    require_final: bool = False,
+) -> dict[str, Any]:
+    with exclusive_lock(_eta_producer_lock_path(config.root)):
+        return _publish_due_eta_locked(
+            config,
+            observed_wall_ns=observed_wall_ns,
+            require_final=require_final,
+        )
+
+
 def _publish_stop_marker(config: CoordinatorConfig, eta_row: Mapping[str, Any]) -> None:
     write_immutable_json(
         full_run_stop_path(config.root),
@@ -2757,7 +3020,13 @@ def _completed_worker_results(config: CoordinatorConfig) -> list[dict[str, Any]]
     results = []
     for replica in config.replicas:
         path = config.root / "progress" / f"replica-{replica.replica_index}.json"
-        value = dict(load_atomic_object(path, "full-run worker completion"))
+        value = dict(
+            load_atomic_object(
+                path,
+                "full-run worker completion",
+                root=config.root,
+            )
+        )
         if (
             value.get("schema") != "amg_swebench_shared_pool_worker_v2"
             or value.get("status") != "PASS"
@@ -2837,6 +3106,7 @@ def _run_full_locked(config: CoordinatorConfig) -> list[dict[str, Any]]:
                     str(config.root),
                     barrier_sha256,
                     replica.task_indices,
+                    str(config.path),
                 ): replica.replica_index
                 for replica in config.replicas
             }
@@ -2849,44 +3119,15 @@ def _run_full_locked(config: CoordinatorConfig) -> list[dict[str, Any]]:
                 )
                 for future in done:
                     results.append(future.result())
-                completed_tasks = _progress_completed_tasks(config)
-                observed_wall_ns = time.time_ns()
-                elapsed = (observed_wall_ns - journal["started_wall_ns"]) / 1e9
-                new_cells = len(
-                    completed_tasks - set(journal["baseline_task_indices"])
-                ) * len(ARMS)
-                reasons = _eta_trigger_reasons(
-                    elapsed_seconds=elapsed,
-                    prior_elapsed_seconds=last_eta_elapsed,
-                    completed_cells=new_cells,
-                    prior_completed_cells=last_eta_cells,
-                    remaining_cells_at_launch=journal["remaining_cells_at_launch"],
-                    workers_pending=bool(pending),
-                )
-                if not reasons:
-                    continue
-                eta = _publish_eta_check(
+                eta_state = _publish_due_eta(
                     config,
-                    journal=journal,
-                    check_index=len(eta_rows) + 1,
-                    observed_wall_ns=observed_wall_ns,
-                    completed_tasks=completed_tasks,
-                    trigger_reasons=reasons,
-                    prior_consecutive=consecutive,
+                    observed_wall_ns=time.time_ns(),
                 )
-                eta_rows.append(eta)
-                last_eta_elapsed = float(eta["progress"]["elapsed_seconds"])
-                last_eta_cells = eta["progress"]["new_completed_cells"]
-                consecutive = eta["receipt"]["consecutive_over_budget_checks"]
-                journal["eta_checks"] = [
-                    {"path": row["path"], "sha256": row["sha256"]} for row in eta_rows
-                ]
-                journal["last_elapsed_seconds"] = last_eta_elapsed
-                journal["last_completed_cells"] = last_eta_cells
-                journal["consecutive_over_budget_checks"] = consecutive
-                _persist_full_run_journal(config, journal)
-                if consecutive >= 2:
-                    _publish_stop_marker(config, eta)
+                journal = eta_state["journal"]
+                eta_rows = eta_state["rows"]
+                last_eta_elapsed = eta_state["last_elapsed_seconds"]
+                last_eta_cells = eta_state["last_completed_cells"]
+                consecutive = eta_state["consecutive_over_budget_checks"]
         if full_run_stop_requested(config.root):
             raise RuntimeError("full run stopped at a clean publication boundary")
         results.sort(key=lambda row: row["replica_index"])
@@ -2908,50 +3149,16 @@ def _run_full_locked(config: CoordinatorConfig) -> list[dict[str, Any]]:
     else:
         results = _completed_worker_results(config)
 
-    if not eta_rows or (
-        eta_rows[-1]["progress"]["new_completed_cells"]
-        != journal["remaining_cells_at_launch"]
-        or "final_completion" not in eta_rows[-1]["progress"]["trigger_reasons"]
-    ):
-        completed_tasks = _progress_completed_tasks(config)
-        observed_wall_ns = time.time_ns()
-        elapsed = (observed_wall_ns - journal["started_wall_ns"]) / 1e9
-        new_cells = len(completed_tasks - set(journal["baseline_task_indices"])) * len(
-            ARMS
-        )
-        if new_cells != journal["remaining_cells_at_launch"]:
-            raise RuntimeError(
-                "full-run workers returned without complete publication coverage"
-            )
-        reasons = _eta_trigger_reasons(
-            elapsed_seconds=elapsed,
-            prior_elapsed_seconds=last_eta_elapsed,
-            completed_cells=new_cells,
-            prior_completed_cells=last_eta_cells,
-            remaining_cells_at_launch=journal["remaining_cells_at_launch"],
-            workers_pending=False,
-        )
-        eta = _publish_eta_check(
-            config,
-            journal=journal,
-            check_index=len(eta_rows) + 1,
-            observed_wall_ns=observed_wall_ns,
-            completed_tasks=completed_tasks,
-            trigger_reasons=reasons,
-            prior_consecutive=consecutive,
-        )
-        eta_rows.append(eta)
-        consecutive = eta["receipt"]["consecutive_over_budget_checks"]
-        if consecutive >= 2:
-            _publish_stop_marker(config, eta)
-            raise RuntimeError("full run stopped at a clean publication boundary")
-        journal["eta_checks"] = [
-            {"path": row["path"], "sha256": row["sha256"]} for row in eta_rows
-        ]
-        journal["last_elapsed_seconds"] = eta["progress"]["elapsed_seconds"]
-        journal["last_completed_cells"] = eta["progress"]["new_completed_cells"]
-        journal["consecutive_over_budget_checks"] = consecutive
-        _persist_full_run_journal(config, journal)
+    eta_state = _publish_due_eta(
+        config,
+        observed_wall_ns=time.time_ns(),
+        require_final=True,
+    )
+    journal = eta_state["journal"]
+    eta_rows = eta_state["rows"]
+    consecutive = eta_state["consecutive_over_budget_checks"]
+    if consecutive >= 2:
+        raise RuntimeError("full run stopped at a clean publication boundary")
 
     audits = []
     audit_drivers = []
@@ -3136,16 +3343,31 @@ def _validated_full_run_timing(
             or set(binding) != {"path", "sha256"}
             or binding.get("path") != str(receipt_path)
             or binding.get("sha256")
-            != hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+            != hashlib.sha256(
+                _read_real_bytes_in_root(
+                    receipt_path,
+                    root=config.root,
+                    label="full-run ETA receipt",
+                )
+            ).hexdigest()
         ):
             raise RuntimeError("full-run ETA receipt binding drifted")
-        progress = load_atomic_object(progress_path, "full-run ETA progress")
+        progress = load_atomic_object(
+            progress_path,
+            "full-run ETA progress",
+            root=config.root,
+        )
         _validate_eta_progress(progress, journal=journal, check_index=index)
-        receipt = load_atomic_object(receipt_path, "full-run ETA receipt")
+        receipt = load_atomic_object(
+            receipt_path,
+            "full-run ETA receipt",
+            root=config.root,
+        )
         _validate_eta_receipt(
             receipt,
             progress=progress,
             progress_path=progress_path,
+            root=config.root,
             prior_consecutive=prior_consecutive,
         )
         _validate_eta_cadence(

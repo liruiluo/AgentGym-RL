@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import stat
 import tempfile
@@ -95,6 +96,34 @@ class AtomicStateTest(unittest.TestCase):
         with self.assertRaises(ImmutableConflictError):
             write_immutable_json(path, {"value": 2})
         self.assertEqual(path.read_bytes(), canonical_json_bytes({"value": 1}))
+
+    def test_immutable_writer_rejects_symlink_even_when_target_bytes_match(self):
+        directory = ensure_private_directory(self.root)
+        outside = Path(self.temp_dir.name) / "outside.json"
+        atomic_write_json(outside, {"value": 1})
+        path = directory / "receipt.json"
+        path.symlink_to(outside)
+        with self.assertRaisesRegex(RuntimeError, "real regular file"):
+            write_immutable_json(path, {"value": 1})
+
+    def test_atomic_writer_rejects_symlink_directory_and_fifo_targets(self):
+        directory = ensure_private_directory(self.root)
+        outside = Path(self.temp_dir.name) / "outside.json"
+        atomic_write_json(outside, {"value": 1})
+        symlink = directory / "journal.json"
+        symlink.symlink_to(outside)
+        with self.assertRaisesRegex(RuntimeError, "real regular file"):
+            atomic_write_json(symlink, {"value": 2})
+
+        nonregular_directory = directory / "progress.json"
+        nonregular_directory.mkdir()
+        with self.assertRaisesRegex(RuntimeError, "real regular file"):
+            atomic_write_json(nonregular_directory, {"value": 2})
+
+        fifo = directory / "receipt.json"
+        os.mkfifo(fifo)
+        with self.assertRaisesRegex(RuntimeError, "real regular file"):
+            atomic_write_json(fifo, {"value": 2})
 
     def test_logical_json_digest_matches_paired_evidence_encoding(self) -> None:
         value = {"task_id": "task-0", "model_patch": ""}
