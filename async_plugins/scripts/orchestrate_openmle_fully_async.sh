@@ -427,11 +427,11 @@ done
 [ -s "$RUN_DIR/endpoints/ready.json" ]
 grep -q '"status":"ready"' "$RUN_DIR/endpoints/ready.json"
 
-eval "$("$PY" - "$LOCK" <<'PY'
+eval "$("$PY" - "$LOCK" "$PREFLIGHT" <<'PY'
 import json, shlex, sys
-x=json.load(open(sys.argv[1])); vals={
-'MANIFEST':x['integration']['pod_root']+'/'+x['integration']['manifests']['train_pool']['relpath'],
-'MANIFEST_SHA':x['integration']['manifests']['train_pool']['sha256'],
+x=json.load(open(sys.argv[1])); p=json.load(open(sys.argv[2])); vals={
+'MANIFEST':p['manifest_path'],
+'MANIFEST_SHA':p['manifest_sha256'],
 'OUTER_COMMIT':x['runtime_source']['outer_commit'],
 'INNER_COMMIT':x['runtime_source']['inner_commit'],
 'PROMPT_SHA':x['runtime_source']['policy_prompt_sha256']}

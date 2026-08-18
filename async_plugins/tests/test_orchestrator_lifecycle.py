@@ -1293,6 +1293,18 @@ class TestBoundedGpuMonitor(unittest.TestCase):
 
 
 class TestShellOrchestratorContract(unittest.TestCase):
+    def test_resident_probe_reuses_mode_specific_runtime_preflight_manifest(
+        self,
+    ) -> None:
+        script = MODULE.parent.parent / "scripts/orchestrate_openmle_fully_async.sh"
+        text = script.read_text(encoding="utf-8")
+        probe_start = text.index('eval "$("$PY" - "$LOCK" "$PREFLIGHT"')
+        probe_end = text.index("ORIGINAL_CPU_OWNER=", probe_start)
+        probe = text[probe_start:probe_end]
+        self.assertIn("'MANIFEST':p['manifest_path']", probe)
+        self.assertIn("'MANIFEST_SHA':p['manifest_sha256']", probe)
+        self.assertNotIn("['manifests']['train_pool']", probe)
+
     def test_crash_guards_and_terminal_publication_order_are_static(self) -> None:
         script = MODULE.parent.parent / "scripts/orchestrate_openmle_fully_async.sh"
         text = script.read_text(encoding="utf-8")
