@@ -57,7 +57,6 @@ from .oci import (
     require_task_eviction_ready,
 )
 from .official_grader import (
-    GraderBusyError,
     OfficialGradeRequest,
     OfficialGraderConfig,
     RetryableGraderError,
@@ -88,10 +87,11 @@ from .shared_pool_contract import (
     validate_shared_model_pool_snapshot,
 )
 from .state import CellKey, OwnerIdentity, sha256_json
+from .state import RuntimeLaneToken
 
 
 RUN_CONFIG_SCHEMA = "amg_swebench_triad_run_config_v1"
-SHARED_POOL_RUN_CONFIG_SCHEMA = "amg_swebench_triad_run_config_shared_pool_v2"
+SHARED_POOL_RUN_CONFIG_SCHEMA = "amg_swebench_triad_run_config_shared_pool_v3"
 OWNER_LABEL = "amg-swebench-triad-eval-0816"
 CONTAINER_NAME_PREFIX = "amg-sbv-triad-"
 SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
@@ -173,6 +173,14 @@ RUNTIME_FIELDS = {
     "external_memory_inodes",
 }
 GRADER_FIELDS = {"python_executable", "output_root", "max_attempts"}
+SHARED_RUNTIME_FIELDS = (RUNTIME_FIELDS - {"server_port"}) | {
+    "task_slots_per_replica",
+    "server_ports",
+}
+SHARED_GRADER_FIELDS = GRADER_FIELDS | {
+    "global_max_concurrency",
+    "semaphore_root",
+}
 SHARED_MODEL_POOL_FIELDS = {
     "owner",
     "readiness_path",
@@ -201,6 +209,10 @@ class ProductionTaskStage:
     archive_path: Path
     mirror_path: Path
     task_root: Path
+    slot_index: int
+    server_port: int
+    lane_generation: int
+    lane_fencing_token: str
 
     def __post_init__(self) -> None:
         if type(self.task_index) is not int or not 0 <= self.task_index < 500:
@@ -214,6 +226,17 @@ class ProductionTaskStage:
             path = getattr(self, name)
             if not isinstance(path, Path) or not path.is_absolute():
                 raise ValueError(f"stage {name} must be an absolute path")
+        if type(self.slot_index) is not int or self.slot_index < 0:
+            raise ValueError("stage slot index is invalid")
+        if type(self.server_port) is not int or not 1 <= self.server_port <= 65535:
+            raise ValueError("stage server port is invalid")
+        if type(self.lane_generation) is not int or self.lane_generation <= 0:
+            raise ValueError("stage lane generation is invalid")
+        if (
+            not isinstance(self.lane_fencing_token, str)
+            or SHA256_RE.fullmatch(self.lane_fencing_token) is None
+        ):
+            raise ValueError("stage lane fencing token is invalid")
 
 
 def exact_fields(value: Mapping[str, Any], expected: set[str], label: str) -> None:
@@ -276,6 +299,37 @@ def positive_number(value: Any, label: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
         raise ValueError(f"{label} must be positive")
     return float(value)
+
+
+def timed_phase(
+    rows: list[dict[str, Any]],
+    phase: str,
+    operation: Callable[[], Any],
+) -> Any:
+    started_wall_ns = time.time_ns()
+    started_monotonic_ns = time.monotonic_ns()
+    status = "PASS"
+    try:
+        return operation()
+    except BaseException:
+        status = "FAIL"
+        raise
+    finally:
+        ended_wall_ns = time.time_ns()
+        ended_monotonic_ns = time.monotonic_ns()
+        rows.append(
+            {
+                "phase": phase,
+                "status": status,
+                "started_wall_ns": started_wall_ns,
+                "ended_wall_ns": ended_wall_ns,
+                "started_monotonic_ns": started_monotonic_ns,
+                "ended_monotonic_ns": ended_monotonic_ns,
+                "duration_ns": max(
+                    0, ended_monotonic_ns - started_monotonic_ns
+                ),
+            }
+        )
 
 
 def read_canonical_object(path: Path, label: str) -> Mapping[str, Any]:
@@ -739,10 +793,37 @@ class ProductionRunConfig:
                 )
 
         runtime = object_value(payload["runtime"], "runtime config")
-        exact_fields(runtime, RUNTIME_FIELDS, "runtime config")
+        exact_fields(
+            runtime,
+            SHARED_RUNTIME_FIELDS
+            if schema == SHARED_POOL_RUN_CONFIG_SCHEMA
+            else RUNTIME_FIELDS,
+            "runtime config",
+        )
         path_value(runtime["pod_local_root"], "pod-local root")
         path_value(runtime["mirrors_root"], "mirror root")
-        integer_value(runtime["server_port"], "server port", maximum=65535)
+        if schema == SHARED_POOL_RUN_CONFIG_SCHEMA:
+            slots = integer_value(
+                runtime["task_slots_per_replica"],
+                "task slots per replica",
+                maximum=2,
+            )
+            ports = runtime["server_ports"]
+            if (
+                slots != 2
+                or not isinstance(ports, list)
+                or len(ports) != slots
+                or len(set(ports)) != slots
+            ):
+                raise ValueError("shared runtime requires exactly two unique slots")
+            for slot_index, port in enumerate(ports):
+                integer_value(
+                    port,
+                    f"server port for slot {slot_index}",
+                    maximum=65535,
+                )
+        else:
+            integer_value(runtime["server_port"], "server port", maximum=65535)
         text_value(runtime["container_python"], "container Python")
         positive_number(runtime["model_timeout_seconds"], "model timeout")
         integer_value(runtime["environment_timeout_seconds"], "environment timeout")
@@ -759,10 +840,27 @@ class ProductionRunConfig:
             raise ValueError("runtime memory limit must be page aligned")
 
         grader = object_value(payload["grader"], "grader config")
-        exact_fields(grader, GRADER_FIELDS, "grader config")
+        exact_fields(
+            grader,
+            SHARED_GRADER_FIELDS
+            if schema == SHARED_POOL_RUN_CONFIG_SCHEMA
+            else GRADER_FIELDS,
+            "grader config",
+        )
         path_value(grader["python_executable"], "grader Python")
         path_value(grader["output_root"], "grader output root")
         integer_value(grader["max_attempts"], "grader attempts")
+        if schema == SHARED_POOL_RUN_CONFIG_SCHEMA:
+            path_value(grader["semaphore_root"], "grader semaphore root")
+            if (
+                integer_value(
+                    grader["global_max_concurrency"],
+                    "global grader concurrency",
+                    maximum=8,
+                )
+                != 8
+            ):
+                raise ValueError("shared-pool grader concurrency must equal eight")
 
     @staticmethod
     def validate_configs(configs: Sequence[RunConfig]) -> None:
@@ -797,6 +895,24 @@ class ProductionRunConfig:
     @property
     def evidence_root(self) -> Path:
         return path_value(self.payload["evidence_root"], "evidence root")
+
+    @property
+    def task_slots_per_replica(self) -> int:
+        if self.shared_model_pool is None:
+            return 1
+        return int(self.section("runtime")["task_slots_per_replica"])
+
+    @property
+    def server_ports(self) -> tuple[int, ...]:
+        runtime = self.section("runtime")
+        if self.shared_model_pool is None:
+            return (int(runtime["server_port"]),)
+        return tuple(runtime["server_ports"])
+
+    def server_port(self, slot_index: int) -> int:
+        if type(slot_index) is not int or not 0 <= slot_index < len(self.server_ports):
+            raise ValueError("runtime slot is outside the configured port lattice")
+        return self.server_ports[slot_index]
 
     @property
     def preflight_expectations(self) -> dict[str, Any]:
@@ -1014,7 +1130,7 @@ def summarize_task4_receipt(
 class ProductionRuntime(Protocol):
     def preflight(self) -> Mapping[str, Any]: ...
 
-    def stage_task(self, task_index: int) -> Any: ...
+    def stage_task(self, task_index: int, *, slot: RuntimeLaneToken) -> Any: ...
 
     def reconcile_cell(self, config: RunConfig, **kwargs: Any) -> Mapping[str, Any]: ...
 
@@ -1025,6 +1141,7 @@ class ProductionRuntime(Protocol):
         *,
         task_indices: Sequence[int],
         allow_foreign_loaded_images: bool = False,
+        slots: Sequence[RuntimeLaneToken],
     ) -> Mapping[str, Any]: ...
 
     def reconcile_unbound_loaded_images(self) -> Mapping[str, Any]: ...
@@ -1035,15 +1152,20 @@ class ProductionRuntime(Protocol):
         stage: Any,
         *,
         generation: int,
+        slot: RuntimeLaneToken,
     ) -> Mapping[str, Any]: ...
 
     def grade(self, **kwargs: Any) -> Mapping[str, Any]: ...
 
-    def audit_residue(self, task_index: int) -> Mapping[str, Any]: ...
+    def audit_residue(
+        self, task_index: int, *, slot: RuntimeLaneToken
+    ) -> Mapping[str, Any]: ...
 
-    def evict_task(self, task_index: int, stage: Any) -> Mapping[str, Any]: ...
+    def evict_task(
+        self, task_index: int, stage: Any, *, slot: RuntimeLaneToken
+    ) -> Mapping[str, Any]: ...
 
-    def cleanup(self) -> Mapping[str, Any]: ...
+    def cleanup(self, *, slots: Sequence[RuntimeLaneToken]) -> Mapping[str, Any]: ...
 
     def final_audit(self) -> Mapping[str, Any]: ...
 
@@ -1066,10 +1188,53 @@ class LinuxProductionRuntime:
             task_index: self.configs[task_index * 3 : task_index * 3 + 3]
             for task_index in range(500)
         }
+        if config.shared_model_pool is None:
+            self.task_slots = {task_index: 0 for task_index in self.by_task}
+        else:
+            shared = config.shared_model_pool
+            assigned = [
+                task_index
+                for task_index, triad in self.by_task.items()
+                if int.from_bytes(
+                    hashlib.sha256(
+                        triad[0].task.task_id.encode("utf-8")
+                    ).digest()[:8],
+                    "big",
+                )
+                % shared["replica_count"]
+                == shared["replica_index"]
+            ]
+            self.task_slots = {
+                task_index: position % config.task_slots_per_replica
+                for position, task_index in enumerate(assigned)
+            }
         self._dataset_rows: tuple[Mapping[str, Any], ...] | None = None
         self._testspec_resolver: Any = None
         self._oci_store: CachedOciStore | None = None
         self._docker_cli: DockerCli | None = None
+
+    def require_slot(
+        self,
+        slot: RuntimeLaneToken,
+        *,
+        task_index: int | None,
+        allow_global: bool = False,
+    ) -> RuntimeLaneToken:
+        if not isinstance(slot, RuntimeLaneToken):
+            raise TypeError("production operation requires a runtime lane token")
+        if slot.task_index != task_index and not (
+            allow_global and slot.task_index is None and task_index is not None
+        ):
+            raise ValueError("runtime lane task binding drifted")
+        if slot.server_port != self.config.server_port(slot.slot_index):
+            raise ValueError("runtime lane port binding drifted")
+        if task_index is not None:
+            expected_slot = self.task_slots.get(task_index)
+            if expected_slot is None:
+                raise ValueError("task is assigned to another shared-model replica")
+            if slot.slot_index != expected_slot:
+                raise ValueError("task was routed to the wrong deterministic slot")
+        return slot
 
     def section(self, name: str) -> Mapping[str, Any]:
         return self.config.section(name)
@@ -2050,6 +2215,7 @@ class LinuxProductionRuntime:
         self,
         task_index: int | None = None,
         arm: str | None = None,
+        slot_index: int | None = None,
     ) -> list[str]:
         arguments = [
             "container",
@@ -2067,6 +2233,15 @@ class LinuxProductionRuntime:
             if arm not in ARMS:
                 raise ValueError("owned-container arm is invalid")
             arguments.extend(["--filter", f"label=amg.arm={arm}"])
+        if slot_index is not None:
+            if (
+                type(slot_index) is not int
+                or not 0 <= slot_index < self.config.task_slots_per_replica
+            ):
+                raise ValueError("owned-container slot is invalid")
+            arguments.extend(
+                ["--filter", f"label=amg.slot_index={slot_index}"]
+            )
         result = self.docker().run(*arguments)
         if result.returncode != 0:
             raise RuntimeError("owned Docker container census failed")
@@ -2367,6 +2542,7 @@ class LinuxProductionRuntime:
         *,
         generation: int,
         before_preflight: bool,
+        slot: RuntimeLaneToken,
     ) -> Mapping[str, Any]:
         if config not in self.configs:
             raise ValueError("cell recovery config is outside the manifest")
@@ -2374,9 +2550,16 @@ class LinuxProductionRuntime:
             raise ValueError("cell recovery generation is invalid")
         if type(before_preflight) is not bool:
             raise TypeError("cell recovery phase flag must be boolean")
+        slot = self.require_slot(
+            slot,
+            task_index=config.task.task_index,
+            allow_global=before_preflight,
+        )
         removed = []
         for container_id in self.owned_container_ids(
-            config.task.task_index, config.capability.arm.value
+            config.task.task_index,
+            config.capability.arm.value,
+            slot.slot_index,
         ):
             record = self.container_record(container_id)
             container_config = object_value(record.get("Config"), "container config")
@@ -2386,14 +2569,20 @@ class LinuxProductionRuntime:
             expected = {
                 "amg.task_index": f"{config.task.task_index:04d}",
                 "amg.arm": config.capability.arm.value,
+                "amg.slot_index": str(slot.slot_index),
+                "amg.server_port": str(slot.server_port),
             }
             if any(labels.get(name) != value for name, value in expected.items()):
                 raise RuntimeError("cell recovery container identity drifted")
             old_generation = labels.get("amg.generation")
+            old_lane_generation = labels.get("amg.lane_generation")
             if (
                 not isinstance(old_generation, str)
                 or not old_generation.isdigit()
                 or int(old_generation) > generation
+                or not isinstance(old_lane_generation, str)
+                or not old_lane_generation.isdigit()
+                or int(old_lane_generation) > slot.generation
             ):
                 raise RuntimeError("cell recovery container generation drifted")
             removed.append(self.remove_owned_container_id(container_id))
@@ -2421,6 +2610,9 @@ class LinuxProductionRuntime:
             "removed_cgroup": removed_cgroup,
             "mounts_after": 0,
             "processes_after": 0,
+            "slot_index": slot.slot_index,
+            "server_port": slot.server_port,
+            "lane_generation": slot.generation,
         }
 
     def global_residue_snapshot(self) -> dict[str, int]:
@@ -2446,9 +2638,15 @@ class LinuxProductionRuntime:
             "owned_containers": len(containers),
         }
 
-    def stage_task(self, task_index: int) -> ProductionTaskStage:
+    def stage_task(
+        self,
+        task_index: int,
+        *,
+        slot: RuntimeLaneToken,
+    ) -> ProductionTaskStage:
         if type(task_index) is not int or task_index not in self.by_task:
             raise ValueError("task index is outside the production manifest")
+        slot = self.require_slot(slot, task_index=task_index)
         configs = self.by_task[task_index]
         instance_id = configs[0].task.task_id
         if any(config.task.task_id != instance_id for config in configs):
@@ -2473,30 +2671,50 @@ class LinuxProductionRuntime:
             / "tasks"
             / f"task-{task_index:04d}"
         )
-        rootfs_cache = materialize_rootfs(binding, task_root / "oci-rootfs")
+        phase_timings: list[dict[str, Any]] = []
+        rootfs_cache = timed_phase(
+            phase_timings,
+            "rootfs_materialization",
+            lambda: materialize_rootfs(binding, task_root / "oci-rootfs"),
+        )
         archive_path = task_root / "image.tar"
-        if archive_path.exists():
-            archive_receipt = read_json_object(
-                task_root / "image.tar.receipt.json", "Docker archive receipt"
-            )
-            if (
-                archive_receipt.get("image") != binding.image
-                or archive_receipt.get("manifest_digest")
-                != binding.manifest_digest
-                or archive_receipt.get("config_digest") != binding.config_digest
-                or archive_receipt.get("archive_size") != archive_path.stat().st_size
-                or archive_receipt.get("archive_sha256")
-                != sha256_file(archive_path)
-            ):
-                raise RuntimeError("resumed Docker archive identity drifted")
-        else:
-            build_docker_archive(binding, archive_path)
-        docker_load = self.docker().ensure_loaded(binding, archive_path)
-        mirror_path = ensure_repository_mirror(
-            rootfs_cache / "rootfs",
-            path_value(runtime["mirrors_root"], "mirrors root"),
-            repo=repo,
-            base_commit=base_commit,
+
+        def prepare_archive() -> None:
+            if archive_path.exists():
+                archive_receipt = read_json_object(
+                    task_root / "image.tar.receipt.json",
+                    "Docker archive receipt",
+                )
+                if (
+                    archive_receipt.get("image") != binding.image
+                    or archive_receipt.get("manifest_digest")
+                    != binding.manifest_digest
+                    or archive_receipt.get("config_digest")
+                    != binding.config_digest
+                    or archive_receipt.get("archive_size")
+                    != archive_path.stat().st_size
+                    or archive_receipt.get("archive_sha256")
+                    != sha256_file(archive_path)
+                ):
+                    raise RuntimeError("resumed Docker archive identity drifted")
+            else:
+                build_docker_archive(binding, archive_path)
+
+        timed_phase(phase_timings, "docker_archive", prepare_archive)
+        docker_load = timed_phase(
+            phase_timings,
+            "docker_load",
+            lambda: self.docker().ensure_loaded(binding, archive_path),
+        )
+        mirror_path = timed_phase(
+            phase_timings,
+            "repository_mirror",
+            lambda: ensure_repository_mirror(
+                rootfs_cache / "rootfs",
+                path_value(runtime["mirrors_root"], "mirrors root"),
+                repo=repo,
+                base_commit=base_commit,
+            ),
         )
         stage = ProductionTaskStage(
             task_index=task_index,
@@ -2508,6 +2726,10 @@ class LinuxProductionRuntime:
             archive_path=archive_path,
             mirror_path=mirror_path,
             task_root=task_root,
+            slot_index=slot.slot_index,
+            server_port=slot.server_port,
+            lane_generation=slot.generation,
+            lane_fencing_token=slot.fencing_token,
         )
         atomic_write_json(
             self.config.run_root
@@ -2528,6 +2750,13 @@ class LinuxProductionRuntime:
                 "mirror_path": str(mirror_path),
                 "docker_load": docker_load,
                 "network_downloads": 0,
+                "slot_index": slot.slot_index,
+                "server_port": slot.server_port,
+                "lane_generation": slot.generation,
+                "lane_fencing_token_sha256": hashlib.sha256(
+                    slot.fencing_token.encode("ascii")
+                ).hexdigest(),
+                "phase_timings": phase_timings,
             },
         )
         return stage
@@ -2536,12 +2765,17 @@ class LinuxProductionRuntime:
     def require_stage(
         config: RunConfig,
         stage: Any,
+        slot: RuntimeLaneToken,
     ) -> ProductionTaskStage:
         if not isinstance(stage, ProductionTaskStage):
             raise TypeError("production cell requires a typed task stage")
         if (
             stage.task_index != config.task.task_index
             or stage.instance_id != config.task.task_id
+            or stage.slot_index != slot.slot_index
+            or stage.server_port != slot.server_port
+            or stage.lane_generation != slot.generation
+            or stage.lane_fencing_token != slot.fencing_token
         ):
             raise ValueError("production cell stage identity drifted")
         return stage
@@ -2607,6 +2841,7 @@ class LinuxProductionRuntime:
         envelope: CgroupV1CellEnvelope,
         attempt_root: Path,
         container_name: str,
+        slot: RuntimeLaneToken,
     ) -> list[str]:
         assets = self.section("assets")
         source = self.section("source")
@@ -2642,7 +2877,7 @@ class LinuxProductionRuntime:
             "SWEBENCH_VERIFIED_RG_SHA256": assets["rg_sha256"],
             "SWEBENCH_VERIFIED_UID_LEASE_ROOT": str(leases),
             "SWEBENCH_VERIFIED_HOST": "127.0.0.1",
-            "SWEBENCH_VERIFIED_PORT": str(runtime["server_port"]),
+            "SWEBENCH_VERIFIED_PORT": str(slot.server_port),
             "SWEBENCH_VERIFIED_WORKSPACE_BYTES": str(
                 runtime["workspace_bytes"]
             ),
@@ -2675,6 +2910,12 @@ class LinuxProductionRuntime:
             f"amg.arm={config.capability.arm.value}",
             "--label",
             f"amg.generation={generation:08d}",
+            "--label",
+            f"amg.slot_index={slot.slot_index}",
+            "--label",
+            f"amg.server_port={slot.server_port}",
+            "--label",
+            f"amg.lane_generation={slot.generation:08d}",
             "--network",
             "host",
             "--privileged",
@@ -2773,11 +3014,15 @@ class LinuxProductionRuntime:
         stage: Any,
         *,
         generation: int,
+        slot: RuntimeLaneToken,
     ) -> Mapping[str, Any]:
-        typed_stage = self.require_stage(config, stage)
+        slot = self.require_slot(slot, task_index=config.task.task_index)
+        typed_stage = self.require_stage(config, stage, slot)
         if type(generation) is not int or generation <= 0:
             raise ValueError("cell generation is invalid")
-        if self.owned_container_ids(config.task.task_index):
+        if self.owned_container_ids(
+            config.task.task_index, slot_index=slot.slot_index
+        ):
             raise RuntimeError("owned task container residue forbids a new cell")
         if self.cgroup_paths(config.task.task_index):
             raise RuntimeError("owned task cgroup residue forbids a new cell")
@@ -2806,12 +3051,13 @@ class LinuxProductionRuntime:
             ),
             backend=self.cgroup_backend(),
         )
-        base_url = f"http://127.0.0.1:{runtime['server_port']}"
+        base_url = f"http://127.0.0.1:{slot.server_port}"
         run_id = (
             f"amg-sbv-{config.task.task_index:04d}-"
             f"{config.capability.arm.value}-g{generation:08d}"
         )
         run_capability = secrets.token_urlsafe(48)
+        phase_timings: list[dict[str, Any]] = []
         record: dict[str, Any] = {
             "schema": "swebench_triad_cell_runtime_v1",
             "status": "FAIL",
@@ -2824,6 +3070,13 @@ class LinuxProductionRuntime:
             "run_capability_sha256": hashlib.sha256(
                 run_capability.encode("ascii")
             ).hexdigest(),
+            "slot_index": slot.slot_index,
+            "server_port": slot.server_port,
+            "lane_generation": slot.generation,
+            "lane_fencing_token_sha256": hashlib.sha256(
+                slot.fencing_token.encode("ascii")
+            ).hexdigest(),
+            "phase_timings": phase_timings,
         }
         if self.config.shared_model_pool is not None:
             shared = self.config.shared_model_pool
@@ -2845,8 +3098,14 @@ class LinuxProductionRuntime:
         prepared = False
         container_created = False
         try:
-            record["rootfs_before"] = attest_rootfs(typed_stage.rootfs_cache)
-            record["cgroup_prepare"] = envelope.prepare()
+            record["rootfs_before"] = timed_phase(
+                phase_timings,
+                "rootfs_attestation_before",
+                lambda: attest_rootfs(typed_stage.rootfs_cache),
+            )
+            record["cgroup_prepare"] = timed_phase(
+                phase_timings, "cgroup_prepare", envelope.prepare
+            )
             prepared = True
             arguments = self.server_container_arguments(
                 config,
@@ -2855,8 +3114,13 @@ class LinuxProductionRuntime:
                 envelope=envelope,
                 attempt_root=attempt_root,
                 container_name=container_name,
+                slot=slot,
             )
-            launched = self.docker().run(*arguments)
+            launched = timed_phase(
+                phase_timings,
+                "environment_container_launch",
+                lambda: self.docker().run(*arguments),
+            )
             container_id = self.require_docker_result(
                 launched, "SWE server container launch"
             )
@@ -2868,7 +3132,11 @@ class LinuxProductionRuntime:
             record["cgroup_descendants_before"] = envelope.verify_descendants(
                 container_init_pid=init_pid
             )
-            metadata_before = self.wait_server(base_url, container_name)
+            metadata_before = timed_phase(
+                phase_timings,
+                "environment_server_readiness",
+                lambda: self.wait_server(base_url, container_name),
+            )
             if (
                 metadata_before.get("active_slot_count") != 0
                 or metadata_before.get("active_workspace_count") != 0
@@ -2888,6 +3156,9 @@ class LinuxProductionRuntime:
                     private_run_id=run_id,
                     run_capability=run_capability,
                     image_manifest_sha256=sha256_file(image_digests),
+                    task_index=config.task.task_index,
+                    arm=config.capability.arm.value,
+                    generation=generation,
                 )
 
             evidence = PrivateEvidenceStore(self.config.evidence_root)
@@ -2910,12 +3181,28 @@ class LinuxProductionRuntime:
                 controller=AgentGymPolicyTurnController.from_agentenv(),
                 evidence_store=evidence,
             )
-            endpoint = runner.run_task(
-                config,
-                bindings.adapter,
-                bindings.model,
+            endpoint = timed_phase(
+                phase_timings,
+                "policy_and_model_execution",
+                lambda: runner.run_task(
+                    config,
+                    bindings.adapter,
+                    bindings.model,
+                ),
             )
-            metadata_after = http_json(base_url + "/metadata", timeout=10.0)
+            transport_events = getattr(bindings.model.transport, "events", None)
+            if not isinstance(transport_events, list) or any(
+                not isinstance(event, Mapping) for event in transport_events
+            ):
+                raise RuntimeError("exact-token transport timing receipt is missing")
+            record["model_transport_events"] = [
+                dict(event) for event in transport_events
+            ]
+            metadata_after = timed_phase(
+                phase_timings,
+                "environment_finalization",
+                lambda: http_json(base_url + "/metadata", timeout=10.0),
+            )
             if (
                 metadata_after.get("active_slot_count") != 0
                 or metadata_after.get("active_workspace_count") != 0
@@ -2929,11 +3216,15 @@ class LinuxProductionRuntime:
             if record["rootfs_after"] != record["rootfs_before"]:
                 raise RuntimeError("active task rootfs mutated during the cell")
             record["container_logs"] = self.container_logs(container_name)
-            record["container_cleanup"] = self.stop_remove_container(
-                container_name
+            record["container_cleanup"] = timed_phase(
+                phase_timings,
+                "environment_container_cleanup",
+                lambda: self.stop_remove_container(container_name),
             )
             container_created = False
-            record["cgroup_teardown"] = envelope.teardown()
+            record["cgroup_teardown"] = timed_phase(
+                phase_timings, "cgroup_teardown", envelope.teardown
+            )
             prepared = False
             record["status"] = "PASS"
             atomic_write_json(receipt_path, record)
@@ -2988,6 +3279,16 @@ class LinuxProductionRuntime:
             command_ledger_path=self.config.run_root
             / "full"
             / "command-exit-ledger.jsonl",
+            semaphore_root=(
+                path_value(grader["semaphore_root"], "grader semaphore root")
+                if self.config.shared_model_pool is not None
+                else self.config.run_root / "state" / "grader-semaphore"
+            ),
+            max_concurrent_graders=(
+                grader["global_max_concurrency"]
+                if self.config.shared_model_pool is not None
+                else 8
+            ),
         )
 
     @staticmethod
@@ -3061,7 +3362,11 @@ class LinuxProductionRuntime:
         accepted: Mapping[str, Any],
         prediction: Mapping[str, Any],
         handoff: Mapping[str, Any],
+        slot: RuntimeLaneToken,
     ) -> Mapping[str, Any]:
+        slot = self.require_slot(
+            slot, task_index=key.task_index, allow_global=True
+        )
         grader_config = self.official_grader_config()
         max_attempts = self.section("grader")["max_attempts"]
         inspected = []
@@ -3131,6 +3436,9 @@ class LinuxProductionRuntime:
             "cell": key.to_payload(),
             "inspected_attempts": inspected,
             "removed_containers": removed,
+            "slot_index": slot.slot_index,
+            "server_port": slot.server_port,
+            "lane_generation": slot.generation,
         }
 
     def reconcile_startup(
@@ -3138,9 +3446,19 @@ class LinuxProductionRuntime:
         *,
         task_indices: Sequence[int],
         allow_foreign_loaded_images: bool = False,
+        slots: Sequence[RuntimeLaneToken],
     ) -> Mapping[str, Any]:
         if type(allow_foreign_loaded_images) is not bool:
             raise TypeError("foreign loaded-image policy must be boolean")
+        slot_tokens = tuple(slots)
+        if (
+            len(slot_tokens) != self.config.task_slots_per_replica
+            or tuple(token.slot_index for token in slot_tokens)
+            != tuple(range(self.config.task_slots_per_replica))
+        ):
+            raise ValueError("startup reconciliation slot lattice drifted")
+        for token in slot_tokens:
+            self.require_slot(token, task_index=None)
         selected = tuple(task_indices)
         if (
             not selected
@@ -3238,6 +3556,14 @@ class LinuxProductionRuntime:
                 for image, image_id in sorted(foreign_loaded_images)
             ],
             "residue": self.global_residue_snapshot(),
+            "slots": [
+                {
+                    "slot_index": token.slot_index,
+                    "server_port": token.server_port,
+                    "lane_generation": token.generation,
+                }
+                for token in slot_tokens
+            ],
         }
 
     def grade(
@@ -3247,9 +3573,11 @@ class LinuxProductionRuntime:
         accepted: Mapping[str, Any],
         prediction: Mapping[str, Any],
         handoff: Mapping[str, Any],
+        slot: RuntimeLaneToken,
     ) -> Mapping[str, Any]:
         if not isinstance(key, CellKey):
             raise TypeError("official grading requires a CellKey")
+        slot = self.require_slot(slot, task_index=key.task_index)
         grader = self.section("grader")
         grader_config = self.official_grader_config()
         last_error: RetryableGraderError | None = None
@@ -3270,6 +3598,7 @@ class LinuxProductionRuntime:
                     accepted=accepted,
                     prediction=prediction,
                     handoff=handoff,
+                    slot=slot,
                 )
         assert last_error is not None
         raise last_error
@@ -3321,6 +3650,9 @@ class LinuxProductionRuntime:
             "task_root_removed",
             "certified_blobs_retained",
             "repository_mirror_retained",
+            "slot_index",
+            "server_port",
+            "lane_generation",
         }
         expected_instance = self.by_task[task_index][0].task.task_id
         if (
@@ -3334,6 +3666,11 @@ class LinuxProductionRuntime:
             or type(value.get("task_root_removed")) is not bool
             or value.get("certified_blobs_retained") is not True
             or value.get("repository_mirror_retained") is not True
+            or value.get("slot_index") != self.task_slots.get(task_index)
+            or value.get("server_port")
+            != self.config.server_port(value.get("slot_index"))
+            or type(value.get("lane_generation")) is not int
+            or value["lane_generation"] <= 0
         ):
             raise RuntimeError("task eviction receipt is invalid")
         return value
@@ -3368,10 +3705,18 @@ class LinuxProductionRuntime:
             if row
         )
 
-    def audit_residue(self, task_index: int) -> Mapping[str, Any]:
+    def audit_residue(
+        self,
+        task_index: int,
+        *,
+        slot: RuntimeLaneToken,
+    ) -> Mapping[str, Any]:
         if type(task_index) is not int or task_index not in self.by_task:
             raise ValueError("task index is outside the production manifest")
-        server_containers = self.owned_container_ids(task_index)
+        slot = self.require_slot(slot, task_index=task_index)
+        server_containers = self.owned_container_ids(
+            task_index, slot_index=slot.slot_index
+        )
         image = self.task_image_identity(task_index)
         image_containers = [] if image is None else self.image_container_ids(image[0])
         containers = sorted(set(server_containers) | set(image_containers))
@@ -3390,6 +3735,9 @@ class LinuxProductionRuntime:
             "tmpfs_mounts": len(tmpfs_mounts),
             "mounts": len(mounts),
             "rootfs_attested": rootfs is not None,
+            "slot_index": slot.slot_index,
+            "server_port": slot.server_port,
+            "lane_generation": slot.generation,
         }
 
     def task_state_rows(
@@ -3461,7 +3809,14 @@ class LinuxProductionRuntime:
             "certified_aliases_removed": aliases,
         }
 
-    def evict_task(self, task_index: int, stage: Any) -> Mapping[str, Any]:
+    def evict_task(
+        self,
+        task_index: int,
+        stage: Any,
+        *,
+        slot: RuntimeLaneToken,
+    ) -> Mapping[str, Any]:
+        slot = self.require_slot(slot, task_index=task_index)
         if stage is not None:
             if not isinstance(stage, ProductionTaskStage):
                 raise TypeError("task eviction stage has the wrong type")
@@ -3475,7 +3830,7 @@ class LinuxProductionRuntime:
             adapted,
             outcomes,
         )
-        residue = self.audit_residue(task_index)
+        residue = self.audit_residue(task_index, slot=slot)
         if any(
             residue[name] != 0
             for name in (
@@ -3504,6 +3859,9 @@ class LinuxProductionRuntime:
             "task_root_removed": task_root_removed,
             "certified_blobs_retained": True,
             "repository_mirror_retained": True,
+            "slot_index": slot.slot_index,
+            "server_port": slot.server_port,
+            "lane_generation": slot.generation,
         }
         atomic_write_json(
             self.config.run_root
@@ -3525,18 +3883,42 @@ class LinuxProductionRuntime:
             + r"([0-9]{4})-(native|amg_compaction_only|amg_memory)-g([0-9]{8})",
             name,
         )
-        if match is None or labels != {
-            **{
-                key: value
-                for key, value in labels.items()
-                if not str(key).startswith("amg.")
-            },
+        expected_amg_labels = {
             "amg.owner": OWNER_LABEL,
-            "amg.task_index": match.group(1),
-            "amg.arm": match.group(2),
-            "amg.generation": match.group(3),
-        }:
+            "amg.task_index": match.group(1) if match is not None else None,
+            "amg.arm": match.group(2) if match is not None else None,
+            "amg.generation": match.group(3) if match is not None else None,
+        }
+        if match is None or any(
+            labels.get(name) != expected
+            for name, expected in expected_amg_labels.items()
+        ):
             raise RuntimeError("refusing to remove an unowned task container")
+        slot_index = labels.get("amg.slot_index")
+        server_port = labels.get("amg.server_port")
+        lane_generation = labels.get("amg.lane_generation")
+        if (
+            not isinstance(slot_index, str)
+            or not slot_index.isdigit()
+            or int(slot_index) >= self.config.task_slots_per_replica
+            or server_port != str(self.config.server_port(int(slot_index)))
+            or not isinstance(lane_generation, str)
+            or not lane_generation.isdigit()
+            or int(lane_generation) <= 0
+        ):
+            raise RuntimeError("refusing to remove a slot-unbound task container")
+        unexpected_amg_labels = {
+            str(name)
+            for name in labels
+            if str(name).startswith("amg.")
+        } - {
+            *expected_amg_labels,
+            "amg.slot_index",
+            "amg.server_port",
+            "amg.lane_generation",
+        }
+        if unexpected_amg_labels:
+            raise RuntimeError("refusing to remove a task container with unknown ownership labels")
         removed = self.docker().run(
             "container", "rm", "--force", container_id
         )
@@ -4558,7 +4940,7 @@ class LinuxProductionRuntime:
             "shared_model_pool": shared_pool,
         }
 
-    def cleanup(self) -> Mapping[str, Any]:
+    def cleanup(self, *, slots: Sequence[RuntimeLaneToken]) -> Mapping[str, Any]:
         if self.config.shared_model_pool is not None:
             raise RuntimeError(
                 "shared-model pool cleanup requires the eight-replica coordinator"
@@ -4580,7 +4962,8 @@ class LinuxProductionRuntime:
             removed_cgroups.append(cell_name)
 
         startup_reconciliation = self.reconcile_startup(
-            task_indices=tuple(sorted(self.by_task))
+            task_indices=tuple(sorted(self.by_task)),
+            slots=slots,
         )
         model = self.stop_model_process()
         holders = self.restore_holders()
@@ -4632,8 +5015,8 @@ class ProductionLifecycleOperations:
     def preflight(self) -> Mapping[str, Any]:
         return self.runtime.preflight()
 
-    def stage_task(self, task_index: int) -> Any:
-        return self.runtime.stage_task(task_index)
+    def stage_task(self, task_index: int, *, slot: RuntimeLaneToken) -> Any:
+        return self.runtime.stage_task(task_index, slot=slot)
 
     def reconcile_cell(
         self,
@@ -4641,11 +5024,13 @@ class ProductionLifecycleOperations:
         *,
         generation: int,
         before_preflight: bool,
+        slot: RuntimeLaneToken,
     ) -> Mapping[str, Any]:
         return self.runtime.reconcile_cell(
             config,
             generation=generation,
             before_preflight=before_preflight,
+            slot=slot,
         )
 
     def reconcile_grade(self, **kwargs: Any) -> Mapping[str, Any]:
@@ -4656,13 +5041,17 @@ class ProductionLifecycleOperations:
         *,
         task_indices: Sequence[int],
         allow_foreign_loaded_images: bool = False,
+        slots: Sequence[RuntimeLaneToken],
     ) -> Mapping[str, Any]:
         if allow_foreign_loaded_images:
             return self.runtime.reconcile_startup(
                 task_indices=task_indices,
                 allow_foreign_loaded_images=True,
+                slots=slots,
             )
-        return self.runtime.reconcile_startup(task_indices=task_indices)
+        return self.runtime.reconcile_startup(
+            task_indices=task_indices, slots=slots
+        )
 
     def reconcile_unbound_loaded_images(self) -> Mapping[str, Any]:
         return self.runtime.reconcile_unbound_loaded_images()
@@ -4673,23 +5062,50 @@ class ProductionLifecycleOperations:
         stage: Any,
         *,
         generation: int,
+        slot: RuntimeLaneToken,
     ) -> Mapping[str, Any]:
-        return self.runtime.run_cell(config, stage, generation=generation)
+        return self.runtime.run_cell(
+            config, stage, generation=generation, slot=slot
+        )
 
     def grade(self, **kwargs: Any) -> Mapping[str, Any]:
         return self.runtime.grade(**kwargs)
 
-    def audit_residue(self, task_index: int) -> Mapping[str, Any]:
-        return self.runtime.audit_residue(task_index)
+    def audit_residue(
+        self, task_index: int, *, slot: RuntimeLaneToken
+    ) -> Mapping[str, Any]:
+        return self.runtime.audit_residue(task_index, slot=slot)
 
-    def evict_task(self, task_index: int, stage: Any) -> Mapping[str, Any]:
-        return self.runtime.evict_task(task_index, stage)
+    def evict_task(
+        self,
+        task_index: int,
+        stage: Any,
+        *,
+        slot: RuntimeLaneToken,
+    ) -> Mapping[str, Any]:
+        return self.runtime.evict_task(task_index, stage, slot=slot)
 
-    def cleanup(self) -> Mapping[str, Any]:
-        return self.runtime.cleanup()
+    def cleanup(self, *, slots: Sequence[RuntimeLaneToken]) -> Mapping[str, Any]:
+        return self.runtime.cleanup(slots=slots)
 
     def final_audit(self) -> Mapping[str, Any]:
         return self.runtime.final_audit()
+
+    def timing_identity(self) -> Mapping[str, Any]:
+        source = self.config.section("source")
+        pod = self.config.section("pod")
+        shared = self.config.shared_model_pool
+        return {
+            "deployment_commit": source["deployment_commit"],
+            "inner_commit": source["inner_commit"],
+            "source_identity_sha256": sha256_json(source),
+            "run_config_sha256": sha256_file(self.config.path),
+            "manifest_sha256": self.config.payload["manifest_sha256"],
+            "replica_index": (
+                shared["replica_index"] if shared is not None else 0
+            ),
+            "gpu_uuid": pod["gpu_uuid"],
+        }
 
 
 OperationsFactory = Callable[

@@ -410,14 +410,16 @@ class FakeLifecycleOperations:
             snapshot["residue"]["owned_containers"] = 1
         return snapshot
 
-    def stage_task(self, task_index: int):
+    def stage_task(self, task_index: int, *, slot):
+        self.assert_slot(slot, task_index)
         self.staged.append(task_index)
         self.events.append(("stage", task_index))
         return {"task_index": task_index, "status": "staged"}
 
     def reconcile_cell(
-        self, config, *, generation, before_preflight
+        self, config, *, generation, before_preflight, slot
     ):
+        self.assert_slot(slot, config.task.task_index)
         self.events.append(
             (
                 "reconcile_cell",
@@ -431,16 +433,19 @@ class FakeLifecycleOperations:
             self.stale_residue = False
         return {"status": "reconciled"}
 
-    def reconcile_grade(self, *, key, accepted, prediction, handoff):
+    def reconcile_grade(self, *, key, accepted, prediction, handoff, slot):
+        self.assert_slot(slot, key.task_index)
         del accepted, prediction, handoff
         self.events.append(("reconcile_grade", key.task_index, key.arm))
         return {"status": "reconciled"}
 
-    def reconcile_startup(self, *, task_indices):
+    def reconcile_startup(self, *, task_indices, slots):
+        self.assertTrue(slots)
         self.events.append(("reconcile_startup", tuple(task_indices)))
         return {"status": "reconciled"}
 
-    def run_cell(self, config, _stage, *, generation):
+    def run_cell(self, config, _stage, *, generation, slot):
+        self.assert_slot(slot, config.task.task_index)
         key = (config.task.task_index, config.capability.arm.value)
         self.run_calls.append(key)
         self.events.append(("run", *key, generation))
@@ -479,7 +484,8 @@ class FakeLifecycleOperations:
             "lifecycle": {"close_receipt_ref": "evidence://close/" + SHA_A},
         }
 
-    def grade(self, *, key, accepted, prediction, handoff):
+    def grade(self, *, key, accepted, prediction, handoff, slot):
+        self.assert_slot(slot, key.task_index)
         del accepted, prediction, handoff
         self.grade_calls.append((key.task_index, key.arm))
         self.events.append(("grade", key.task_index, key.arm))
@@ -491,7 +497,8 @@ class FakeLifecycleOperations:
             "report_sha256": SHA_D,
         }
 
-    def audit_residue(self, task_index: int):
+    def audit_residue(self, task_index: int, *, slot):
+        self.assert_slot(slot, task_index)
         return {
             "task_index": task_index,
             "active_slots": 0,
@@ -504,17 +511,38 @@ class FakeLifecycleOperations:
             "rootfs_attested": True,
         }
 
-    def evict_task(self, task_index: int, _stage):
+    def evict_task(self, task_index: int, _stage, *, slot):
+        self.assert_slot(slot, task_index)
         self.evicted.append(task_index)
         self.events.append(("evict", task_index, _stage is None))
         return {"task_index": task_index, "status": "evicted"}
 
-    def cleanup(self):
+    def cleanup(self, *, slots):
+        self.assertTrue(slots)
         self.cleanup_calls += 1
         return {"owned_residue": 0, "allocation_retained": True}
 
     def final_audit(self):
         return {"status": "PASS", "residue": {}}
+
+    @staticmethod
+    def assert_slot(slot, task_index):
+        if slot.task_index not in {None, task_index}:
+            raise AssertionError("operation received another task's slot")
+
+    @staticmethod
+    def assertTrue(value):
+        if not value:
+            raise AssertionError("expected a nonempty value")
+
+    @staticmethod
+    def timing_identity():
+        return {
+            "deployment_commit": "d" * 40,
+            "run_config_sha256": "c" * 64,
+            "replica_index": 0,
+            "gpu_uuid": "GPU-test",
+        }
 
 
 class PreflightValidationTest(unittest.TestCase):
@@ -628,7 +656,9 @@ class LifecycleDriverTest(unittest.TestCase):
         self.assertGreaterEqual(self.operations.preflight_calls, 3)
 
     def test_reconcile_dead_work_returns_the_complete_production_list_shape(self):
+        slots = [self.driver.acquire_runtime_lane(None, slot_index=0)]
         receipts = self.driver.reconcile_dead_work()
+        self.driver.release_runtime_lane(slots[0])
 
         self.assertIs(type(receipts), list)
         self.assertEqual(receipts, [{"startup": {"status": "reconciled"}}])
@@ -741,11 +771,57 @@ class LifecycleDriverTest(unittest.TestCase):
             self.operations.events.index(("verify_triad",)),
             self.operations.events.index(grade_events[0]),
         )
+        self.assertEqual(
+            [event[2] for event in run_events],
+            ["native", "amg_compaction_only", "amg_memory"],
+        )
+
+    def test_task_completion_can_be_validated_without_acquiring_a_runtime_lane(self):
+        completion = self.driver.run_task(0, gate=True)
+        self.assertEqual(self.driver.load_task_completion(0), completion)
+
+    def test_task_phase_timing_binds_slot_port_and_nonnegative_boundaries(self):
+        completion = self.driver.run_task(0, gate=True)
+        timing_ref = completion["timing_receipt"]
+        timing = json.loads(Path(timing_ref["path"]).read_text())
+        self.assertEqual(timing["status"], "READY_FOR_PUBLICATION")
+        self.assertEqual(timing["slot_index"], 0)
+        self.assertEqual(timing["server_port"], 18100)
+        self.assertEqual(
+            timing["task_seed"], self.driver.by_task[0][0].task.seed
+        )
+        self.assertTrue(timing["phase_durations_are_non_additive"])
+        phases = [row["phase"] for row in timing["phases"]]
+        self.assertEqual(
+            phases,
+            [
+                "task_slot_queue",
+                "oci_stage",
+                "cell_native",
+                "cell_amg_compaction_only",
+                "cell_amg_memory",
+                "triad_validation",
+                "official_grade_native",
+                "official_grade_amg_compaction_only",
+                "official_grade_amg_memory",
+                "residue_audit",
+                "task_eviction",
+                "publication_ready",
+            ],
+        )
+        for row in timing["phases"]:
+            self.assertGreaterEqual(row["duration_ns"], 0)
+            self.assertGreaterEqual(
+                row["ended_monotonic_ns"], row["started_monotonic_ns"]
+            )
+            self.assertGreaterEqual(row["ended_wall_ns"], row["started_wall_ns"])
 
     def test_grade_all_rejects_noncanonical_accepted_triad_before_outcomes(self):
-        stage = self.operations.stage_task(1)
+        slot = self.driver.acquire_runtime_lane(1, slot_index=0)
+        stage = self.operations.stage_task(1, slot=slot)
         for config in self.driver.by_task[1]:
-            self.driver._accepted_or_run(config, stage)
+            self.driver._accepted_or_run(config, stage, slot=slot)
+        self.driver.release_runtime_lane(slot)
 
         def reject_task_one(rows):
             if rows[0]["task_index"] == 1:
@@ -772,8 +848,12 @@ class LifecycleDriverTest(unittest.TestCase):
     def test_complete_audit_rejects_cross_task_namespace_and_root_reuse(self):
         original_run_cell = self.operations.run_cell
 
-        def run_cell_with_cross_task_reuse(config, stage, *, generation):
-            row = original_run_cell(config, stage, generation=generation)
+        def run_cell_with_cross_task_reuse(
+            config, stage, *, generation, slot
+        ):
+            row = original_run_cell(
+                config, stage, generation=generation, slot=slot
+            )
             row["audit_namespace"] = config.capability.arm.value
             row["audit_root"] = f"root-{config.capability.arm.value}"
             return row
@@ -796,7 +876,7 @@ class LifecycleDriverTest(unittest.TestCase):
     def test_complete_outcomes_resume_eviction_without_restage_or_rerun(self):
         original_evict = self.operations.evict_task
 
-        def fail_once(task_index, stage):
+        def fail_once(task_index, stage, *, slot):
             self.operations.evict_task = original_evict
             raise RuntimeError("simulated crash before eviction receipt")
 
@@ -824,6 +904,126 @@ class LifecycleDriverTest(unittest.TestCase):
         self.assertEqual(resumed_operations.grade_calls, [])
         self.assertEqual(resumed_operations.evicted, [0])
         self.assertEqual(result["accepted_cells"], 3)
+
+    def test_every_task_phase_crash_resumes_without_duplicate_publication(self):
+        checkpoints = (
+            "stage",
+            "arm_native",
+            "arm_amg_compaction_only",
+            "arm_amg_memory",
+            "triad",
+            "grade_native",
+            "grade_amg_compaction_only",
+            "grade_amg_memory",
+            "eviction",
+            "publication",
+        )
+
+        def build(case_root, operations, pid):
+            return LifecycleDriver(
+                root=case_root / "run",
+                configs=configs_for_two_tasks(),
+                owner=OwnerIdentity("host", "boot", pid, pid * 10),
+                owner_is_alive=lambda _owner: False,
+                operations=operations,
+                evidence_root=case_root / "evidence",
+                endpoint_validator=lambda row: (
+                    None
+                    if row.get("marker") == "valid-endpoint"
+                    else (_ for _ in ()).throw(ValueError("invalid endpoint"))
+                ),
+                triad_validator=triad_verification,
+                preflight_expectations=preflight_expectations(),
+                assigned_task_indices=(0,),
+            )
+
+        for offset, checkpoint in enumerate(checkpoints, start=1):
+            with self.subTest(checkpoint=checkpoint), tempfile.TemporaryDirectory() as raw:
+                case_root = Path(raw)
+                operations = FakeLifecycleOperations(case_root / "evidence")
+                driver = build(case_root, operations, 500 + offset)
+                crashed = False
+
+                def crash_once():
+                    nonlocal crashed
+                    if not crashed:
+                        crashed = True
+                        raise RuntimeError(f"crash after {checkpoint}")
+
+                if checkpoint == "stage":
+                    original = operations.stage_task
+
+                    def stage(task_index, *, slot):
+                        result = original(task_index, slot=slot)
+                        crash_once()
+                        return result
+
+                    operations.stage_task = stage
+                elif checkpoint.startswith("arm_"):
+                    target = checkpoint.removeprefix("arm_")
+                    original = driver._accepted_or_run
+
+                    def accepted(config, stage, *, slot):
+                        result = original(config, stage, slot=slot)
+                        if config.capability.arm.value == target:
+                            crash_once()
+                        return result
+
+                    driver._accepted_or_run = accepted
+                elif checkpoint == "triad":
+                    def verify(rows):
+                        result = triad_verification(rows)
+                        crash_once()
+                        return result
+
+                    driver.triad_validator = verify
+                elif checkpoint.startswith("grade_"):
+                    target = checkpoint.removeprefix("grade_")
+                    original = driver._grade_if_missing
+
+                    def grade(key, *, slot):
+                        result = original(key, slot=slot)
+                        if key.arm == target:
+                            crash_once()
+                        return result
+
+                    driver._grade_if_missing = grade
+                elif checkpoint == "eviction":
+                    original = operations.evict_task
+
+                    def evict(task_index, stage, *, slot):
+                        result = original(task_index, stage, slot=slot)
+                        crash_once()
+                        return result
+
+                    operations.evict_task = evict
+                else:
+                    original = driver.task_result
+
+                    def publish(*args, **kwargs):
+                        result = original(*args, **kwargs)
+                        crash_once()
+                        return result
+
+                    driver.task_result = publish
+
+                with self.assertRaisesRegex(RuntimeError, "crash after"):
+                    driver.run_task(0, gate=True)
+
+                resumed_operations = FakeLifecycleOperations(case_root / "evidence")
+                resumed = build(case_root, resumed_operations, 700 + offset)
+                result = resumed.run_task(0, gate=True)
+                self.assertEqual(result["accepted_cells"], 3)
+                self.assertEqual(result["official_outcomes"], 3)
+                self.assertEqual(
+                    len(list((case_root / "run/state/accepted").glob("0000-*.json"))),
+                    3,
+                )
+                self.assertEqual(
+                    len(list((case_root / "run/state/outcomes").glob("0000-*.json"))),
+                    3,
+                )
+                self.assertTrue((case_root / "run/full/task-0000.json").is_file())
 
     def test_real_runner_task_id_is_accepted_and_private_payloads_are_used(self):
         self.driver.run_task(0, gate=True)

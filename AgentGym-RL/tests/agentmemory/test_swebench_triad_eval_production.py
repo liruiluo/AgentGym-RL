@@ -42,7 +42,34 @@ from swebench_triad_eval.production import (
     validate_exact_token_proxy_config,
 )
 from swebench_triad_eval.cli import validate_preflight_snapshot
-from swebench_triad_eval.state import CellKey, sha256_json
+from swebench_triad_eval.state import (
+    CellKey,
+    OwnerIdentity,
+    RuntimeLaneToken,
+    sha256_json,
+)
+
+
+def runtime_slot(runtime, task_index=None, slot_index=None):
+    if slot_index is None:
+        slot_index = 0 if task_index is None else runtime.task_slots[task_index]
+    return RuntimeLaneToken(
+        driver_key="a" * 64,
+        lease_id="b" * 64,
+        owner=OwnerIdentity("host", "boot", 101, 1001),
+        task_index=task_index,
+        slot_index=slot_index,
+        server_port=runtime.config.server_port(slot_index),
+        generation=1,
+        fencing_token="c" * 64,
+    )
+
+
+def startup_slots(runtime):
+    return tuple(
+        runtime_slot(runtime, slot_index=slot_index)
+        for slot_index in range(runtime.config.task_slots_per_replica)
+    )
 
 
 class RecordingProductionRuntime:
@@ -53,11 +80,11 @@ class RecordingProductionRuntime:
         self.calls.append(("preflight",))
         return {"snapshot": True}
 
-    def stage_task(self, task_index):
+    def stage_task(self, task_index, *, slot):
         self.calls.append(("stage", task_index))
         return {"task_index": task_index}
 
-    def reconcile_cell(self, config, *, generation, before_preflight):
+    def reconcile_cell(self, config, *, generation, before_preflight, slot):
         self.calls.append(
             (
                 "reconcile_cell",
@@ -73,7 +100,7 @@ class RecordingProductionRuntime:
         self.calls.append(("reconcile_grade", kwargs["key"]))
         return {"reconciled": True}
 
-    def reconcile_startup(self, *, task_indices):
+    def reconcile_startup(self, *, task_indices, slots):
         self.calls.append(("reconcile_startup", tuple(task_indices)))
         return {"reconciled": True}
 
@@ -81,7 +108,7 @@ class RecordingProductionRuntime:
         self.calls.append(("reconcile_unbound_loaded_images",))
         return {"status": "PASS", "remaining_images": 0}
 
-    def run_cell(self, config, stage, *, generation):
+    def run_cell(self, config, stage, *, generation, slot):
         self.calls.append(
             (
                 "run",
@@ -97,15 +124,15 @@ class RecordingProductionRuntime:
         self.calls.append(("grade", kwargs["key"]))
         return {"outcome": True}
 
-    def audit_residue(self, task_index):
+    def audit_residue(self, task_index, *, slot):
         self.calls.append(("audit", task_index))
         return {"containers": 0}
 
-    def evict_task(self, task_index, stage):
+    def evict_task(self, task_index, stage, *, slot):
         self.calls.append(("evict", task_index, stage))
         return {"evicted": True}
 
-    def cleanup(self):
+    def cleanup(self, *, slots):
         self.calls.append(("cleanup",))
         return {"owned_residue": 0, "allocation_retained": True}
 
@@ -128,21 +155,38 @@ class ProductionOperationsBoundaryTest(unittest.TestCase):
         )
 
     def test_every_lifecycle_boundary_is_concrete_and_generation_bound(self):
-        stage = self.operations.stage_task(7)
+        slot = RuntimeLaneToken(
+            driver_key="a" * 64,
+            lease_id="b" * 64,
+            owner=OwnerIdentity("host", "boot", 101, 1001),
+            task_index=7,
+            slot_index=0,
+            server_port=self.config.server_port(0),
+            generation=1,
+            fencing_token="c" * 64,
+        )
+        global_slot = RuntimeLaneToken(
+            **{**slot.__dict__, "task_index": None}
+        )
+        stage = self.operations.stage_task(7, slot=slot)
         config = self.config.configs[7 * 3 + 2]
         self.assertEqual(self.operations.preflight(), {"snapshot": True})
         self.assertEqual(
             self.operations.reconcile_cell(
-                config, generation=19, before_preflight=True
+                config, generation=19, before_preflight=True, slot=slot
             ),
             {"reconciled": True},
         )
         self.assertEqual(
-            self.operations.reconcile_startup(task_indices=(7,)),
+            self.operations.reconcile_startup(
+                task_indices=(7,), slots=(global_slot,)
+            ),
             {"reconciled": True},
         )
         self.assertEqual(
-            self.operations.run_cell(config, stage, generation=19),
+            self.operations.run_cell(
+                config, stage, generation=19, slot=slot
+            ),
             {"endpoint": True},
         )
         key = CellKey(7, "amg_memory")
@@ -152,15 +196,18 @@ class ProductionOperationsBoundaryTest(unittest.TestCase):
                 accepted={},
                 prediction={},
                 handoff={},
+                slot=slot,
             ),
             {"outcome": True},
         )
-        self.assertEqual(self.operations.audit_residue(7), {"containers": 0})
         self.assertEqual(
-            self.operations.evict_task(7, stage), {"evicted": True}
+            self.operations.audit_residue(7, slot=slot), {"containers": 0}
         )
         self.assertEqual(
-            self.operations.cleanup(),
+            self.operations.evict_task(7, stage, slot=slot), {"evicted": True}
+        )
+        self.assertEqual(
+            self.operations.cleanup(slots=(global_slot,)),
             {"owned_residue": 0, "allocation_retained": True},
         )
         self.assertEqual(self.operations.final_audit(), {"status": "PASS"})
@@ -458,6 +505,7 @@ class LinuxProductionRuntimeTest(unittest.TestCase):
                     accepted=accepted,
                     prediction=prediction,
                     handoff=handoff,
+                    slot=runtime_slot(runtime, 0),
                 )
             self.assertFalse(outcome["resolved"])
             self.assertEqual(attempts, [(23, 1), (23, 2)])
@@ -525,6 +573,7 @@ class LinuxProductionRuntimeTest(unittest.TestCase):
                     accepted=accepted,
                     prediction=prediction,
                     handoff=handoff,
+                    slot=runtime_slot(runtime, 0),
                 )
             self.assertEqual(raised.exception.failure_class, "grader_spawn_failure")
             self.assertEqual(popen.call_count, 1)
@@ -557,7 +606,9 @@ class LinuxProductionRuntimeTest(unittest.TestCase):
             ), patch.object(
                 runtime, "verify_task_rootfs", return_value={"status": "PASS"}
             ):
-                residue = runtime.audit_residue(0)
+                residue = runtime.audit_residue(
+                    0, slot=runtime_slot(runtime, 0)
+                )
             self.assertEqual(residue["containers"], 1)
             self.assertEqual(residue["processes"], 2)
             self.assertEqual(residue["tmpfs_mounts"], 1)
@@ -579,6 +630,37 @@ class LinuxProductionRuntimeTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "unowned"):
                     runtime.remove_owned_container_id("foreign")
             docker.run.assert_not_called()
+
+    def test_container_cleanup_accepts_exact_slot_fencing_labels(self):
+        with tempfile.TemporaryDirectory() as raw:
+            runtime = self.make_runtime(Path(raw))
+            docker = Mock()
+            docker.run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=b"", stderr=b""
+            )
+            labels = {
+                "foreign.label": "retained",
+                "amg.owner": "amg-swebench-triad-eval-0816",
+                "amg.task_index": "0000",
+                "amg.arm": "native",
+                "amg.generation": "00000001",
+                "amg.slot_index": "0",
+                "amg.server_port": str(runtime.config.server_port(0)),
+                "amg.lane_generation": "00000003",
+            }
+            with patch.object(runtime, "docker", return_value=docker), patch.object(
+                runtime,
+                "container_record",
+                return_value={
+                    "Name": "/amg-sbv-triad-0000-native-g00000001",
+                    "Config": {"Labels": labels},
+                },
+            ):
+                receipt = runtime.remove_owned_container_id("owned")
+            self.assertTrue(receipt["removed"])
+            docker.run.assert_called_once_with(
+                "container", "rm", "--force", "owned"
+            )
 
     def test_task_root_cleanup_refuses_any_surviving_mount(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -630,7 +712,9 @@ class LinuxProductionRuntimeTest(unittest.TestCase):
                 "global_residue_snapshot",
                 return_value={"owned_containers": 0},
             ):
-                receipt = runtime.reconcile_startup(task_indices=(0,))
+                receipt = runtime.reconcile_startup(
+                    task_indices=(0,), slots=startup_slots(runtime)
+                )
             evict.assert_called_once()
             self.assertEqual(receipt["removed_task_roots"], [0])
 
@@ -658,9 +742,13 @@ class LinuxProductionRuntimeTest(unittest.TestCase):
                 5
             ], patches[6], patches[7]:
                 with self.assertRaisesRegex(RuntimeError, "no durable task-stage"):
-                    runtime.reconcile_startup(task_indices=(0,))
+                    runtime.reconcile_startup(
+                        task_indices=(0,), slots=startup_slots(runtime)
+                    )
                 receipt = runtime.reconcile_startup(
-                    task_indices=(0,), allow_foreign_loaded_images=True
+                    task_indices=(0,),
+                    allow_foreign_loaded_images=True,
+                    slots=startup_slots(runtime),
                 )
             self.assertEqual(
                 receipt["foreign_loaded_images"],
@@ -694,7 +782,9 @@ class LinuxProductionRuntimeTest(unittest.TestCase):
                 "global_residue_snapshot",
                 return_value={"owned_containers": 0},
             ):
-                receipt = runtime.reconcile_startup(task_indices=(0,))
+                receipt = runtime.reconcile_startup(
+                    task_indices=(0,), slots=startup_slots(runtime)
+                )
             evict.assert_called_once_with(*staged)
             self.assertEqual(receipt["foreign_loaded_images"], [])
 
@@ -733,6 +823,9 @@ class LinuxProductionRuntimeTest(unittest.TestCase):
                         "task_root_removed": True,
                         "certified_blobs_retained": True,
                         "repository_mirror_retained": True,
+                        "slot_index": 0,
+                        "server_port": runtime.config.server_port(0),
+                        "lane_generation": 1,
                     }
                 )
             )
@@ -755,7 +848,9 @@ class LinuxProductionRuntimeTest(unittest.TestCase):
                 "global_residue_snapshot",
                 return_value={"owned_containers": 0},
             ):
-                receipt = runtime.reconcile_startup(task_indices=(0, 1))
+                receipt = runtime.reconcile_startup(
+                    task_indices=(0, 1), slots=startup_slots(runtime)
+                )
 
             evict.assert_called_once_with("swebench/resuming:latest", image_id)
             self.assertEqual(receipt["removed_task_roots"], [1])
@@ -786,7 +881,9 @@ class LinuxProductionRuntimeTest(unittest.TestCase):
                 "task_image_identity",
                 side_effect=lambda task_index: identities[task_index],
             ), self.assertRaisesRegex(RuntimeError, "multiple active task leases"):
-                runtime.reconcile_startup(task_indices=(0, 1))
+                runtime.reconcile_startup(
+                    task_indices=(0, 1), slots=startup_slots(runtime)
+                )
 
     def test_loaded_image_census_does_not_depend_on_a_stage_receipt(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -842,7 +939,7 @@ class LinuxProductionRuntimeTest(unittest.TestCase):
             ), patch.object(
                 runtime, "global_residue_snapshot", return_value=zero
             ):
-                receipt = runtime.cleanup()
+                receipt = runtime.cleanup(slots=startup_slots(runtime))
             restore.assert_called_once_with()
             self.assertTrue(receipt["holders_restored"])
             self.assertEqual(receipt["owned_residue"], 0)
@@ -1289,7 +1386,20 @@ class SharedModelPoolProductionTest(unittest.TestCase):
     @staticmethod
     def shared_config(root: Path) -> tuple[ProductionRunConfig, dict[str, Any]]:
         config_path, payload = production_config(root)
-        payload["schema"] = "amg_swebench_triad_run_config_shared_pool_v2"
+        payload["schema"] = "amg_swebench_triad_run_config_shared_pool_v3"
+        payload["runtime"] = dict(payload["runtime"])
+        payload["runtime"].pop("server_port")
+        payload["runtime"].update(
+            {
+                "task_slots_per_replica": 2,
+                "server_ports": [18103, 18111],
+            }
+        )
+        payload["grader"] = {
+            **payload["grader"],
+            "global_max_concurrency": 8,
+            "semaphore_root": str(root / "grader-semaphore"),
+        }
         payload["pod"] = {
             **payload["pod"],
             "gpu_uuid": "GPU-shared-3",
@@ -1320,6 +1430,71 @@ class SharedModelPoolProductionTest(unittest.TestCase):
         }
         config_path.write_bytes(canonical_json_bytes(payload))
         return ProductionRunConfig.load(config_path), payload
+
+    def test_cell_reconciliation_is_bound_to_its_exact_slot(self):
+        with tempfile.TemporaryDirectory() as raw:
+            config, _ = self.shared_config(Path(raw))
+            runtime = LinuxProductionRuntime(config, config.configs)
+            task_index = next(
+                index for index, slot_index in runtime.task_slots.items()
+                if slot_index == 1
+            )
+            cell = runtime.by_task[task_index][0]
+            slot = runtime_slot(runtime, task_index)
+            with patch.object(
+                runtime, "owned_container_ids", return_value=[]
+            ) as containers, patch.object(
+                runtime, "cgroup_paths", return_value=[]
+            ), patch.object(
+                runtime, "mount_records_under", return_value=[]
+            ), patch.object(
+                runtime, "cgroup_process_ids", return_value=[]
+            ):
+                receipt = runtime.reconcile_cell(
+                    cell,
+                    generation=2,
+                    before_preflight=False,
+                    slot=slot,
+                )
+            containers.assert_called_once_with(
+                task_index, cell.capability.arm.value, 1
+            )
+            self.assertEqual(receipt["slot_index"], 1)
+            self.assertEqual(receipt["server_port"], config.server_port(1))
+
+    def test_cell_reconciliation_rejects_a_future_lane_generation(self):
+        with tempfile.TemporaryDirectory() as raw:
+            config, _ = self.shared_config(Path(raw))
+            runtime = LinuxProductionRuntime(config, config.configs)
+            task_index = next(
+                index for index, slot_index in runtime.task_slots.items()
+                if slot_index == 1
+            )
+            cell = runtime.by_task[task_index][0]
+            slot = runtime_slot(runtime, task_index)
+            labels = {
+                "amg.owner": "amg-swebench-triad-eval-0816",
+                "amg.task_index": f"{task_index:04d}",
+                "amg.arm": cell.capability.arm.value,
+                "amg.generation": "00000001",
+                "amg.slot_index": "1",
+                "amg.server_port": str(slot.server_port),
+                "amg.lane_generation": str(slot.generation + 1),
+            }
+            with patch.object(
+                runtime, "owned_container_ids", return_value=["future"]
+            ), patch.object(
+                runtime,
+                "container_record",
+                return_value={"Config": {"Labels": labels}},
+            ):
+                with self.assertRaisesRegex(RuntimeError, "generation drifted"):
+                    runtime.reconcile_cell(
+                        cell,
+                        generation=2,
+                        before_preflight=False,
+                        slot=slot,
+                    )
 
     def test_exact_token_proxy_config_binds_listen_and_upstream_ports(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -1707,7 +1882,12 @@ class SharedModelPoolProductionTest(unittest.TestCase):
             ) as live_probe, self.assertRaisesRegex(
                 RuntimeError, "fields drifted"
             ):
-                runtime.run_cell(runtime.by_task[task_index][0], stage, generation=1)
+                runtime.run_cell(
+                    runtime.by_task[task_index][0],
+                    stage,
+                    generation=1,
+                    slot=runtime_slot(runtime, task_index),
+                )
             live_probe.assert_called_once_with(require_preflight_binding=True)
 
     def test_final_audit_reprobes_and_embeds_the_live_shared_pool(self):
@@ -1850,7 +2030,7 @@ class SharedModelPoolProductionTest(unittest.TestCase):
             ) as restore_holders, self.assertRaisesRegex(
                 RuntimeError, "eight-replica coordinator"
             ):
-                runtime.cleanup()
+                runtime.cleanup(slots=startup_slots(runtime))
             containers.assert_not_called()
             cgroups.assert_not_called()
             reconcile.assert_not_called()

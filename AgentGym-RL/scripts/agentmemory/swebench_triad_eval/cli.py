@@ -10,11 +10,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import sys
+import threading
 import time
 from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
@@ -42,6 +43,7 @@ from .state import (
     DriverLeaseRegistry,
     ManifestCell,
     OwnerIdentity,
+    RuntimeLaneToken,
     sha256_json,
 )
 
@@ -64,7 +66,7 @@ class PreflightContractError(RuntimeError):
 class LifecycleOperations(Protocol):
     def preflight(self) -> Mapping[str, Any]: ...
 
-    def stage_task(self, task_index: int) -> Any: ...
+    def stage_task(self, task_index: int, *, slot: RuntimeLaneToken) -> Any: ...
 
     def reconcile_cell(
         self,
@@ -72,6 +74,7 @@ class LifecycleOperations(Protocol):
         *,
         generation: int,
         before_preflight: bool,
+        slot: RuntimeLaneToken,
     ) -> Mapping[str, Any]: ...
 
     def reconcile_grade(
@@ -81,6 +84,7 @@ class LifecycleOperations(Protocol):
         accepted: Mapping[str, Any],
         prediction: Mapping[str, Any],
         handoff: Mapping[str, Any],
+        slot: RuntimeLaneToken,
     ) -> Mapping[str, Any]: ...
 
     def reconcile_startup(
@@ -88,6 +92,7 @@ class LifecycleOperations(Protocol):
         *,
         task_indices: Sequence[int],
         allow_foreign_loaded_images: bool = False,
+        slots: Sequence[RuntimeLaneToken],
     ) -> Mapping[str, Any]: ...
 
     def run_cell(
@@ -96,6 +101,7 @@ class LifecycleOperations(Protocol):
         stage: Any,
         *,
         generation: int,
+        slot: RuntimeLaneToken,
     ) -> Mapping[str, Any]: ...
 
     def grade(
@@ -105,15 +111,151 @@ class LifecycleOperations(Protocol):
         accepted: Mapping[str, Any],
         prediction: Mapping[str, Any],
         handoff: Mapping[str, Any],
+        slot: RuntimeLaneToken,
     ) -> Mapping[str, Any]: ...
 
-    def audit_residue(self, task_index: int) -> Mapping[str, Any]: ...
+    def audit_residue(
+        self, task_index: int, *, slot: RuntimeLaneToken
+    ) -> Mapping[str, Any]: ...
 
-    def evict_task(self, task_index: int, stage: Any) -> Mapping[str, Any]: ...
+    def evict_task(
+        self, task_index: int, stage: Any, *, slot: RuntimeLaneToken
+    ) -> Mapping[str, Any]: ...
 
-    def cleanup(self) -> Mapping[str, Any]: ...
+    def cleanup(self, *, slots: Sequence[RuntimeLaneToken]) -> Mapping[str, Any]: ...
 
     def final_audit(self) -> Mapping[str, Any]: ...
+
+    def timing_identity(self) -> Mapping[str, Any]: ...
+
+
+class TaskTimingRecorder:
+    """Persist non-additive wall/monotonic phase boundaries for one task."""
+
+    def __init__(
+        self,
+        *,
+        root: Path,
+        task_index: int,
+        task_id: str,
+        task_seed: int,
+        slot: RuntimeLaneToken,
+        identity: Mapping[str, Any],
+        queued_wall_ns: int,
+        queued_monotonic_ns: int,
+        acquired_wall_ns: int,
+        acquired_monotonic_ns: int,
+    ) -> None:
+        self.root = root
+        self.task_index = task_index
+        self.task_id = task_id
+        self.task_seed = task_seed
+        self.slot = slot
+        self.identity = dict(identity)
+        self.started_wall_ns = queued_wall_ns
+        self.started_monotonic_ns = queued_monotonic_ns
+        self.phases: list[dict[str, Any]] = [
+            self._phase_row(
+                "task_slot_queue",
+                queued_wall_ns,
+                acquired_wall_ns,
+                queued_monotonic_ns,
+                acquired_monotonic_ns,
+                "PASS",
+            )
+        ]
+        self._persisted: dict[str, Any] | None = None
+
+    @staticmethod
+    def _phase_row(
+        name: str,
+        started_wall_ns: int,
+        ended_wall_ns: int,
+        started_monotonic_ns: int,
+        ended_monotonic_ns: int,
+        status: str,
+    ) -> dict[str, Any]:
+        return {
+            "phase": name,
+            "status": status,
+            "started_wall_ns": started_wall_ns,
+            "ended_wall_ns": ended_wall_ns,
+            "started_monotonic_ns": started_monotonic_ns,
+            "ended_monotonic_ns": ended_monotonic_ns,
+            "duration_ns": max(0, ended_monotonic_ns - started_monotonic_ns),
+        }
+
+    def measure(self, name: str, operation: Callable[[], Any]) -> Any:
+        if self._persisted is not None:
+            raise RuntimeError("task timing receipt is already terminal")
+        started_wall_ns = time.time_ns()
+        started_monotonic_ns = time.monotonic_ns()
+        status = "PASS"
+        try:
+            return operation()
+        except BaseException:
+            status = "FAIL"
+            raise
+        finally:
+            self.phases.append(
+                self._phase_row(
+                    name,
+                    started_wall_ns,
+                    time.time_ns(),
+                    started_monotonic_ns,
+                    time.monotonic_ns(),
+                    status,
+                )
+            )
+
+    def persist(self, status: str) -> dict[str, Any]:
+        if self._persisted is not None:
+            if self._persisted["status"] != status:
+                raise RuntimeError("task timing terminal status drifted")
+            return dict(self._persisted)
+        ended_wall_ns = time.time_ns()
+        ended_monotonic_ns = time.monotonic_ns()
+        receipt = {
+            "schema": "swebench_triad_task_phase_timing_v1",
+            "status": status,
+            "task_index": self.task_index,
+            "task_id": self.task_id,
+            "task_seed": self.task_seed,
+            "slot_index": self.slot.slot_index,
+            "server_port": self.slot.server_port,
+            "lane_generation": self.slot.generation,
+            "lane_fencing_token_sha256": hashlib.sha256(
+                self.slot.fencing_token.encode("ascii")
+            ).hexdigest(),
+            "started_wall_ns": self.started_wall_ns,
+            "ended_wall_ns": ended_wall_ns,
+            "started_monotonic_ns": self.started_monotonic_ns,
+            "ended_monotonic_ns": ended_monotonic_ns,
+            "duration_ns": max(
+                0, ended_monotonic_ns - self.started_monotonic_ns
+            ),
+            "identity": self.identity,
+            "phases": self.phases,
+            "phase_durations_are_non_additive": True,
+        }
+        path = (
+            self.root
+            / "control"
+            / "timings"
+            / f"task-{self.task_index:04d}"
+            / f"lane-{self.slot.slot_index}-generation-{self.slot.generation:08d}.json"
+        )
+        atomic_write_json(path, receipt)
+        self._persisted = {
+            "status": status,
+            "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        return dict(self._persisted)
+
+    @property
+    def terminal(self) -> bool:
+        return self._persisted is not None
 
 
 def _fail(message: str) -> None:
@@ -608,6 +750,7 @@ class LifecycleDriver:
         clock: Callable[[], float] = time.monotonic,
         assigned_task_indices: Sequence[int] | None = None,
         lease_registry: DriverLeaseRegistry | None = None,
+        slot_ports: Sequence[int] | None = None,
     ) -> None:
         self.root = ensure_private_directory(root)
         self.configs = tuple(configs)
@@ -638,8 +781,32 @@ class LifecycleDriver:
             or lease_registry.assigned_task_indices != assigned
         ):
             raise ValueError("lifecycle lease registry does not bind its shard")
+        ports = (
+            tuple(slot_ports)
+            if slot_ports is not None
+            else (
+                lease_registry.slot_ports
+                if lease_registry is not None
+                else (18100,)
+            )
+        )
+        if (
+            not ports
+            or len(ports) > 2
+            or any(type(port) is not int or not 1 <= port <= 65535 for port in ports)
+            or len(set(ports)) != len(ports)
+            or (
+                lease_registry is not None
+                and ports != lease_registry.slot_ports
+            )
+        ):
+            raise ValueError("lifecycle runtime slot ports are invalid")
         self.assigned_task_indices = assigned
         self.lease_registry = lease_registry
+        self.slot_ports = ports
+        self._lane_lock = threading.Lock()
+        self._active_lanes: dict[int, RuntimeLaneToken] = {}
+        self._local_lane_generations = [0 for _ in ports]
         self.by_key = {
             CellKey(config.task.task_index, config.capability.arm.value): config
             for config in self.configs
@@ -669,15 +836,64 @@ class LifecycleDriver:
         self.lease_registry.start_heartbeat()
         self.lease_registry.assert_healthy()
 
-    def acquire_runtime_lane(self, task_index: int | None) -> None:
-        if self.lease_registry is None:
-            return
-        self.ensure_driver_lease()
-        self.lease_registry.acquire_lane(task_index=task_index)
+    def task_slot_index(self, task_index: int) -> int:
+        if task_index not in self.assigned_task_indices:
+            raise ValueError("task index is outside the assigned shard")
+        return self.assigned_task_indices.index(task_index) % len(self.slot_ports)
 
-    def release_runtime_lane(self) -> None:
+    def acquire_runtime_lane(
+        self,
+        task_index: int | None,
+        *,
+        slot_index: int,
+    ) -> RuntimeLaneToken:
+        if type(slot_index) is not int or not 0 <= slot_index < len(self.slot_ports):
+            raise ValueError("runtime slot is outside the configured lattice")
+        if task_index is not None and self.task_slot_index(task_index) != slot_index:
+            raise ValueError("task was routed to the wrong deterministic slot")
         if self.lease_registry is not None:
-            self.lease_registry.release_lane()
+            self.ensure_driver_lease()
+            token = self.lease_registry.acquire_lane(
+                task_index=task_index,
+                slot_index=slot_index,
+            )
+        else:
+            with self._lane_lock:
+                if slot_index in self._active_lanes:
+                    raise RuntimeError("runtime slot is already active")
+                self._local_lane_generations[slot_index] += 1
+                token = RuntimeLaneToken(
+                    driver_key=sha256_json(self.owner.to_payload()),
+                    lease_id="0" * 64,
+                    owner=self.owner,
+                    task_index=task_index,
+                    slot_index=slot_index,
+                    server_port=self.slot_ports[slot_index],
+                    generation=self._local_lane_generations[slot_index],
+                    fencing_token=secrets.token_hex(32),
+                )
+        with self._lane_lock:
+            existing = self._active_lanes.get(slot_index)
+            if existing is not None and existing != token:
+                raise RuntimeError("runtime slot is already active")
+            self._active_lanes[slot_index] = token
+        return token
+
+    def assert_runtime_lane(self, token: RuntimeLaneToken) -> None:
+        with self._lane_lock:
+            if self._active_lanes.get(token.slot_index) != token:
+                raise RuntimeError("runtime lane token is not active")
+        if self.lease_registry is not None:
+            self.lease_registry.assert_lane(token)
+
+    def release_runtime_lane(self, token: RuntimeLaneToken) -> None:
+        self.assert_runtime_lane(token)
+        if self.lease_registry is not None:
+            self.lease_registry.release_lane(token)
+        with self._lane_lock:
+            if self._active_lanes.get(token.slot_index) != token:
+                raise RuntimeError("runtime lane changed during release")
+            del self._active_lanes[token.slot_index]
 
     @staticmethod
     def _index_configs(
@@ -764,10 +980,15 @@ class LifecycleDriver:
             if previous.owner != self.owner and self.owner_is_alive(previous.owner):
                 raise RuntimeError(f"cell recovery found a live owner: {key.slug}")
             token = self.store.acquire(key)
+            slot = self._active_lanes.get(self.task_slot_index(key.task_index))
+            if slot is None:
+                raise RuntimeError("cell recovery requires its deterministic slot")
+            self.assert_runtime_lane(slot)
             receipt = self.operations.reconcile_cell(
                 self.by_key[key],
                 generation=token.generation,
                 before_preflight=True,
+                slot=slot,
             )
             if not isinstance(receipt, Mapping):
                 raise RuntimeError("cell recovery receipt is invalid")
@@ -797,11 +1018,16 @@ class LifecycleDriver:
                 self.store, accepted, key
             )
             token = self.store.acquire_grade(key)
+            slot = self._active_lanes.get(self.task_slot_index(key.task_index))
+            if slot is None:
+                raise RuntimeError("grader recovery requires its deterministic slot")
+            self.assert_runtime_lane(slot)
             receipt = self.operations.reconcile_grade(
                 key=key,
                 accepted=accepted,
                 prediction=prediction,
                 handoff=handoff,
+                slot=slot,
             )
             if not isinstance(receipt, Mapping):
                 raise RuntimeError("grader recovery receipt is invalid")
@@ -816,10 +1042,18 @@ class LifecycleDriver:
             startup = self.operations.reconcile_startup(
                 task_indices=self.assigned_task_indices,
                 allow_foreign_loaded_images=True,
+                slots=tuple(
+                    self._active_lanes[index]
+                    for index in range(len(self.slot_ports))
+                ),
             )
         else:
             startup = self.operations.reconcile_startup(
-                task_indices=self.assigned_task_indices
+                task_indices=self.assigned_task_indices,
+                slots=tuple(
+                    self._active_lanes[index]
+                    for index in range(len(self.slot_ports))
+                ),
             )
         if not isinstance(startup, Mapping):
             raise RuntimeError("startup reconciliation receipt is invalid")
@@ -834,18 +1068,26 @@ class LifecycleDriver:
         return receipts
 
     def live_preflight(self) -> dict[str, Any]:
-        self.acquire_runtime_lane(None)
+        slots = [
+            self.acquire_runtime_lane(None, slot_index=slot_index)
+            for slot_index in range(len(self.slot_ports))
+        ]
         try:
             self.reconcile_dead_work()
             result = self.preflight()
         except BaseException:
             raise
         else:
-            self.release_runtime_lane()
+            for slot in reversed(slots):
+                self.release_runtime_lane(slot)
             return result
 
     def _accepted_or_run(
-        self, config: RunConfig, stage: Any
+        self,
+        config: RunConfig,
+        stage: Any,
+        *,
+        slot: RuntimeLaneToken,
     ) -> Mapping[str, Any]:
         key = CellKey(config.task.task_index, config.capability.arm.value)
         if self.store.accepted_path(key).exists():
@@ -858,6 +1100,7 @@ class LifecycleDriver:
             config,
             generation=token.generation,
             before_preflight=False,
+            slot=slot,
         )
         if not isinstance(runtime_reconciliation, Mapping):
             raise RuntimeError("cell runtime reconciliation receipt is invalid")
@@ -869,6 +1112,7 @@ class LifecycleDriver:
             config,
             stage,
             generation=token.generation,
+            slot=slot,
         )
         self.store.record_endpoint(token, row)
         artifact = _mapping(row.get("final_artifact"), "endpoint artifact")
@@ -902,7 +1146,12 @@ class LifecycleDriver:
         self.store.record_handoff(token, handoff)
         return self.store.accept_current_attempt(token)
 
-    def _grade_if_missing(self, key: CellKey) -> Mapping[str, Any]:
+    def _grade_if_missing(
+        self,
+        key: CellKey,
+        *,
+        slot: RuntimeLaneToken,
+    ) -> Mapping[str, Any]:
         if self.store.outcome_path(key).exists():
             return _load_official_outcome(self.store, key)
         accepted = _load_accepted(self.store, key)
@@ -918,6 +1167,7 @@ class LifecycleDriver:
             accepted=accepted,
             prediction=prediction,
             handoff=handoff,
+            slot=slot,
         )
         self.store.record_official_outcome(grade_token, outcome)
         return _load_official_outcome(self.store, key)
@@ -960,12 +1210,28 @@ class LifecycleDriver:
             raise ValueError("task index is outside the manifest")
         return self.root / "full" / f"task-{task_index:04d}.json"
 
-    def load_task_completion(self, task_index: int) -> dict[str, Any]:
+    def load_task_completion(
+        self,
+        task_index: int,
+        *,
+        slot: RuntimeLaneToken | None = None,
+    ) -> dict[str, Any]:
+        expected_slot_index = self.task_slot_index(task_index)
+        expected_server_port = self.slot_ports[expected_slot_index]
+        if slot is not None:
+            if not isinstance(slot, RuntimeLaneToken):
+                raise TypeError("task completion slot has the wrong type")
+            if (
+                slot.task_index != task_index
+                or slot.slot_index != expected_slot_index
+                or slot.server_port != expected_server_port
+            ):
+                raise RuntimeError("task completion active-slot binding drifted")
         completion = read_json(self.task_completion_path(task_index))
         if (
             not isinstance(completion, Mapping)
             or completion.get("schema")
-            != "swebench_triad_task_completion_v1"
+            != "swebench_triad_task_completion_v2"
             or completion.get("task_index") != task_index
             or completion.get("instance_id")
             != self.by_task[task_index][0].task.task_id
@@ -973,8 +1239,26 @@ class LifecycleDriver:
             or completion.get("official_outcomes") != 3
             or not isinstance(completion.get("triad_verification"), Mapping)
             or not isinstance(completion.get("eviction"), Mapping)
+            or completion.get("slot_index") != expected_slot_index
+            or completion.get("server_port") != expected_server_port
+            or type(completion.get("lane_generation")) is not int
+            or completion["lane_generation"] <= 0
+            or not isinstance(
+                completion.get("lane_fencing_token_sha256"), str
+            )
+            or len(completion["lane_fencing_token_sha256"]) != 64
+            or not isinstance(completion.get("timing_receipt"), Mapping)
+            or set(completion["timing_receipt"]) != {"status", "path", "sha256"}
         ):
             raise RuntimeError("task completion receipt is invalid")
+        timing_path = Path(completion["timing_receipt"]["path"])
+        if (
+            not timing_path.is_absolute()
+            or not timing_path.is_file()
+            or hashlib.sha256(timing_path.read_bytes()).hexdigest()
+            != completion["timing_receipt"]["sha256"]
+        ):
+            raise RuntimeError("task completion timing binding drifted")
         return dict(completion)
 
     @staticmethod
@@ -1002,13 +1286,15 @@ class LifecycleDriver:
         eviction: Mapping[str, Any],
         triad_verification: Mapping[str, Any],
         wall_seconds: float,
+        slot: RuntimeLaneToken,
+        timing_receipt: Mapping[str, Any],
     ) -> dict[str, Any]:
         outcomes = [
             _load_official_outcome(self.store, CellKey(task_index, arm))
             for arm in ARMS
         ]
         result = {
-            "schema": "swebench_triad_task_completion_v1",
+            "schema": "swebench_triad_task_completion_v2",
             "task_index": task_index,
             "gate_task": gate,
             "instance_id": self.by_task[task_index][0].task.task_id,
@@ -1019,36 +1305,96 @@ class LifecycleDriver:
             "residue": dict(residue),
             "eviction": dict(eviction),
             "wall_seconds": wall_seconds,
+            "slot_index": slot.slot_index,
+            "server_port": slot.server_port,
+            "lane_generation": slot.generation,
+            "lane_fencing_token_sha256": hashlib.sha256(
+                slot.fencing_token.encode("ascii")
+            ).hexdigest(),
+            "timing_receipt": dict(timing_receipt),
         }
-        atomic_write_json(self.task_completion_path(task_index), result)
+        write_immutable_json(self.task_completion_path(task_index), result)
         return result
 
-    def run_task(self, task_index: int, *, gate: bool = False) -> dict[str, Any]:
+    def run_task(
+        self,
+        task_index: int,
+        *,
+        gate: bool = False,
+        slot_index: int | None = None,
+    ) -> dict[str, Any]:
         if task_index not in self.assigned_task_indices:
             raise ValueError("task index is outside the assigned shard")
-        self.acquire_runtime_lane(task_index)
+        expected_slot = self.task_slot_index(task_index)
+        if slot_index is None:
+            slot_index = expected_slot
+        if slot_index != expected_slot:
+            raise ValueError("task was routed to the wrong deterministic slot")
+        queued_wall_ns = time.time_ns()
+        queued_monotonic_ns = time.monotonic_ns()
+        slot = self.acquire_runtime_lane(task_index, slot_index=slot_index)
+        recorder = TaskTimingRecorder(
+            root=self.root,
+            task_index=task_index,
+            task_id=self.by_task[task_index][0].task.task_id,
+            task_seed=self.by_task[task_index][0].task.seed,
+            slot=slot,
+            identity=self.operations.timing_identity(),
+            queued_wall_ns=queued_wall_ns,
+            queued_monotonic_ns=queued_monotonic_ns,
+            acquired_wall_ns=time.time_ns(),
+            acquired_monotonic_ns=time.monotonic_ns(),
+        )
         try:
-            result = self._run_task_in_lane(task_index, gate=gate)
+            result = self._run_task_in_lane(
+                task_index,
+                gate=gate,
+                slot=slot,
+                recorder=recorder,
+            )
         except BaseException:
+            if not recorder.terminal:
+                recorder.persist("FAIL")
             raise
         else:
-            self.release_runtime_lane()
+            self.release_runtime_lane(slot)
             return result
 
     def _run_task_in_lane(
-        self, task_index: int, *, gate: bool = False
+        self,
+        task_index: int,
+        *,
+        gate: bool = False,
+        slot: RuntimeLaneToken,
+        recorder: TaskTimingRecorder,
     ) -> dict[str, Any]:
         if task_index not in self.by_task:
             raise ValueError("task index is outside the manifest")
         if self.task_complete(task_index):
             completion_path = self.task_completion_path(task_index)
             if completion_path.exists():
-                return self.load_task_completion(task_index)
-            residue = self.operations.audit_residue(task_index)
+                completion = recorder.measure(
+                    "resume_completion_validation",
+                    lambda: self.load_task_completion(task_index, slot=slot),
+                )
+                recorder.persist("RESUME_VALIDATED")
+                return completion
+            residue = recorder.measure(
+                "residue_audit",
+                lambda: self.operations.audit_residue(task_index, slot=slot),
+            )
             recovery_stage = None
             if residue.get("rootfs_attested") is not True:
-                recovery_stage = self.operations.stage_task(task_index)
-                residue = self.operations.audit_residue(task_index)
+                recovery_stage = recorder.measure(
+                    "oci_stage",
+                    lambda: self.operations.stage_task(task_index, slot=slot),
+                )
+                residue = recorder.measure(
+                    "post_stage_residue_audit",
+                    lambda: self.operations.audit_residue(
+                        task_index, slot=slot
+                    ),
+                )
             self.require_zero_residue(residue)
             accepted_rows = [
                 _load_accepted(self.store, CellKey(task_index, arm))
@@ -1062,10 +1408,20 @@ class LifecycleDriver:
                 )[0]
                 for arm, accepted in zip(ARMS, accepted_rows)
             ]
-            triad_verification = self.triad_validator(endpoint_rows)
+            triad_verification = recorder.measure(
+                "triad_validation",
+                lambda: self.triad_validator(endpoint_rows),
+            )
             if not isinstance(triad_verification, Mapping):
                 raise RuntimeError("triad verification receipt is invalid")
-            eviction = self.operations.evict_task(task_index, recovery_stage)
+            eviction = recorder.measure(
+                "task_eviction",
+                lambda: self.operations.evict_task(
+                    task_index, recovery_stage, slot=slot
+                ),
+            )
+            recorder.measure("publication_ready", lambda: None)
+            timing_receipt = recorder.persist("READY_FOR_PUBLICATION")
             return self.task_result(
                 task_index,
                 gate=gate,
@@ -1073,12 +1429,23 @@ class LifecycleDriver:
                 eviction=eviction,
                 triad_verification=triad_verification,
                 wall_seconds=0.0,
+                slot=slot,
+                timing_receipt=timing_receipt,
             )
-        stage = self.operations.stage_task(task_index)
+        stage = recorder.measure(
+            "oci_stage",
+            lambda: self.operations.stage_task(task_index, slot=slot),
+        )
         started = self.clock()
         accepted_rows = []
         for config in self.by_task[task_index]:
-            accepted = self._accepted_or_run(config, stage)
+            self.assert_runtime_lane(slot)
+            accepted = recorder.measure(
+                f"cell_{config.capability.arm.value}",
+                lambda config=config: self._accepted_or_run(
+                    config, stage, slot=slot
+                ),
+            )
             accepted_rows.append(dict(accepted))
         endpoint_rows = [
             _load_attempt_boundaries(
@@ -1090,15 +1457,24 @@ class LifecycleDriver:
                 self.by_task[task_index], accepted_rows
             )
         ]
-        triad_verification = self.triad_validator(endpoint_rows)
+        triad_verification = recorder.measure(
+            "triad_validation",
+            lambda: self.triad_validator(endpoint_rows),
+        )
         if not isinstance(triad_verification, Mapping):
             raise RuntimeError("triad verification receipt is invalid")
         outcomes = []
         for config in self.by_task[task_index]:
             outcomes.append(
                 dict(
-                    self._grade_if_missing(
-                        CellKey(task_index, config.capability.arm.value)
+                    recorder.measure(
+                        f"official_grade_{config.capability.arm.value}",
+                        lambda config=config: self._grade_if_missing(
+                            CellKey(
+                                task_index, config.capability.arm.value
+                            ),
+                            slot=slot,
+                        ),
                     )
                 )
             )
@@ -1106,9 +1482,17 @@ class LifecycleDriver:
             raise RuntimeError("accepted triad arm lattice drifted")
         if [row.get("arm") for row in outcomes] != list(ARMS):
             raise RuntimeError("official triad arm lattice drifted")
-        residue = self.operations.audit_residue(task_index)
+        residue = recorder.measure(
+            "residue_audit",
+            lambda: self.operations.audit_residue(task_index, slot=slot),
+        )
         self.require_zero_residue(residue)
-        eviction = self.operations.evict_task(task_index, stage)
+        eviction = recorder.measure(
+            "task_eviction",
+            lambda: self.operations.evict_task(task_index, stage, slot=slot),
+        )
+        recorder.measure("publication_ready", lambda: None)
+        timing_receipt = recorder.persist("READY_FOR_PUBLICATION")
         return self.task_result(
             task_index,
             gate=gate,
@@ -1116,6 +1500,8 @@ class LifecycleDriver:
             eviction=eviction,
             triad_verification=triad_verification,
             wall_seconds=max(0.0, self.clock() - started),
+            slot=slot,
+            timing_receipt=timing_receipt,
         )
 
     def _validate_gate(
@@ -1264,18 +1650,23 @@ class LifecycleDriver:
                     missing.append(key)
             if not missing:
                 continue
-            self.acquire_runtime_lane(task_index)
+            slot = self.acquire_runtime_lane(
+                task_index,
+                slot_index=self.task_slot_index(task_index),
+            )
             try:
-                stage = self.operations.stage_task(task_index)
+                stage = self.operations.stage_task(task_index, slot=slot)
                 for key in missing:
-                    self._grade_if_missing(key)
-                residue = self.operations.audit_residue(task_index)
+                    self._grade_if_missing(key, slot=slot)
+                residue = self.operations.audit_residue(
+                    task_index, slot=slot
+                )
                 self.require_zero_residue(residue)
-                self.operations.evict_task(task_index, stage)
+                self.operations.evict_task(task_index, stage, slot=slot)
             except BaseException:
                 raise
             else:
-                self.release_runtime_lane()
+                self.release_runtime_lane(slot)
         return self.status()
 
     def task_status(self, task_index: int) -> dict[str, Any]:
@@ -1470,10 +1861,13 @@ class LifecycleDriver:
     def cleanup(self) -> dict[str, Any]:
         if self.assigned_task_indices != tuple(sorted(self.by_task)):
             raise RuntimeError("global cleanup requires the full task shard")
-        self.acquire_runtime_lane(None)
+        slots = [
+            self.acquire_runtime_lane(None, slot_index=slot_index)
+            for slot_index in range(len(self.slot_ports))
+        ]
         if self.lease_registry is not None:
             self.lease_registry.assert_no_other_live_drivers()
-        result = self.operations.cleanup()
+        result = self.operations.cleanup(slots=tuple(slots))
         if not isinstance(result, Mapping):
             raise RuntimeError("cleanup receipt is invalid")
         if result.get("owned_residue") != 0:
@@ -1481,7 +1875,8 @@ class LifecycleDriver:
         if result.get("allocation_retained") is not True:
             raise RuntimeError("cleanup did not retain the allocation")
         atomic_write_json(self.root / "control" / "cleanup.json", result)
-        self.release_runtime_lane()
+        for slot in reversed(slots):
+            self.release_runtime_lane(slot)
         if self.lease_registry is not None:
             self.lease_registry.release()
         return dict(result)
@@ -1573,6 +1968,7 @@ def driver_from_config(
         owner=selected_owner,
         assigned_task_indices=selected_tasks,
         local_owner_is_alive=local_liveness,
+        slot_ports=production.server_ports,
     )
     factory = operations_factory or ProductionLifecycleOperations
     operations = factory(production, production.configs)
@@ -1588,6 +1984,7 @@ def driver_from_config(
         preflight_expectations=production.preflight_expectations,
         assigned_task_indices=selected_tasks,
         lease_registry=lease_registry,
+        slot_ports=production.server_ports,
     )
 
 

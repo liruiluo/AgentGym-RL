@@ -137,19 +137,62 @@ class GradeClaimToken:
     owner: OwnerIdentity
 
 
+@dataclass(frozen=True)
+class RuntimeLaneToken:
+    """Generation-bound authority for one deterministic runtime slot."""
+
+    driver_key: str
+    lease_id: str
+    owner: OwnerIdentity
+    task_index: int | None
+    slot_index: int
+    server_port: int
+    generation: int
+    fencing_token: str
+
+    def __post_init__(self) -> None:
+        require_sha256(self.driver_key, "runtime lane driver key")
+        if not isinstance(self.lease_id, str) or len(self.lease_id) != 64:
+            raise ValueError("runtime lane lease ID is invalid")
+        if not isinstance(self.owner, OwnerIdentity):
+            raise TypeError("runtime lane owner is invalid")
+        if self.task_index is not None and (
+            type(self.task_index) is not int or self.task_index < 0
+        ):
+            raise ValueError("runtime lane task index is invalid")
+        if type(self.slot_index) is not int or self.slot_index < 0:
+            raise ValueError("runtime lane slot index is invalid")
+        if (
+            type(self.server_port) is not int
+            or not 1 <= self.server_port <= 65535
+        ):
+            raise ValueError("runtime lane server port is invalid")
+        if type(self.generation) is not int or self.generation <= 0:
+            raise ValueError("runtime lane generation is invalid")
+        if (
+            not isinstance(self.fencing_token, str)
+            or len(self.fencing_token) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.fencing_token
+            )
+        ):
+            raise ValueError("runtime lane fencing token is invalid")
+
+
 class DriverLeaseRegistry:
-    """Cross-host driver, shard, and single-runtime-lane leases.
+    """Cross-host driver, shard, and deterministic runtime-slot leases.
 
     Driver heartbeats are the cross-host liveness source.  Task records are
-    explicit shard assignments, while the one runtime-lane record prevents two
-    otherwise disjoint drivers from mutating the single assigned pod at once.
-    All takeovers are serialized and require the previous driver heartbeat to
-    be expired (or its same-host process identity to be proven dead).
+    explicit shard assignments.  Exactly one generation-bound record exists
+    for each configured slot/port, so a stale worker cannot publish, clean up,
+    or release a successor's slot.  All takeovers are serialized and require
+    the previous driver heartbeat to be proven dead.
     """
 
     DRIVER_SCHEMA = "swebench_triad_driver_lease_v1"
     TASK_SCHEMA = "swebench_triad_task_lease_v1"
-    LANE_SCHEMA = "swebench_triad_runtime_lane_lease_v1"
+    LANE_SCHEMA = "swebench_triad_runtime_lane_lease_v2"
 
     def __init__(
         self,
@@ -161,6 +204,7 @@ class DriverLeaseRegistry:
         ttl_ns: int = 90_000_000_000,
         heartbeat_interval_seconds: float = 15.0,
         local_owner_is_alive: Callable[[OwnerIdentity], bool] | None = None,
+        slot_ports: Sequence[int] = (18100,),
     ) -> None:
         if not isinstance(owner, OwnerIdentity):
             raise TypeError("driver lease owner must be an OwnerIdentity")
@@ -181,6 +225,14 @@ class DriverLeaseRegistry:
             raise ValueError("driver heartbeat interval must be shorter than its TTL")
         if local_owner_is_alive is not None and not callable(local_owner_is_alive):
             raise TypeError("local driver liveness probe must be callable")
+        ports = tuple(slot_ports)
+        if (
+            not ports
+            or len(ports) > 2
+            or any(type(port) is not int or not 1 <= port <= 65535 for port in ports)
+            or len(set(ports)) != len(ports)
+        ):
+            raise ValueError("runtime slot ports must be one or two unique ports")
         self.root = ensure_private_directory(root)
         self.drivers_root = ensure_private_directory(self.root / "drivers")
         self.tasks_root = ensure_private_directory(self.root / "tasks")
@@ -191,6 +243,7 @@ class DriverLeaseRegistry:
         self.ttl_ns = ttl_ns
         self.heartbeat_interval_seconds = float(heartbeat_interval_seconds)
         self.local_owner_is_alive = local_owner_is_alive or (lambda _owner: True)
+        self.slot_ports = ports
         self.driver_key = sha256_json(owner.to_payload())
         self.lease_id: str | None = None
         self._heartbeat_stop = threading.Event()
@@ -262,9 +315,10 @@ class DriverLeaseRegistry:
             raise ValueError("task lease index is invalid")
         return self.tasks_root / f"task-{task_index:04d}.json"
 
-    @property
-    def lane_path(self) -> Path:
-        return self.lanes_root / "runtime.json"
+    def lane_path(self, slot_index: int) -> Path:
+        if type(slot_index) is not int or not 0 <= slot_index < len(self.slot_ports):
+            raise ValueError("runtime lane slot is outside the configured lattice")
+        return self.lanes_root / f"slot-{slot_index}.json"
 
     @staticmethod
     def _driver_fields() -> set[str]:
@@ -499,7 +553,12 @@ class DriverLeaseRegistry:
             "lease_id",
             "owner",
             "task_index",
+            "slot_index",
+            "server_port",
+            "generation",
+            "fencing_token",
             "acquired_at_ns",
+            "status",
         }
         if not isinstance(value, Mapping) or set(value) != expected:
             raise FenceViolationError("runtime lane lease fields are not canonical")
@@ -514,54 +573,118 @@ class DriverLeaseRegistry:
         task_index = value.get("task_index")
         if task_index is not None and (type(task_index) is not int or task_index < 0):
             raise FenceViolationError("runtime lane task index is invalid")
+        slot_index = value.get("slot_index")
+        if (
+            type(slot_index) is not int
+            or not 0 <= slot_index < len(self.slot_ports)
+        ):
+            raise FenceViolationError("runtime lane slot index is invalid")
+        if value.get("server_port") != self.slot_ports[slot_index]:
+            raise FenceViolationError("runtime lane server port drifted")
+        if type(value.get("generation")) is not int or value["generation"] <= 0:
+            raise FenceViolationError("runtime lane generation is invalid")
+        fencing_token = value.get("fencing_token")
+        if (
+            not isinstance(fencing_token, str)
+            or len(fencing_token) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in fencing_token
+            )
+        ):
+            raise FenceViolationError("runtime lane fencing token is invalid")
         if type(value.get("acquired_at_ns")) is not int or value["acquired_at_ns"] < 0:
             raise FenceViolationError("runtime lane acquisition time is invalid")
+        if value.get("status") not in {"active", "released"}:
+            raise FenceViolationError("runtime lane status is invalid")
         return dict(value)
 
-    def acquire_lane(self, *, task_index: int | None) -> None:
+    @staticmethod
+    def _lane_token(value: Mapping[str, Any]) -> RuntimeLaneToken:
+        return RuntimeLaneToken(
+            driver_key=value["driver_key"],
+            lease_id=value["lease_id"],
+            owner=OwnerIdentity.from_payload(value["owner"]),
+            task_index=value["task_index"],
+            slot_index=value["slot_index"],
+            server_port=value["server_port"],
+            generation=value["generation"],
+            fencing_token=value["fencing_token"],
+        )
+
+    def acquire_lane(
+        self,
+        *,
+        task_index: int | None,
+        slot_index: int,
+    ) -> RuntimeLaneToken:
         if task_index is not None and task_index not in self.assigned_task_indices:
             raise ValueError("runtime lane task is outside the assigned shard")
+        path = self.lane_path(slot_index)
         self.assert_healthy() if self.lease_id is not None else self.acquire()
         with exclusive_lock(self.lock_path):
             current_driver = self._read_driver(self.driver_key)
             if current_driver is None:
                 raise FenceViolationError("runtime lane driver lease disappeared")
             self._refresh_locked(current_driver)
-            if self.lane_path.exists():
-                lane = self._validate_lane(read_json(self.lane_path))
+            previous_generation = 0
+            if path.exists():
+                lane = self._validate_lane(read_json(path))
+                if lane["slot_index"] != slot_index:
+                    raise FenceViolationError("runtime lane path identity drifted")
+                previous_generation = lane["generation"]
                 if (
-                    lane["driver_key"] == self.driver_key
+                    lane["status"] == "active"
+                    and lane["task_index"] == task_index
+                    and lane["driver_key"] == self.driver_key
                     and lane["lease_id"] == self.lease_id
                 ):
-                    lane["task_index"] = task_index
-                    lane["acquired_at_ns"] = self.now_ns()
-                    atomic_write_json(self.lane_path, lane)
-                    return
-                if self._pointer_driver_is_live(lane):
+                    return self._lane_token(lane)
+                if lane["status"] == "active" and self._pointer_driver_is_live(lane):
                     raise ClaimBusyError("runtime lane has a live driver lease")
-            atomic_write_json(
-                self.lane_path,
-                {
-                    "schema": self.LANE_SCHEMA,
-                    "driver_key": self.driver_key,
-                    "lease_id": self.lease_id,
-                    "owner": self.owner.to_payload(),
-                    "task_index": task_index,
-                    "acquired_at_ns": self.now_ns(),
-                },
-            )
+            lane = {
+                "schema": self.LANE_SCHEMA,
+                "driver_key": self.driver_key,
+                "lease_id": self.lease_id,
+                "owner": self.owner.to_payload(),
+                "task_index": task_index,
+                "slot_index": slot_index,
+                "server_port": self.slot_ports[slot_index],
+                "generation": previous_generation + 1,
+                "fencing_token": secrets.token_hex(32),
+                "acquired_at_ns": self.now_ns(),
+                "status": "active",
+            }
+            atomic_write_json(path, lane)
+            return self._lane_token(lane)
 
-    def release_lane(self) -> None:
+    def assert_lane(self, token: RuntimeLaneToken) -> None:
+        if not isinstance(token, RuntimeLaneToken):
+            raise TypeError("runtime lane fence requires a lane token")
         with exclusive_lock(self.lock_path):
-            if not self.lane_path.exists():
-                return
-            lane = self._validate_lane(read_json(self.lane_path))
-            if (
-                lane["driver_key"] != self.driver_key
-                or lane["lease_id"] != self.lease_id
-            ):
-                raise FenceViolationError("refusing to release another runtime lane")
-            self.lane_path.unlink()
+            path = self.lane_path(token.slot_index)
+            if not path.exists():
+                raise FenceViolationError("runtime lane lease disappeared")
+            lane = self._validate_lane(read_json(path))
+            if lane["status"] != "active" or self._lane_token(lane) != token:
+                raise FenceViolationError("runtime lane token was fenced")
+            current_driver = self._read_driver(self.driver_key)
+            if current_driver is None:
+                raise FenceViolationError("runtime lane driver lease disappeared")
+            self._refresh_locked(current_driver)
+
+    def release_lane(self, token: RuntimeLaneToken) -> None:
+        if not isinstance(token, RuntimeLaneToken):
+            raise TypeError("runtime lane release requires a lane token")
+        with exclusive_lock(self.lock_path):
+            path = self.lane_path(token.slot_index)
+            if not path.exists():
+                raise FenceViolationError("runtime lane lease disappeared")
+            lane = self._validate_lane(read_json(path))
+            if lane["status"] != "active" or self._lane_token(lane) != token:
+                raise FenceViolationError("refusing to release a fenced runtime lane")
+            lane["status"] = "released"
+            atomic_write_json(path, lane)
 
     def assert_no_other_live_drivers(self) -> None:
         for path in sorted(self.drivers_root.glob("*.json")):
@@ -579,13 +702,18 @@ class DriverLeaseRegistry:
             with exclusive_lock(self.lock_path):
                 if self.lease_id is None:
                     return
-                if self.lane_path.exists():
-                    lane = self._validate_lane(read_json(self.lane_path))
+                for slot_index in range(len(self.slot_ports)):
+                    path = self.lane_path(slot_index)
+                    if not path.exists():
+                        continue
+                    lane = self._validate_lane(read_json(path))
                     if (
-                        lane["driver_key"] == self.driver_key
+                        lane["status"] == "active"
+                        and lane["driver_key"] == self.driver_key
                         and lane["lease_id"] == self.lease_id
                     ):
-                        self.lane_path.unlink()
+                        lane["status"] = "released"
+                        atomic_write_json(path, lane)
                 for task_index in self.assigned_task_indices:
                     path = self.task_path(task_index)
                     if not path.exists():

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 import stat
 import tempfile
@@ -382,9 +381,10 @@ class CrossHostLeaseRegistryTest(unittest.TestCase):
             now_ns=lambda: self.now,
             ttl_ns=60_000_000_000,
             local_owner_is_alive=lambda _owner: True,
+            slot_ports=(18100, 18101),
         )
 
-    def test_disjoint_shards_coexist_and_global_lane_is_exclusive(self) -> None:
+    def test_disjoint_shards_share_distinct_slots_but_not_one_slot(self) -> None:
         first = self.registry(self.owner_a, (0, 2, 4))
         second = self.registry(self.owner_b, (1, 3, 5))
         first.acquire()
@@ -393,11 +393,38 @@ class CrossHostLeaseRegistryTest(unittest.TestCase):
         self.assertEqual(first.assigned_task_indices, (0, 2, 4))
         self.assertEqual(second.assigned_task_indices, (1, 3, 5))
 
-        first.acquire_lane(task_index=0)
+        first_token = first.acquire_lane(task_index=0, slot_index=0)
         with self.assertRaises(ClaimBusyError):
-            second.acquire_lane(task_index=1)
-        first.release_lane()
-        second.acquire_lane(task_index=1)
+            second.acquire_lane(task_index=1, slot_index=0)
+        second_token = second.acquire_lane(task_index=1, slot_index=1)
+        self.assertNotEqual(first_token.server_port, second_token.server_port)
+        first.release_lane(first_token)
+        takeover = second.acquire_lane(task_index=1, slot_index=0)
+        self.assertEqual(takeover.slot_index, 0)
+
+    def test_stale_slot_fence_cannot_release_successor(self) -> None:
+        first = self.registry(self.owner_a, (0,))
+        first.acquire()
+        token = first.acquire_lane(task_index=0, slot_index=0)
+        first.release_lane(token)
+        successor = first.acquire_lane(task_index=0, slot_index=0)
+        self.assertGreater(successor.generation, token.generation)
+        with self.assertRaises(FenceViolationError):
+            first.release_lane(token)
+        first.assert_lane(successor)
+
+    def test_dead_slot_owner_is_taken_over_with_a_new_generation(self) -> None:
+        first = self.registry(self.owner_a, (0,))
+        second = self.registry(self.owner_b, (1,))
+        first.acquire()
+        second.acquire()
+        original = first.acquire_lane(task_index=0, slot_index=0)
+        first._close_process_liveness_lock()
+        successor = second.acquire_lane(task_index=1, slot_index=0)
+        self.assertGreater(successor.generation, original.generation)
+        self.assertNotEqual(successor.fencing_token, original.fencing_token)
+        with self.assertRaises(FenceViolationError):
+            first.assert_lane(original)
 
     def test_overlapping_two_driver_race_has_exactly_one_winner(self) -> None:
         first = self.registry(self.owner_a, (0,))

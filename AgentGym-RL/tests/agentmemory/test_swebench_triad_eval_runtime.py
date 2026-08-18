@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 import tempfile
@@ -116,6 +117,60 @@ class ExactTokenVllmTransportTest(unittest.TestCase):
         self.assertEqual(payload, before)
         self.assertEqual(sent, {**payload, "return_token_ids": True})
         self.assertIs(response, self.delegate.chat_response)
+
+    def test_exact_tokens_are_invariant_across_c1_c2_reverse_and_resume(self) -> None:
+        def execute(task_index: int, generation: int):
+            transport = ExactTokenVllmTransport(
+                RecordingTransport(),
+                request_context={
+                    "run_id": f"task-{task_index}",
+                    "task_index": task_index,
+                    "arm": "native",
+                    "generation": generation,
+                },
+            )
+            transport.post(
+                "http://127.0.0.1:8000/tokenize",
+                tokenize_payload(),
+                timeout_seconds=5.0,
+            )
+            transport.post(
+                "http://127.0.0.1:8000/v1/chat/completions",
+                chat_payload(),
+                timeout_seconds=5.0,
+            )
+            event = transport.events[-1]
+            return {
+                "prompt": event["prompt_token_ids"],
+                "response": event["response_token_ids"],
+                "semantic": event["semantic_request_sha256"],
+                "request_id": event["request_id"],
+            }
+
+        serial = {task: execute(task, 1) for task in (0, 1)}
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            concurrent = dict(zip((0, 1), executor.map(lambda task: execute(task, 1), (0, 1))))
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            reversed_rows = list(executor.map(lambda task: execute(task, 1), (1, 0)))
+        reversed_arrival = dict(zip((1, 0), reversed_rows))
+        resumed = execute(0, 2)
+
+        for task in (0, 1):
+            expected = {
+                name: serial[task][name]
+                for name in ("prompt", "response", "semantic")
+            }
+            self.assertEqual(
+                {name: concurrent[task][name] for name in expected}, expected
+            )
+            self.assertEqual(
+                {name: reversed_arrival[task][name] for name in expected},
+                expected,
+            )
+        self.assertEqual(resumed["prompt"], serial[0]["prompt"])
+        self.assertEqual(resumed["response"], serial[0]["response"])
+        self.assertEqual(resumed["semantic"], serial[0]["semantic"])
+        self.assertNotEqual(resumed["request_id"], serial[0]["request_id"])
 
     def test_missing_or_malformed_prompt_ids_fail_closed(self) -> None:
         malformed = (
@@ -249,6 +304,9 @@ class SwebenchRuntimeFactoryTest(unittest.TestCase):
             private_run_id="private-attempt-1",
             run_capability="private-capability",
             image_manifest_sha256="a" * 64,
+            task_index=config.task.task_index,
+            arm=config.capability.arm.value,
+            generation=1,
         )
         delegate = RecordingTransport()
         seen = []

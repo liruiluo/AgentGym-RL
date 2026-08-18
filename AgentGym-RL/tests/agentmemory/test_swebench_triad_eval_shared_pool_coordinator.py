@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import copy
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -46,6 +49,14 @@ def startup_reconciliation(task_index: int) -> list[dict[str, object]]:
                 "foreign_staged_tasks": [],
                 "foreign_loaded_images": [],
                 "residue": {},
+                "slots": [
+                    {
+                        "slot_index": slot_index,
+                        "server_port": 18100 + task_index * 2 + slot_index,
+                        "lane_generation": 1,
+                    }
+                    for slot_index in range(2)
+                ],
             }
         }
     ]
@@ -59,7 +70,7 @@ def make_shared_coordinator(root: Path) -> Path:
     for replica in range(8):
         replica_root = root / f"replica-{replica}"
         config = copy.deepcopy(template)
-        config["schema"] = "amg_swebench_triad_run_config_shared_pool_v2"
+        config["schema"] = "amg_swebench_triad_run_config_shared_pool_v3"
         config["run_root"] = str(replica_root / "run")
         config["evidence_root"] = str(replica_root / "evidence")
         config["pod"]["gpu_uuid"] = f"GPU-shared-{replica}"
@@ -73,8 +84,20 @@ def make_shared_coordinator(root: Path) -> Path:
             }
         )
         config["runtime"]["pod_local_root"] = str(replica_root / "pod-local")
-        config["runtime"]["server_port"] = 18_100 + replica
+        config["runtime"].pop("server_port")
+        config["runtime"].update(
+            {
+                "task_slots_per_replica": 2,
+                "server_ports": [18_100 + replica, 18_108 + replica],
+            }
+        )
         config["grader"]["output_root"] = str(replica_root / "grader")
+        config["grader"].update(
+            {
+                "global_max_concurrency": 8,
+                "semaphore_root": str(root / "grader-semaphore"),
+            }
+        )
         config["shared_model_pool"] = {
             "owner": OWNER,
             "readiness_path": str(root / "pool-readiness.json"),
@@ -128,6 +151,43 @@ def fake_image_rows(_production, task_ids):
     )
 
 
+def write_startup_barrier(
+    root: Path, config: CoordinatorConfig | None = None
+) -> str:
+    control = root / "control"
+    control.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema": "amg_swebench_shared_pool_startup_barrier_v1",
+        "status": "PASS",
+        "replica_count": 8,
+        "task_slots_per_replica": 2,
+        "all_slots_held_during_reconciliation": True,
+        "startup_reconciliation_complete": True,
+        "coordinator_index_sha256": (
+            hashlib.sha256(config.path.read_bytes()).hexdigest()
+            if config is not None
+            else "a" * 64
+        ),
+        "replica_config_sha256s": (
+            [
+                hashlib.sha256(replica.path.read_bytes()).hexdigest()
+                for replica in config.replicas
+            ]
+            if config is not None
+            else [f"{index:064x}" for index in range(8)]
+        ),
+        "reconciliations": [{"replica_index": index} for index in range(8)],
+        "shared_image_reconciliation": {
+            "status": "PASS",
+            "remaining_images": 0,
+        },
+        "replicas": [{"replica_index": index} for index in range(8)],
+    }
+    path = control / "preflight-all.json"
+    path.write_bytes(canonical_json_bytes(payload))
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 class CoordinatorConfigTest(unittest.TestCase):
     def test_assignment_is_deterministic_complete_and_runtime_is_disjoint(self):
         with tempfile.TemporaryDirectory() as raw, patch(
@@ -149,6 +209,26 @@ class CoordinatorConfigTest(unittest.TestCase):
             self.assertEqual(row["replica_index"], assigned_replica(row["task_id"]))
             self.assertTrue(row["image_config_digest"].startswith("sha256:"))
         self.assertTrue(all(replica.task_indices for replica in config.replicas))
+        for replica in config.replicas:
+            rows = [
+                config.assignment[task_index]
+                for task_index in replica.task_indices
+            ]
+            self.assertEqual(
+                [row["slot_index"] for row in rows],
+                [position % 2 for position in range(len(rows))],
+            )
+            self.assertEqual(replica.production.task_slots_per_replica, 2)
+        all_ports = [
+            port
+            for replica in config.replicas
+            for port in (
+                *replica.production.server_ports,
+                replica.production.shared_model_pool["model_port"],
+                replica.production.shared_model_pool["proxy_port"],
+            )
+        ]
+        self.assertEqual(len(all_ports), len(set(all_ports)))
 
     def test_common_runtime_drift_fails_closed(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -176,7 +256,9 @@ class CoordinatorConfigTest(unittest.TestCase):
             paths = [Path(row["config_path"]) for row in value["replicas"]]
             first = json.loads(paths[0].read_text())
             second = json.loads(paths[1].read_text())
-            second["runtime"]["server_port"] = first["runtime"]["server_port"]
+            second["runtime"]["server_ports"][0] = first["runtime"][
+                "server_ports"
+            ][0]
             encoded = canonical_json_bytes(second)
             paths[1].write_bytes(encoded)
             value["replicas"][1]["config_sha256"] = hashlib.sha256(encoded).hexdigest()
@@ -184,7 +266,7 @@ class CoordinatorConfigTest(unittest.TestCase):
             with patch(
                 "swebench_triad_eval.shared_pool_coordinator.image_lock_rows",
                 side_effect=fake_image_rows,
-            ), self.assertRaisesRegex(ValueError, "not unique"):
+            ), self.assertRaisesRegex(ValueError, "globally unique"):
                 CoordinatorConfig.load(index)
 
     def test_cross_category_port_collision_fails_closed(self):
@@ -195,7 +277,9 @@ class CoordinatorConfigTest(unittest.TestCase):
             paths = [Path(row["config_path"]) for row in value["replicas"]]
             first = json.loads(paths[0].read_text())
             second = json.loads(paths[1].read_text())
-            second["runtime"]["server_port"] = first["shared_model_pool"]["model_port"]
+            second["runtime"]["server_ports"][0] = first[
+                "shared_model_pool"
+            ]["model_port"]
             encoded = canonical_json_bytes(second)
             paths[1].write_bytes(encoded)
             value["replicas"][1]["config_sha256"] = hashlib.sha256(
@@ -287,28 +371,176 @@ class WorkerTest(unittest.TestCase):
             def reconcile_dead_work(self):
                 raise AssertionError("coordinator preflight owns reconciliation")
 
-            def run_task(self, task_index, *, gate):
-                calls.append((task_index, gate))
+            def run_task(self, task_index, *, gate, slot_index):
+                calls.append((task_index, gate, slot_index))
 
         with tempfile.TemporaryDirectory() as raw, patch(
             "swebench_triad_eval.shared_pool_coordinator.driver_from_config",
             return_value=Driver(),
         ):
+            barrier_sha256 = write_startup_barrier(Path(raw))
             result = _worker(
                 "/tmp/config.json",
                 (4, 9),
                 (IMAGE_DIGEST, IMAGE_DIGEST),
+                (0, 1),
                 3,
                 raw,
+                barrier_sha256,
             )
             lock_root = Path(raw) / "control" / "image-leases"
             self.assertEqual(len(list(lock_root.glob("*.lock"))), 1)
-        self.assertEqual(calls, ["lease", "preflight", (4, False), (9, False)])
+        self.assertEqual(calls[:2], ["lease", "preflight"])
+        self.assertEqual(
+            sorted(calls[2:]), [(4, False, 0), (9, False, 1)]
+        )
         self.assertEqual(result["completed_tasks"], 2)
 
     def test_worker_rejects_task_image_lattice_drift(self):
         with self.assertRaisesRegex(ValueError, "lattice"):
-            _worker("/tmp/config.json", (1,), (), 0, "/tmp/root")
+            _worker(
+                "/tmp/config.json",
+                (1,),
+                (),
+                (0,),
+                0,
+                "/tmp/root",
+                "a" * 64,
+            )
+
+    def test_worker_admits_at_most_two_tasks_and_never_shares_a_slot(self):
+        active = 0
+        maximum = 0
+        active_slots = set()
+        slot_maximum = {0: 0, 1: 0}
+        lock = threading.Lock()
+        first_wave = threading.Barrier(2)
+
+        class Driver:
+            lease_registry = None
+
+            @staticmethod
+            def ensure_driver_lease():
+                return None
+
+            @staticmethod
+            def _read_validated_preflight():
+                return None
+
+            def run_task(self, task_index, *, gate, slot_index):
+                nonlocal active, maximum
+                self.assertFalse(gate)
+                with lock:
+                    if slot_index in active_slots:
+                        raise AssertionError("one slot admitted two live tasks")
+                    active_slots.add(slot_index)
+                    active += 1
+                    maximum = max(maximum, active)
+                    slot_maximum[slot_index] = max(
+                        slot_maximum[slot_index], 1
+                    )
+                try:
+                    if task_index in {4, 9}:
+                        first_wave.wait(timeout=2)
+                    time.sleep(0.01)
+                finally:
+                    with lock:
+                        active -= 1
+                        active_slots.remove(slot_index)
+
+            @staticmethod
+            def assertFalse(value):
+                if value:
+                    raise AssertionError("unexpected gate task")
+
+        with tempfile.TemporaryDirectory() as raw, patch(
+            "swebench_triad_eval.shared_pool_coordinator.driver_from_config",
+            return_value=Driver(),
+        ):
+            barrier_sha256 = write_startup_barrier(Path(raw))
+            result = _worker(
+                "/tmp/config.json",
+                (4, 9, 12, 15),
+                tuple("sha256:" + f"{index:064x}" for index in range(4)),
+                (0, 1, 0, 1),
+                3,
+                raw,
+                barrier_sha256,
+            )
+        self.assertEqual(maximum, 2)
+        self.assertEqual(slot_maximum, {0: 1, 1: 1})
+        self.assertEqual(result["completed_task_indices"], [4, 9, 12, 15])
+        self.assertEqual(
+            [row["completed_task_indices"] for row in result["slots"]],
+            [[4, 12], [9, 15]],
+        )
+
+    def test_duplicate_digest_183_185_is_whole_task_exclusive(self):
+        active = 0
+        maximum = 0
+        lock = threading.Lock()
+
+        class Driver:
+            lease_registry = None
+
+            @staticmethod
+            def ensure_driver_lease():
+                return None
+
+            @staticmethod
+            def _read_validated_preflight():
+                return None
+
+            def run_task(self, task_index, *, gate, slot_index):
+                del task_index, gate, slot_index
+                nonlocal active, maximum
+                with lock:
+                    active += 1
+                    maximum = max(maximum, active)
+                time.sleep(0.04)
+                with lock:
+                    active -= 1
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            barrier_sha256 = write_startup_barrier(root)
+            with patch(
+                "swebench_triad_eval.shared_pool_coordinator.driver_from_config",
+                side_effect=lambda *_args, **_kwargs: Driver(),
+            ):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    futures = [
+                        executor.submit(
+                            _worker,
+                            f"/tmp/config-{task_index}.json",
+                            (task_index,),
+                            (IMAGE_DIGEST,),
+                            (0,),
+                            replica_index,
+                            raw,
+                            barrier_sha256,
+                        )
+                        for task_index, replica_index in ((183, 4), (185, 7))
+                    ]
+                    for future in futures:
+                        future.result()
+        self.assertEqual(maximum, 1)
+
+    def test_worker_refuses_to_claim_before_global_startup_barrier(self):
+        with tempfile.TemporaryDirectory() as raw, patch(
+            "swebench_triad_eval.shared_pool_coordinator.driver_from_config"
+        ) as driver:
+            with self.assertRaisesRegex(RuntimeError, "startup reconciliation"):
+                _worker(
+                    "/tmp/config.json",
+                    (183,),
+                    (IMAGE_DIGEST,),
+                    (0,),
+                    4,
+                    raw,
+                    "a" * 64,
+                )
+            driver.assert_not_called()
 
 
 class SharedPoolPreflightTest(unittest.TestCase):
@@ -357,9 +589,9 @@ class SharedPoolPreflightTest(unittest.TestCase):
                 self.lease_registry = Registry(index)
                 self.operations = self
 
-            def acquire_runtime_lane(self, task_index):
+            def acquire_runtime_lane(self, task_index, *, slot_index):
                 self.assert_task_none(task_index)
-                events.append(("acquire", self.index))
+                events.append(("acquire", self.index, slot_index))
 
             @staticmethod
             def assert_task_none(task_index):
@@ -376,7 +608,7 @@ class SharedPoolPreflightTest(unittest.TestCase):
             @staticmethod
             def assertEqual_all_acquired():
                 acquired = [row for row in events if row[0] == "acquire"]
-                if len(acquired) != 8:
+                if len(acquired) != 16:
                     raise AssertionError("reconciliation began before all lanes")
 
             def reconcile_unbound_loaded_images(self):
@@ -405,6 +637,9 @@ class SharedPoolPreflightTest(unittest.TestCase):
                 )
                 for index in range(8)
             )
+            (root / "index.json").write_text("index")
+            for replica in replicas:
+                replica.path.write_text(f"config-{replica.replica_index}")
             config = CoordinatorConfig(root / "index.json", root, replicas, ())
             for replica in replicas:
                 drivers[str(replica.path)] = Driver(replica.replica_index)
@@ -414,10 +649,10 @@ class SharedPoolPreflightTest(unittest.TestCase):
             ):
                 receipts = preflight_all(config)
         self.assertEqual(len(receipts), 8)
-        self.assertEqual([row[0] for row in events[:8]], ["acquire"] * 8)
-        self.assertEqual([row[0] for row in events[8:16]], ["reconcile"] * 8)
-        self.assertEqual(events[16], ("shared-images", 0))
-        self.assertEqual([row[0] for row in events[17:25]], ["preflight"] * 8)
+        self.assertEqual([row[0] for row in events[:16]], ["acquire"] * 16)
+        self.assertEqual([row[0] for row in events[16:24]], ["reconcile"] * 8)
+        self.assertEqual(events[24], ("shared-images", 0))
+        self.assertEqual([row[0] for row in events[25:33]], ["preflight"] * 8)
 
     def test_lane_acquisition_failure_releases_the_failing_driver_too(self):
         released = []
@@ -434,7 +669,7 @@ class SharedPoolPreflightTest(unittest.TestCase):
                 self.index = index
                 self.lease_registry = Registry(index)
 
-            def acquire_runtime_lane(self, _task_index):
+            def acquire_runtime_lane(self, _task_index, *, slot_index):
                 if self.index == 3:
                     raise RuntimeError("simulated live driver")
 
@@ -450,6 +685,9 @@ class SharedPoolPreflightTest(unittest.TestCase):
                 )
                 for index in range(8)
             )
+            (root / "index.json").write_text("index")
+            for replica in replicas:
+                replica.path.write_text(f"config-{replica.replica_index}")
             config = CoordinatorConfig(root / "index.json", root, replicas, ())
             with patch(
                 "swebench_triad_eval.shared_pool_coordinator.driver_from_config",
@@ -647,7 +885,11 @@ class GateBindingTest(unittest.TestCase):
                 }
                 for index in range(500)
             )
+            (root / "index.json").write_text("index")
+            for replica in replicas:
+                replica.path.write_text(f"config-{replica.replica_index}")
             config = CoordinatorConfig(root / "index.json", root, replicas, assignment)
+            write_startup_barrier(root, config)
             (root / "control" / "gate.json").write_bytes(
                 canonical_json_bytes({"status": "PASS"})
             )
@@ -684,7 +926,11 @@ class GateBindingTest(unittest.TestCase):
                 }
                 for index in range(500)
             )
+            (root / "index.json").write_text("index")
+            for replica in replicas:
+                replica.path.write_text(f"config-{replica.replica_index}")
             config = CoordinatorConfig(root / "index.json", root, replicas, assignment)
+            write_startup_barrier(root, config)
             fabricated = {"fabricated": True}
             (root / "control" / "gate.json").write_bytes(
                 canonical_json_bytes(

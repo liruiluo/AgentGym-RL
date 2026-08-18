@@ -18,6 +18,7 @@ from paired_eval.serialization import canonical_json_bytes
 
 from . import ARMS
 from .atomic import (
+    atomic_write_json,
     ensure_private_directory,
     read_json,
     write_immutable_bytes,
@@ -134,6 +135,8 @@ class OfficialGraderConfig:
     timeout_seconds: int = 1_800
     namespace: str = "swebench"
     command_ledger_path: Path | None = None
+    semaphore_root: Path | None = None
+    max_concurrent_graders: int = 8
 
     def __post_init__(self) -> None:
         for name in (
@@ -162,6 +165,215 @@ class OfficialGraderConfig:
                     self.command_ledger_path, "command_ledger_path"
                 ),
             )
+        semaphore_root = self.semaphore_root
+        if semaphore_root is None:
+            semaphore_root = self.output_root / "global-semaphore"
+        object.__setattr__(
+            self,
+            "semaphore_root",
+            require_absolute_path(semaphore_root, "semaphore_root"),
+        )
+        if self.max_concurrent_graders != 8:
+            raise ValueError("official grader global concurrency must equal eight")
+
+
+class GraderSemaphorePermit:
+    """One crash-recoverable cross-process official-grader permit."""
+
+    def __init__(
+        self,
+        *,
+        root: Path,
+        slot_index: int,
+        descriptor: int,
+        binding_sha256: str,
+        queued_wall_ns: int,
+        queued_monotonic_ns: int,
+    ) -> None:
+        self.root = root
+        self.slot_index = slot_index
+        self.descriptor = descriptor
+        self.binding_sha256 = binding_sha256
+        self.queued_wall_ns = queued_wall_ns
+        self.queued_monotonic_ns = queued_monotonic_ns
+        self.acquired_wall_ns = time.time_ns()
+        self.acquired_monotonic_ns = time.monotonic_ns()
+        self.process_identity: tuple[int, int] | None = None
+        self.process_inherits_descriptor = False
+        self.released = False
+
+    @property
+    def occupant_path(self) -> Path:
+        return self.root / f"slot-{self.slot_index}.json"
+
+    def bind_process(
+        self,
+        pid: int,
+        start_ticks: int,
+        *,
+        inherits_descriptor: bool,
+    ) -> None:
+        if type(pid) is not int or pid <= 0 or type(start_ticks) is not int or start_ticks <= 0:
+            raise ValueError("grader semaphore process identity is invalid")
+        if type(inherits_descriptor) is not bool:
+            raise TypeError("grader semaphore inheritance flag must be boolean")
+        self.process_identity = (pid, start_ticks)
+        self.process_inherits_descriptor = inherits_descriptor
+        atomic_write_json(
+            self.occupant_path,
+            {
+                "schema": "swebench_triad_grader_semaphore_occupant_v1",
+                "slot_index": self.slot_index,
+                "binding_sha256": self.binding_sha256,
+                "pid": pid,
+                "start_ticks": start_ticks,
+            },
+        )
+
+    def _bound_process_is_alive(self) -> bool:
+        if self.process_identity is None:
+            return False
+        pid, start_ticks = self.process_identity
+        try:
+            return (
+                process_state(pid) != "Z"
+                and process_start_ticks(pid) == start_ticks
+                and process_environment_value(pid, GRADER_OWNER_ENV)
+                == self.binding_sha256
+            )
+        except ProcessLookupError:
+            return False
+
+    def release(self, attempt_root: Path, *, status: str) -> None:
+        if self.released:
+            raise RuntimeError("grader semaphore permit was already released")
+        ended_wall_ns = time.time_ns()
+        ended_monotonic_ns = time.monotonic_ns()
+        bound_process_alive = self._bound_process_is_alive()
+        # A recovered grader owns the permit inherited from its original
+        # launcher, not the temporary permit acquired by this recovery call.
+        # Retaining the temporary occupant would leak one semaphore slot on
+        # every busy recovery probe until all eight slots were exhausted.
+        live_child_retained = (
+            bound_process_alive and self.process_inherits_descriptor
+        )
+        if not live_child_retained:
+            try:
+                self.occupant_path.unlink()
+            except FileNotFoundError:
+                pass
+        atomic_write_json(
+            attempt_root / "grader-semaphore.json",
+            {
+                "schema": "swebench_triad_grader_semaphore_timing_v1",
+                "status": status,
+                "slot_index": self.slot_index,
+                "max_concurrent_graders": 8,
+                "queued_wall_ns": self.queued_wall_ns,
+                "acquired_wall_ns": self.acquired_wall_ns,
+                "ended_wall_ns": ended_wall_ns,
+                "queued_monotonic_ns": self.queued_monotonic_ns,
+                "acquired_monotonic_ns": self.acquired_monotonic_ns,
+                "ended_monotonic_ns": ended_monotonic_ns,
+                "queue_wait_ns": max(
+                    0, self.acquired_monotonic_ns - self.queued_monotonic_ns
+                ),
+                "permit_hold_ns": max(
+                    0, ended_monotonic_ns - self.acquired_monotonic_ns
+                ),
+                "binding_sha256": self.binding_sha256,
+                "bound_process_alive": bound_process_alive,
+                "process_inherits_descriptor": self.process_inherits_descriptor,
+                "live_child_retained": live_child_retained,
+            },
+        )
+        try:
+            fcntl.flock(self.descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(self.descriptor)
+            self.released = True
+
+
+class GlobalGraderSemaphore:
+    def __init__(self, config: OfficialGraderConfig) -> None:
+        self.root = ensure_private_directory(config.semaphore_root)
+        self.limit = config.max_concurrent_graders
+
+    @staticmethod
+    def _occupant_is_alive(value: Any) -> bool:
+        if (
+            not isinstance(value, Mapping)
+            or set(value)
+            != {
+                "schema",
+                "slot_index",
+                "binding_sha256",
+                "pid",
+                "start_ticks",
+            }
+            or value.get("schema")
+            != "swebench_triad_grader_semaphore_occupant_v1"
+        ):
+            raise GraderContractError("grader semaphore occupant drifted")
+        require_sha256(value.get("binding_sha256"), "grader semaphore binding")
+        pid = value.get("pid")
+        ticks = value.get("start_ticks")
+        if type(pid) is not int or pid <= 0 or type(ticks) is not int or ticks <= 0:
+            raise GraderContractError("grader semaphore process identity drifted")
+        try:
+            return (
+                process_state(pid) != "Z"
+                and process_start_ticks(pid) == ticks
+                and process_environment_value(pid, GRADER_OWNER_ENV)
+                == value["binding_sha256"]
+            )
+        except ProcessLookupError:
+            return False
+
+    def acquire(self, binding_sha256: str) -> GraderSemaphorePermit:
+        require_sha256(binding_sha256, "grader semaphore binding")
+        queued_wall_ns = time.time_ns()
+        queued_monotonic_ns = time.monotonic_ns()
+        while True:
+            for slot_index in range(self.limit):
+                lock_path = self.root / f"slot-{slot_index}.lock"
+                descriptor = os.open(
+                    lock_path,
+                    os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                )
+                try:
+                    os.fchmod(descriptor, 0o600)
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    os.close(descriptor)
+                    continue
+                occupant_path = self.root / f"slot-{slot_index}.json"
+                try:
+                    if occupant_path.exists() and self._occupant_is_alive(
+                        read_json(occupant_path)
+                    ):
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                        os.close(descriptor)
+                        continue
+                    try:
+                        occupant_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    permit = GraderSemaphorePermit(
+                        root=self.root,
+                        slot_index=slot_index,
+                        descriptor=descriptor,
+                        binding_sha256=binding_sha256,
+                        queued_wall_ns=queued_wall_ns,
+                        queued_monotonic_ns=queued_monotonic_ns,
+                    )
+                    return permit
+                except BaseException:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    os.close(descriptor)
+                    raise
+            time.sleep(0.05)
 
 
 @dataclass(frozen=True)
@@ -355,7 +567,7 @@ def verify_python_executable(path: Path) -> Path:
         raise GraderConfigurationError(
             "official grader Python is unavailable"
         ) from error
-    executable = require_regular_file(resolved, "official grader Python")
+    require_regular_file(resolved, "official grader Python")
     if not os.access(invocation_path, os.X_OK):
         raise GraderConfigurationError("official grader Python is not executable")
     return invocation_path
@@ -1425,9 +1637,10 @@ def persist_process_timeout(
     )
 
 
-def run_official_grader(
+def _run_official_grader_with_permit(
     config: OfficialGraderConfig,
     request: OfficialGradeRequest,
+    permit: GraderSemaphorePermit,
 ) -> dict[str, Any]:
     request.validate()
     attempt_root = ensure_private_directory(grade_attempt_directory(config, request))
@@ -1520,6 +1733,9 @@ def run_official_grader(
                     "live grader leader is absent from its owned process group"
                 )
         if alive:
+            permit.bind_process(
+                pid, ticks, inherits_descriptor=False
+            )
             started_at_ns = started["started_at_ns"]
             deadline_ns = started_at_ns + int(
                 (config.timeout_seconds + PROCESS_TIMEOUT_GRACE_SECONDS)
@@ -1598,6 +1814,9 @@ def run_official_grader(
                 "command_sha256": sha256_json(command),
                 "owner_binding_sha256": binding_sha256,
             },
+        )
+        permit.bind_process(
+            matching[0], matching[1], inherits_descriptor=False
         )
         deadline_ns = launching["started_at_ns"] + int(
             (config.timeout_seconds + PROCESS_TIMEOUT_GRACE_SECONDS)
@@ -1685,15 +1904,23 @@ def run_official_grader(
                 "command_sha256": sha256_json(command),
             },
         )
-        process = subprocess.Popen(
-            command,
-            cwd=attempt_root,
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
+        os.set_inheritable(permit.descriptor, True)
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=attempt_root,
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+                pass_fds=(permit.descriptor,),
+            )
+        finally:
+            os.set_inheritable(permit.descriptor, False)
         ticks = process_start_ticks(process.pid)
+        permit.bind_process(
+            process.pid, ticks, inherits_descriptor=True
+        )
         write_immutable_json(
             started_path,
             {
@@ -1800,6 +2027,33 @@ def run_official_grader(
         },
     )
     return finish_grade_attempt(attempt_root, request, command=command)
+
+
+def run_official_grader(
+    config: OfficialGraderConfig,
+    request: OfficialGradeRequest,
+) -> dict[str, Any]:
+    """Run or recover one grade while holding one of eight global permits."""
+
+    if not isinstance(config, OfficialGraderConfig):
+        raise TypeError("official grader config has the wrong type")
+    request.validate()
+    attempt_root = ensure_private_directory(grade_attempt_directory(config, request))
+    binding_sha256 = sha256_json(request_binding(request))
+    permit = GlobalGraderSemaphore(config).acquire(binding_sha256)
+    status = "error"
+    try:
+        outcome = _run_official_grader_with_permit(config, request, permit)
+        status = "completed"
+        return outcome
+    except GraderBusyError:
+        status = "live_grader_retained"
+        raise
+    except RetryableGraderError:
+        status = "retryable"
+        raise
+    finally:
+        permit.release(attempt_root, status=status)
 
 
 __all__ = [

@@ -10,9 +10,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import threading
 import time
 from collections.abc import Mapping, Sequence
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import (
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    as_completed,
+)
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -42,8 +47,10 @@ from .state import CellKey, sha256_json
 INDEX_SCHEMA = "amg_swebench_shared_pool_index_v1"
 ASSIGNMENT_SCHEMA = "amg_swebench_shared_pool_assignment_v1"
 SUMMARY_SCHEMA = "amg_swebench_shared_pool_official_summary_v1"
-WORKERS_COMPLETE_SCHEMA = "amg_swebench_shared_pool_workers_complete_v2"
+WORKERS_COMPLETE_SCHEMA = "amg_swebench_shared_pool_workers_complete_v3"
 SHA256_PREFIXED_LENGTH = 71
+TASK_SLOTS_PER_REPLICA = 2
+STARTUP_BARRIER_SCHEMA = "amg_swebench_shared_pool_startup_barrier_v1"
 
 
 def assigned_replica(task_id: str, replica_count: int = 8) -> int:
@@ -197,7 +204,7 @@ class CoordinatorConfig:
                     "runtime": {
                         name: runtime[name]
                         for name in runtime
-                        if name not in {"pod_local_root", "server_port"}
+                        if name not in {"pod_local_root", "server_ports"}
                     },
                     "grader": {
                         name: grader[name] for name in grader if name != "output_root"
@@ -220,19 +227,20 @@ class CoordinatorConfig:
                 common = identity
             elif identity != common:
                 raise ValueError("replica configs do not share one frozen runtime")
-            network_ports.extend(
-                (
-                    runtime["server_port"],
-                    shared["model_port"],
-                    shared["proxy_port"],
-                )
-            )
+            if (
+                runtime["task_slots_per_replica"]
+                != TASK_SLOTS_PER_REPLICA
+                or len(runtime["server_ports"]) != TASK_SLOTS_PER_REPLICA
+            ):
+                raise ValueError("replica task-slot lattice drifted")
+            network_ports.extend(runtime["server_ports"])
+            network_ports.extend((shared["model_port"], shared["proxy_port"]))
             unique_runtime_rows.append(
                 (
                     production.run_root,
                     production.evidence_root,
                     Path(runtime["pod_local_root"]),
-                    runtime["server_port"],
+                    tuple(runtime["server_ports"]),
                     Path(grader["output_root"]),
                     shared["gpu_uuid"],
                     shared["model_port"],
@@ -250,7 +258,7 @@ class CoordinatorConfig:
         for column in zip(*unique_runtime_rows):
             if len(set(column)) != 8:
                 raise ValueError("replica-local runtime identities are not unique")
-        if len(set(network_ports)) != 3 * len(productions):
+        if len(set(network_ports)) != 4 * len(productions):
             raise ValueError("replica-local network ports are not globally unique")
 
         first = productions[0][3]
@@ -262,7 +270,7 @@ class CoordinatorConfig:
         if sorted(task_ids) != list(range(500)):
             raise ValueError("coordinator manifest is not the full 500 tasks")
         image_rows = image_lock_rows(first, task_ids)
-        assignment = tuple(
+        assignment_rows = [
             {
                 "task_index": task_index,
                 "task_id": task_ids[task_index],
@@ -271,7 +279,14 @@ class CoordinatorConfig:
                 "image_config_digest": image_rows[task_index]["image_config_digest"],
             }
             for task_index in range(500)
-        )
+        ]
+        for replica_index in range(8):
+            replica_tasks = [
+                row for row in assignment_rows if row["replica_index"] == replica_index
+            ]
+            for position, row in enumerate(replica_tasks):
+                row["slot_index"] = position % TASK_SLOTS_PER_REPLICA
+        assignment = tuple(assignment_rows)
         replicas = []
         for replica_index, gpu_uuid, config_path, production in productions:
             tasks = tuple(
@@ -303,6 +318,8 @@ class CoordinatorConfig:
             "algorithm": SHARED_MODEL_POOL_ASSIGNMENT,
             "replica_count": 8,
             "paired_arms_same_replica": True,
+            "task_slots_per_replica": TASK_SLOTS_PER_REPLICA,
+            "deterministic_slot_assignment": "sorted_shard_position_mod_2",
             "task_count": 500,
             "cell_count": 1500,
             "tasks": list(self.assignment),
@@ -437,6 +454,7 @@ def _extract_startup_reconciliation(
                 "foreign_staged_tasks",
                 "foreign_loaded_images",
                 "residue",
+                "slots",
             }
             if not isinstance(raw_startup, Mapping) or set(raw_startup) != startup_fields:
                 raise RuntimeError("startup reconciliation receipt fields drifted")
@@ -466,6 +484,30 @@ def _extract_startup_reconciliation(
             )
             if not isinstance(raw_startup["residue"], Mapping):
                 raise RuntimeError("startup reconciliation residue drifted")
+            slots = raw_startup["slots"]
+            if (
+                not isinstance(slots, list)
+                or len(slots) != TASK_SLOTS_PER_REPLICA
+                or any(
+                    not isinstance(row, Mapping)
+                    for row in slots
+                )
+            ):
+                raise RuntimeError("startup reconciliation slot lattice drifted")
+            if (
+                [row.get("slot_index") for row in slots] != [0, 1]
+                or any(
+                    set(row)
+                    != {"slot_index", "server_port", "lane_generation"}
+                    or type(row["server_port"]) is not int
+                    or not 1 <= row["server_port"] <= 65535
+                    or type(row["lane_generation"]) is not int
+                    or row["lane_generation"] <= 0
+                    for row in slots
+                )
+                or len({row["server_port"] for row in slots}) != len(slots)
+            ):
+                raise RuntimeError("startup reconciliation slot lattice drifted")
             startup = raw_startup
             continue
         if fields == {"cell", "generation", "accepted_recovered", "runtime"}:
@@ -503,6 +545,21 @@ def preflight_all(config: CoordinatorConfig) -> list[dict[str, Any]]:
     shared daemon must be empty again.
     """
 
+    coordinator_sha256 = hashlib.sha256(config.path.read_bytes()).hexdigest()
+    replica_config_sha256s = [
+        hashlib.sha256(replica.path.read_bytes()).hexdigest()
+        for replica in config.replicas
+    ]
+    barrier_path = config.root / "control" / "preflight-all.json"
+    atomic_write_json(
+        barrier_path,
+        {
+            "schema": STARTUP_BARRIER_SCHEMA,
+            "status": "RECONCILING",
+            "coordinator_index_sha256": coordinator_sha256,
+            "replica_config_sha256s": replica_config_sha256s,
+        },
+    )
     receipts = []
     drivers = []
     try:
@@ -511,7 +568,8 @@ def preflight_all(config: CoordinatorConfig) -> list[dict[str, Any]]:
                 replica.path, assigned_task_indices=replica.task_indices
             )
             drivers.append((replica, driver))
-            driver.acquire_runtime_lane(None)
+            for slot_index in range(TASK_SLOTS_PER_REPLICA):
+                driver.acquire_runtime_lane(None, slot_index=slot_index)
         reconciliations = []
         startup_reconciliations = []
         for replica, driver in drivers:
@@ -556,15 +614,81 @@ def preflight_all(config: CoordinatorConfig) -> list[dict[str, Any]]:
         for _, driver in reversed(drivers):
             release_driver(driver)
     result = {
-        "schema": "amg_swebench_shared_pool_preflight_v1",
+        "schema": STARTUP_BARRIER_SCHEMA,
         "status": "PASS",
         "replica_count": 8,
+        "task_slots_per_replica": TASK_SLOTS_PER_REPLICA,
+        "all_slots_held_during_reconciliation": True,
+        "startup_reconciliation_complete": True,
+        "coordinator_index_sha256": coordinator_sha256,
+        "replica_config_sha256s": replica_config_sha256s,
         "reconciliations": reconciliations,
         "shared_image_reconciliation": shared_image_reconciliation,
         "replicas": receipts,
     }
-    atomic_write_json(config.root / "control" / "preflight-all.json", result)
+    atomic_write_json(barrier_path, result)
     return receipts
+
+
+def require_startup_barrier(
+    coordinator_root: Path,
+    *,
+    expected_sha256: str | None = None,
+) -> Mapping[str, Any]:
+    path = coordinator_root / "control" / "preflight-all.json"
+    value = load_canonical_object(path, "startup reconciliation barrier")
+    if expected_sha256 is not None and (
+        not isinstance(expected_sha256, str)
+        or hashlib.sha256(path.read_bytes()).hexdigest() != expected_sha256
+    ):
+        raise RuntimeError("startup reconciliation barrier digest drifted")
+    if (
+        value.get("schema") != STARTUP_BARRIER_SCHEMA
+        or value.get("status") != "PASS"
+        or value.get("replica_count") != 8
+        or value.get("task_slots_per_replica") != TASK_SLOTS_PER_REPLICA
+        or value.get("all_slots_held_during_reconciliation") is not True
+        or value.get("startup_reconciliation_complete") is not True
+        or not isinstance(value.get("coordinator_index_sha256"), str)
+        or len(value["coordinator_index_sha256"]) != 64
+        or not isinstance(value.get("replica_config_sha256s"), list)
+        or len(value["replica_config_sha256s"]) != 8
+        or any(
+            not isinstance(digest, str) or len(digest) != 64
+            for digest in value["replica_config_sha256s"]
+        )
+        or not isinstance(value.get("reconciliations"), list)
+        or len(value["reconciliations"]) != 8
+        or not isinstance(value.get("replicas"), list)
+        or len(value["replicas"]) != 8
+        or not isinstance(value.get("shared_image_reconciliation"), Mapping)
+        or value["shared_image_reconciliation"].get("status") != "PASS"
+        or value["shared_image_reconciliation"].get("remaining_images") != 0
+    ):
+        raise RuntimeError("startup reconciliation barrier is invalid")
+    return value
+
+
+def validated_startup_barrier(
+    config: CoordinatorConfig,
+    *,
+    expected_sha256: str | None = None,
+) -> Mapping[str, Any]:
+    value = require_startup_barrier(
+        config.root,
+        expected_sha256=expected_sha256,
+    )
+    expected_configs = [
+        hashlib.sha256(replica.path.read_bytes()).hexdigest()
+        for replica in config.replicas
+    ]
+    if (
+        value.get("coordinator_index_sha256")
+        != hashlib.sha256(config.path.read_bytes()).hexdigest()
+        or value.get("replica_config_sha256s") != expected_configs
+    ):
+        raise RuntimeError("startup reconciliation barrier config binding drifted")
+    return value
 
 
 def cleanup_all(config: CoordinatorConfig) -> Mapping[str, Any]:
@@ -587,6 +711,7 @@ def cleanup_all(config: CoordinatorConfig) -> Mapping[str, Any]:
 
 
 def run_gate(config: CoordinatorConfig) -> Mapping[str, Any]:
+    validated_startup_barrier(config)
     replica = config.task_zero_replica
     driver = driver_from_config(replica.path, assigned_task_indices=(0,))
     try:
@@ -609,50 +734,111 @@ def _worker(
     config_path: str,
     task_indices: tuple[int, ...],
     task_image_digests: tuple[str, ...],
+    task_slot_indices: tuple[int, ...],
     replica_index: int,
     coordinator_root: str,
+    startup_barrier_sha256: str,
 ) -> dict[str, Any]:
-    if len(task_indices) != len(task_image_digests):
+    if not (
+        len(task_indices)
+        == len(task_image_digests)
+        == len(task_slot_indices)
+    ):
         raise ValueError("worker task/image lock lattice drifted")
-    driver = driver_from_config(Path(config_path), assigned_task_indices=task_indices)
-    progress_path = (
-        Path(coordinator_root) / "progress" / f"replica-{replica_index}.json"
+    if tuple(sorted(set(task_indices))) != task_indices or any(
+        slot_index not in range(TASK_SLOTS_PER_REPLICA)
+        for slot_index in task_slot_indices
+    ):
+        raise ValueError("worker deterministic slot lattice drifted")
+    root = Path(coordinator_root)
+    require_startup_barrier(
+        root,
+        expected_sha256=startup_barrier_sha256,
     )
+    driver = driver_from_config(Path(config_path), assigned_task_indices=task_indices)
+    progress_path = root / "progress" / f"replica-{replica_index}.json"
     started = time.monotonic()
-    completed = 0
+    completed: set[int] = set()
+    progress_lock = threading.Lock()
+    digest_locks: dict[str, Any] = {}
     try:
         driver.ensure_driver_lease()
         driver._read_validated_preflight()
         image_locks = ensure_private_directory(
-            Path(coordinator_root) / "control" / "image-leases"
+            root / "control" / "image-leases"
         )
-        for task_index, image_digest in zip(task_indices, task_image_digests):
-            if len(
-                image_digest
-            ) != SHA256_PREFIXED_LENGTH or not image_digest.startswith("sha256:"):
+        queues: list[list[tuple[int, str]]] = [
+            [] for _ in range(TASK_SLOTS_PER_REPLICA)
+        ]
+        for task_index, image_digest, slot_index in zip(
+            task_indices,
+            task_image_digests,
+            task_slot_indices,
+        ):
+            if (
+                len(image_digest) != SHA256_PREFIXED_LENGTH
+                or not image_digest.startswith("sha256:")
+            ):
                 raise ValueError("worker image lock digest drifted")
-            with exclusive_lock(image_locks / f"{image_digest[7:]}.lock"):
-                driver.run_task(task_index, gate=task_index == 0)
-            completed += 1
-            atomic_write_json(
-                progress_path,
-                {
-                    "schema": "amg_swebench_shared_pool_progress_v1",
-                    "status": "RUNNING",
-                    "replica_index": replica_index,
-                    "completed_tasks": completed,
-                    "total_tasks": len(task_indices),
-                    "last_task_index": task_index,
-                    "last_image_config_digest": image_digest,
-                    "wall_seconds": round(time.monotonic() - started, 6),
-                },
+            queues[slot_index].append((task_index, image_digest))
+            digest_locks.setdefault(
+                image_digest,
+                threading.Lock(),
             )
+
+        def run_slot(slot_index: int) -> dict[str, Any]:
+            slot_started = time.monotonic()
+            slot_completed = []
+            for task_index, image_digest in queues[slot_index]:
+                with digest_locks[image_digest]:
+                    with exclusive_lock(
+                        image_locks / f"{image_digest[7:]}.lock"
+                    ):
+                        driver.run_task(
+                            task_index,
+                            gate=task_index == 0,
+                            slot_index=slot_index,
+                        )
+                slot_completed.append(task_index)
+                with progress_lock:
+                    completed.add(task_index)
+                    atomic_write_json(
+                        progress_path,
+                        {
+                            "schema": "amg_swebench_shared_pool_progress_v2",
+                            "status": "RUNNING",
+                            "replica_index": replica_index,
+                            "task_slots_per_replica": TASK_SLOTS_PER_REPLICA,
+                            "completed_task_indices": sorted(completed),
+                            "completed_tasks": len(completed),
+                            "total_tasks": len(task_indices),
+                            "last_task_index": task_index,
+                            "last_slot_index": slot_index,
+                            "last_image_config_digest": image_digest,
+                            "wall_seconds": round(
+                                time.monotonic() - started, 6
+                            ),
+                        },
+                    )
+            return {
+                "slot_index": slot_index,
+                "completed_task_indices": slot_completed,
+                "wall_seconds": round(time.monotonic() - slot_started, 6),
+            }
+
+        with ThreadPoolExecutor(
+            max_workers=TASK_SLOTS_PER_REPLICA
+        ) as executor:
+            slot_results = list(executor.map(run_slot, range(TASK_SLOTS_PER_REPLICA)))
         result = {
-            "schema": "amg_swebench_shared_pool_worker_v1",
+            "schema": "amg_swebench_shared_pool_worker_v2",
             "status": "PASS",
             "replica_index": replica_index,
-            "completed_tasks": completed,
+            "task_slots_per_replica": TASK_SLOTS_PER_REPLICA,
+            "completed_task_indices": sorted(completed),
+            "completed_tasks": len(completed),
             "total_tasks": len(task_indices),
+            "slots": slot_results,
             "wall_seconds": round(time.monotonic() - started, 6),
         }
         atomic_write_json(progress_path, result)
@@ -662,6 +848,9 @@ def _worker(
 
 
 def run_full(config: CoordinatorConfig) -> list[dict[str, Any]]:
+    validated_startup_barrier(config)
+    barrier_path = config.root / "control" / "preflight-all.json"
+    barrier_sha256 = hashlib.sha256(barrier_path.read_bytes()).hexdigest()
     gate = read_json(config.root / "control" / "gate.json")
     task_zero = config.task_zero_replica
     if (
@@ -698,8 +887,13 @@ def run_full(config: CoordinatorConfig) -> list[dict[str, Any]]:
                     config.assignment[task_index]["image_config_digest"]
                     for task_index in replica.task_indices
                 ),
+                tuple(
+                    config.assignment[task_index]["slot_index"]
+                    for task_index in replica.task_indices
+                ),
                 replica.replica_index,
                 str(config.root),
+                barrier_sha256,
             ): replica.replica_index
             for replica in config.replicas
         }
@@ -708,11 +902,15 @@ def run_full(config: CoordinatorConfig) -> list[dict[str, Any]]:
     results.sort(key=lambda row: row["replica_index"])
     for replica, result in zip(config.replicas, results):
         if (
-            result.get("schema") != "amg_swebench_shared_pool_worker_v1"
+            result.get("schema") != "amg_swebench_shared_pool_worker_v2"
             or result.get("status") != "PASS"
             or result.get("replica_index") != replica.replica_index
             or result.get("completed_tasks") != len(replica.task_indices)
             or result.get("total_tasks") != len(replica.task_indices)
+            or result.get("task_slots_per_replica")
+            != TASK_SLOTS_PER_REPLICA
+            or result.get("completed_task_indices")
+            != list(replica.task_indices)
         ):
             raise RuntimeError("shared-pool worker completion drifted")
 
@@ -724,7 +922,8 @@ def run_full(config: CoordinatorConfig) -> list[dict[str, Any]]:
                 replica.path, assigned_task_indices=replica.task_indices
             )
             audit_drivers.append((replica, driver))
-            driver.acquire_runtime_lane(None)
+            for slot_index in range(TASK_SLOTS_PER_REPLICA):
+                driver.acquire_runtime_lane(None, slot_index=slot_index)
         for replica, driver in audit_drivers:
             audit = driver.operations.final_audit()
             if (
@@ -765,6 +964,7 @@ def run_full(config: CoordinatorConfig) -> list[dict[str, Any]]:
             "assignment_sha256": hashlib.sha256(
                 assignment_path.read_bytes()
             ).hexdigest(),
+            "startup_barrier_sha256": barrier_sha256,
             "gate_sha256": hashlib.sha256(gate_path.read_bytes()).hexdigest(),
             "workers": results,
             "final_audits": audits,
@@ -781,6 +981,7 @@ def validated_workers_complete(config: CoordinatorConfig) -> Mapping[str, Any]:
         "status",
         "coordinator_index_sha256",
         "assignment_sha256",
+        "startup_barrier_sha256",
         "gate_sha256",
         "workers",
         "final_audits",
@@ -795,6 +996,10 @@ def validated_workers_complete(config: CoordinatorConfig) -> Mapping[str, Any]:
         != hashlib.sha256(config.path.read_bytes()).hexdigest()
         or value.get("assignment_sha256")
         != hashlib.sha256(assignment_path.read_bytes()).hexdigest()
+        or value.get("startup_barrier_sha256")
+        != hashlib.sha256(
+            (config.root / "control" / "preflight-all.json").read_bytes()
+        ).hexdigest()
         or value.get("gate_sha256")
         != hashlib.sha256(gate_path.read_bytes()).hexdigest()
     ):
@@ -808,11 +1013,15 @@ def validated_workers_complete(config: CoordinatorConfig) -> Mapping[str, Any]:
     for replica, worker, audit_row in zip(config.replicas, workers, audits):
         if (
             not isinstance(worker, Mapping)
-            or worker.get("schema") != "amg_swebench_shared_pool_worker_v1"
+            or worker.get("schema") != "amg_swebench_shared_pool_worker_v2"
             or worker.get("status") != "PASS"
             or worker.get("replica_index") != replica.replica_index
             or worker.get("completed_tasks") != len(replica.task_indices)
             or worker.get("total_tasks") != len(replica.task_indices)
+            or worker.get("task_slots_per_replica")
+            != TASK_SLOTS_PER_REPLICA
+            or worker.get("completed_task_indices")
+            != list(replica.task_indices)
             or not isinstance(audit_row, Mapping)
             or set(audit_row) != {"replica_index", "receipt", "receipt_sha256"}
             or audit_row.get("replica_index") != replica.replica_index

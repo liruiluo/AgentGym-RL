@@ -41,6 +41,9 @@ class SwebenchRuntimeEndpoint:
     private_run_id: str
     run_capability: str
     image_manifest_sha256: str
+    task_index: int
+    arm: str
+    generation: int
 
     def __post_init__(self) -> None:
         for name in ("env_server_base", "private_run_id", "run_capability"):
@@ -49,6 +52,12 @@ class SwebenchRuntimeEndpoint:
                 raise ValueError(f"{name} must be nonempty normalized text")
         if SHA256_PATTERN.fullmatch(self.image_manifest_sha256) is None:
             raise ValueError("image manifest identity must be lowercase SHA-256")
+        if type(self.task_index) is not int or self.task_index < 0:
+            raise ValueError("runtime endpoint task index is invalid")
+        if not isinstance(self.arm, str) or not self.arm:
+            raise ValueError("runtime endpoint arm is invalid")
+        if type(self.generation) is not int or self.generation <= 0:
+            raise ValueError("runtime endpoint generation is invalid")
 
 
 def client_done(client: Any) -> bool:
@@ -198,10 +207,19 @@ def make_swebench_runtime_factory(
             ),
             evidence_store=evidence_store,
         )
+        transport = ExactTokenVllmTransport(
+            transport_factory(),
+            request_context={
+                "run_id": endpoint.private_run_id,
+                "task_index": endpoint.task_index,
+                "arm": endpoint.arm,
+                "generation": endpoint.generation,
+            },
+        )
         model = OpenAICompatibleModelClient(
             base_url=model_base_url,
             model_config=config.model,
-            transport=ExactTokenVllmTransport(transport_factory()),
+            transport=transport,
             evidence_store=evidence_store,
             timeout_seconds=model_timeout_seconds,
             enable_thinking=False,

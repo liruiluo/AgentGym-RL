@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -19,6 +20,7 @@ from swebench_triad_eval.official_grader import (
     GraderBusyError,
     GraderConfigurationError,
     GraderContractError,
+    GlobalGraderSemaphore,
     OfficialGradeRequest,
     OfficialGraderConfig,
     RetryableGraderError,
@@ -294,6 +296,86 @@ class OfficialGraderTest(unittest.TestCase):
                 request or grade_request(),
             )
         return result, fake
+
+    def test_global_grader_semaphore_never_admits_more_than_eight(self) -> None:
+        semaphore = GlobalGraderSemaphore(self.config)
+        condition = threading.Condition()
+        release = threading.Event()
+        active = 0
+        maximum = 0
+        receipts = []
+
+        def worker(index: int) -> None:
+            nonlocal active, maximum
+            binding = hashlib.sha256(str(index).encode()).hexdigest()
+            permit = semaphore.acquire(binding)
+            with condition:
+                active += 1
+                maximum = max(maximum, active)
+                condition.notify_all()
+            release.wait(timeout=5)
+            with condition:
+                active -= 1
+            attempt = self.root / f"semaphore-attempt-{index}"
+            attempt.mkdir()
+            permit.release(attempt, status="completed")
+            receipts.append(
+                json.loads((attempt / "grader-semaphore.json").read_text())
+            )
+
+        threads = [
+            threading.Thread(target=worker, args=(index,))
+            for index in range(9)
+        ]
+        for thread in threads:
+            thread.start()
+        with condition:
+            reached = condition.wait_for(lambda: active == 8, timeout=3)
+        self.assertTrue(reached)
+        self.assertEqual(maximum, 8)
+        release.set()
+        for thread in threads:
+            thread.join(timeout=5)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(len(receipts), 9)
+        self.assertTrue(
+            all(row["max_concurrent_graders"] == 8 for row in receipts)
+        )
+        self.assertTrue(all(row["queue_wait_ns"] >= 0 for row in receipts))
+
+    def test_recovery_probe_does_not_leak_a_second_live_grader_slot(self) -> None:
+        semaphore = GlobalGraderSemaphore(self.config)
+        recovered = semaphore.acquire(SHA_A)
+        recovered.bind_process(
+            os.getpid(), 1, inherits_descriptor=False
+        )
+        recovered_attempt = self.root / "recovered-semaphore-attempt"
+        recovered_attempt.mkdir()
+        with patch.object(recovered, "_bound_process_is_alive", return_value=True):
+            recovered.release(recovered_attempt, status="live_grader_retained")
+        self.assertFalse(recovered.occupant_path.exists())
+        recovered_receipt = json.loads(
+            (recovered_attempt / "grader-semaphore.json").read_text()
+        )
+        self.assertTrue(recovered_receipt["bound_process_alive"])
+        self.assertFalse(recovered_receipt["process_inherits_descriptor"])
+        self.assertFalse(recovered_receipt["live_child_retained"])
+
+        spawned = semaphore.acquire(SHA_B)
+        spawned.bind_process(
+            os.getpid(), 1, inherits_descriptor=True
+        )
+        spawned_attempt = self.root / "spawned-semaphore-attempt"
+        spawned_attempt.mkdir()
+        with patch.object(spawned, "_bound_process_is_alive", return_value=True):
+            spawned.release(spawned_attempt, status="live_grader_retained")
+        self.assertTrue(spawned.occupant_path.exists())
+        spawned_receipt = json.loads(
+            (spawned_attempt / "grader-semaphore.json").read_text()
+        )
+        self.assertTrue(spawned_receipt["process_inherits_descriptor"])
+        self.assertTrue(spawned_receipt["live_child_retained"])
+        spawned.occupant_path.unlink()
 
     def test_invocation_is_single_instance_pinned_and_prediction_is_canonical(
         self,
