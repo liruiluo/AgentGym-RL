@@ -883,9 +883,7 @@ class LifecycleDriverTest(unittest.TestCase):
         )
         self.assertTrue(publication["recovered_after_crash"])
         timing = json.loads(Path(completion["timing_receipt"]["path"]).read_text())
-        self.assertEqual(
-            publication["started_wall_ns"], timing["ended_wall_ns"]
-        )
+        self.assertEqual(publication["started_wall_ns"], timing["ended_wall_ns"])
         self.assertEqual(
             publication["started_monotonic_ns"],
             timing["ended_monotonic_ns"],
@@ -897,6 +895,31 @@ class LifecycleDriverTest(unittest.TestCase):
                 self.driver.task_completion_path(0).read_bytes()
             ).hexdigest(),
         )
+        self.assertGreaterEqual(
+            publication["ended_wall_ns"],
+            self.driver.task_completion_path(0).stat().st_mtime_ns,
+        )
+
+    def test_recovery_observation_includes_delayed_durable_tail(self):
+        completion = self.driver.run_task(0, gate=True)
+        publication_path = self.driver.task_publication_path(0)
+        publication_path.unlink()
+        timing = json.loads(Path(completion["timing_receipt"]["path"]).read_text())
+        delayed_wall = timing["ended_wall_ns"] + 250_000_000
+        delayed_monotonic = timing["ended_monotonic_ns"] + 250_000_000
+        with (
+            patch("swebench_triad_eval.cli.time.time_ns", return_value=delayed_wall),
+            patch(
+                "swebench_triad_eval.cli.time.monotonic_ns",
+                return_value=delayed_monotonic,
+            ),
+        ):
+            self.driver._recover_task_publication(0, completion)
+        publication = json.loads(publication_path.read_text())
+        self.assertTrue(publication["recovered_after_crash"])
+        self.assertEqual(publication["ended_wall_ns"], delayed_wall)
+        self.assertEqual(publication["ended_monotonic_ns"], delayed_monotonic)
+        self.assertEqual(publication["duration_ns"], 250_000_000)
 
     def test_grade_all_rejects_noncanonical_accepted_triad_before_outcomes(self):
         slot = self.driver.acquire_runtime_lane(1, slot_index=0)

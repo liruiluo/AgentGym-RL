@@ -28,6 +28,7 @@ from .atomic import (
     atomic_write_bytes,
     atomic_write_json,
     ensure_private_directory,
+    exclusive_lock,
     read_json,
     write_immutable_json,
 )
@@ -1307,40 +1308,49 @@ class LifecycleDriver:
     ) -> None:
         """Roll forward a completion-visible/publication-sidecar crash window.
 
-        The immutable completion is the task commit.  Its bound phase-timing
-        receipt records the instant immediately before publication and the
-        completion inode mtime records the durable content write.  Those two
-        immutable facts reconstruct a conservative publication interval without
-        rerunning a cell or the official grader.  Concurrent resumptions derive
-        identical bytes, so ``write_immutable_json`` remains the final fence.
+        The completion inode timestamp predates the final directory-fsync fence,
+        so it cannot be used as the publication end.  Recovery is serialized and
+        uses the observation made *after* the immutable completion is visible.
+        The resulting interval intentionally includes the crash/recovery gap and
+        is therefore conservative for the hard wall-time gate.
         """
 
-        completion_path = self.task_completion_path(task_index)
-        timing_path = Path(completion["timing_receipt"]["path"])
-        timing = read_json(timing_path)
-        started_wall_ns = timing.get("ended_wall_ns")
-        started_monotonic_ns = timing.get("ended_monotonic_ns")
-        ended_wall_ns = completion_path.stat().st_mtime_ns
-        if (
-            timing.get("schema") != "swebench_triad_task_phase_timing_v1"
-            or timing.get("status") != "READY_FOR_PUBLICATION"
-            or timing.get("task_index") != task_index
-            or type(started_wall_ns) is not int
-            or type(started_monotonic_ns) is not int
-            or ended_wall_ns < started_wall_ns
-        ):
-            raise RuntimeError("task publication recovery evidence is invalid")
-        duration_ns = ended_wall_ns - started_wall_ns
-        recovered = self._task_publication(
-            task_index,
-            completion,
-            started_wall_ns=started_wall_ns,
-            ended_wall_ns=ended_wall_ns,
-            started_monotonic_ns=started_monotonic_ns,
-            ended_monotonic_ns=started_monotonic_ns + duration_ns,
-            recovered_after_crash=True,
-        )
-        write_immutable_json(self.task_publication_path(task_index), recovered)
+        publication_path = self.task_publication_path(task_index)
+        lock_path = publication_path.with_name(publication_path.name + ".recovery.lock")
+        with exclusive_lock(lock_path):
+            if publication_path.exists():
+                return
+            if publication_path.is_symlink():
+                raise RuntimeError("task publication recovery target is a symlink")
+            completion_path = self.task_completion_path(task_index)
+            timing_path = Path(completion["timing_receipt"]["path"])
+            timing = read_json(timing_path)
+            started_wall_ns = timing.get("ended_wall_ns")
+            started_monotonic_ns = timing.get("ended_monotonic_ns")
+            ended_wall_ns = time.time_ns()
+            ended_monotonic_ns = time.monotonic_ns()
+            if (
+                timing.get("schema") != "swebench_triad_task_phase_timing_v1"
+                or timing.get("status") != "READY_FOR_PUBLICATION"
+                or timing.get("task_index") != task_index
+                or type(started_wall_ns) is not int
+                or type(started_monotonic_ns) is not int
+                or ended_wall_ns < started_wall_ns
+                or ended_monotonic_ns < started_monotonic_ns
+                or not completion_path.is_file()
+                or completion_path.is_symlink()
+            ):
+                raise RuntimeError("task publication recovery evidence is invalid")
+            recovered = self._task_publication(
+                task_index,
+                completion,
+                started_wall_ns=started_wall_ns,
+                ended_wall_ns=ended_wall_ns,
+                started_monotonic_ns=started_monotonic_ns,
+                ended_monotonic_ns=ended_monotonic_ns,
+                recovered_after_crash=True,
+            )
+            write_immutable_json(publication_path, recovered)
 
     def load_task_completion(
         self,

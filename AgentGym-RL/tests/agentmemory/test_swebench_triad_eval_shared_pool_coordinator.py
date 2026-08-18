@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from paired_eval.serialization import canonical_json_bytes
+from swebench_triad_eval.model_transport import scheduler_request_id
 from swebench_triad_eval.atomic import atomic_write_json, canonical_json_bytes as atomic_json_bytes
 from swebench_triad_eval.state import (
     OwnerIdentity,
@@ -25,6 +26,7 @@ from swebench_triad_eval.state import (
 )
 from swebench_triad_eval.shared_pool_coordinator import (
     INDEX_SCHEMA,
+    ETA_PROGRESS_SCHEMA,
     ETA_RECEIPT_SCHEMA,
     FULL_RUN_TIMING_SCHEMA,
     STOP_MARKER_SCHEMA,
@@ -34,7 +36,14 @@ from swebench_triad_eval.shared_pool_coordinator import (
     CoordinatorConfig,
     ReplicaConfig,
     _collect_timing_gate,
+    _eta_progress_path,
+    _eta_receipt_from_progress,
+    _eta_receipt_path,
     _extract_startup_reconciliation,
+    _load_cell_timing,
+    _publish_eta_check,
+    _reconcile_eta_history,
+    _validate_eta_cadence,
     _validated_full_run_timing,
     _worker,
     aggregate,
@@ -572,7 +581,11 @@ class TimingGateContractTest(unittest.TestCase):
                         return self.root / "full" / f"task-{task_index:04d}.json"
 
                     def task_publication_path(self, task_index):
-                        return self.root / "full" / f"task-{task_index:04d}.publication.json"
+                        return (
+                            self.root
+                            / "full"
+                            / f"task-{task_index:04d}.publication.json"
+                        )
 
                     def load_task_completion(self, task_index):
                         timing = self.root / "timings" / f"task-{task_index:04d}.json"
@@ -580,19 +593,25 @@ class TimingGateContractTest(unittest.TestCase):
                             "timing_receipt": {
                                 "status": "READY_FOR_PUBLICATION",
                                 "path": str(timing),
-                                "sha256": hashlib.sha256(timing.read_bytes()).hexdigest(),
+                                "sha256": hashlib.sha256(
+                                    timing.read_bytes()
+                                ).hexdigest(),
                             }
                         }
 
                 driver = Driver(replica, run_root)
                 fake_drivers[str(replica.path)] = driver
                 selected = [
-                    row for row in contract["panel_tasks"]
+                    row
+                    for row in contract["panel_tasks"]
                     if row["replica_index"] == replica.replica_index
                 ]
                 for offset, panel in enumerate(selected):
                     task_index = panel["task_index"]
-                    start = replica.replica_index * 1_000_000_000_000 + offset * 10_000_000_000
+                    start = (
+                        replica.replica_index * 1_000_000_000_000
+                        + offset * 10_000_000_000
+                    )
                     end = start + 100_000_000_000
                     phases = []
                     cursor = start
@@ -624,11 +643,34 @@ class TimingGateContractTest(unittest.TestCase):
                             "schema": "swebench_triad_task_phase_timing_v1",
                             "status": "READY_FOR_PUBLICATION",
                             "task_index": task_index,
+                            "task_id": panel["task_id"],
+                            "task_seed": next(
+                                config.task.seed
+                                for config in replica.production.configs
+                                if config.task.task_index == task_index
+                            ),
                             "slot_index": panel["slot_index"],
+                            "server_port": replica.production.section("runtime")[
+                                "server_ports"
+                            ][panel["slot_index"]],
+                            "lane_generation": 1,
+                            "lane_fencing_token_sha256": "f" * 64,
+                            "started_wall_ns": start,
+                            "ended_wall_ns": end,
                             "started_monotonic_ns": start,
                             "ended_monotonic_ns": end,
                             "duration_ns": end - start,
+                            "identity": {
+                                "deployment_commit": "d" * 40,
+                                "inner_commit": "e" * 40,
+                                "source_identity_sha256": "a" * 64,
+                                "run_config_sha256": "b" * 64,
+                                "manifest_sha256": "c" * 64,
+                                "replica_index": replica.replica_index,
+                                "gpu_uuid": replica.gpu_uuid,
+                            },
                             "phases": phases,
+                            "phase_durations_are_non_additive": True,
                         },
                     )
                     completion = driver.task_completion_path(task_index)
@@ -640,20 +682,36 @@ class TimingGateContractTest(unittest.TestCase):
                             "status": "PASS",
                             "recovered_after_crash": False,
                             "task_index": task_index,
+                            "completion_path": str(completion),
                             "completion_sha256": hashlib.sha256(
                                 completion.read_bytes()
                             ).hexdigest(),
+                            "timing_receipt_sha256": hashlib.sha256(
+                                timing.read_bytes()
+                            ).hexdigest(),
+                            "started_wall_ns": end,
+                            "ended_wall_ns": end + 100_000_000,
                             "started_monotonic_ns": end,
                             "ended_monotonic_ns": end + 100_000_000,
                             "duration_ns": 100_000_000,
                         },
                     )
 
-            def cell_timing(_replica, _driver, task_index, arm):
+            def cell_timing(_replica, _driver, task_index, arm, **_identity):
                 return {
                     "task_index": task_index,
+                    "task_id": config.assignment[task_index]["task_id"],
                     "arm": arm,
                     "generation": 1,
+                    "replica_index": config.assignment[task_index]["replica_index"],
+                    "gpu_uuid": config.replicas[
+                        config.assignment[task_index]["replica_index"]
+                    ].gpu_uuid,
+                    "slot_index": config.assignment[task_index]["slot_index"],
+                    "server_port": 65_000,
+                    "lane_generation": 1,
+                    "lane_fencing_token_sha256": "f" * 64,
+                    "shared_model_pool_sha256": "c" * 64,
                     "model_generation_seconds": 5.0,
                     "environment_tool_execution_seconds": 6.0,
                     "publication_seconds": 0.01,
@@ -662,12 +720,33 @@ class TimingGateContractTest(unittest.TestCase):
                     "publication_receipt_sha256": "b" * 64,
                 }
 
-            with patch(
-                "swebench_triad_eval.shared_pool_coordinator.driver_from_config",
-                side_effect=lambda path, **_kwargs: fake_drivers[str(path)],
-            ), patch(
-                "swebench_triad_eval.shared_pool_coordinator._load_cell_timing",
-                side_effect=cell_timing,
+            with (
+                patch(
+                    "swebench_triad_eval.shared_pool_coordinator.driver_from_config",
+                    side_effect=lambda path, **_kwargs: fake_drivers[str(path)],
+                ),
+                patch(
+                    "swebench_triad_eval.shared_pool_coordinator.validated_preflight_pool_snapshot",
+                    side_effect=lambda replica: {
+                        "replica_index": replica.replica_index
+                    },
+                ),
+                patch(
+                    "swebench_triad_eval.shared_pool_coordinator._expected_task_timing_identity",
+                    side_effect=lambda replica: {
+                        "deployment_commit": "d" * 40,
+                        "inner_commit": "e" * 40,
+                        "source_identity_sha256": "a" * 64,
+                        "run_config_sha256": "b" * 64,
+                        "manifest_sha256": "c" * 64,
+                        "replica_index": replica.replica_index,
+                        "gpu_uuid": replica.gpu_uuid,
+                    },
+                ),
+                patch(
+                    "swebench_triad_eval.shared_pool_coordinator._load_cell_timing",
+                    side_effect=cell_timing,
+                ),
             ):
                 receipt = _collect_timing_gate(config, contract)
                 validated = validated_timing_gate(config)
@@ -706,6 +785,191 @@ class TimingGateContractTest(unittest.TestCase):
             atomic_write_json(gate_path, over)
             with self.assertRaisesRegex(RuntimeError, "incomplete or over budget"):
                 validated_timing_gate(config)
+
+
+class ExactTimingReceiptIdentityTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.runtime_path = (
+            self.root / "control/cells/0007-native/generation-00000001.json"
+        )
+        self.runtime_path.parent.mkdir(parents=True)
+        policy = {
+            "phase": "policy_and_model_execution",
+            "status": "PASS",
+            "started_wall_ns": 100,
+            "ended_wall_ns": 300,
+            "started_monotonic_ns": 100,
+            "ended_monotonic_ns": 300,
+            "duration_ns": 200,
+        }
+        run_id = "amg-sbv-0007-native-g00000001"
+        self.runtime = {
+            "schema": "swebench_triad_cell_runtime_v1",
+            "status": "PASS",
+            "task_index": 7,
+            "instance_id": "owner__task-0007",
+            "arm": "native",
+            "generation": 1,
+            "container_name": "fixture-container",
+            "run_id": run_id,
+            "run_capability_sha256": "a" * 64,
+            "slot_index": 1,
+            "server_port": 18101,
+            "lane_generation": 3,
+            "lane_fencing_token_sha256": "b" * 64,
+            "phase_timings": [policy],
+            "shared_model_pool": {"fixture": True},
+            "rootfs_before": {},
+            "cgroup_prepare": {},
+            "container_id": "c" * 12,
+            "cgroup_descendants_before": {},
+            "metadata_before": {},
+            "model_transport_events": [
+                {
+                    "phase": "tokenize",
+                    "semantic_request_sha256": "d" * 64,
+                    "prompt_token_ids": [1],
+                    "started_wall_ns": 110,
+                    "ended_wall_ns": 120,
+                    "started_monotonic_ns": 110,
+                    "ended_monotonic_ns": 120,
+                    "duration_ns": 10,
+                },
+                {
+                    "phase": "chat_completion",
+                    "request_id": scheduler_request_id(
+                        run_id=run_id,
+                        task_index=7,
+                        arm="native",
+                        generation=1,
+                        turn_index=0,
+                    ),
+                    "turn_index": 0,
+                    "semantic_request_sha256": "e" * 64,
+                    "prompt_token_ids": [1],
+                    "response_token_ids": [2],
+                    "started_wall_ns": 130,
+                    "ended_wall_ns": 150,
+                    "started_monotonic_ns": 130,
+                    "ended_monotonic_ns": 150,
+                    "duration_ns": 20,
+                },
+            ],
+            "metadata_after": {},
+            "cgroup_descendants_after": {},
+            "rootfs_after": {},
+            "container_logs": {},
+            "container_cleanup": {},
+            "cgroup_teardown": {},
+        }
+        atomic_write_json(self.runtime_path, self.runtime)
+        self.publication_path = self.runtime_path.with_name(
+            self.runtime_path.stem + ".publication.json"
+        )
+        self.publication = {
+            "schema": "swebench_triad_cell_publication_timing_v1",
+            "status": "PASS",
+            "cell_status": "PASS",
+            "task_index": 7,
+            "arm": "native",
+            "generation": 1,
+            "runtime_receipt_path": str(self.runtime_path),
+            "runtime_receipt_sha256": hashlib.sha256(
+                self.runtime_path.read_bytes()
+            ).hexdigest(),
+            "started_wall_ns": 300,
+            "ended_wall_ns": 320,
+            "started_monotonic_ns": 300,
+            "ended_monotonic_ns": 320,
+            "duration_ns": 20,
+        }
+        atomic_write_json(self.publication_path, self.publication)
+        self.replica = SimpleNamespace(
+            replica_index=0,
+            gpu_uuid="GPU-0",
+            production=SimpleNamespace(run_root=self.root),
+        )
+        self.driver = SimpleNamespace(
+            store=SimpleNamespace(read_accepted=lambda _key: {"attempt_generation": 1})
+        )
+        self.task_row = {
+            "task_index": 7,
+            "task_id": "owner__task-0007",
+            "replica_index": 0,
+            "slot_index": 1,
+        }
+        self.task_timing = {
+            "server_port": 18101,
+            "lane_generation": 3,
+            "lane_fencing_token_sha256": "b" * 64,
+        }
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def collect(self):
+        with patch(
+            "swebench_triad_eval.shared_pool_coordinator.validate_live_pool_snapshot"
+        ):
+            return _load_cell_timing(
+                self.replica,
+                self.driver,
+                7,
+                "native",
+                task_row=self.task_row,
+                task_timing=self.task_timing,
+                listener_reference={"fixture": True},
+            )
+
+    def rewrite_runtime(self, value):
+        atomic_write_json(self.runtime_path, value)
+        publication = copy.deepcopy(self.publication)
+        publication["runtime_receipt_sha256"] = hashlib.sha256(
+            self.runtime_path.read_bytes()
+        ).hexdigest()
+        atomic_write_json(self.publication_path, publication)
+
+    def test_exact_task_replica_slot_lane_and_event_identity_passes(self):
+        row = self.collect()
+        self.assertEqual(row["task_id"], self.task_row["task_id"])
+        self.assertEqual(row["replica_index"], 0)
+        self.assertEqual(row["slot_index"], 1)
+        self.assertEqual(row["server_port"], 18101)
+        self.assertEqual(row["lane_generation"], 3)
+
+    def test_one_field_identity_and_timestamp_drifts_fail_closed(self):
+        mutations = (
+            ("instance_id", "wrong"),
+            ("slot_index", 99),
+            ("server_port", -1),
+            ("lane_generation", 99),
+        )
+        for field, value in mutations:
+            with self.subTest(field=field):
+                changed = copy.deepcopy(self.runtime)
+                changed[field] = value
+                self.rewrite_runtime(changed)
+                with self.assertRaisesRegex(RuntimeError, "identity drifted"):
+                    self.collect()
+        changed = copy.deepcopy(self.runtime)
+        changed["phase_timings"][0]["duration_ns"] += 1
+        self.rewrite_runtime(changed)
+        with self.assertRaisesRegex(RuntimeError, "timestamp arithmetic"):
+            self.collect()
+        changed = copy.deepcopy(self.runtime)
+        changed["model_transport_events"][1]["request_id"] = "0" * 64
+        self.rewrite_runtime(changed)
+        with self.assertRaisesRegex(RuntimeError, "chat event identity"):
+            self.collect()
+
+    def test_publication_requires_exact_timestamp_schema(self):
+        changed = copy.deepcopy(self.publication)
+        changed.pop("started_wall_ns")
+        atomic_write_json(self.publication_path, changed)
+        with self.assertRaisesRegex(RuntimeError, "publication"):
+            self.collect()
 
 
 class ImageLockRowsTest(unittest.TestCase):
@@ -1442,26 +1706,133 @@ class SharedPoolCleanupTest(unittest.TestCase):
 
 
 
+class FullRunTransactionRestartTest(unittest.TestCase):
+    def journal(self, root: Path) -> dict[str, object]:
+        return {
+            "schema": "amg_swebench_full_run_transaction_v1",
+            "status": "RUNNING",
+            "started_wall_ns": 1_000_000_000,
+            "updated_wall_ns": 1_000_000_000,
+            "baseline_task_indices": [],
+            "remaining_cells_at_launch": 1500,
+            "timing_gate_sha256": "a" * 64,
+            "eta_checks": [],
+            "last_elapsed_seconds": 0.0,
+            "last_completed_cells": 0,
+            "consecutive_over_budget_checks": 0,
+            "full_run_timing_sha256": None,
+            "workers_complete_sha256": None,
+        }
+
+    def test_restart_rolls_forward_orphan_progress_and_global_sequence(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            config = SimpleNamespace(root=root)
+            journal = self.journal(root)
+            progress_path = _eta_progress_path(root, 1)
+            progress = {
+                "schema": ETA_PROGRESS_SCHEMA,
+                "status": "PASS",
+                "check_index": 1,
+                "observed_wall_ns": 11_000_000_000,
+                "elapsed_seconds": 10.0,
+                "baseline_task_indices_sha256": sha256_json(
+                    {"baseline_task_indices": []}
+                ),
+                "completed_task_indices": list(range(25)),
+                "new_completed_task_indices": list(range(25)),
+                "baseline_completed_tasks": 0,
+                "baseline_completed_cells": 0,
+                "new_completed_tasks": 25,
+                "new_completed_cells": 75,
+                "remaining_cells_at_launch": 1500,
+                "trigger_reasons": ["cell_interval"],
+                "timing_gate_sha256": "a" * 64,
+            }
+            atomic_write_json(progress_path, progress)
+            rows, elapsed, cells, consecutive = _reconcile_eta_history(config, journal)
+            self.assertTrue(_eta_receipt_path(root, 1).is_file())
+            self.assertEqual((elapsed, cells, consecutive), (10.0, 75, 0))
+            second = _publish_eta_check(
+                config,
+                journal=journal,
+                check_index=2,
+                observed_wall_ns=21_000_000_000,
+                completed_tasks=set(range(50)),
+                trigger_reasons=["cell_interval"],
+                prior_consecutive=0,
+            )
+            self.assertEqual(second["receipt"]["check_index"], 2)
+            self.assertEqual(len(rows), 1)
+            self.assertNotEqual(rows[0]["path"], second["path"])
+
+    def test_gap_duplicate_and_reordered_progress_are_rejected(self):
+        base = {
+            "new_completed_cells": 300,
+            "remaining_cells_at_launch": 1500,
+            "elapsed_seconds": 4000.0,
+            "trigger_reasons": ["elapsed_interval", "cell_interval"],
+        }
+        with self.assertRaisesRegex(RuntimeError, "cadence"):
+            _validate_eta_cadence(base, prior_elapsed=0.0, prior_cells=0)
+        duplicate = dict(base)
+        duplicate.update(
+            {
+                "new_completed_cells": 75,
+                "elapsed_seconds": 10.0,
+                "trigger_reasons": ["cell_interval"],
+            }
+        )
+        _validate_eta_cadence(duplicate, prior_elapsed=0.0, prior_cells=0)
+        with self.assertRaisesRegex(RuntimeError, "trigger"):
+            _validate_eta_cadence(duplicate, prior_elapsed=10.0, prior_cells=75)
+        with self.assertRaisesRegex(RuntimeError, "reordered"):
+            _validate_eta_cadence(duplicate, prior_elapsed=20.0, prior_cells=100)
+
+
 class FullRunTimingBindingTest(unittest.TestCase):
     def _write_receipts(self, root: Path):
         timing_gate = {"projection": {"projected_full_makespan_seconds": 100.0}}
         timing_gate_path = root / "control" / "timing-gate.json"
         atomic_write_json(timing_gate_path, timing_gate)
-        timing_gate_sha256 = hashlib.sha256(
-            timing_gate_path.read_bytes()
-        ).hexdigest()
+        timing_gate_sha256 = hashlib.sha256(timing_gate_path.read_bytes()).hexdigest()
+        progress_path = root / "control" / "eta" / "progress-000001.json"
+        progress = {
+            "schema": ETA_PROGRESS_SCHEMA,
+            "status": "PASS",
+            "check_index": 1,
+            "observed_wall_ns": 10_000_000_001,
+            "elapsed_seconds": 10.0,
+            "baseline_task_indices_sha256": sha256_json({"baseline_task_indices": []}),
+            "completed_task_indices": list(range(500)),
+            "new_completed_task_indices": list(range(500)),
+            "baseline_completed_tasks": 0,
+            "baseline_completed_cells": 0,
+            "new_completed_tasks": 500,
+            "new_completed_cells": 1500,
+            "remaining_cells_at_launch": 1500,
+            "trigger_reasons": ["cell_interval", "final_completion"],
+            "timing_gate_sha256": timing_gate_sha256,
+        }
+        atomic_write_json(progress_path, progress)
         eta_path = root / "control" / "eta" / "check-000001.json"
         eta = {
             "schema": ETA_RECEIPT_SCHEMA,
             "status": "WITHIN_STOP_THRESHOLD",
             "check_index": 1,
+            "progress_snapshot_path": str(progress_path),
+            "progress_snapshot_sha256": hashlib.sha256(
+                progress_path.read_bytes()
+            ).hexdigest(),
+            "observed_wall_ns": 10_000_000_001,
             "elapsed_seconds": 10.0,
             "baseline_completed_tasks": 0,
             "baseline_completed_cells": 0,
-            "new_completed_tasks": 1,
-            "new_completed_cells": 3,
+            "new_completed_tasks": 500,
+            "new_completed_cells": 1500,
             "remaining_cells_at_launch": 1500,
-            "projected_remaining_makespan_seconds": 5000.0,
+            "trigger_reasons": ["cell_interval", "final_completion"],
+            "projected_remaining_makespan_seconds": 10.0,
             "stop_threshold_seconds": TIMING_BUDGET_SECONDS * 1.5,
             "consecutive_over_budget_checks": 0,
             "timing_gate_sha256": timing_gate_sha256,
@@ -1475,14 +1846,14 @@ class FullRunTimingBindingTest(unittest.TestCase):
             "actual_wall_seconds": 10.0,
             "initial_projected_full_makespan_seconds": 100.0,
             "timing_gate_sha256": timing_gate_sha256,
-            "baseline_completed_tasks": 0,
+            "baseline_task_indices": [],
             "eta_checks": [
                 {
                     "path": str(eta_path),
                     "sha256": hashlib.sha256(eta_path.read_bytes()).hexdigest(),
                 }
             ],
-            "final_projected_remaining_makespan_seconds": 5000.0,
+            "final_projected_remaining_makespan_seconds": 10.0,
         }
         atomic_write_json(root / "control" / "full-run-timing.json", full)
         return timing_gate, timing_gate_sha256, eta_path
@@ -1513,6 +1884,46 @@ class FullRunTimingBindingTest(unittest.TestCase):
                     timing_gate=timing_gate,
                     timing_gate_sha256=digest,
                 )
+
+    def test_closure_rejects_omitted_time_and_cell_checkpoints(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            timing_gate, digest, eta_path = self._write_receipts(root)
+            progress_path = root / "control/eta/progress-000001.json"
+            progress = json.loads(progress_path.read_text())
+            progress["observed_wall_ns"] = 4_000_000_000_001
+            progress["elapsed_seconds"] = 4000.0
+            progress["trigger_reasons"] = [
+                "elapsed_interval",
+                "cell_interval",
+                "final_completion",
+            ]
+            atomic_write_json(progress_path, progress)
+            receipt = _eta_receipt_from_progress(
+                progress,
+                progress_path=progress_path,
+                prior_consecutive=0,
+            )
+            atomic_write_json(eta_path, receipt)
+            full_path = root / "control/full-run-timing.json"
+            full = json.loads(full_path.read_text())
+            full["ended_wall_ns"] = 4_000_000_000_001
+            full["actual_wall_seconds"] = 4000.0
+            full["eta_checks"][0]["sha256"] = hashlib.sha256(
+                eta_path.read_bytes()
+            ).hexdigest()
+            full["final_projected_remaining_makespan_seconds"] = receipt[
+                "projected_remaining_makespan_seconds"
+            ]
+            atomic_write_json(full_path, full)
+            with self.assertRaisesRegex(RuntimeError, "mandatory cadence"):
+                _validated_full_run_timing(
+                    SimpleNamespace(root=root),
+                    timing_gate=timing_gate,
+                    timing_gate_sha256=digest,
+                )
+
+
 
 
 class WorkersCompleteTimingBindingTest(unittest.TestCase):
