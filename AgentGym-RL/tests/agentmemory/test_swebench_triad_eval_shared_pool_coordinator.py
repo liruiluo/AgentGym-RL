@@ -2140,6 +2140,108 @@ class FullRunTransactionRestartTest(unittest.TestCase):
             "workers_complete_sha256": None,
         }
 
+    def test_restart_rejects_cross_replica_progress_without_durable_completion(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (root / "progress").mkdir()
+            (root / "control").mkdir()
+            replicas = tuple(
+                SimpleNamespace(
+                    replica_index=index,
+                    path=root / f"replica-{index}.json",
+                    task_indices=tuple(range(index, 500, 8)),
+                )
+                for index in range(8)
+            )
+            config = SimpleNamespace(
+                path=root / "coordinator-index.json",
+                root=root,
+                replicas=replicas,
+            )
+            config.path.write_text("fixture")
+            reported = set(range(25))
+            for replica in replicas:
+                rows = sorted(reported.intersection(replica.task_indices))
+                atomic_write_json(
+                    root
+                    / "progress"
+                    / f"replica-{replica.replica_index}.json",
+                    {
+                        "schema": "amg_swebench_shared_pool_progress_v2",
+                        "status": "RUNNING",
+                        "replica_index": replica.replica_index,
+                        "completed_task_indices": rows,
+                    },
+                )
+            journal = self.journal(root)
+            journal["started_wall_ns"] = time.time_ns() - 1_000_000_000
+            journal["updated_wall_ns"] = journal["started_wall_ns"]
+            atomic_write_json(
+                root / "control" / "full-run-transaction.json",
+                journal,
+            )
+
+            completion_root = root / "completions"
+            completion_root.mkdir()
+            bogus_task = 1
+
+            class Driver:
+                lease_registry = None
+
+                @staticmethod
+                def ensure_driver_lease():
+                    return None
+
+                @staticmethod
+                def _read_validated_preflight():
+                    return None
+
+                @staticmethod
+                def task_completion_path(task_index):
+                    return completion_root / f"task-{task_index:04d}.json"
+
+                @classmethod
+                def load_task_completion(cls, task_index):
+                    return json.loads(cls.task_completion_path(task_index).read_text())
+
+            for task_index in reported - {bogus_task}:
+                atomic_write_json(
+                    Driver.task_completion_path(task_index),
+                    {"task_index": task_index},
+                )
+
+            publisher = replicas[0]
+            with patch(
+                "swebench_triad_eval.shared_pool_coordinator.require_startup_barrier",
+                return_value={},
+            ), patch(
+                "swebench_triad_eval.shared_pool_coordinator.driver_from_config",
+                return_value=Driver(),
+            ), patch.object(
+                CoordinatorConfig,
+                "load",
+                return_value=config,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "full-run progress lacks its durable task completion",
+                ):
+                    _worker(
+                        str(publisher.path),
+                        (),
+                        (),
+                        (),
+                        publisher.replica_index,
+                        str(root),
+                        "b" * 64,
+                        publisher.task_indices,
+                        str(config.path),
+                    )
+            self.assertFalse(_eta_progress_path(root, 1).exists())
+            self.assertFalse(_eta_receipt_path(root, 1).exists())
+
     def test_restart_serializes_unreported_durable_completions_before_replay(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -2147,6 +2249,7 @@ class FullRunTransactionRestartTest(unittest.TestCase):
             replicas = tuple(
                 SimpleNamespace(
                     replica_index=index,
+                    path=root / f"replica-{index}.json",
                     task_indices=tuple(range(index, 500, 8)),
                 )
                 for index in range(8)
@@ -2192,9 +2295,6 @@ class FullRunTransactionRestartTest(unittest.TestCase):
             target = replicas[1]
             completion_root = root / "completions"
             completion_root.mkdir()
-            durable = sorted(
-                reported.intersection(target.task_indices).union({49, 57})
-            )
 
             class Driver:
                 lease_registry = None
@@ -2222,7 +2322,7 @@ class FullRunTransactionRestartTest(unittest.TestCase):
                         {"task_index": task_index},
                     )
 
-            for task_index in durable:
+            for task_index in reported.union({49, 57}):
                 atomic_write_json(
                     Driver.task_completion_path(task_index),
                     {"task_index": task_index},
@@ -2275,6 +2375,7 @@ class FullRunTransactionRestartTest(unittest.TestCase):
             replicas = tuple(
                 SimpleNamespace(
                     replica_index=index,
+                    path=root / f"replica-{index}.json",
                     task_indices=tuple(range(index, 500, 8)),
                 )
                 for index in range(8)
@@ -2337,7 +2438,7 @@ class FullRunTransactionRestartTest(unittest.TestCase):
                         {"task_index": task_index},
                     )
 
-            for task_index in reported.intersection(target.task_indices):
+            for task_index in reported:
                 atomic_write_json(
                     Driver.task_completion_path(task_index),
                     {"task_index": task_index},
@@ -2849,12 +2950,13 @@ class FullRunTransactionRestartTest(unittest.TestCase):
             for replica_index in range(8):
                 replica_tasks = tuple(range(replica_index, 500, 8))
                 new_tasks = tuple(task for task in replica_tasks if task >= 452)
+                config_path = root / f"replica-{replica_index}.json"
                 replica = SimpleNamespace(
                     replica_index=replica_index,
+                    path=config_path,
                     task_indices=replica_tasks,
                 )
                 replicas.append(replica)
-                config_path = root / f"replica-{replica_index}.json"
                 config_path.write_text("fixture")
                 drivers[str(config_path)] = Driver(
                     root / f"completions-{replica_index}",

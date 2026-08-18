@@ -1152,6 +1152,83 @@ def full_run_stop_requested(root: Path) -> bool:
     return True
 
 
+def _replica_reported_progress(
+    config: CoordinatorConfig,
+    replica: ReplicaConfig,
+) -> set[int]:
+    path = config.root / "progress" / f"replica-{replica.replica_index}.json"
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return set()
+    value = load_atomic_object(
+        path,
+        "full-run replica progress",
+        root=config.root,
+    )
+    rows = value.get("completed_task_indices")
+    if (
+        value.get("schema")
+        not in {
+            "amg_swebench_shared_pool_progress_v2",
+            "amg_swebench_shared_pool_worker_v2",
+        }
+        or value.get("status")
+        not in {"RUNNING", "PASS", "STOPPED_AT_PUBLICATION_BOUNDARY"}
+        or value.get("replica_index") != replica.replica_index
+        or not isinstance(rows, list)
+        or any(type(task) is not int for task in rows)
+        or len(rows) != len(set(rows))
+        or not set(rows).issubset(replica.task_indices)
+    ):
+        raise RuntimeError("full-run progress identity drifted")
+    return set(rows)
+
+
+def _validate_all_reported_progress_durability(
+    config: CoordinatorConfig,
+    *,
+    current_replica_index: int,
+    current_driver: Any,
+) -> dict[int, set[int]]:
+    reported_by_replica: dict[int, set[int]] = {}
+    temporary_drivers = []
+    try:
+        for replica in config.replicas:
+            reported = _replica_reported_progress(config, replica)
+            reported_by_replica[replica.replica_index] = reported
+            if not reported:
+                continue
+            verifier = current_driver
+            if replica.replica_index != current_replica_index:
+                verifier = driver_from_config(
+                    replica.path,
+                    assigned_task_indices=replica.task_indices,
+                )
+                if verifier is not current_driver:
+                    temporary_drivers.append(verifier)
+            for task_index in sorted(reported):
+                completion_path = verifier.task_completion_path(task_index)
+                try:
+                    completion_info = completion_path.lstat()
+                except FileNotFoundError as error:
+                    raise RuntimeError(
+                        "full-run progress lacks its durable task completion"
+                    ) from error
+                if (
+                    stat.S_ISLNK(completion_info.st_mode)
+                    or not stat.S_ISREG(completion_info.st_mode)
+                ):
+                    raise RuntimeError(
+                        "full-run progress lacks its durable task completion"
+                    )
+                verifier.load_task_completion(task_index)
+    finally:
+        for verifier in temporary_drivers:
+            release_driver(verifier)
+    return reported_by_replica
+
+
 def _worker(
     config_path: str,
     task_indices: tuple[int, ...],
@@ -1216,43 +1293,16 @@ def _worker(
                 driver.load_task_completion(task_index)
                 completed.add(task_index)
         if eta_config is not None:
-            try:
-                progress_path.lstat()
-            except FileNotFoundError:
-                reported_completed: set[int] = set()
-            else:
-                prior_progress = load_atomic_object(
-                    progress_path,
-                    "full-run replica progress",
-                    root=root,
-                )
-                prior_rows = prior_progress.get("completed_task_indices")
-                if (
-                    prior_progress.get("schema")
-                    not in {
-                        "amg_swebench_shared_pool_progress_v2",
-                        "amg_swebench_shared_pool_worker_v2",
-                    }
-                    or prior_progress.get("status")
-                    not in {
-                        "RUNNING",
-                        "PASS",
-                        "STOPPED_AT_PUBLICATION_BOUNDARY",
-                    }
-                    or prior_progress.get("replica_index") != replica_index
-                    or not isinstance(prior_rows, list)
-                    or any(type(task) is not int for task in prior_rows)
-                    or len(prior_rows) != len(set(prior_rows))
-                    or not set(prior_rows).issubset(replica_tasks)
-                ):
-                    raise RuntimeError("full-run progress identity drifted")
-                reported_completed = set(prior_rows)
+            with exclusive_lock(_eta_producer_lock_path(root)):
+                reported_completed = _validate_all_reported_progress_durability(
+                    eta_config,
+                    current_replica_index=replica_index,
+                    current_driver=driver,
+                )[replica_index]
                 if not reported_completed.issubset(completed):
                     raise RuntimeError(
                         "full-run progress lacks its durable task completion"
                     )
-
-            with exclusive_lock(_eta_producer_lock_path(root)):
                 _publish_due_eta_locked(
                     eta_config,
                     observed_wall_ns=time.time_ns(),
@@ -2391,33 +2441,7 @@ def validated_timing_gate(config: CoordinatorConfig) -> Mapping[str, Any]:
 def _progress_completed_tasks(config: CoordinatorConfig) -> set[int]:
     completed: set[int] = set()
     for replica in config.replicas:
-        path = config.root / "progress" / f"replica-{replica.replica_index}.json"
-        if not path.exists():
-            if path.is_symlink():
-                raise RuntimeError("full-run progress is a dangling symlink")
-            continue
-        value = load_atomic_object(
-            path,
-            "full-run replica progress",
-            root=config.root,
-        )
-        rows = value.get("completed_task_indices")
-        if (
-            value.get("schema")
-            not in {
-                "amg_swebench_shared_pool_progress_v2",
-                "amg_swebench_shared_pool_worker_v2",
-            }
-            or value.get("status")
-            not in {"RUNNING", "PASS", "STOPPED_AT_PUBLICATION_BOUNDARY"}
-            or value.get("replica_index") != replica.replica_index
-            or not isinstance(rows, list)
-            or any(type(task) is not int for task in rows)
-            or len(rows) != len(set(rows))
-            or not set(rows).issubset(replica.task_indices)
-        ):
-            raise RuntimeError("full-run progress identity drifted")
-        completed.update(rows)
+        completed.update(_replica_reported_progress(config, replica))
     return completed
 
 
