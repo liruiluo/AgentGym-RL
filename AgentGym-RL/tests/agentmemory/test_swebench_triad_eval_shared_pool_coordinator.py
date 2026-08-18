@@ -38,6 +38,7 @@ from swebench_triad_eval.shared_pool_coordinator import (
     CoordinatorConfig,
     ReplicaConfig,
     _collect_timing_gate,
+    _durable_progress_gate_path,
     _eta_progress_path,
     _eta_receipt_from_progress,
     _eta_receipt_path,
@@ -45,7 +46,9 @@ from swebench_triad_eval.shared_pool_coordinator import (
     _extract_startup_reconciliation,
     _load_cell_timing,
     _load_or_create_full_run_journal,
+    _publish_due_eta,
     _publish_eta_check,
+    _persist_durable_progress_gate,
     _reconcile_eta_history,
     _validate_eta_cadence,
     _validated_full_run_timing,
@@ -2239,6 +2242,97 @@ class FullRunTransactionRestartTest(unittest.TestCase):
                         publisher.task_indices,
                         str(config.path),
                     )
+            self.assertFalse(_eta_progress_path(root, 1).exists())
+            self.assertFalse(_eta_receipt_path(root, 1).exists())
+
+    def test_coordinator_poll_rejects_progress_before_global_durable_gate(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (root / "progress").mkdir()
+            (root / "control").mkdir()
+            replicas = tuple(
+                SimpleNamespace(
+                    replica_index=index,
+                    path=root / f"replica-{index}.json",
+                    task_indices=tuple(range(index, 500, 8)),
+                )
+                for index in range(8)
+            )
+            config = SimpleNamespace(root=root, replicas=replicas)
+            reported = set(range(25))
+            for replica in replicas:
+                rows = sorted(reported.intersection(replica.task_indices))
+                atomic_write_json(
+                    root
+                    / "progress"
+                    / f"replica-{replica.replica_index}.json",
+                    {
+                        "schema": "amg_swebench_shared_pool_progress_v2",
+                        "status": "RUNNING",
+                        "replica_index": replica.replica_index,
+                        "completed_task_indices": rows,
+                    },
+                )
+            journal = self.journal(root)
+            journal["started_wall_ns"] = time.time_ns() - 1_000_000_000
+            journal["updated_wall_ns"] = journal["started_wall_ns"]
+            atomic_write_json(
+                root / "control" / "full-run-transaction.json",
+                journal,
+            )
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "durable validation gate",
+            ):
+                _publish_due_eta(config, observed_wall_ns=time.time_ns())
+            self.assertFalse(_eta_progress_path(root, 1).exists())
+            self.assertFalse(_eta_receipt_path(root, 1).exists())
+
+    def test_coordinator_poll_rejects_durable_gate_drift_and_symlink(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (root / "progress").mkdir()
+            (root / "control").mkdir()
+            replicas = tuple(
+                SimpleNamespace(
+                    replica_index=index,
+                    task_indices=tuple(range(index, 500, 8)),
+                )
+                for index in range(8)
+            )
+            config = SimpleNamespace(root=root, replicas=replicas)
+            journal = self.journal(root)
+            journal["started_wall_ns"] = time.time_ns() - 1_000_000_000
+            journal["updated_wall_ns"] = journal["started_wall_ns"]
+            atomic_write_json(
+                root / "control" / "full-run-transaction.json",
+                journal,
+            )
+            durable = {replica.replica_index: set() for replica in replicas}
+            _persist_durable_progress_gate(config, durable)
+            atomic_write_json(
+                root / "progress" / "replica-0.json",
+                {
+                    "schema": "amg_swebench_shared_pool_progress_v2",
+                    "status": "RUNNING",
+                    "replica_index": 0,
+                    "completed_task_indices": [0],
+                },
+            )
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "durable validation gate",
+            ):
+                _publish_due_eta(config, observed_wall_ns=time.time_ns())
+
+            (root / "progress" / "replica-0.json").unlink()
+            gate_path = _durable_progress_gate_path(root)
+            outside = root / "outside-gate.json"
+            gate_path.replace(outside)
+            gate_path.symlink_to(outside)
+            with self.assertRaisesRegex(RuntimeError, "not a real regular file"):
+                _publish_due_eta(config, observed_wall_ns=time.time_ns())
             self.assertFalse(_eta_progress_path(root, 1).exists())
             self.assertFalse(_eta_receipt_path(root, 1).exists())
 

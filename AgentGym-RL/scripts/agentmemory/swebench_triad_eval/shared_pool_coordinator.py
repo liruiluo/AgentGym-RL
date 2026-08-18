@@ -76,6 +76,7 @@ ETA_CADENCE_TOLERANCE_SECONDS = ETA_POLL_SECONDS * 2
 ETA_PROGRESS_SCHEMA = "amg_swebench_full_run_progress_v1"
 ETA_RECEIPT_SCHEMA = "amg_swebench_full_run_eta_v2"
 FULL_RUN_JOURNAL_SCHEMA = "amg_swebench_full_run_transaction_v1"
+DURABLE_PROGRESS_GATE_SCHEMA = "amg_swebench_full_run_durable_progress_gate_v1"
 FULL_RUN_TIMING_SCHEMA = "amg_swebench_full_run_timing_v2"
 STOP_MARKER_SCHEMA = "amg_swebench_full_run_stop_v1"
 TIMING_REQUIRED_METRICS = (
@@ -1188,9 +1189,15 @@ def _replica_reported_progress(
 def _validate_all_reported_progress_durability(
     config: CoordinatorConfig,
     *,
-    current_replica_index: int,
-    current_driver: Any,
+    current_replica_index: int | None = None,
+    current_driver: Any | None = None,
 ) -> dict[int, set[int]]:
+    if (current_replica_index is None) != (current_driver is None):
+        raise ValueError("current progress verifier identity is incomplete")
+    if current_replica_index is not None and current_replica_index not in {
+        replica.replica_index for replica in config.replicas
+    }:
+        raise ValueError("current progress verifier replica is unknown")
     reported_by_replica: dict[int, set[int]] = {}
     temporary_drivers = []
     try:
@@ -1200,13 +1207,12 @@ def _validate_all_reported_progress_durability(
             if not reported:
                 continue
             verifier = current_driver
-            if replica.replica_index != current_replica_index:
+            if verifier is None or replica.replica_index != current_replica_index:
                 verifier = driver_from_config(
                     replica.path,
                     assigned_task_indices=replica.task_indices,
                 )
-                if verifier is not current_driver:
-                    temporary_drivers.append(verifier)
+                temporary_drivers.append(verifier)
             for task_index in sorted(reported):
                 completion_path = verifier.task_completion_path(task_index)
                 try:
@@ -1227,6 +1233,105 @@ def _validate_all_reported_progress_durability(
         for verifier in temporary_drivers:
             release_driver(verifier)
     return reported_by_replica
+
+
+def _durable_progress_gate_path(root: Path) -> Path:
+    return root / "control" / "eta-durable-progress-gate.json"
+
+
+def _durable_progress_gate_payload(
+    config: CoordinatorConfig,
+    reported_by_replica: Mapping[int, set[int]],
+) -> dict[str, Any]:
+    expected_indices = [replica.replica_index for replica in config.replicas]
+    if set(reported_by_replica) != set(expected_indices):
+        raise RuntimeError("full-run durable validation gate coverage drifted")
+    rows = []
+    for replica in config.replicas:
+        completed = reported_by_replica[replica.replica_index]
+        if not isinstance(completed, set) or not completed.issubset(
+            replica.task_indices
+        ):
+            raise RuntimeError("full-run durable validation gate coverage drifted")
+        rows.append(
+            {
+                "replica_index": replica.replica_index,
+                "completed_task_indices": sorted(completed),
+            }
+        )
+    return {
+        "schema": DURABLE_PROGRESS_GATE_SCHEMA,
+        "status": "PASS",
+        "replicas": rows,
+    }
+
+
+def _persist_durable_progress_gate(
+    config: CoordinatorConfig,
+    reported_by_replica: Mapping[int, set[int]],
+) -> None:
+    atomic_write_json(
+        _durable_progress_gate_path(config.root),
+        _durable_progress_gate_payload(config, reported_by_replica),
+    )
+
+
+def _load_durable_progress_gate(
+    config: CoordinatorConfig,
+) -> dict[int, set[int]]:
+    path = _durable_progress_gate_path(config.root)
+    try:
+        path.lstat()
+    except FileNotFoundError as error:
+        raise RuntimeError(
+            "full-run progress lacks its durable validation gate"
+        ) from error
+    value = load_atomic_object(
+        path,
+        "full-run durable progress validation gate",
+        root=config.root,
+    )
+    rows = value.get("replicas")
+    if (
+        set(value) != {"schema", "status", "replicas"}
+        or value.get("schema") != DURABLE_PROGRESS_GATE_SCHEMA
+        or value.get("status") != "PASS"
+        or not isinstance(rows, list)
+        or len(rows) != len(config.replicas)
+    ):
+        raise RuntimeError("full-run durable validation gate drifted")
+    reported_by_replica: dict[int, set[int]] = {}
+    for replica, row in zip(config.replicas, rows):
+        completed = (
+            row.get("completed_task_indices")
+            if isinstance(row, Mapping)
+            else None
+        )
+        if (
+            not isinstance(row, Mapping)
+            or set(row) != {"replica_index", "completed_task_indices"}
+            or row.get("replica_index") != replica.replica_index
+            or not isinstance(completed, list)
+            or any(type(task) is not int for task in completed)
+            or completed != sorted(set(completed))
+            or not set(completed).issubset(replica.task_indices)
+        ):
+            raise RuntimeError("full-run durable validation gate drifted")
+        reported_by_replica[replica.replica_index] = set(completed)
+    return reported_by_replica
+
+
+def _validated_durable_progress_gate(
+    config: CoordinatorConfig,
+) -> dict[int, set[int]]:
+    validated = _load_durable_progress_gate(config)
+    reported = {
+        replica.replica_index: _replica_reported_progress(config, replica)
+        for replica in config.replicas
+    }
+    if validated != reported:
+        raise RuntimeError("full-run progress lacks its durable validation gate")
+    return validated
 
 
 def _worker(
@@ -1294,15 +1399,20 @@ def _worker(
                 completed.add(task_index)
         if eta_config is not None:
             with exclusive_lock(_eta_producer_lock_path(root)):
-                reported_completed = _validate_all_reported_progress_durability(
+                reported_by_replica = _validate_all_reported_progress_durability(
                     eta_config,
                     current_replica_index=replica_index,
                     current_driver=driver,
-                )[replica_index]
+                )
+                reported_completed = reported_by_replica[replica_index]
                 if not reported_completed.issubset(completed):
                     raise RuntimeError(
                         "full-run progress lacks its durable task completion"
                     )
+                _persist_durable_progress_gate(
+                    eta_config,
+                    reported_by_replica,
+                )
                 _publish_due_eta_locked(
                     eta_config,
                     observed_wall_ns=time.time_ns(),
@@ -1323,6 +1433,11 @@ def _worker(
                             "last_task_index": recovered_task,
                             "wall_seconds": round(time.monotonic() - started, 6),
                         },
+                    )
+                    reported_by_replica[replica_index] = set(reported_completed)
+                    _persist_durable_progress_gate(
+                        eta_config,
+                        reported_by_replica,
                     )
                     _publish_due_eta_locked(
                         eta_config,
@@ -1385,6 +1500,11 @@ def _worker(
                     else nullcontext()
                 )
                 with producer:
+                    durable_progress = (
+                        _load_durable_progress_gate(eta_config)
+                        if eta_config is not None
+                        else None
+                    )
                     with progress_lock:
                         completed.add(task_index)
                         invocation_completed.add(task_index)
@@ -1407,6 +1527,11 @@ def _worker(
                             },
                         )
                     if eta_config is not None:
+                        durable_progress[replica_index] = set(completed)
+                        _persist_durable_progress_gate(
+                            eta_config,
+                            durable_progress,
+                        )
                         _publish_due_eta_locked(
                             eta_config,
                             observed_wall_ns=time.time_ns(),
@@ -3005,6 +3130,8 @@ def _publish_due_eta_locked(
     observed_wall_ns: int | None = None,
     require_final: bool = False,
 ) -> dict[str, Any]:
+    durable_progress = _validated_durable_progress_gate(config)
+    completed_tasks = set().union(*durable_progress.values())
     journal_path = full_run_journal_path(config.root)
     journal_seed = load_atomic_object(
         journal_path,
@@ -3021,7 +3148,6 @@ def _publish_due_eta_locked(
         config,
         journal,
     )
-    completed_tasks = _progress_completed_tasks(config)
     observed = time.time_ns() if observed_wall_ns is None else observed_wall_ns
     elapsed = (observed - journal["started_wall_ns"]) / 1e9
     new_cells = len(completed_tasks - set(journal["baseline_task_indices"])) * len(
@@ -3161,12 +3287,15 @@ def _run_full_locked(config: CoordinatorConfig) -> list[dict[str, Any]]:
         phase="full",
         startup_barrier_sha256=barrier_sha256,
     )
-    journal = _load_or_create_full_run_journal(
-        config, timing_gate_sha256=timing_gate_sha256
-    )
-    eta_rows, last_eta_elapsed, last_eta_cells, consecutive = _reconcile_eta_history(
-        config, journal
-    )
+    with exclusive_lock(_eta_producer_lock_path(config.root)):
+        reported_by_replica = _validate_all_reported_progress_durability(config)
+        _persist_durable_progress_gate(config, reported_by_replica)
+        journal = _load_or_create_full_run_journal(
+            config, timing_gate_sha256=timing_gate_sha256
+        )
+        eta_rows, last_eta_elapsed, last_eta_cells, consecutive = (
+            _reconcile_eta_history(config, journal)
+        )
     if consecutive >= 2:
         _publish_stop_marker(config, eta_rows[-1])
     if full_run_stop_requested(config.root):
