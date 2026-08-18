@@ -8,6 +8,7 @@ dereferencing, official grading, gate-to-full transition, and owned cleanup.
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import hashlib
 import json
 from pathlib import Path
@@ -17,7 +18,7 @@ import stat
 import sys
 import threading
 import time
-from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
+from typing import Any, Callable, ContextManager, Mapping, Optional, Protocol, Sequence
 
 from paired_eval.contracts import RunConfig
 from paired_eval.serialization import canonical_json_bytes
@@ -145,6 +146,8 @@ class TaskTimingRecorder:
         queued_monotonic_ns: int,
         acquired_wall_ns: int,
         acquired_monotonic_ns: int,
+        slot_dequeued_wall_ns: int | None = None,
+        slot_dequeued_monotonic_ns: int | None = None,
     ) -> None:
         self.root = root
         self.task_index = task_index
@@ -154,16 +157,41 @@ class TaskTimingRecorder:
         self.identity = dict(identity)
         self.started_wall_ns = queued_wall_ns
         self.started_monotonic_ns = queued_monotonic_ns
+        if (slot_dequeued_wall_ns is None) != (
+            slot_dequeued_monotonic_ns is None
+        ):
+            raise ValueError("task slot dequeue timestamps are incomplete")
+        queue_ended_wall_ns = (
+            acquired_wall_ns
+            if slot_dequeued_wall_ns is None
+            else slot_dequeued_wall_ns
+        )
+        queue_ended_monotonic_ns = (
+            acquired_monotonic_ns
+            if slot_dequeued_monotonic_ns is None
+            else slot_dequeued_monotonic_ns
+        )
         self.phases: list[dict[str, Any]] = [
             self._phase_row(
                 "task_slot_queue",
                 queued_wall_ns,
-                acquired_wall_ns,
+                queue_ended_wall_ns,
                 queued_monotonic_ns,
-                acquired_monotonic_ns,
+                queue_ended_monotonic_ns,
                 "PASS",
             )
         ]
+        if slot_dequeued_wall_ns is not None:
+            self.phases.append(
+                self._phase_row(
+                    "runtime_lane_wait",
+                    slot_dequeued_wall_ns,
+                    acquired_wall_ns,
+                    slot_dequeued_monotonic_ns,
+                    acquired_monotonic_ns,
+                    "PASS",
+                )
+            )
         self._persisted: dict[str, Any] | None = None
 
     @staticmethod
@@ -184,6 +212,36 @@ class TaskTimingRecorder:
             "ended_monotonic_ns": ended_monotonic_ns,
             "duration_ns": max(0, ended_monotonic_ns - started_monotonic_ns),
         }
+
+    def add_external_phase(self, value: Mapping[str, Any]) -> None:
+        expected = {
+            "phase",
+            "status",
+            "started_wall_ns",
+            "ended_wall_ns",
+            "started_monotonic_ns",
+            "ended_monotonic_ns",
+            "duration_ns",
+        }
+        if (
+            self._persisted is not None
+            or not isinstance(value, Mapping)
+            or set(value) != expected
+            or not isinstance(value.get("phase"), str)
+            or not value["phase"]
+            or value.get("status") != "PASS"
+            or any(
+                type(value.get(name)) is not int or value[name] < 0
+                for name in expected
+                if name.endswith("_ns")
+            )
+            or value["ended_wall_ns"] < value["started_wall_ns"]
+            or value["ended_monotonic_ns"] < value["started_monotonic_ns"]
+            or value["duration_ns"]
+            != value["ended_monotonic_ns"] - value["started_monotonic_ns"]
+        ):
+            raise RuntimeError("external task timing phase is invalid")
+        self.phases.append(dict(value))
 
     def measure(self, name: str, operation: Callable[[], Any]) -> Any:
         if self._persisted is not None:
@@ -1210,6 +1268,11 @@ class LifecycleDriver:
             raise ValueError("task index is outside the manifest")
         return self.root / "full" / f"task-{task_index:04d}.json"
 
+    def task_publication_path(self, task_index: int) -> Path:
+        if task_index not in self.by_task:
+            raise ValueError("task index is outside the manifest")
+        return self.root / "full" / f"task-{task_index:04d}.publication.json"
+
     def load_task_completion(
         self,
         task_index: int,
@@ -1259,6 +1322,40 @@ class LifecycleDriver:
             != completion["timing_receipt"]["sha256"]
         ):
             raise RuntimeError("task completion timing binding drifted")
+        publication = read_json(self.task_publication_path(task_index))
+        completion_path = self.task_completion_path(task_index)
+        expected_publication_fields = {
+            "schema",
+            "status",
+            "task_index",
+            "completion_path",
+            "completion_sha256",
+            "timing_receipt_sha256",
+            "started_wall_ns",
+            "ended_wall_ns",
+            "started_monotonic_ns",
+            "ended_monotonic_ns",
+            "duration_ns",
+        }
+        if (
+            not isinstance(publication, Mapping)
+            or set(publication) != expected_publication_fields
+            or publication.get("schema")
+            != "swebench_triad_task_publication_timing_v1"
+            or publication.get("status") != "PASS"
+            or publication.get("task_index") != task_index
+            or publication.get("completion_path") != str(completion_path)
+            or publication.get("completion_sha256")
+            != hashlib.sha256(completion_path.read_bytes()).hexdigest()
+            or publication.get("timing_receipt_sha256")
+            != completion["timing_receipt"]["sha256"]
+            or type(publication.get("duration_ns")) is not int
+            or publication["duration_ns"] < 0
+            or publication["duration_ns"]
+            != publication.get("ended_monotonic_ns")
+            - publication.get("started_monotonic_ns")
+        ):
+            raise RuntimeError("task completion publication binding drifted")
         return dict(completion)
 
     @staticmethod
@@ -1313,7 +1410,28 @@ class LifecycleDriver:
             ).hexdigest(),
             "timing_receipt": dict(timing_receipt),
         }
-        write_immutable_json(self.task_completion_path(task_index), result)
+        completion_path = self.task_completion_path(task_index)
+        started_wall_ns = time.time_ns()
+        started_monotonic_ns = time.monotonic_ns()
+        write_immutable_json(completion_path, result)
+        ended_wall_ns = time.time_ns()
+        ended_monotonic_ns = time.monotonic_ns()
+        publication = {
+            "schema": "swebench_triad_task_publication_timing_v1",
+            "status": "PASS",
+            "task_index": task_index,
+            "completion_path": str(completion_path),
+            "completion_sha256": hashlib.sha256(
+                completion_path.read_bytes()
+            ).hexdigest(),
+            "timing_receipt_sha256": timing_receipt["sha256"],
+            "started_wall_ns": started_wall_ns,
+            "ended_wall_ns": ended_wall_ns,
+            "started_monotonic_ns": started_monotonic_ns,
+            "ended_monotonic_ns": ended_monotonic_ns,
+            "duration_ns": max(0, ended_monotonic_ns - started_monotonic_ns),
+        }
+        write_immutable_json(self.task_publication_path(task_index), publication)
         return result
 
     def run_task(
@@ -1322,6 +1440,14 @@ class LifecycleDriver:
         *,
         gate: bool = False,
         slot_index: int | None = None,
+        admission: Callable[
+            [RuntimeLaneToken], ContextManager[Mapping[str, Any] | None]
+        ]
+        | None = None,
+        queued_wall_ns: int | None = None,
+        queued_monotonic_ns: int | None = None,
+        slot_dequeued_wall_ns: int | None = None,
+        slot_dequeued_monotonic_ns: int | None = None,
     ) -> dict[str, Any]:
         if task_index not in self.assigned_task_indices:
             raise ValueError("task index is outside the assigned shard")
@@ -1330,8 +1456,11 @@ class LifecycleDriver:
             slot_index = expected_slot
         if slot_index != expected_slot:
             raise ValueError("task was routed to the wrong deterministic slot")
-        queued_wall_ns = time.time_ns()
-        queued_monotonic_ns = time.monotonic_ns()
+        if (queued_wall_ns is None) != (queued_monotonic_ns is None):
+            raise ValueError("task queue timestamps are incomplete")
+        if queued_wall_ns is None:
+            queued_wall_ns = time.time_ns()
+            queued_monotonic_ns = time.monotonic_ns()
         slot = self.acquire_runtime_lane(task_index, slot_index=slot_index)
         recorder = TaskTimingRecorder(
             root=self.root,
@@ -1344,14 +1473,20 @@ class LifecycleDriver:
             queued_monotonic_ns=queued_monotonic_ns,
             acquired_wall_ns=time.time_ns(),
             acquired_monotonic_ns=time.monotonic_ns(),
+            slot_dequeued_wall_ns=slot_dequeued_wall_ns,
+            slot_dequeued_monotonic_ns=slot_dequeued_monotonic_ns,
         )
         try:
-            result = self._run_task_in_lane(
-                task_index,
-                gate=gate,
-                slot=slot,
-                recorder=recorder,
-            )
+            admission_context = admission(slot) if admission is not None else nullcontext()
+            with admission_context as admission_timing:
+                if admission_timing is not None:
+                    recorder.add_external_phase(admission_timing)
+                result = self._run_task_in_lane(
+                    task_index,
+                    gate=gate,
+                    slot=slot,
+                    recorder=recorder,
+                )
         except BaseException:
             if not recorder.terminal:
                 recorder.persist("FAIL")

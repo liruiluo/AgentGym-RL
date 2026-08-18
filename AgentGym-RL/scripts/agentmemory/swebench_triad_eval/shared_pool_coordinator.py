@@ -8,8 +8,11 @@ gate before full work, and aggregates exactly 500 x 3 official outcomes.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
+import math
+import statistics
 import threading
 import time
 from collections.abc import Mapping, Sequence
@@ -28,7 +31,9 @@ from . import ARMS
 from .atomic import (
     atomic_write_bytes,
     atomic_write_json,
+    canonical_json_bytes as atomic_json_bytes,
     ensure_private_directory,
+    fsync_directory,
     exclusive_lock,
     read_json,
 )
@@ -42,7 +47,7 @@ from .shared_pool_contract import (
     SHARED_MODEL_POOL_ASSIGNMENT,
     validate_shared_model_pool_snapshot,
 )
-from .state import CellKey, sha256_json
+from .state import CellKey, RuntimeLaneToken, sha256_json
 
 INDEX_SCHEMA = "amg_swebench_shared_pool_index_v1"
 ASSIGNMENT_SCHEMA = "amg_swebench_shared_pool_assignment_v1"
@@ -51,6 +56,22 @@ WORKERS_COMPLETE_SCHEMA = "amg_swebench_shared_pool_workers_complete_v3"
 SHA256_PREFIXED_LENGTH = 71
 TASK_SLOTS_PER_REPLICA = 2
 STARTUP_BARRIER_SCHEMA = "amg_swebench_shared_pool_startup_barrier_v1"
+DIGEST_OCCUPANT_SCHEMA = "amg_swebench_image_digest_occupant_v1"
+DIGEST_RECONCILIATION_SCHEMA = "amg_swebench_image_digest_reconciliation_v1"
+TIMING_CONTRACT_SCHEMA = "amg_swebench_c2_timing_contract_v1"
+TIMING_GATE_SCHEMA = "amg_swebench_c2_timing_gate_v1"
+TIMING_BUDGET_SECONDS = 28_800.0
+TIMING_REQUIRED_METRICS = (
+    "setup_materialization",
+    "queue_wait",
+    "digest_wait",
+    "model_generation",
+    "environment_tool_execution",
+    "grading",
+    "publication",
+    "per_cell_wall",
+    "replica_makespan",
+)
 
 
 def assigned_replica(task_id: str, replica_count: int = 8) -> int:
@@ -73,6 +94,182 @@ def load_canonical_object(path: Path, label: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping) or canonical_json_bytes(value) != payload:
         raise RuntimeError(f"{label} is not a canonical object")
     return value
+
+
+def load_atomic_object(path: Path, label: str) -> Mapping[str, Any]:
+    """Load JSON written by :func:`atomic_write_json` (canonical plus LF)."""
+
+    try:
+        payload = path.read_bytes()
+        value = json.loads(payload.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"cannot load {label}") from error
+    if not isinstance(value, Mapping) or atomic_json_bytes(value) != payload:
+        raise RuntimeError(f"{label} is not a canonical atomic object")
+    return value
+
+
+def _digest_paths(root: Path, image_digest: str) -> tuple[Path, Path]:
+    if (
+        len(image_digest) != SHA256_PREFIXED_LENGTH
+        or not image_digest.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in image_digest[7:])
+    ):
+        raise ValueError("image digest lease identity is invalid")
+    leases = ensure_private_directory(root / "control" / "image-leases")
+    stem = image_digest[7:]
+    return leases / f"{stem}.lock", leases / f"{stem}.occupant.json"
+
+
+def _validate_digest_occupant(value: Any, *, path: Path) -> Mapping[str, Any]:
+    expected = {
+        "schema",
+        "status",
+        "image_config_digest",
+        "task_index",
+        "replica_index",
+        "slot_index",
+        "driver_key",
+        "driver_lease_id",
+        "driver_owner",
+        "lane_generation",
+        "lane_fencing_token_sha256",
+        "startup_barrier_sha256",
+        "acquired_at_unix_ns",
+    }
+    digest = "sha256:" + path.name.removesuffix(".occupant.json")
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != expected
+        or value.get("schema") != DIGEST_OCCUPANT_SCHEMA
+        or value.get("status") != "ACTIVE"
+        or value.get("image_config_digest") != digest
+        or type(value.get("task_index")) is not int
+        or value["task_index"] < 0
+        or type(value.get("replica_index")) is not int
+        or not 0 <= value["replica_index"] < 8
+        or type(value.get("slot_index")) is not int
+        or not 0 <= value["slot_index"] < TASK_SLOTS_PER_REPLICA
+        or not isinstance(value.get("driver_key"), str)
+        or len(value["driver_key"]) != 64
+        or not isinstance(value.get("driver_lease_id"), str)
+        or len(value["driver_lease_id"]) != 64
+        or not isinstance(value.get("driver_owner"), Mapping)
+        or type(value.get("lane_generation")) is not int
+        or value["lane_generation"] <= 0
+        or not isinstance(value.get("lane_fencing_token_sha256"), str)
+        or len(value["lane_fencing_token_sha256"]) != 64
+        or not isinstance(value.get("startup_barrier_sha256"), str)
+        or len(value["startup_barrier_sha256"]) != 64
+        or type(value.get("acquired_at_unix_ns")) is not int
+        or value["acquired_at_unix_ns"] <= 0
+    ):
+        raise RuntimeError("durable image-digest occupant is invalid")
+    return value
+
+
+@contextmanager
+def digest_lease_admission(
+    *,
+    coordinator_root: Path,
+    image_digest: str,
+    task_index: int,
+    replica_index: int,
+    startup_barrier_sha256: str,
+    slot: RuntimeLaneToken,
+):
+    """Fence duplicate OCI-digest work across owner death and SIGKILL."""
+
+    lock_path, occupant_path = _digest_paths(coordinator_root, image_digest)
+    wait_started_wall_ns = time.time_ns()
+    wait_started_monotonic_ns = time.monotonic_ns()
+    with exclusive_lock(lock_path):
+        wait_ended_wall_ns = time.time_ns()
+        wait_ended_monotonic_ns = time.monotonic_ns()
+        if occupant_path.exists() or occupant_path.is_symlink():
+            occupant = load_atomic_object(
+                occupant_path, "durable image-digest occupant"
+            )
+            _validate_digest_occupant(occupant, path=occupant_path)
+            raise RuntimeError(
+                "durable image-digest occupant requires all-eight reconciliation"
+            )
+        occupant = {
+            "schema": DIGEST_OCCUPANT_SCHEMA,
+            "status": "ACTIVE",
+            "image_config_digest": image_digest,
+            "task_index": task_index,
+            "replica_index": replica_index,
+            "slot_index": slot.slot_index,
+            "driver_key": slot.driver_key,
+            "driver_lease_id": slot.lease_id,
+            "driver_owner": slot.owner.to_payload(),
+            "lane_generation": slot.generation,
+            "lane_fencing_token_sha256": hashlib.sha256(
+                slot.fencing_token.encode("ascii")
+            ).hexdigest(),
+            "startup_barrier_sha256": startup_barrier_sha256,
+            "acquired_at_unix_ns": time.time_ns(),
+        }
+        atomic_write_json(occupant_path, occupant)
+        completed = False
+        try:
+            yield {
+                "phase": "image_digest_wait",
+                "status": "PASS",
+                "started_wall_ns": wait_started_wall_ns,
+                "ended_wall_ns": wait_ended_wall_ns,
+                "started_monotonic_ns": wait_started_monotonic_ns,
+                "ended_monotonic_ns": wait_ended_monotonic_ns,
+                "duration_ns": max(
+                    0, wait_ended_monotonic_ns - wait_started_monotonic_ns
+                ),
+            }
+            completed = True
+        finally:
+            if completed:
+                current = load_atomic_object(
+                    occupant_path, "durable image-digest occupant"
+                )
+                if current != occupant:
+                    raise RuntimeError("durable image-digest occupant was fenced")
+                occupant_path.unlink()
+                fsync_directory(occupant_path.parent)
+
+
+def reconcile_digest_occupants(root: Path) -> Mapping[str, Any]:
+    """Clear stale occupants only after caller completed all-eight reconciliation."""
+
+    leases = ensure_private_directory(root / "control" / "image-leases")
+    cleared = []
+    for path in sorted(leases.glob("*.occupant.json")):
+        before = path.read_bytes()
+        occupant = load_atomic_object(path, "durable image-digest occupant")
+        _validate_digest_occupant(occupant, path=path)
+        lock_path, expected_path = _digest_paths(root, occupant["image_config_digest"])
+        if expected_path != path:
+            raise RuntimeError("durable image-digest occupant path drifted")
+        with exclusive_lock(lock_path):
+            if path.read_bytes() != before:
+                raise RuntimeError("durable image-digest occupant changed during reconciliation")
+            path.unlink()
+            fsync_directory(path.parent)
+        cleared.append(
+            {
+                "image_config_digest": occupant["image_config_digest"],
+                "task_index": occupant["task_index"],
+                "replica_index": occupant["replica_index"],
+                "slot_index": occupant["slot_index"],
+                "occupant_sha256": hashlib.sha256(before).hexdigest(),
+            }
+        )
+    return {
+        "schema": DIGEST_RECONCILIATION_SCHEMA,
+        "status": "PASS",
+        "all_eight_replica_lanes_held": True,
+        "stale_occupants": len(cleared),
+        "cleared": cleared,
+    }
 
 
 def image_lock_rows(
@@ -600,6 +797,7 @@ def preflight_all(config: CoordinatorConfig) -> list[dict[str, Any]]:
             or shared_image_reconciliation.get("remaining_images") != 0
         ):
             raise RuntimeError("shared Docker image reconciliation failed")
+        digest_lease_reconciliation = reconcile_digest_occupants(config.root)
         for replica, driver in drivers:
             receipt = driver.preflight()
             receipts.append(
@@ -624,6 +822,7 @@ def preflight_all(config: CoordinatorConfig) -> list[dict[str, Any]]:
         "replica_config_sha256s": replica_config_sha256s,
         "reconciliations": reconciliations,
         "shared_image_reconciliation": shared_image_reconciliation,
+        "digest_lease_reconciliation": digest_lease_reconciliation,
         "replicas": receipts,
     }
     atomic_write_json(barrier_path, result)
@@ -636,7 +835,7 @@ def require_startup_barrier(
     expected_sha256: str | None = None,
 ) -> Mapping[str, Any]:
     path = coordinator_root / "control" / "preflight-all.json"
-    value = load_canonical_object(path, "startup reconciliation barrier")
+    value = load_atomic_object(path, "startup reconciliation barrier")
     if expected_sha256 is not None and (
         not isinstance(expected_sha256, str)
         or hashlib.sha256(path.read_bytes()).hexdigest() != expected_sha256
@@ -664,6 +863,14 @@ def require_startup_barrier(
         or not isinstance(value.get("shared_image_reconciliation"), Mapping)
         or value["shared_image_reconciliation"].get("status") != "PASS"
         or value["shared_image_reconciliation"].get("remaining_images") != 0
+        or not isinstance(value.get("digest_lease_reconciliation"), Mapping)
+        or value["digest_lease_reconciliation"].get("schema")
+        != DIGEST_RECONCILIATION_SCHEMA
+        or value["digest_lease_reconciliation"].get("status") != "PASS"
+        or value["digest_lease_reconciliation"].get(
+            "all_eight_replica_lanes_held"
+        )
+        is not True
     ):
         raise RuntimeError("startup reconciliation barrier is invalid")
     return value
@@ -764,10 +971,8 @@ def _worker(
     try:
         driver.ensure_driver_lease()
         driver._read_validated_preflight()
-        image_locks = ensure_private_directory(
-            root / "control" / "image-leases"
-        )
-        queues: list[list[tuple[int, str]]] = [
+        ensure_private_directory(root / "control" / "image-leases")
+        queues: list[list[tuple[int, str, int, int]]] = [
             [] for _ in range(TASK_SLOTS_PER_REPLICA)
         ]
         for task_index, image_digest, slot_index in zip(
@@ -780,7 +985,9 @@ def _worker(
                 or not image_digest.startswith("sha256:")
             ):
                 raise ValueError("worker image lock digest drifted")
-            queues[slot_index].append((task_index, image_digest))
+            queues[slot_index].append(
+                (task_index, image_digest, time.time_ns(), time.monotonic_ns())
+            )
             digest_locks.setdefault(
                 image_digest,
                 threading.Lock(),
@@ -789,16 +996,29 @@ def _worker(
         def run_slot(slot_index: int) -> dict[str, Any]:
             slot_started = time.monotonic()
             slot_completed = []
-            for task_index, image_digest in queues[slot_index]:
+            for task_index, image_digest, queued_wall_ns, queued_monotonic_ns in queues[
+                slot_index
+            ]:
+                slot_dequeued_wall_ns = time.time_ns()
+                slot_dequeued_monotonic_ns = time.monotonic_ns()
                 with digest_locks[image_digest]:
-                    with exclusive_lock(
-                        image_locks / f"{image_digest[7:]}.lock"
-                    ):
-                        driver.run_task(
-                            task_index,
-                            gate=task_index == 0,
-                            slot_index=slot_index,
-                        )
+                    driver.run_task(
+                        task_index,
+                        gate=task_index == 0,
+                        slot_index=slot_index,
+                        admission=lambda slot: digest_lease_admission(
+                            coordinator_root=root,
+                            image_digest=image_digest,
+                            task_index=task_index,
+                            replica_index=replica_index,
+                            startup_barrier_sha256=startup_barrier_sha256,
+                            slot=slot,
+                        ),
+                        queued_wall_ns=queued_wall_ns,
+                        queued_monotonic_ns=queued_monotonic_ns,
+                        slot_dequeued_wall_ns=slot_dequeued_wall_ns,
+                        slot_dequeued_monotonic_ns=slot_dequeued_monotonic_ns,
+                    )
                 slot_completed.append(task_index)
                 with progress_lock:
                     completed.add(task_index)
@@ -847,10 +1067,160 @@ def _worker(
         release_driver(driver)
 
 
-def run_full(config: CoordinatorConfig) -> list[dict[str, Any]]:
+def _require_sha256_text(value: Any, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise RuntimeError(f"{label} is not a SHA-256")
+    return value
+
+
+def _require_git_oid(value: Any, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 40
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise RuntimeError(f"{label} is not a Git object ID")
+    return value
+
+
+def timing_contract_path(config: CoordinatorConfig) -> Path:
+    return config.root / "control" / "timing-contract.json"
+
+
+def load_timing_contract(config: CoordinatorConfig) -> Mapping[str, Any]:
+    path = timing_contract_path(config)
+    value = load_canonical_object(path, "C=2 timing contract")
+    expected_fields = {
+        "schema",
+        "status",
+        "budget_seconds",
+        "task_slots_per_replica",
+        "panel_selection",
+        "panel_tasks",
+        "required_metrics",
+        "projection",
+        "bindings",
+    }
+    if (
+        set(value) != expected_fields
+        or value.get("schema") != TIMING_CONTRACT_SCHEMA
+        or value.get("status") != "FROZEN"
+        or value.get("budget_seconds") != TIMING_BUDGET_SECONDS
+        or value.get("task_slots_per_replica") != TASK_SLOTS_PER_REPLICA
+        or value.get("panel_selection")
+        != "per_replica_slotwise_deterministic_spread_distinct_digest_v1"
+        or value.get("required_metrics") != list(TIMING_REQUIRED_METRICS)
+    ):
+        raise RuntimeError("C=2 timing contract fields drifted")
+    projection = value.get("projection")
+    if (
+        not isinstance(projection, Mapping)
+        or set(projection)
+        != {
+            "formula",
+            "straggler_percentile",
+            "straggler_margin_floor",
+            "full_task_count",
+            "full_cell_count",
+        }
+        or projection.get("formula")
+        != "max(panel_replica_makespan*ceil(shard_tasks/2))*max(1.10,p95_task/median_task)"
+        or projection.get("straggler_percentile") != 0.95
+        or projection.get("straggler_margin_floor") != 1.10
+        or projection.get("full_task_count") != 500
+        or projection.get("full_cell_count") != 1500
+    ):
+        raise RuntimeError("C=2 timing projection contract drifted")
+    bindings = value.get("bindings")
+    expected_binding_fields = {
+        "coordinator_index_sha256",
+        "replica_config_sha256s",
+        "manifest_sha256",
+        "deployment_commit",
+        "deployment_tree",
+        "inner_commit",
+        "assignment_algorithm",
+    }
+    if not isinstance(bindings, Mapping) or set(bindings) != expected_binding_fields:
+        raise RuntimeError("C=2 timing contract bindings drifted")
+    for name in ("coordinator_index_sha256", "manifest_sha256"):
+        _require_sha256_text(bindings.get(name), f"timing binding {name}")
+    for name in ("deployment_commit", "deployment_tree", "inner_commit"):
+        _require_git_oid(bindings.get(name), f"timing binding {name}")
+    expected_configs = [
+        hashlib.sha256(replica.path.read_bytes()).hexdigest()
+        for replica in config.replicas
+    ]
+    first = config.replicas[0].production
+    source = first.section("source")
+    if (
+        bindings["coordinator_index_sha256"]
+        != hashlib.sha256(config.path.read_bytes()).hexdigest()
+        or bindings.get("replica_config_sha256s") != expected_configs
+        or bindings["manifest_sha256"] != first.payload["manifest_sha256"]
+        or bindings["deployment_commit"] != source["deployment_commit"]
+        or bindings["inner_commit"] != source["inner_commit"]
+        or bindings["assignment_algorithm"] != SHARED_MODEL_POOL_ASSIGNMENT
+    ):
+        raise RuntimeError("C=2 timing contract source binding drifted")
+    rows = value.get("panel_tasks")
+    if not isinstance(rows, list) or len(rows) != 16:
+        raise RuntimeError("C=2 timing panel denominator drifted")
+    seen_tasks = set()
+    per_replica: dict[int, list[Mapping[str, Any]]] = {
+        replica: [] for replica in range(8)
+    }
+    for row in rows:
+        if not isinstance(row, Mapping) or set(row) != {
+            "replica_index",
+            "slot_index",
+            "task_index",
+            "task_id",
+            "image_config_digest",
+        }:
+            raise RuntimeError("C=2 timing panel row fields drifted")
+        task_index = row["task_index"]
+        replica_index = row["replica_index"]
+        if (
+            type(task_index) is not int
+            or not 0 <= task_index < 500
+            or task_index == 0
+            or task_index in seen_tasks
+            or type(replica_index) is not int
+            or not 0 <= replica_index < 8
+            or row["slot_index"] not in range(TASK_SLOTS_PER_REPLICA)
+        ):
+            raise RuntimeError("C=2 timing panel identity drifted")
+        assignment = config.assignment[task_index]
+        if any(
+            row.get(name) != assignment[name]
+            for name in (
+                "replica_index",
+                "slot_index",
+                "task_id",
+                "image_config_digest",
+            )
+        ):
+            raise RuntimeError("C=2 timing panel assignment drifted")
+        seen_tasks.add(task_index)
+        per_replica[replica_index].append(row)
+    for replica_index, panel in per_replica.items():
+        if (
+            len(panel) != 2
+            or sorted(row["slot_index"] for row in panel) != [0, 1]
+            or len({row["image_config_digest"] for row in panel}) != 2
+            or any(row["replica_index"] != replica_index for row in panel)
+        ):
+            raise RuntimeError("C=2 timing panel diversity drifted")
+    return value
+
+
+def _validated_gate(config: CoordinatorConfig) -> Mapping[str, Any]:
     validated_startup_barrier(config)
-    barrier_path = config.root / "control" / "preflight-all.json"
-    barrier_sha256 = hashlib.sha256(barrier_path.read_bytes()).hexdigest()
     gate = read_json(config.root / "control" / "gate.json")
     task_zero = config.task_zero_replica
     if (
@@ -865,9 +1235,7 @@ def run_full(config: CoordinatorConfig) -> list[dict[str, Any]]:
         or gate.get("gate_sha256") != sha256_json(gate["gate"])
     ):
         raise RuntimeError("full run requires the canonical task-0 gate")
-    gate_driver = driver_from_config(
-        task_zero.path, assigned_task_indices=(0,)
-    )
+    gate_driver = driver_from_config(task_zero.path, assigned_task_indices=(0,))
     try:
         if not gate_driver.gate_path.is_file():
             raise RuntimeError("full run requires the canonical task-0 gate")
@@ -876,6 +1244,512 @@ def run_full(config: CoordinatorConfig) -> list[dict[str, Any]]:
         release_driver(gate_driver)
     if gate["gate"] != canonical_gate:
         raise RuntimeError("full run requires the canonical task-0 gate")
+    return gate
+
+
+def _percentile(values: Sequence[float], quantile: float) -> float:
+    if not values or not 0.0 <= quantile <= 1.0:
+        raise ValueError("percentile input is invalid")
+    ordered = sorted(float(value) for value in values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = (len(ordered) - 1) * quantile
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def _metric_summary(values: Sequence[float]) -> Mapping[str, Any]:
+    if not values or any(value < 0 or not math.isfinite(value) for value in values):
+        raise RuntimeError("timing metric values are invalid")
+    return {
+        "count": len(values),
+        "p50_seconds": round(_percentile(values, 0.50), 6),
+        "p95_seconds": round(_percentile(values, 0.95), 6),
+        "max_seconds": round(max(values), 6),
+    }
+
+
+def _phase_map(rows: Any, label: str) -> Mapping[str, Mapping[str, Any]]:
+    if not isinstance(rows, list) or not rows:
+        raise RuntimeError(f"{label} phase timings are missing")
+    result = {}
+    for row in rows:
+        if (
+            not isinstance(row, Mapping)
+            or not isinstance(row.get("phase"), str)
+            or row.get("status") != "PASS"
+            or type(row.get("duration_ns")) is not int
+            or row["duration_ns"] < 0
+            or row["phase"] in result
+        ):
+            raise RuntimeError(f"{label} phase timing is invalid")
+        result[row["phase"]] = row
+    return result
+
+
+def _load_cell_timing(
+    replica: ReplicaConfig,
+    driver: Any,
+    task_index: int,
+    arm: str,
+) -> Mapping[str, Any]:
+    accepted = driver.store.read_accepted(CellKey(task_index, arm))
+    generation = accepted["attempt_generation"]
+    runtime_path = (
+        replica.production.run_root
+        / "control"
+        / "cells"
+        / f"{task_index:04d}-{arm}"
+        / f"generation-{generation:08d}.json"
+    )
+    runtime = load_atomic_object(runtime_path, "timing-panel cell runtime")
+    if (
+        runtime.get("schema") != "swebench_triad_cell_runtime_v1"
+        or runtime.get("status") != "PASS"
+        or runtime.get("task_index") != task_index
+        or runtime.get("arm") != arm
+        or runtime.get("generation") != generation
+    ):
+        raise RuntimeError("timing-panel cell runtime identity drifted")
+    publication_path = runtime_path.with_name(
+        runtime_path.stem + ".publication.json"
+    )
+    publication = load_atomic_object(
+        publication_path, "timing-panel cell publication"
+    )
+    if (
+        publication.get("schema")
+        != "swebench_triad_cell_publication_timing_v1"
+        or publication.get("status") != "PASS"
+        or publication.get("cell_status") != "PASS"
+        or publication.get("task_index") != task_index
+        or publication.get("arm") != arm
+        or publication.get("generation") != generation
+        or publication.get("runtime_receipt_path") != str(runtime_path)
+        or publication.get("runtime_receipt_sha256")
+        != hashlib.sha256(runtime_path.read_bytes()).hexdigest()
+        or type(publication.get("duration_ns")) is not int
+        or publication["duration_ns"] < 0
+    ):
+        raise RuntimeError("timing-panel cell publication binding drifted")
+    phases = _phase_map(runtime.get("phase_timings"), "cell runtime")
+    policy = phases.get("policy_and_model_execution")
+    if policy is None:
+        raise RuntimeError("timing-panel policy phase is missing")
+    events = runtime.get("model_transport_events")
+    if not isinstance(events, list) or not events:
+        raise RuntimeError("timing-panel model transport events are missing")
+    model_ns = 0
+    for event in events:
+        if (
+            not isinstance(event, Mapping)
+            or event.get("phase") not in {"tokenize", "chat_completion"}
+            or type(event.get("duration_ns")) is not int
+            or event["duration_ns"] < 0
+        ):
+            raise RuntimeError("timing-panel model transport event is invalid")
+        if event["phase"] == "chat_completion":
+            model_ns += event["duration_ns"]
+    if model_ns <= 0 or model_ns > policy["duration_ns"]:
+        raise RuntimeError("timing-panel model/environment decomposition is invalid")
+    environment_ns = policy["duration_ns"] - model_ns
+    for name, phase in phases.items():
+        if name.startswith(("environment_", "cgroup_")):
+            environment_ns += phase["duration_ns"]
+    started = min(row["started_monotonic_ns"] for row in phases.values())
+    ended = max(row["ended_monotonic_ns"] for row in phases.values())
+    cell_wall_ns = ended - started + publication["duration_ns"]
+    return {
+        "task_index": task_index,
+        "arm": arm,
+        "generation": generation,
+        "model_generation_seconds": model_ns / 1e9,
+        "environment_tool_execution_seconds": environment_ns / 1e9,
+        "publication_seconds": publication["duration_ns"] / 1e9,
+        "cell_wall_seconds": cell_wall_ns / 1e9,
+        "runtime_receipt_sha256": hashlib.sha256(
+            runtime_path.read_bytes()
+        ).hexdigest(),
+        "publication_receipt_sha256": hashlib.sha256(
+            publication_path.read_bytes()
+        ).hexdigest(),
+    }
+
+
+def _collect_timing_gate(
+    config: CoordinatorConfig,
+    contract: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    panel_rows = contract["panel_tasks"]
+    task_rows = []
+    cell_rows = []
+    replica_makespans = []
+    phase_values: dict[str, list[float]] = {
+        name: [] for name in TIMING_REQUIRED_METRICS
+    }
+    for replica in config.replicas:
+        selected = [
+            row for row in panel_rows if row["replica_index"] == replica.replica_index
+        ]
+        driver = driver_from_config(
+            replica.path,
+            assigned_task_indices=replica.task_indices,
+        )
+        replica_intervals = []
+        try:
+            for panel in selected:
+                task_index = panel["task_index"]
+                completion = driver.load_task_completion(task_index)
+                timing_path = Path(completion["timing_receipt"]["path"])
+                timing = load_atomic_object(timing_path, "timing-panel task timing")
+                if (
+                    timing.get("schema") != "swebench_triad_task_phase_timing_v1"
+                    or timing.get("status") != "READY_FOR_PUBLICATION"
+                    or timing.get("task_index") != task_index
+                    or timing.get("slot_index") != panel["slot_index"]
+                ):
+                    raise RuntimeError("timing-panel task timing identity drifted")
+                phases = _phase_map(timing.get("phases"), "task")
+                required_task_phases = {
+                    "task_slot_queue",
+                    "runtime_lane_wait",
+                    "image_digest_wait",
+                    "oci_stage",
+                    "official_grade_native",
+                    "official_grade_amg_compaction_only",
+                    "official_grade_amg_memory",
+                }
+                if not required_task_phases.issubset(phases):
+                    raise RuntimeError("timing-panel task phases are incomplete")
+                publication_path = driver.task_publication_path(task_index)
+                publication = read_json(publication_path)
+                if (
+                    publication.get("schema")
+                    != "swebench_triad_task_publication_timing_v1"
+                    or publication.get("status") != "PASS"
+                    or publication.get("task_index") != task_index
+                    or publication.get("completion_sha256")
+                    != hashlib.sha256(
+                        driver.task_completion_path(task_index).read_bytes()
+                    ).hexdigest()
+                ):
+                    raise RuntimeError("timing-panel task publication drifted")
+                setup = phases["oci_stage"]["duration_ns"] / 1e9
+                queue_wait = phases["task_slot_queue"]["duration_ns"] / 1e9
+                digest_wait = phases["image_digest_wait"]["duration_ns"] / 1e9
+                grading = sum(
+                    phases[f"official_grade_{arm}"]["duration_ns"]
+                    for arm in ARMS
+                ) / 1e9
+                publication_seconds = publication["duration_ns"] / 1e9
+                task_cells = [
+                    _load_cell_timing(replica, driver, task_index, arm)
+                    for arm in ARMS
+                ]
+                cell_rows.extend(task_cells)
+                model_generation = sum(
+                    row["model_generation_seconds"] for row in task_cells
+                )
+                environment = sum(
+                    row["environment_tool_execution_seconds"] for row in task_cells
+                )
+                publication_seconds += sum(
+                    row["publication_seconds"] for row in task_cells
+                )
+                task_seconds = timing["duration_ns"] / 1e9 + publication["duration_ns"] / 1e9
+                task_row = {
+                    "replica_index": replica.replica_index,
+                    "slot_index": panel["slot_index"],
+                    "task_index": task_index,
+                    "task_id": panel["task_id"],
+                    "setup_materialization_seconds": setup,
+                    "queue_wait_seconds": queue_wait,
+                    "digest_wait_seconds": digest_wait,
+                    "model_generation_seconds": model_generation,
+                    "environment_tool_execution_seconds": environment,
+                    "grading_seconds": grading,
+                    "publication_seconds": publication_seconds,
+                    "task_wall_seconds": task_seconds,
+                    "task_timing_sha256": hashlib.sha256(
+                        timing_path.read_bytes()
+                    ).hexdigest(),
+                    "task_publication_sha256": hashlib.sha256(
+                        publication_path.read_bytes()
+                    ).hexdigest(),
+                }
+                task_rows.append(task_row)
+                replica_intervals.append(
+                    (timing["started_monotonic_ns"], timing["ended_monotonic_ns"])
+                )
+                phase_values["setup_materialization"].append(setup)
+                phase_values["queue_wait"].append(queue_wait)
+                phase_values["digest_wait"].append(digest_wait)
+                phase_values["model_generation"].append(model_generation)
+                phase_values["environment_tool_execution"].append(environment)
+                phase_values["grading"].append(grading)
+                phase_values["publication"].append(publication_seconds)
+            overlap_ns = min(end for _, end in replica_intervals) - max(
+                start for start, _ in replica_intervals
+            )
+            if len(replica_intervals) != 2 or overlap_ns <= 0:
+                raise RuntimeError("timing panel did not exercise C=2 on every replica")
+            makespan = (
+                max(end for _, end in replica_intervals)
+                - min(start for start, _ in replica_intervals)
+            ) / 1e9
+            replica_makespans.append(
+                {
+                    "replica_index": replica.replica_index,
+                    "panel_tasks": [row["task_index"] for row in selected],
+                    "panel_makespan_seconds": makespan,
+                    "overlap_seconds": overlap_ns / 1e9,
+                    "full_shard_tasks": len(replica.task_indices),
+                    "projected_waves": math.ceil(
+                        len(replica.task_indices) / TASK_SLOTS_PER_REPLICA
+                    ),
+                }
+            )
+            phase_values["replica_makespan"].append(makespan)
+        finally:
+            release_driver(driver)
+    for cell in cell_rows:
+        phase_values["per_cell_wall"].append(cell["cell_wall_seconds"])
+    task_seconds = [row["task_wall_seconds"] for row in task_rows]
+    median_task = statistics.median(task_seconds)
+    if median_task <= 0:
+        raise RuntimeError("timing panel task median is nonpositive")
+    p95_task = _percentile(task_seconds, 0.95)
+    straggler_margin = max(1.10, p95_task / median_task)
+    projected_without_margin = max(
+        row["panel_makespan_seconds"] * row["projected_waves"]
+        for row in replica_makespans
+    )
+    projected = projected_without_margin * straggler_margin
+    status_value = "PASS" if projected <= TIMING_BUDGET_SECONDS else "FAIL_CLOSED"
+    barrier_path = config.root / "control" / "preflight-all.json"
+    gate_path = config.root / "control" / "gate.json"
+    assignment_path = config.root / "control" / "assignment.json"
+    result = {
+        "schema": TIMING_GATE_SCHEMA,
+        "status": status_value,
+        "budget_seconds": TIMING_BUDGET_SECONDS,
+        "panel_task_count": 16,
+        "panel_cell_count": 48,
+        "task_slots_per_replica": TASK_SLOTS_PER_REPLICA,
+        "metrics": {
+            name: _metric_summary(values)
+            for name, values in phase_values.items()
+        },
+        "tasks": task_rows,
+        "cells": cell_rows,
+        "replicas": replica_makespans,
+        "projection": {
+            "formula": contract["projection"]["formula"],
+            "task_p95_seconds": p95_task,
+            "task_median_seconds": median_task,
+            "straggler_margin": straggler_margin,
+            "projected_without_margin_seconds": projected_without_margin,
+            "projected_full_makespan_seconds": projected,
+            "within_budget": projected <= TIMING_BUDGET_SECONDS,
+        },
+        "bindings": {
+            "timing_contract_sha256": hashlib.sha256(
+                timing_contract_path(config).read_bytes()
+            ).hexdigest(),
+            "coordinator_index_sha256": hashlib.sha256(
+                config.path.read_bytes()
+            ).hexdigest(),
+            "assignment_sha256": hashlib.sha256(
+                assignment_path.read_bytes()
+            ).hexdigest(),
+            "startup_barrier_sha256": hashlib.sha256(
+                barrier_path.read_bytes()
+            ).hexdigest(),
+            "gate_sha256": hashlib.sha256(gate_path.read_bytes()).hexdigest(),
+            "replica_config_sha256s": [
+                hashlib.sha256(replica.path.read_bytes()).hexdigest()
+                for replica in config.replicas
+            ],
+            "deployment_commit": contract["bindings"]["deployment_commit"],
+            "deployment_tree": contract["bindings"]["deployment_tree"],
+            "inner_commit": contract["bindings"]["inner_commit"],
+        },
+    }
+    atomic_write_json(config.root / "control" / "timing-gate.json", result)
+    if status_value != "PASS":
+        raise RuntimeError(
+            f"SWE timing projection exceeds 28800 seconds: {projected:.3f}"
+        )
+    return result
+
+
+def run_timing(config: CoordinatorConfig) -> Mapping[str, Any]:
+    _validated_gate(config)
+    contract = load_timing_contract(config)
+    barrier_path = config.root / "control" / "preflight-all.json"
+    barrier_sha256 = hashlib.sha256(barrier_path.read_bytes()).hexdigest()
+    panel_rows = contract["panel_tasks"]
+    results = []
+    with ProcessPoolExecutor(max_workers=8) as executor:
+        futures = {}
+        for replica in config.replicas:
+            selected = sorted(
+                (
+                    row
+                    for row in panel_rows
+                    if row["replica_index"] == replica.replica_index
+                ),
+                key=lambda row: row["task_index"],
+            )
+            futures[
+                executor.submit(
+                    _worker,
+                    str(replica.path),
+                    tuple(row["task_index"] for row in selected),
+                    tuple(row["image_config_digest"] for row in selected),
+                    tuple(row["slot_index"] for row in selected),
+                    replica.replica_index,
+                    str(config.root),
+                    barrier_sha256,
+                )
+            ] = replica.replica_index
+        for future in as_completed(futures):
+            results.append(future.result())
+    if (
+        len(results) != 8
+        or sum(row.get("completed_tasks", 0) for row in results) != 16
+        or any(row.get("status") != "PASS" for row in results)
+    ):
+        raise RuntimeError("C=2 timing-panel worker completion drifted")
+    return _collect_timing_gate(config, contract)
+
+
+def validated_timing_gate(config: CoordinatorConfig) -> Mapping[str, Any]:
+    contract = load_timing_contract(config)
+    path = config.root / "control" / "timing-gate.json"
+    gate = load_atomic_object(path, "C=2 timing gate")
+    bindings = gate.get("bindings")
+    projection = gate.get("projection")
+    expected_binding_fields = {
+        "timing_contract_sha256",
+        "coordinator_index_sha256",
+        "assignment_sha256",
+        "startup_barrier_sha256",
+        "gate_sha256",
+        "replica_config_sha256s",
+        "deployment_commit",
+        "deployment_tree",
+        "inner_commit",
+    }
+    if (
+        gate.get("schema") != TIMING_GATE_SCHEMA
+        or gate.get("status") != "PASS"
+        or gate.get("budget_seconds") != TIMING_BUDGET_SECONDS
+        or gate.get("panel_task_count") != 16
+        or gate.get("panel_cell_count") != 48
+        or gate.get("task_slots_per_replica") != TASK_SLOTS_PER_REPLICA
+        or not isinstance(gate.get("metrics"), Mapping)
+        or set(gate["metrics"]) != set(TIMING_REQUIRED_METRICS)
+        or not isinstance(gate.get("tasks"), list)
+        or len(gate["tasks"]) != 16
+        or not isinstance(gate.get("cells"), list)
+        or len(gate["cells"]) != 48
+        or not isinstance(gate.get("replicas"), list)
+        or len(gate["replicas"]) != 8
+        or not isinstance(bindings, Mapping)
+        or set(bindings) != expected_binding_fields
+        or not isinstance(projection, Mapping)
+        or projection.get("formula") != contract["projection"]["formula"]
+        or projection.get("within_budget") is not True
+        or not isinstance(projection.get("projected_full_makespan_seconds"), (int, float))
+        or projection["projected_full_makespan_seconds"] > TIMING_BUDGET_SECONDS
+    ):
+        raise RuntimeError("C=2 timing gate is incomplete or over budget")
+    try:
+        task_seconds = [float(row["task_wall_seconds"]) for row in gate["tasks"]]
+        replica_bases = [
+            float(row["panel_makespan_seconds"]) * int(row["projected_waves"])
+            for row in gate["replicas"]
+        ]
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError("C=2 timing gate projection inputs are invalid") from error
+    if (
+        any(value <= 0 or not math.isfinite(value) for value in task_seconds)
+        or any(value <= 0 or not math.isfinite(value) for value in replica_bases)
+    ):
+        raise RuntimeError("C=2 timing gate projection inputs are invalid")
+    expected_p95 = _percentile(task_seconds, 0.95)
+    expected_median = statistics.median(task_seconds)
+    expected_margin = max(1.10, expected_p95 / expected_median)
+    expected_without_margin = max(replica_bases)
+    expected_projected = expected_without_margin * expected_margin
+    numeric_projection = {
+        "task_p95_seconds": expected_p95,
+        "task_median_seconds": expected_median,
+        "straggler_margin": expected_margin,
+        "projected_without_margin_seconds": expected_without_margin,
+        "projected_full_makespan_seconds": expected_projected,
+    }
+    if any(
+        not math.isclose(
+            float(projection.get(name, -1)), expected_value, rel_tol=1e-12, abs_tol=1e-9
+        )
+        for name, expected_value in numeric_projection.items()
+    ):
+        raise RuntimeError("C=2 timing gate projection arithmetic drifted")
+    for name, summary in gate["metrics"].items():
+        expected_count = 48 if name == "per_cell_wall" else 8 if name == "replica_makespan" else 16
+        if (
+            not isinstance(summary, Mapping)
+            or set(summary) != {"count", "p50_seconds", "p95_seconds", "max_seconds"}
+            or summary.get("count") != expected_count
+            or any(
+                not isinstance(summary.get(field), (int, float))
+                or summary[field] < 0
+                or not math.isfinite(float(summary[field]))
+                for field in ("p50_seconds", "p95_seconds", "max_seconds")
+            )
+        ):
+            raise RuntimeError("C=2 timing gate metric summary drifted")
+
+    expected = {
+        "timing_contract_sha256": hashlib.sha256(
+            timing_contract_path(config).read_bytes()
+        ).hexdigest(),
+        "coordinator_index_sha256": hashlib.sha256(
+            config.path.read_bytes()
+        ).hexdigest(),
+        "assignment_sha256": hashlib.sha256(
+            (config.root / "control" / "assignment.json").read_bytes()
+        ).hexdigest(),
+        "startup_barrier_sha256": hashlib.sha256(
+            (config.root / "control" / "preflight-all.json").read_bytes()
+        ).hexdigest(),
+        "gate_sha256": hashlib.sha256(
+            (config.root / "control" / "gate.json").read_bytes()
+        ).hexdigest(),
+        "replica_config_sha256s": [
+            hashlib.sha256(replica.path.read_bytes()).hexdigest()
+            for replica in config.replicas
+        ],
+        "deployment_commit": contract["bindings"]["deployment_commit"],
+        "deployment_tree": contract["bindings"]["deployment_tree"],
+        "inner_commit": contract["bindings"]["inner_commit"],
+    }
+    if dict(bindings) != expected:
+        raise RuntimeError("C=2 timing gate binding drifted")
+    return gate
+
+
+def run_full(config: CoordinatorConfig) -> list[dict[str, Any]]:
+    _validated_gate(config)
+    validated_timing_gate(config)
+    barrier_path = config.root / "control" / "preflight-all.json"
+    barrier_sha256 = hashlib.sha256(barrier_path.read_bytes()).hexdigest()
     results = []
     with ProcessPoolExecutor(max_workers=8) as executor:
         futures = {
@@ -975,7 +1849,7 @@ def run_full(config: CoordinatorConfig) -> list[dict[str, Any]]:
 
 def validated_workers_complete(config: CoordinatorConfig) -> Mapping[str, Any]:
     path = config.root / "control" / "workers-complete.json"
-    value = load_canonical_object(path, "workers-complete receipt")
+    value = load_atomic_object(path, "workers-complete receipt")
     expected_fields = {
         "schema",
         "status",
@@ -1082,7 +1956,7 @@ def aggregate(config: CoordinatorConfig) -> Mapping[str, Any]:
                     or runtime.get("instance_id") != task["task_id"]
                     or runtime.get("arm") != arm
                     or runtime.get("generation") != generation
-                    or canonical_json_bytes(runtime) != runtime_path.read_bytes()
+                    or atomic_json_bytes(runtime) != runtime_path.read_bytes()
                 ):
                     raise RuntimeError("cell runtime receipt identity drifted")
                 validate_live_pool_snapshot(
@@ -1198,7 +2072,7 @@ def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(prog="swebench-shared-pool")
     value.add_argument(
         "command",
-        choices=("preflight", "gate", "run", "status", "aggregate", "cleanup"),
+        choices=("preflight", "gate", "timing", "run", "status", "aggregate", "cleanup"),
     )
     value.add_argument("--index", type=Path, required=True)
     return value
@@ -1214,11 +2088,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if arguments.command == "preflight":
         result: Any = preflight_all(config)
     elif arguments.command == "gate":
-        preflight_all(config)
         result = run_gate(config)
+    elif arguments.command == "timing":
+        result = run_timing(config)
     elif arguments.command == "run":
-        preflight_all(config)
-        run_gate(config)
         result = run_full(config)
     elif arguments.command == "cleanup":
         result = cleanup_all(config)

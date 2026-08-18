@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
 from dataclasses import replace
 import hashlib
 import json
 import os
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -815,6 +817,56 @@ class LifecycleDriverTest(unittest.TestCase):
                 row["ended_monotonic_ns"], row["started_monotonic_ns"]
             )
             self.assertGreaterEqual(row["ended_wall_ns"], row["started_wall_ns"])
+
+    def test_coordinator_queue_digest_and_publication_timings_are_durable(self):
+        queued_wall = time.time_ns() - 5_000_000_000
+        queued_mono = time.monotonic_ns() - 5_000_000_000
+        dequeued_wall = queued_wall + 2_000_000_000
+        dequeued_mono = queued_mono + 2_000_000_000
+
+        @contextmanager
+        def admission(_slot):
+            start_wall = time.time_ns()
+            start_mono = time.monotonic_ns()
+            end_wall = start_wall + 1_000_000
+            end_mono = start_mono + 1_000_000
+            yield {
+                "phase": "image_digest_wait",
+                "status": "PASS",
+                "started_wall_ns": start_wall,
+                "ended_wall_ns": end_wall,
+                "started_monotonic_ns": start_mono,
+                "ended_monotonic_ns": end_mono,
+                "duration_ns": 1_000_000,
+            }
+
+        completion = self.driver.run_task(
+            0,
+            gate=True,
+            admission=admission,
+            queued_wall_ns=queued_wall,
+            queued_monotonic_ns=queued_mono,
+            slot_dequeued_wall_ns=dequeued_wall,
+            slot_dequeued_monotonic_ns=dequeued_mono,
+        )
+        timing = json.loads(Path(completion["timing_receipt"]["path"]).read_text())
+        phases = {row["phase"]: row for row in timing["phases"]}
+        self.assertEqual(phases["task_slot_queue"]["duration_ns"], 2_000_000_000)
+        self.assertIn("runtime_lane_wait", phases)
+        self.assertEqual(phases["image_digest_wait"]["duration_ns"], 1_000_000)
+        publication_path = self.driver.task_publication_path(0)
+        publication = json.loads(publication_path.read_text())
+        completion_path = self.driver.task_completion_path(0)
+        self.assertEqual(
+            publication["completion_sha256"],
+            hashlib.sha256(completion_path.read_bytes()).hexdigest(),
+        )
+        self.assertEqual(
+            publication["timing_receipt_sha256"],
+            completion["timing_receipt"]["sha256"],
+        )
+        self.assertGreaterEqual(publication["duration_ns"], 0)
+        self.assertEqual(self.driver.load_task_completion(0), completion)
 
     def test_grade_all_rejects_noncanonical_accepted_triad_before_outcomes(self):
         slot = self.driver.acquire_runtime_lane(1, slot_index=0)

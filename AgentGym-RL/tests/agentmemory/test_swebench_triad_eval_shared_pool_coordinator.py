@@ -4,28 +4,45 @@ import copy
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
+import os
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+import signal
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from paired_eval.serialization import canonical_json_bytes
-from swebench_triad_eval.state import sha256_json
+from swebench_triad_eval.atomic import atomic_write_json, canonical_json_bytes as atomic_json_bytes
+from swebench_triad_eval.state import (
+    OwnerIdentity,
+    RuntimeLaneToken,
+    sha256_json,
+)
 from swebench_triad_eval.shared_pool_coordinator import (
     INDEX_SCHEMA,
+    TIMING_BUDGET_SECONDS,
+    TIMING_REQUIRED_METRICS,
     CoordinatorConfig,
     ReplicaConfig,
+    _collect_timing_gate,
     _extract_startup_reconciliation,
     _worker,
     aggregate,
     assigned_replica,
     cleanup_all,
+    digest_lease_admission,
     image_lock_rows,
+    load_atomic_object,
+    load_timing_contract,
+    reconcile_digest_occupants,
     preflight_all,
     run_full,
+    validated_timing_gate,
     validate_live_pool_snapshot,
 )
 from test_swebench_triad_eval_cli import production_config
@@ -181,11 +198,177 @@ def write_startup_barrier(
             "status": "PASS",
             "remaining_images": 0,
         },
+        "digest_lease_reconciliation": {
+            "schema": "amg_swebench_image_digest_reconciliation_v1",
+            "status": "PASS",
+            "all_eight_replica_lanes_held": True,
+            "stale_occupants": 0,
+            "cleared": [],
+        },
         "replicas": [{"replica_index": index} for index in range(8)],
     }
     path = control / "preflight-all.json"
-    path.write_bytes(canonical_json_bytes(payload))
+    path.write_bytes(atomic_json_bytes(payload))
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def write_timing_contract(config: CoordinatorConfig) -> dict[str, object]:
+    panel = []
+    for replica in config.replicas:
+        for slot_index in range(2):
+            row = next(
+                config.assignment[task_index]
+                for task_index in replica.task_indices
+                if task_index != 0
+                and config.assignment[task_index]["slot_index"] == slot_index
+            )
+            panel.append(
+                {
+                    name: row[name]
+                    for name in (
+                        "replica_index",
+                        "slot_index",
+                        "task_index",
+                        "task_id",
+                        "image_config_digest",
+                    )
+                }
+            )
+    production = config.replicas[0].production
+    source = production.section("source")
+    contract = {
+        "schema": "amg_swebench_c2_timing_contract_v1",
+        "status": "FROZEN",
+        "budget_seconds": TIMING_BUDGET_SECONDS,
+        "task_slots_per_replica": 2,
+        "panel_selection": (
+            "per_replica_slotwise_deterministic_spread_distinct_digest_v1"
+        ),
+        "panel_tasks": panel,
+        "required_metrics": list(TIMING_REQUIRED_METRICS),
+        "projection": {
+            "formula": (
+                "max(panel_replica_makespan*ceil(shard_tasks/2))*"
+                "max(1.10,p95_task/median_task)"
+            ),
+            "straggler_percentile": 0.95,
+            "straggler_margin_floor": 1.10,
+            "full_task_count": 500,
+            "full_cell_count": 1500,
+        },
+        "bindings": {
+            "coordinator_index_sha256": hashlib.sha256(
+                config.path.read_bytes()
+            ).hexdigest(),
+            "replica_config_sha256s": [
+                hashlib.sha256(replica.path.read_bytes()).hexdigest()
+                for replica in config.replicas
+            ],
+            "manifest_sha256": production.payload["manifest_sha256"],
+            "deployment_commit": source["deployment_commit"],
+            "deployment_tree": "8" * 40,
+            "inner_commit": source["inner_commit"],
+            "assignment_algorithm": "uint64_be(sha256(task_id)[:8]) % 8",
+        },
+    }
+    path = config.root / "control" / "timing-contract.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(canonical_json_bytes(contract))
+    return contract
+
+
+def write_timing_gate(config: CoordinatorConfig, contract: dict[str, object]) -> Path:
+    assignment_path = config.root / "control" / "assignment.json"
+    barrier_path = config.root / "control" / "preflight-all.json"
+    gate_path = config.root / "control" / "gate.json"
+    if not assignment_path.exists():
+        config.write_assignment()
+    if not barrier_path.exists():
+        write_startup_barrier(config.root, config)
+    if not gate_path.exists():
+        atomic_write_json(gate_path, {"schema": "fixture", "status": "PASS"})
+    task_seconds = [100.0 + index for index in range(16)]
+    ordered = sorted(task_seconds)
+    position = (len(ordered) - 1) * 0.95
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    p95 = ordered[lower] * (upper - position) + ordered[upper] * (position - lower)
+    median = (ordered[7] + ordered[8]) / 2
+    margin = max(1.10, p95 / median)
+    replica_rows = [
+        {
+            "replica_index": replica,
+            "panel_tasks": [replica * 2, replica * 2 + 1],
+            "panel_makespan_seconds": 120.0 + replica,
+            "overlap_seconds": 50.0,
+            "full_shard_tasks": len(config.replicas[replica].task_indices),
+            "projected_waves": 32,
+        }
+        for replica in range(8)
+    ]
+    without_margin = max(
+        row["panel_makespan_seconds"] * row["projected_waves"]
+        for row in replica_rows
+    )
+    projected = without_margin * margin
+    summaries = {}
+    for name in TIMING_REQUIRED_METRICS:
+        count = 48 if name == "per_cell_wall" else 8 if name == "replica_makespan" else 16
+        summaries[name] = {
+            "count": count,
+            "p50_seconds": 1.0,
+            "p95_seconds": 2.0,
+            "max_seconds": 3.0,
+        }
+    payload = {
+        "schema": "amg_swebench_c2_timing_gate_v1",
+        "status": "PASS",
+        "budget_seconds": TIMING_BUDGET_SECONDS,
+        "panel_task_count": 16,
+        "panel_cell_count": 48,
+        "task_slots_per_replica": 2,
+        "metrics": summaries,
+        "tasks": [
+            {"task_index": index, "task_wall_seconds": seconds}
+            for index, seconds in enumerate(task_seconds)
+        ],
+        "cells": [{"cell": index} for index in range(48)],
+        "replicas": replica_rows,
+        "projection": {
+            "formula": contract["projection"]["formula"],
+            "task_p95_seconds": p95,
+            "task_median_seconds": median,
+            "straggler_margin": margin,
+            "projected_without_margin_seconds": without_margin,
+            "projected_full_makespan_seconds": projected,
+            "within_budget": True,
+        },
+        "bindings": {
+            "timing_contract_sha256": hashlib.sha256(
+                (config.root / "control" / "timing-contract.json").read_bytes()
+            ).hexdigest(),
+            "coordinator_index_sha256": hashlib.sha256(
+                config.path.read_bytes()
+            ).hexdigest(),
+            "assignment_sha256": hashlib.sha256(
+                assignment_path.read_bytes()
+            ).hexdigest(),
+            "startup_barrier_sha256": hashlib.sha256(
+                barrier_path.read_bytes()
+            ).hexdigest(),
+            "gate_sha256": hashlib.sha256(gate_path.read_bytes()).hexdigest(),
+            "replica_config_sha256s": [
+                hashlib.sha256(replica.path.read_bytes()).hexdigest()
+                for replica in config.replicas
+            ],
+            "deployment_commit": contract["bindings"]["deployment_commit"],
+            "deployment_tree": contract["bindings"]["deployment_tree"],
+            "inner_commit": contract["bindings"]["inner_commit"],
+        },
+    }
+    path = config.root / "control" / "timing-gate.json"
+    atomic_write_json(path, payload)
+    return path
 
 
 class CoordinatorConfigTest(unittest.TestCase):
@@ -302,6 +485,189 @@ class CoordinatorConfigTest(unittest.TestCase):
                 CoordinatorConfig.load(index)
 
 
+class TimingGateContractTest(unittest.TestCase):
+    def load_config(self, root: Path) -> CoordinatorConfig:
+        with patch(
+            "swebench_triad_eval.shared_pool_coordinator.image_lock_rows",
+            side_effect=fake_image_rows,
+        ):
+            return CoordinatorConfig.load(make_shared_coordinator(root))
+
+    def test_frozen_panel_has_two_distinct_slots_and_digests_per_replica(self):
+        with tempfile.TemporaryDirectory() as raw:
+            config = self.load_config(Path(raw))
+            contract = write_timing_contract(config)
+            loaded = load_timing_contract(config)
+        self.assertEqual(loaded, contract)
+        for replica in range(8):
+            rows = [
+                row for row in loaded["panel_tasks"]
+                if row["replica_index"] == replica
+            ]
+            self.assertEqual(sorted(row["slot_index"] for row in rows), [0, 1])
+            self.assertEqual(len({row["image_config_digest"] for row in rows}), 2)
+
+    def test_validated_timing_gate_recomputes_projection_and_rejects_tampering(self):
+        with tempfile.TemporaryDirectory() as raw:
+            config = self.load_config(Path(raw))
+            contract = write_timing_contract(config)
+            gate_path = write_timing_gate(config, contract)
+            accepted = validated_timing_gate(config)
+            self.assertTrue(accepted["projection"]["within_budget"])
+            tampered = json.loads(gate_path.read_text())
+            tampered["projection"]["projected_full_makespan_seconds"] -= 1
+            atomic_write_json(gate_path, tampered)
+            with self.assertRaisesRegex(RuntimeError, "arithmetic"):
+                validated_timing_gate(config)
+
+    def test_synthetic_16_task_panel_collects_all_required_metrics(self):
+        with tempfile.TemporaryDirectory() as raw:
+            config = self.load_config(Path(raw))
+            contract = write_timing_contract(config)
+            config.write_assignment()
+            write_startup_barrier(config.root, config)
+            atomic_write_json(
+                config.root / "control" / "gate.json",
+                {"schema": "fixture", "status": "PASS"},
+            )
+            fake_drivers = {}
+            for replica in config.replicas:
+                run_root = replica.production.run_root
+
+                class Driver:
+                    lease_registry = None
+
+                    def __init__(self, selected_replica, selected_root):
+                        self.replica = selected_replica
+                        self.root = selected_root
+
+                    def task_completion_path(self, task_index):
+                        return self.root / "full" / f"task-{task_index:04d}.json"
+
+                    def task_publication_path(self, task_index):
+                        return self.root / "full" / f"task-{task_index:04d}.publication.json"
+
+                    def load_task_completion(self, task_index):
+                        timing = self.root / "timings" / f"task-{task_index:04d}.json"
+                        return {
+                            "timing_receipt": {
+                                "status": "READY_FOR_PUBLICATION",
+                                "path": str(timing),
+                                "sha256": hashlib.sha256(timing.read_bytes()).hexdigest(),
+                            }
+                        }
+
+                driver = Driver(replica, run_root)
+                fake_drivers[str(replica.path)] = driver
+                selected = [
+                    row for row in contract["panel_tasks"]
+                    if row["replica_index"] == replica.replica_index
+                ]
+                for offset, panel in enumerate(selected):
+                    task_index = panel["task_index"]
+                    start = replica.replica_index * 1_000_000_000_000 + offset * 10_000_000_000
+                    end = start + 100_000_000_000
+                    phases = []
+                    cursor = start
+                    for name, duration in (
+                        ("task_slot_queue", 1_000_000_000),
+                        ("runtime_lane_wait", 100_000_000),
+                        ("image_digest_wait", 2_000_000_000),
+                        ("oci_stage", 3_000_000_000),
+                        ("official_grade_native", 4_000_000_000),
+                        ("official_grade_amg_compaction_only", 4_000_000_000),
+                        ("official_grade_amg_memory", 4_000_000_000),
+                    ):
+                        phases.append(
+                            {
+                                "phase": name,
+                                "status": "PASS",
+                                "started_wall_ns": cursor,
+                                "ended_wall_ns": cursor + duration,
+                                "started_monotonic_ns": cursor,
+                                "ended_monotonic_ns": cursor + duration,
+                                "duration_ns": duration,
+                            }
+                        )
+                        cursor += duration
+                    timing = run_root / "timings" / f"task-{task_index:04d}.json"
+                    atomic_write_json(
+                        timing,
+                        {
+                            "schema": "swebench_triad_task_phase_timing_v1",
+                            "status": "READY_FOR_PUBLICATION",
+                            "task_index": task_index,
+                            "slot_index": panel["slot_index"],
+                            "started_monotonic_ns": start,
+                            "ended_monotonic_ns": end,
+                            "duration_ns": end - start,
+                            "phases": phases,
+                        },
+                    )
+                    completion = driver.task_completion_path(task_index)
+                    atomic_write_json(completion, {"task_index": task_index})
+                    atomic_write_json(
+                        driver.task_publication_path(task_index),
+                        {
+                            "schema": "swebench_triad_task_publication_timing_v1",
+                            "status": "PASS",
+                            "task_index": task_index,
+                            "completion_sha256": hashlib.sha256(
+                                completion.read_bytes()
+                            ).hexdigest(),
+                            "duration_ns": 100_000_000,
+                        },
+                    )
+
+            def cell_timing(_replica, _driver, task_index, arm):
+                return {
+                    "task_index": task_index,
+                    "arm": arm,
+                    "generation": 1,
+                    "model_generation_seconds": 5.0,
+                    "environment_tool_execution_seconds": 6.0,
+                    "publication_seconds": 0.01,
+                    "cell_wall_seconds": 12.0,
+                    "runtime_receipt_sha256": "a" * 64,
+                    "publication_receipt_sha256": "b" * 64,
+                }
+
+            with patch(
+                "swebench_triad_eval.shared_pool_coordinator.driver_from_config",
+                side_effect=lambda path, **_kwargs: fake_drivers[str(path)],
+            ), patch(
+                "swebench_triad_eval.shared_pool_coordinator._load_cell_timing",
+                side_effect=cell_timing,
+            ):
+                receipt = _collect_timing_gate(config, contract)
+            self.assertEqual(receipt["status"], "PASS")
+            self.assertEqual(receipt["panel_task_count"], 16)
+            self.assertEqual(receipt["panel_cell_count"], 48)
+            self.assertEqual(set(receipt["metrics"]), set(TIMING_REQUIRED_METRICS))
+            self.assertLessEqual(
+                receipt["projection"]["projected_full_makespan_seconds"],
+                TIMING_BUDGET_SECONDS,
+            )
+            validated_timing_gate(config)
+
+    def test_over_budget_timing_gate_is_rejected(self):
+        with tempfile.TemporaryDirectory() as raw:
+            config = self.load_config(Path(raw))
+            contract = write_timing_contract(config)
+            gate_path = write_timing_gate(config, contract)
+            over = json.loads(gate_path.read_text())
+            scale = 10.0
+            for row in over["replicas"]:
+                row["panel_makespan_seconds"] *= scale
+            over["projection"]["projected_without_margin_seconds"] *= scale
+            over["projection"]["projected_full_makespan_seconds"] *= scale
+            over["projection"]["within_budget"] = False
+            over["status"] = "FAIL_CLOSED"
+            atomic_write_json(gate_path, over)
+            with self.assertRaisesRegex(RuntimeError, "incomplete or over budget"):
+                validated_timing_gate(config)
+
+
 class ImageLockRowsTest(unittest.TestCase):
     def test_image_rows_bind_task_order_and_preserve_duplicate_config_digest(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -355,6 +721,132 @@ class ImageLockRowsTest(unittest.TestCase):
                 image_lock_rows(production, tasks)
 
 
+class AtomicReceiptContractTest(unittest.TestCase):
+    def test_atomic_writer_round_trips_through_atomic_loader(self):
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "receipt.json"
+            payload = {"schema": "fixture_v1", "status": "PASS"}
+            atomic_write_json(path, payload)
+            self.assertEqual(path.read_bytes(), atomic_json_bytes(payload))
+            self.assertEqual(load_atomic_object(path, "fixture"), payload)
+
+    def test_atomic_loader_rejects_no_lf_external_canonical_bytes(self):
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "receipt.json"
+            path.write_bytes(canonical_json_bytes({"status": "PASS"}))
+            with self.assertRaisesRegex(RuntimeError, "canonical atomic"):
+                load_atomic_object(path, "fixture")
+
+
+def fake_runtime_slot(task_index: int, slot_index: int) -> RuntimeLaneToken:
+    return RuntimeLaneToken(
+        driver_key="d" * 64,
+        lease_id="e" * 64,
+        owner=OwnerIdentity("host", "boot", 123, 456),
+        task_index=task_index,
+        slot_index=slot_index,
+        server_port=18100 + slot_index,
+        generation=task_index + 1,
+        fencing_token="f" * 64,
+    )
+
+
+class DurableDigestLeaseTest(unittest.TestCase):
+    def admission(self, root: Path, task_index: int = 183):
+        return digest_lease_admission(
+            coordinator_root=root,
+            image_digest=IMAGE_DIGEST,
+            task_index=task_index,
+            replica_index=4 if task_index == 183 else 7,
+            startup_barrier_sha256="b" * 64,
+            slot=fake_runtime_slot(task_index, 0),
+        )
+
+    def test_failed_owner_leaves_occupant_and_waiter_fails_closed(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            with self.assertRaisesRegex(RuntimeError, "owner failed"):
+                with self.admission(root):
+                    raise RuntimeError("owner failed")
+            occupants = list(
+                (root / "control" / "image-leases").glob("*.occupant.json")
+            )
+            self.assertEqual(len(occupants), 1)
+            with self.assertRaisesRegex(RuntimeError, "all-eight reconciliation"):
+                with self.admission(root, 185):
+                    self.fail("stale digest occupant admitted a successor")
+            receipt = reconcile_digest_occupants(root)
+            self.assertEqual(receipt["stale_occupants"], 1)
+            self.assertFalse(occupants[0].exists())
+            with self.admission(root, 185):
+                pass
+
+    def test_cleanup_failure_preserves_occupant(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            original_unlink = Path.unlink
+
+            def fail_occupant(path, *args, **kwargs):
+                if path.name.endswith(".occupant.json"):
+                    raise OSError("injected occupant cleanup failure")
+                return original_unlink(path, *args, **kwargs)
+
+            with patch.object(Path, "unlink", fail_occupant), self.assertRaisesRegex(
+                OSError, "cleanup failure"
+            ):
+                with self.admission(root):
+                    pass
+            self.assertEqual(
+                len(list((root / "control" / "image-leases").glob("*.occupant.json"))),
+                1,
+            )
+
+    def test_sigkill_releases_flock_but_not_durable_occupant(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            ready = root / "ready"
+            code = r"""
+import pathlib
+import time
+from swebench_triad_eval.shared_pool_coordinator import digest_lease_admission
+from swebench_triad_eval.state import OwnerIdentity, RuntimeLaneToken
+root = pathlib.Path(__import__('sys').argv[1])
+ready = pathlib.Path(__import__('sys').argv[2])
+slot = RuntimeLaneToken(
+    driver_key='d' * 64, lease_id='e' * 64,
+    owner=OwnerIdentity('host', 'boot', 123, 456),
+    task_index=183, slot_index=0, server_port=18100,
+    generation=184, fencing_token='f' * 64,
+)
+with digest_lease_admission(
+    coordinator_root=root, image_digest='sha256:' + 'a' * 64,
+    task_index=183, replica_index=4,
+    startup_barrier_sha256='b' * 64, slot=slot,
+):
+    ready.write_text('ready')
+    while True:
+        time.sleep(1)
+"""
+            process = subprocess.Popen([sys.executable, "-c", code, str(root), str(ready)])
+            try:
+                deadline = time.monotonic() + 5
+                while not ready.exists() and process.poll() is None:
+                    if time.monotonic() >= deadline:
+                        self.fail("SIGKILL fixture did not acquire the digest lease")
+                    time.sleep(0.01)
+                os.kill(process.pid, signal.SIGKILL)
+                self.assertEqual(process.wait(timeout=5), -signal.SIGKILL)
+                with self.assertRaisesRegex(RuntimeError, "all-eight reconciliation"):
+                    with self.admission(root, 185):
+                        self.fail("post-SIGKILL waiter was admitted")
+                receipt = reconcile_digest_occupants(root)
+                self.assertEqual(receipt["stale_occupants"], 1)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+
+
 class WorkerTest(unittest.TestCase):
     def test_worker_uses_digest_lock_and_does_not_repeat_startup_reconciliation(self):
         calls = []
@@ -371,8 +863,9 @@ class WorkerTest(unittest.TestCase):
             def reconcile_dead_work(self):
                 raise AssertionError("coordinator preflight owns reconciliation")
 
-            def run_task(self, task_index, *, gate, slot_index):
-                calls.append((task_index, gate, slot_index))
+            def run_task(self, task_index, *, gate, slot_index, admission, **_timing):
+                with admission(fake_runtime_slot(task_index, slot_index)):
+                    calls.append((task_index, gate, slot_index))
 
         with tempfile.TemporaryDirectory() as raw, patch(
             "swebench_triad_eval.shared_pool_coordinator.driver_from_config",
@@ -427,26 +920,27 @@ class WorkerTest(unittest.TestCase):
             def _read_validated_preflight():
                 return None
 
-            def run_task(self, task_index, *, gate, slot_index):
+            def run_task(self, task_index, *, gate, slot_index, admission, **_timing):
                 nonlocal active, maximum
                 self.assertFalse(gate)
-                with lock:
-                    if slot_index in active_slots:
-                        raise AssertionError("one slot admitted two live tasks")
-                    active_slots.add(slot_index)
-                    active += 1
-                    maximum = max(maximum, active)
-                    slot_maximum[slot_index] = max(
-                        slot_maximum[slot_index], 1
-                    )
-                try:
-                    if task_index in {4, 9}:
-                        first_wave.wait(timeout=2)
-                    time.sleep(0.01)
-                finally:
+                with admission(fake_runtime_slot(task_index, slot_index)):
                     with lock:
-                        active -= 1
-                        active_slots.remove(slot_index)
+                        if slot_index in active_slots:
+                            raise AssertionError("one slot admitted two live tasks")
+                        active_slots.add(slot_index)
+                        active += 1
+                        maximum = max(maximum, active)
+                        slot_maximum[slot_index] = max(
+                            slot_maximum[slot_index], 1
+                        )
+                    try:
+                        if task_index in {4, 9}:
+                            first_wave.wait(timeout=2)
+                        time.sleep(0.01)
+                    finally:
+                        with lock:
+                            active -= 1
+                            active_slots.remove(slot_index)
 
             @staticmethod
             def assertFalse(value):
@@ -491,15 +985,16 @@ class WorkerTest(unittest.TestCase):
             def _read_validated_preflight():
                 return None
 
-            def run_task(self, task_index, *, gate, slot_index):
-                del task_index, gate, slot_index
+            def run_task(self, task_index, *, gate, slot_index, admission, **_timing):
+                del gate
                 nonlocal active, maximum
-                with lock:
-                    active += 1
-                    maximum = max(maximum, active)
-                time.sleep(0.04)
-                with lock:
-                    active -= 1
+                with admission(fake_runtime_slot(task_index, slot_index)):
+                    with lock:
+                        active += 1
+                        maximum = max(maximum, active)
+                    time.sleep(0.04)
+                    with lock:
+                        active -= 1
 
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -967,6 +1462,49 @@ class GateBindingTest(unittest.TestCase):
                 "swebench_triad_eval.shared_pool_coordinator.ProcessPoolExecutor"
             ) as executor, self.assertRaisesRegex(
                 RuntimeError, "canonical task-0 gate"
+            ):
+                run_full(config)
+            executor.assert_not_called()
+
+    def test_run_full_requires_fresh_under_budget_timing_gate(self):
+        with tempfile.TemporaryDirectory() as raw, patch(
+            "swebench_triad_eval.shared_pool_coordinator.image_lock_rows",
+            side_effect=fake_image_rows,
+        ):
+            config = CoordinatorConfig.load(make_shared_coordinator(Path(raw)))
+            config.write_assignment()
+            write_startup_barrier(config.root, config)
+            canonical_gate = {"canonical": True}
+            atomic_write_json(
+                config.root / "control" / "gate.json",
+                {
+                    "schema": "amg_swebench_shared_pool_gate_v1",
+                    "status": "PASS",
+                    "replica_index": config.task_zero_replica.replica_index,
+                    "gpu_uuid": config.task_zero_replica.gpu_uuid,
+                    "gate": canonical_gate,
+                    "gate_sha256": sha256_json(canonical_gate),
+                },
+            )
+
+            class Driver:
+                lease_registry = None
+                gate_path = config.root / "gate-PASS.json"
+
+                @staticmethod
+                def gate(*, auto_run_full):
+                    if auto_run_full:
+                        raise AssertionError("full validation must not recurse")
+                    return canonical_gate
+
+            Driver.gate_path.write_text("{}")
+            with patch(
+                "swebench_triad_eval.shared_pool_coordinator.driver_from_config",
+                return_value=Driver(),
+            ), patch(
+                "swebench_triad_eval.shared_pool_coordinator.ProcessPoolExecutor"
+            ) as executor, self.assertRaisesRegex(
+                RuntimeError, "C=2 timing contract"
             ):
                 run_full(config)
             executor.assert_not_called()

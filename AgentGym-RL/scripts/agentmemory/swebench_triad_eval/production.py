@@ -3078,6 +3078,39 @@ class LinuxProductionRuntime:
             ).hexdigest(),
             "phase_timings": phase_timings,
         }
+        publication_path = receipt_path.with_name(
+            receipt_path.stem + ".publication.json"
+        )
+
+        def publish_runtime_record() -> None:
+            started_wall_ns = time.time_ns()
+            started_monotonic_ns = time.monotonic_ns()
+            atomic_write_json(receipt_path, record)
+            ended_wall_ns = time.time_ns()
+            ended_monotonic_ns = time.monotonic_ns()
+            atomic_write_json(
+                publication_path,
+                {
+                    "schema": "swebench_triad_cell_publication_timing_v1",
+                    "status": "PASS",
+                    "cell_status": record["status"],
+                    "task_index": config.task.task_index,
+                    "arm": config.capability.arm.value,
+                    "generation": generation,
+                    "runtime_receipt_path": str(receipt_path),
+                    "runtime_receipt_sha256": hashlib.sha256(
+                        receipt_path.read_bytes()
+                    ).hexdigest(),
+                    "started_wall_ns": started_wall_ns,
+                    "ended_wall_ns": ended_wall_ns,
+                    "started_monotonic_ns": started_monotonic_ns,
+                    "ended_monotonic_ns": ended_monotonic_ns,
+                    "duration_ns": max(
+                        0, ended_monotonic_ns - started_monotonic_ns
+                    ),
+                },
+            )
+
         if self.config.shared_model_pool is not None:
             shared = self.config.shared_model_pool
             expected_replica = int.from_bytes(
@@ -3227,7 +3260,7 @@ class LinuxProductionRuntime:
             )
             prepared = False
             record["status"] = "PASS"
-            atomic_write_json(receipt_path, record)
+            publish_runtime_record()
             return endpoint
         except BaseException as error:
             record["error"] = {
@@ -3256,7 +3289,7 @@ class LinuxProductionRuntime:
                 except BaseException as cleanup_error:
                     cleanup_errors.append(repr(cleanup_error))
             record["cleanup_errors"] = cleanup_errors
-            atomic_write_json(receipt_path, record)
+            publish_runtime_record()
             if cleanup_errors:
                 raise RuntimeError(
                     "cell execution failed and owned cleanup was incomplete"
