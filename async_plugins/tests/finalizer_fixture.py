@@ -229,17 +229,31 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
     }
 
 
-def _shell_info(*, changed_paths=(), stdout="ok", attempts=1) -> dict:
+def _execution_info(
+    *,
+    kind="shell_command",
+    changed_paths=(),
+    stdout="ok",
+    attempts=0,
+    completed=0,
+) -> dict:
     return {
-        "action_kind": "shell_command",
+        "action_kind": kind,
         "action_status": "completed",
-        "counter_delta": {"execution_attempt_count": attempts},
+        "counter_delta": {
+            "execution_action_count": int(attempts > 0),
+            "execution_attempt_count": attempts,
+            "execution_completed_count": completed,
+        },
         "execution": {
+            "action_kind": kind,
             "status": "completed",
-            "exit_code": 0,
+            "exit_code": 0 if kind == "shell_command" else None,
             "stdout": stdout,
             "changed_paths": list(changed_paths),
+            "execution_action_delta": int(attempts > 0),
             "execution_attempt_delta": attempts,
+            "execution_completed_delta": completed,
         },
     }
 
@@ -249,29 +263,64 @@ def _action_rows(
 ) -> list[dict]:
     if chain:
         actions = [
-            ("printf 'alpha=2\\n' > plan.md", _shell_info(changed_paths=("plan.md",))),
             (
-                "compact context while retaining plan.md",
-                {},
+                "shell_command {\"command\":\"mkdir -p .agent_memory && printf "
+                "'%s\\\\n' 'objective: improve validation' "
+                "'measured_validation_or_failure: validation_mae=1.0' "
+                "'conclusion: update the model' 'code_path: train.py' "
+                "'next_action: edit train.py before rerunning' > "
+                ".agent_memory/OPENMLE_CONTINUATION.md\",\"workdir\":\".\","
+                "\"timeout_ms\":20000}",
+                _execution_info(
+                    changed_paths=(".agent_memory/OPENMLE_CONTINUATION.md",)
+                ),
             ),
-            ("cat plan.md", _shell_info(stdout="alpha=2")),
             (
-                "printf 'alpha=3\\n' > plan.md",
-                _shell_info(changed_paths=("plan.md",)),
+                "shell_command {\"command\":\"cat "
+                ".agent_memory/OPENMLE_CONTINUATION.md\",\"workdir\":\".\","
+                "\"timeout_ms\":20000}",
+                _execution_info(
+                    stdout=(
+                        "objective: improve validation\n"
+                        "measured_validation_or_failure: validation_mae=1.0\n"
+                        "conclusion: update the model\n"
+                        "code_path: train.py\n"
+                        "next_action: edit train.py before rerunning\n"
+                    )
+                ),
             ),
-            ("python plan.md", _shell_info(stdout="alpha=3")),
+            (
+                "apply_patch\n*** Begin Patch\n*** Update File: train.py\n"
+                "@@\n-print(1)\n+print(2)\n*** End Patch",
+                _execution_info(kind="apply_patch", changed_paths=("train.py",)),
+            ),
+            (
+                "shell_command {\"command\":\"python train.py\",\"workdir\":\".\","
+                "\"timeout_ms\":20000}",
+                _execution_info(
+                    stdout="validation_mae=0.8", attempts=1, completed=1
+                ),
+            ),
         ]
     else:
         actions = [("submit", {"action_kind": "submit", "action_status": "completed"})]
     rows = []
     for order, (action, env_info) in enumerate(actions):
         wrapper_evidence = {}
-        if chain and order == 1:
+        context_transition = {}
+        control_request = None
+        if chain and order == 0:
             wrapper_evidence = {
                 "event": "context_compaction",
-                "author": "policy",
-                "synthetic": False,
+                "continuation_path": ".agent_memory/OPENMLE_CONTINUATION.md",
+                "continuation_persisted": True,
+                "preserved_policy_output": True,
+                "preserved_native_observation": True,
+                "native_action_kind": env_info["action_kind"],
+                "native_action_status": env_info["action_status"],
             }
+            context_transition = {"operation": "replace_messages", "messages": []}
+            control_request = "Persist continuation state before compaction."
         rows.append(
             {
                 "schema": "amg_task_neutral_action_row_v1",
@@ -288,9 +337,9 @@ def _action_rows(
                 "action": action,
                 "action_submission": {"raw_policy_output": action},
                 "env_info_after": env_info,
-                "context_transition": {},
+                "context_transition": context_transition,
                 "wrapper_evidence": wrapper_evidence,
-                "control_request": None,
+                "control_request": control_request,
                 "outcome": "success" if order == len(actions) - 1 else "continue",
                 "prompt_token_count": 2,
                 "prompt_token_sha256": "a" * 64,

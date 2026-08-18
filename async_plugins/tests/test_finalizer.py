@@ -51,6 +51,43 @@ def rewrite_first_step_record(fixture: dict, mutation: JsonMutation) -> None:
     rewrite_first_rollout(fixture, mutate_document)
 
 
+def rewrite_chain_record(
+    fixture: dict, order: int, mutation: JsonMutation
+) -> None:
+    path = sorted(fixture["rollout_dir"].glob("*.jsonl"))[0]
+    documents = [
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    records = [json.loads(document["step_record_json"]) for document in documents]
+    chain_uids = {
+        record["trajectory_uid"]
+        for record in records
+        if record.get("wrapper_evidence", {}).get("event") == "context_compaction"
+    }
+    if len(chain_uids) != 1:
+        raise AssertionError(f"expected one chain trajectory, got {chain_uids!r}")
+    chain_uid = chain_uids.pop()
+    matches = 0
+    for document, record in zip(documents, records):
+        if (
+            record.get("trajectory_uid") == chain_uid
+            and record.get("trajectory_row_order") == order
+        ):
+            mutation(record)
+            document["output"] = record["action"]
+            document["step_record_json"] = json.dumps(record, sort_keys=True)
+            matches += 1
+    if matches != 1:
+        raise AssertionError(
+            f"expected one chain row at order {order}, found {matches}"
+        )
+    path.write_text(
+        "\n".join(json.dumps(document, sort_keys=True) for document in documents)
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def rewrite_metrics(fixture: dict, mutation: JsonMutation) -> None:
     path = fixture["metrics_path"]
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
@@ -474,6 +511,68 @@ class TestFinalizerRuntimeReceipt(FinalizerTestCase):
 
 
 class TestFinalizerFileLogger(FinalizerTestCase):
+    def test_step_zero_rollouter_bootstrap_and_split_publication_rows_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+            original = json.loads(
+                fixture["metrics_path"].read_text(encoding="utf-8").splitlines()[0]
+            )
+            learner = dict(original["data"])
+            bypass = {
+                key: learner.pop(key)
+                for key in (
+                    "rollout_corr/bypass_real_token_count",
+                    "rollout_corr/bypass_max_abs_diff",
+                )
+            }
+            rows = [
+                {
+                    "step": 0,
+                    "data": {
+                        "fully_async/rollouter/active_time": 1.0,
+                        "dynamic_resource/rollout_resource_utilization": 0.5,
+                    },
+                },
+                {"step": 1, "data": bypass},
+                {"step": 1, "data": learner},
+            ]
+            fixture["metrics_path"].write_text(
+                "\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+
+            self.assertEqual(verdict["status"], "pass", verdict)
+
+    def test_step_zero_must_be_rollouter_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+            with fixture["metrics_path"].open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps({"step": 0, "data": {"actor/grad_norm": 1.0}})
+                    + "\n"
+                )
+            self.assert_failed(
+                fixture["run_dir"], contains="step 0 is not rollouter-only"
+            )
+
+    def test_each_publication_has_learner_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory), mode="formal")
+            rows = [
+                json.loads(line)
+                for line in fixture["metrics_path"].read_text(encoding="utf-8").splitlines()
+            ]
+            rows[1]["data"].pop("actor/grad_norm")
+            fixture["metrics_path"].write_text(
+                "\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+            self.assert_failed(
+                fixture["run_dir"], contains="publication step 2 has no unique nonzero actor update metric"
+            )
+
     def test_publication_cycle_evidence_is_complete_and_exact(self):
         cases: tuple[tuple[str, JsonMutation], ...] = (
             (
@@ -517,6 +616,47 @@ class TestFinalizerFileLogger(FinalizerTestCase):
                 fixture = self.build(Path(directory))
                 rewrite_metrics(fixture, mutation)
                 self.assert_failed(fixture["run_dir"], contains=expected)
+
+    def test_update_metrics_require_unique_canonical_grad_norms(self):
+        cases = (
+            ("actor", "distractor/value"),
+            ("critic", "critic/values/max"),
+        )
+        for role, decoy in cases:
+            with self.subTest(role=role), tempfile.TemporaryDirectory() as directory:
+                fixture = self.build(Path(directory))
+                rows = [
+                    json.loads(line)
+                    for line in fixture["metrics_path"]
+                    .read_text(encoding="utf-8")
+                    .splitlines()
+                ]
+                rows[0]["data"].pop(f"{role}/grad_norm")
+                rows[0]["data"][decoy] = 1.0
+                fixture["metrics_path"].write_text(
+                    "\n".join(json.dumps(row, sort_keys=True) for row in rows)
+                    + "\n",
+                    encoding="utf-8",
+                )
+                self.assert_failed(
+                    fixture["run_dir"],
+                    contains=f"no unique nonzero {role} update metric",
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+            with fixture["metrics_path"].open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {"step": 1, "data": {"actor/grad_norm": 2.0}},
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+            self.assert_failed(
+                fixture["run_dir"],
+                contains="no unique nonzero actor update metric",
+            )
 
     def test_file_logger_token_sum_and_validation_count_are_cross_checked(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -569,6 +709,93 @@ class TestFinalizerRollouts(FinalizerTestCase):
             verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
             self.assertEqual(verdict["status"], "pass", verdict)
 
+    def test_action_rows_may_be_physically_interleaved_within_an_update(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+            path = fixture["rollout_dir"] / "1.jsonl"
+            documents = [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+            ]
+            documents.sort(
+                key=lambda document: (
+                    -json.loads(document["step_record_json"])["trajectory_row_order"],
+                    json.loads(document["step_record_json"])["trajectory_uid"],
+                )
+            )
+            path.write_text(
+                "\n".join(
+                    json.dumps(document, sort_keys=True) for document in documents
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+
+            self.assertEqual(verdict["status"], "pass", verdict)
+
+    def test_duplicate_or_missing_action_order_still_fails(self):
+        for bad_order in (1, 99):
+            with (
+                self.subTest(bad_order=bad_order),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                fixture = self.build(Path(directory))
+                rewrite_first_step_record(
+                    fixture,
+                    lambda record: record.update(trajectory_row_order=bad_order),
+                )
+                self.assert_failed(
+                    fixture["run_dir"], contains="action rows are not contiguous"
+                )
+
+    def test_cross_update_uid_reuse_and_early_terminal_fail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory), mode="formal")
+            first_path = fixture["rollout_dir"] / "1.jsonl"
+            second_path = fixture["rollout_dir"] / "2.jsonl"
+            first_record = json.loads(
+                json.loads(first_path.read_text(encoding="utf-8").splitlines()[0])[
+                    "step_record_json"
+                ]
+            )
+            documents = [
+                json.loads(line)
+                for line in second_path.read_text(encoding="utf-8").splitlines()
+            ]
+            record = json.loads(documents[0]["step_record_json"])
+            record["trajectory_uid"] = first_record["trajectory_uid"]
+            documents[0]["step_record_json"] = json.dumps(record, sort_keys=True)
+            second_path.write_text(
+                "\n".join(json.dumps(document, sort_keys=True) for document in documents)
+                + "\n",
+                encoding="utf-8",
+            )
+            self.assert_failed(
+                fixture["run_dir"], contains="appears in multiple updates"
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+            rewrite_chain_record(
+                fixture,
+                2,
+                lambda record: record.update(
+                    trajectory_terminal=True, rollout_done_flag=True
+                ),
+            )
+            rewrite_chain_record(
+                fixture,
+                3,
+                lambda record: record.update(
+                    trajectory_terminal=False, rollout_done_flag=False
+                ),
+            )
+            self.assert_failed(
+                fixture["run_dir"], contains="terminal row is not the maximum action order"
+            )
+
     def test_rollout_files_must_have_numeric_optimizer_step_names(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.build(Path(directory))
@@ -620,7 +847,7 @@ class TestFinalizerRollouts(FinalizerTestCase):
     def test_missing_or_synthetic_memory_chain_is_not_accepted(self):
         cases = (
             "missing_compaction",
-            "synthetic_compaction",
+            "unpersisted_compaction",
             "empty_read",
             "failed_execute",
         )
@@ -632,15 +859,15 @@ class TestFinalizerRollouts(FinalizerTestCase):
                 for raw in path.read_text(encoding="utf-8").splitlines():
                     document = json.loads(raw)
                     record = json.loads(document["step_record_json"])
-                    if record["trajectory_row_order"] == 1:
+                    if record["trajectory_row_order"] == 0:
                         if case == "missing_compaction":
                             record["wrapper_evidence"].pop("event", None)
-                        elif case == "synthetic_compaction":
-                            record["wrapper_evidence"]["synthetic"] = True
-                    elif record["trajectory_row_order"] == 2 and case == "empty_read":
+                        elif case == "unpersisted_compaction":
+                            record["wrapper_evidence"]["continuation_persisted"] = False
+                    elif record["trajectory_row_order"] == 1 and case == "empty_read":
                         record["env_info_after"]["execution"]["stdout"] = ""
                     elif (
-                        record["trajectory_row_order"] == 4 and case == "failed_execute"
+                        record["trajectory_row_order"] == 3 and case == "failed_execute"
                     ):
                         record["env_info_after"]["execution"]["exit_code"] = 1
                     document["step_record_json"] = json.dumps(record, sort_keys=True)
@@ -652,7 +879,135 @@ class TestFinalizerRollouts(FinalizerTestCase):
                 )
 
 
+    def test_apply_patch_can_persist_the_compaction_document(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+            action = (
+                "apply_patch\n*** Begin Patch\n"
+                "*** Add File: .agent_memory/OPENMLE_CONTINUATION.md\n"
+                "+objective: improve validation\n"
+                "+measured_validation_or_failure: validation_mae=1.0\n"
+                "+conclusion: update the model\n"
+                "+code_path: train.py\n"
+                "+next_action: edit train.py before rerunning\n"
+                "*** End Patch"
+            )
+
+            def mutate(record: dict) -> None:
+                record["action"] = action
+                record["action_submission"]["raw_policy_output"] = action
+                info = record["env_info_after"]
+                info["action_kind"] = "apply_patch"
+                record["wrapper_evidence"]["native_action_kind"] = "apply_patch"
+                execution = info["execution"]
+                execution["action_kind"] = "apply_patch"
+                execution["exit_code"] = None
+
+            rewrite_chain_record(fixture, 0, mutate)
+
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+
+            self.assertEqual(verdict["status"], "pass", verdict)
+
+    def test_action_decoys_do_not_form_a_memory_chain(self):
+        orders = {
+            "echo_read": 1,
+            "commented_execute": 3,
+            "subpath_read": 1,
+            "subpath_edit": 2,
+            "subpath_execute": 3,
+        }
+        for case, order in orders.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                fixture = self.build(Path(directory))
+
+                def mutate(record: dict) -> None:
+                    if case == "echo_read":
+                        action = (
+                            "shell_command {\"command\":\"printf 'objective: improve "
+                            "validation\\nmeasured_validation_or_failure: validation_mae=1.0"
+                            "\\nconclusion: update the model\\ncode_path: train.py"
+                            "\\nnext_action: edit train.py before rerunning\\n' # "
+                            ".agent_memory/OPENMLE_CONTINUATION.md\",\"workdir\":\".\","
+                            "\"timeout_ms\":20000}"
+                        )
+                    elif case == "commented_execute":
+                        action = (
+                            "shell_command {\"command\":\"python other.py # train.py\","
+                            "\"workdir\":\".\",\"timeout_ms\":20000}"
+                        )
+                    elif case == "subpath_read":
+                        action = (
+                            "shell_command {\"command\":\"cat nested/.agent_memory/"
+                            "OPENMLE_CONTINUATION.md\",\"workdir\":\".\","
+                            "\"timeout_ms\":20000}"
+                        )
+                    elif case == "subpath_edit":
+                        action = (
+                            "apply_patch\n*** Begin Patch\n"
+                            "*** Update File: nested/train.py\n"
+                            "@@\n-print(1)\n+print(2)\n*** End Patch"
+                        )
+                        record["env_info_after"]["execution"]["changed_paths"] = [
+                            "nested/train.py"
+                        ]
+                    else:
+                        action = (
+                            "shell_command {\"command\":\"python nested/train.py\","
+                            "\"workdir\":\".\",\"timeout_ms\":20000}"
+                        )
+                    record["action"] = action
+                    record["action_submission"]["raw_policy_output"] = action
+
+                rewrite_chain_record(fixture, order, mutate)
+                self.assert_failed(
+                    fixture["run_dir"],
+                    contains="policy-authored external-document chain",
+                )
+
+    def test_continuation_fields_and_completed_execution_are_required(self):
+        cases = ("missing_objective", "not_completed")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                fixture = self.build(Path(directory))
+                order = 1 if case == "missing_objective" else 3
+
+                def mutate(record: dict) -> None:
+                    if case == "missing_objective":
+                        execution = record["env_info_after"]["execution"]
+                        execution["stdout"] = "\n".join(
+                            line
+                            for line in execution["stdout"].splitlines()
+                            if not line.startswith("objective:")
+                        )
+                    else:
+                        info = record["env_info_after"]
+                        info["counter_delta"]["execution_completed_count"] = 0
+                        info["execution"]["execution_completed_delta"] = 0
+
+                rewrite_chain_record(fixture, order, mutate)
+                self.assert_failed(
+                    fixture["run_dir"],
+                    contains="policy-authored external-document chain",
+                )
+
+
 class TestFinalizerConfigAndCheckpoint(FinalizerTestCase):
+    def test_hydra_interpolation_is_resolved_before_drift_comparison(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+            config = yaml.safe_load(fixture["hydra_path"].read_text(encoding="utf-8"))
+            config["trainer"]["n_gpus_per_node"] = (
+                "${oc.select:rollout.n_gpus_per_node}"
+            )
+            fixture["hydra_path"].write_text(
+                yaml.safe_dump(config, sort_keys=True), encoding="utf-8"
+            )
+
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+
+            self.assertEqual(verdict["status"], "pass", verdict)
+
     def test_resolved_config_mismatch_and_hydra_drift_fail(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.build(Path(directory))
