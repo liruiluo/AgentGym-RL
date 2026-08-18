@@ -190,6 +190,63 @@ class _MemoryChainClient:
         self.closed = True
 
 
+class _ExcludedClient(_MemoryChainClient):
+    def __init__(
+        self,
+        *,
+        reason="executor_infrastructure_fault",
+        exclude_on_action=1,
+    ):
+        super().__init__()
+        self.sample_excluded = False
+        self.reason = reason
+        self.exclude_on_action = exclude_on_action
+
+    def step(self, action):
+        self.actions.append(action)
+        if len(self.actions) < self.exclude_on_action:
+            return StepOutput(
+                state="valid prefix before infrastructure fault",
+                reward=0.25,
+                done=False,
+                info=build_task_neutral_transition_info(),
+            )
+        self.sample_excluded = True
+        return StepOutput(
+            state="infrastructure fault excluded this sample",
+            reward=None,
+            done=True,
+            info=build_task_neutral_transition_info(
+                env_info={
+                    "truncated": True,
+                    "terminal_reason": self.reason,
+                },
+                wrapper_evidence={
+                    "outcome": "environment_error",
+                    "terminal_reason": self.reason,
+                },
+            ),
+        )
+
+
+class _SuccessfulClient(_MemoryChainClient):
+    def __init__(self):
+        super().__init__()
+        self.sample_excluded = False
+
+    def step(self, action):
+        self.actions.append(action)
+        return StepOutput(
+            state="valid terminal sample",
+            reward=1.0,
+            done=True,
+            info=build_task_neutral_transition_info(
+                env_info={"resolved": True},
+                wrapper_evidence={"outcome": "success"},
+            ),
+        )
+
+
 class _HorizonClient(_MemoryChainClient):
     def step(self, action):
         self.actions.append(action)
@@ -407,6 +464,76 @@ class TestAMGAgentLoop(IsolatedAsyncioTestCase):
             record["horizon_finalization"]["wrapper_evidence"]["source"], "horizon"
         )
         self.assertTrue(record["horizon_finalization"]["env_info"]["resolved"])
+
+    async def test_excluded_attempt_is_closed_and_resampled_as_a_whole_trajectory(self):
+        excluded = _ExcludedClient(exclude_on_action=2)
+        successful = _SuccessfulClient()
+        loop = self._loop(
+            ["DISCARDED PREFIX", "DISCARDED FAULT", "KEPT ACTION"],
+            max_turns=2,
+        )
+        loop.agentgym_config["max_retries"] = 2
+
+        with mock.patch.object(
+            agent_loop_module,
+            "create_env_client",
+            side_effect=[excluded, successful],
+        ) as create_client:
+            outputs = await loop.run(
+                {"max_tokens": 8},
+                item_id="resampled-task",
+                data_idx=7,
+                uid="trajectory-resampled",
+                raw_prompt=[{"role": "system", "content": "system"}],
+            )
+
+        self.assertEqual(create_client.call_count, 2)
+        self.assertTrue(excluded.closed)
+        self.assertTrue(successful.closed)
+        self.assertEqual(
+            excluded.actions,
+            ["DISCARDED PREFIX", "DISCARDED FAULT"],
+        )
+        self.assertEqual(successful.actions, ["KEPT ACTION"])
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(outputs[0].extra_fields["action_text"], "KEPT ACTION")
+        self.assertEqual(outputs[0].response_ids, [102])
+        self.assertEqual(outputs[0].response_logprobs, [-0.03])
+        self.assertEqual(outputs[0].reward_score, 1.0)
+        self.assertEqual(outputs[0].extra_fields["sample_reschedule_attempt"], 1)
+        record = json.loads(outputs[0].extra_fields["step_record_json"])
+        self.assertEqual(record["sample_reschedule_attempt"], 1)
+        self.assertNotIn("DISCARDED PREFIX", outputs[0].extra_fields["step_record_json"])
+        self.assertNotIn("DISCARDED FAULT", outputs[0].extra_fields["step_record_json"])
+
+    async def test_repeated_exclusion_fails_closed_after_bounded_retries(self):
+        first = _ExcludedClient(reason="executor_infrastructure_fault")
+        second = _ExcludedClient(reason="grader_infrastructure_fault")
+        loop = self._loop(["FIRST EXCLUDED", "SECOND EXCLUDED"], max_turns=1)
+        loop.agentgym_config["max_retries"] = 1
+
+        with mock.patch.object(
+            agent_loop_module,
+            "create_env_client",
+            side_effect=[first, second],
+        ) as create_client:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "excluded after 2 complete trajectory attempts.*grader_infrastructure_fault",
+            ):
+                await loop.run(
+                    {"max_tokens": 8},
+                    item_id="always-excluded-task",
+                    data_idx=8,
+                    uid="trajectory-always-excluded",
+                    raw_prompt=[{"role": "system", "content": "system"}],
+                )
+
+        self.assertEqual(create_client.call_count, 2)
+        self.assertTrue(first.closed)
+        self.assertTrue(second.closed)
+        self.assertEqual(first.actions, ["FIRST EXCLUDED"])
+        self.assertEqual(second.actions, ["SECOND EXCLUDED"])
 
 
 if __name__ == "__main__":

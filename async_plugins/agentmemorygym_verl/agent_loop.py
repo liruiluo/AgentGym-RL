@@ -91,6 +91,28 @@ def _digest_token_ids(token_ids: Sequence[int]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+class _SampleExcluded(Exception):
+    """Unwind one infra-faulted environment attempt without emitting PPO rows."""
+
+    def __init__(self, summary: str) -> None:
+        super().__init__(summary)
+        self.summary = summary
+
+
+def _sample_exclusion_summary(step_output: Any) -> str:
+    payload = {
+        "state": _json_safe(getattr(step_output, "state", None)),
+        "info": _json_safe(getattr(step_output, "info", {})),
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return encoded[:2048]
+
+
 def _receipt_parts(
     step_output: Any, action: str
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
@@ -291,6 +313,41 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
         priority: int = 0,
         **kwargs: Any,
     ) -> list[AgentLoopOutput]:
+        max_retries = int(_get(self.agentgym_config, "max_retries", 2))
+        if max_retries < 0:
+            raise ValueError("AMG max_retries must be non-negative")
+
+        attempt_kwargs = dict(kwargs)
+        attempt_kwargs["uid"] = self._resolve_trajectory_uid(kwargs)
+        data_idx = self._resolve_data_idx(kwargs)
+        item_id = str(_scalar(kwargs.get("item_id", data_idx)))
+        last_exclusion: _SampleExcluded | None = None
+        for sample_reschedule_attempt in range(max_retries + 1):
+            try:
+                return await self._run_single_attempt(
+                    sampling_params,
+                    priority,
+                    sample_reschedule_attempt=sample_reschedule_attempt,
+                    **attempt_kwargs,
+                )
+            except _SampleExcluded as exc:
+                last_exclusion = exc
+
+        assert last_exclusion is not None
+        raise RuntimeError(
+            f"AMG sample item_id={item_id!r} data_idx={data_idx} was excluded after "
+            f"{max_retries + 1} complete trajectory attempts: "
+            f"{last_exclusion.summary}"
+        ) from last_exclusion
+
+    async def _run_single_attempt(
+        self,
+        sampling_params: dict[str, Any],
+        priority: int = 0,
+        *,
+        sample_reschedule_attempt: int,
+        **kwargs: Any,
+    ) -> list[AgentLoopOutput]:
         priority = int(_scalar(priority))
         data_idx = self._resolve_data_idx(kwargs)
         item_id = str(_scalar(kwargs.get("item_id", data_idx)))
@@ -400,6 +457,12 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                 step_output, next_messages = complete_policy_turn(
                     client, prepared, action
                 )
+                if getattr(client, "sample_excluded", False):
+                    if not bool(step_output.done):
+                        raise RuntimeError(
+                            "AMG sample_excluded requires a terminal environment step"
+                        )
+                    raise _SampleExcluded(_sample_exclusion_summary(step_output))
                 next_messages = [dict(message) for message in next_messages]
                 reward = float(step_output.reward)
                 done = bool(step_output.done)
@@ -433,6 +496,7 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                     "trajectory_uid": trajectory_uid,
                     "trajectory_row_uid": row_uid,
                     "trajectory_row_order": row_order,
+                    "sample_reschedule_attempt": sample_reschedule_attempt,
                     "trajectory_terminal": False,
                     "rollout_done_flag": done,
                     "immediate_reward": reward,
@@ -463,6 +527,7 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                         "trajectory_uid": trajectory_uid,
                         "trajectory_row_uid": row_uid,
                         "trajectory_row_order": row_order,
+                        "sample_reschedule_attempt": sample_reschedule_attempt,
                         "trajectory_terminal": False,
                         "rollout_done_flag": done,
                         "immediate_reward": reward,
@@ -513,6 +578,14 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                 finalizer = getattr(client, "finalize_policy_horizon", None)
                 horizon_output = finalizer() if callable(finalizer) else None
                 if horizon_output is not None:
+                    if getattr(client, "sample_excluded", False):
+                        if not bool(horizon_output.done):
+                            raise RuntimeError(
+                                "AMG sample_excluded requires terminal horizon finalization"
+                            )
+                        raise _SampleExcluded(
+                            _sample_exclusion_summary(horizon_output)
+                        )
                     if not bool(horizon_output.done):
                         raise RuntimeError(
                             "AMG horizon finalization must terminate the episode"
