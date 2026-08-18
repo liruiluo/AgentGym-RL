@@ -2140,6 +2140,247 @@ class FullRunTransactionRestartTest(unittest.TestCase):
             "workers_complete_sha256": None,
         }
 
+    def test_restart_serializes_unreported_durable_completions_before_replay(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (root / "progress").mkdir()
+            replicas = tuple(
+                SimpleNamespace(
+                    replica_index=index,
+                    task_indices=tuple(range(index, 500, 8)),
+                )
+                for index in range(8)
+            )
+            config = SimpleNamespace(
+                path=root / "coordinator-index.json",
+                root=root,
+                replicas=replicas,
+            )
+            config.path.write_text("fixture")
+            reported = set(range(49))
+            for replica in replicas:
+                rows = sorted(reported.intersection(replica.task_indices))
+                atomic_write_json(
+                    root / "progress" / f"replica-{replica.replica_index}.json",
+                    {
+                        "schema": "amg_swebench_shared_pool_progress_v2",
+                        "status": "RUNNING",
+                        "replica_index": replica.replica_index,
+                        "completed_task_indices": rows,
+                    },
+                )
+
+            journal = self.journal(root)
+            journal["started_wall_ns"] = time.time_ns() - 20_000_000_000
+            journal["updated_wall_ns"] = journal["started_wall_ns"]
+            first = _publish_eta_check(
+                config,
+                journal=journal,
+                check_index=1,
+                observed_wall_ns=journal["started_wall_ns"] + 10_000_000_000,
+                completed_tasks=set(range(25)),
+                trigger_reasons=["cell_interval"],
+                prior_consecutive=0,
+            )
+            _reconcile_eta_history(config, journal)
+            self.assertEqual(first["progress"]["new_completed_cells"], 75)
+            atomic_write_json(
+                root / "control" / "full-run-transaction.json",
+                journal,
+            )
+
+            target = replicas[1]
+            completion_root = root / "completions"
+            completion_root.mkdir()
+            durable = sorted(
+                reported.intersection(target.task_indices).union({49, 57})
+            )
+
+            class Driver:
+                lease_registry = None
+
+                @staticmethod
+                def ensure_driver_lease():
+                    return None
+
+                @staticmethod
+                def _read_validated_preflight():
+                    return None
+
+                @staticmethod
+                def task_completion_path(task_index):
+                    return completion_root / f"task-{task_index:04d}.json"
+
+                @classmethod
+                def load_task_completion(cls, task_index):
+                    return json.loads(cls.task_completion_path(task_index).read_text())
+
+                @classmethod
+                def run_task(cls, task_index, **_kwargs):
+                    atomic_write_json(
+                        cls.task_completion_path(task_index),
+                        {"task_index": task_index},
+                    )
+
+            for task_index in durable:
+                atomic_write_json(
+                    Driver.task_completion_path(task_index),
+                    {"task_index": task_index},
+                )
+
+            with patch(
+                "swebench_triad_eval.shared_pool_coordinator.require_startup_barrier",
+                return_value={},
+            ), patch(
+                "swebench_triad_eval.shared_pool_coordinator.driver_from_config",
+                return_value=Driver(),
+            ), patch.object(
+                CoordinatorConfig,
+                "load",
+                return_value=config,
+            ):
+                result = _worker(
+                    str(root / "replica-1.json"),
+                    (49, 57),
+                    tuple(
+                        "sha256:" + f"{task:064x}"
+                        for task in (49, 57)
+                    ),
+                    (0, 1),
+                    target.replica_index,
+                    str(root),
+                    "b" * 64,
+                    target.task_indices,
+                    str(config.path),
+                )
+            self.assertEqual(result["status"], "PASS")
+            persisted = load_atomic_object(
+                root / "control" / "full-run-transaction.json",
+                "fixture journal",
+            )
+            rows, _elapsed, cells, _consecutive = _reconcile_eta_history(
+                config,
+                dict(persisted),
+            )
+            self.assertEqual(
+                [row["progress"]["new_completed_cells"] for row in rows],
+                [75, 150],
+            )
+            self.assertEqual(cells, 150)
+
+    def test_restart_seals_due_progress_before_running_a_new_task(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (root / "progress").mkdir()
+            replicas = tuple(
+                SimpleNamespace(
+                    replica_index=index,
+                    task_indices=tuple(range(index, 500, 8)),
+                )
+                for index in range(8)
+            )
+            config = SimpleNamespace(
+                path=root / "coordinator-index.json",
+                root=root,
+                replicas=replicas,
+            )
+            config.path.write_text("fixture")
+            reported = set(range(25))
+            for replica in replicas:
+                rows = sorted(reported.intersection(replica.task_indices))
+                atomic_write_json(
+                    root / "progress" / f"replica-{replica.replica_index}.json",
+                    {
+                        "schema": "amg_swebench_shared_pool_progress_v2",
+                        "status": "RUNNING",
+                        "replica_index": replica.replica_index,
+                        "completed_task_indices": rows,
+                    },
+                )
+            journal = self.journal(root)
+            journal["started_wall_ns"] = time.time_ns() - 20_000_000_000
+            journal["updated_wall_ns"] = journal["started_wall_ns"]
+            atomic_write_json(
+                root / "control" / "full-run-transaction.json",
+                journal,
+            )
+
+            target = replicas[0]
+            completion_root = root / "completions"
+            completion_root.mkdir()
+            ran_after_eta = []
+
+            class Driver:
+                lease_registry = None
+
+                @staticmethod
+                def ensure_driver_lease():
+                    return None
+
+                @staticmethod
+                def _read_validated_preflight():
+                    return None
+
+                @staticmethod
+                def task_completion_path(task_index):
+                    return completion_root / f"task-{task_index:04d}.json"
+
+                @classmethod
+                def load_task_completion(cls, task_index):
+                    return json.loads(cls.task_completion_path(task_index).read_text())
+
+                @classmethod
+                def run_task(cls, task_index, **_kwargs):
+                    ran_after_eta.append(_eta_progress_path(root, 1).is_file())
+                    atomic_write_json(
+                        cls.task_completion_path(task_index),
+                        {"task_index": task_index},
+                    )
+
+            for task_index in reported.intersection(target.task_indices):
+                atomic_write_json(
+                    Driver.task_completion_path(task_index),
+                    {"task_index": task_index},
+                )
+
+            with patch(
+                "swebench_triad_eval.shared_pool_coordinator.require_startup_barrier",
+                return_value={},
+            ), patch(
+                "swebench_triad_eval.shared_pool_coordinator.driver_from_config",
+                return_value=Driver(),
+            ), patch.object(
+                CoordinatorConfig,
+                "load",
+                return_value=config,
+            ):
+                result = _worker(
+                    str(root / "replica-0.json"),
+                    (32,),
+                    ("sha256:" + f"{32:064x}",),
+                    (0,),
+                    target.replica_index,
+                    str(root),
+                    "b" * 64,
+                    target.task_indices,
+                    str(config.path),
+                )
+            self.assertEqual(result["status"], "PASS")
+            self.assertEqual(ran_after_eta, [True])
+            persisted = load_atomic_object(
+                root / "control" / "full-run-transaction.json",
+                "fixture journal",
+            )
+            rows, _elapsed, cells, _consecutive = _reconcile_eta_history(
+                config,
+                dict(persisted),
+            )
+            self.assertEqual(
+                [row["progress"]["new_completed_cells"] for row in rows],
+                [75],
+            )
+            self.assertEqual(cells, 75)
+
     def test_restart_rolls_forward_orphan_progress_and_global_sequence(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

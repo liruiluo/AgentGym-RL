@@ -1215,6 +1215,69 @@ def _worker(
                     raise RuntimeError("durable task completion is not a file")
                 driver.load_task_completion(task_index)
                 completed.add(task_index)
+        if eta_config is not None:
+            try:
+                progress_path.lstat()
+            except FileNotFoundError:
+                reported_completed: set[int] = set()
+            else:
+                prior_progress = load_atomic_object(
+                    progress_path,
+                    "full-run replica progress",
+                    root=root,
+                )
+                prior_rows = prior_progress.get("completed_task_indices")
+                if (
+                    prior_progress.get("schema")
+                    not in {
+                        "amg_swebench_shared_pool_progress_v2",
+                        "amg_swebench_shared_pool_worker_v2",
+                    }
+                    or prior_progress.get("status")
+                    not in {
+                        "RUNNING",
+                        "PASS",
+                        "STOPPED_AT_PUBLICATION_BOUNDARY",
+                    }
+                    or prior_progress.get("replica_index") != replica_index
+                    or not isinstance(prior_rows, list)
+                    or any(type(task) is not int for task in prior_rows)
+                    or len(prior_rows) != len(set(prior_rows))
+                    or not set(prior_rows).issubset(replica_tasks)
+                ):
+                    raise RuntimeError("full-run progress identity drifted")
+                reported_completed = set(prior_rows)
+                if not reported_completed.issubset(completed):
+                    raise RuntimeError(
+                        "full-run progress lacks its durable task completion"
+                    )
+
+            with exclusive_lock(_eta_producer_lock_path(root)):
+                _publish_due_eta_locked(
+                    eta_config,
+                    observed_wall_ns=time.time_ns(),
+                )
+            for recovered_task in sorted(completed - reported_completed):
+                with exclusive_lock(_eta_producer_lock_path(root)):
+                    reported_completed.add(recovered_task)
+                    atomic_write_json(
+                        progress_path,
+                        {
+                            "schema": "amg_swebench_shared_pool_progress_v2",
+                            "status": "RUNNING",
+                            "replica_index": replica_index,
+                            "task_slots_per_replica": TASK_SLOTS_PER_REPLICA,
+                            "completed_task_indices": sorted(reported_completed),
+                            "completed_tasks": len(reported_completed),
+                            "total_tasks": len(replica_tasks),
+                            "last_task_index": recovered_task,
+                            "wall_seconds": round(time.monotonic() - started, 6),
+                        },
+                    )
+                    _publish_due_eta_locked(
+                        eta_config,
+                        observed_wall_ns=time.time_ns(),
+                    )
         ensure_private_directory(root / "control" / "image-leases")
         queues: list[list[tuple[int, str, int, int]]] = [
             [] for _ in range(TASK_SLOTS_PER_REPLICA)
