@@ -667,9 +667,10 @@ class TestMarkerTransactions(unittest.TestCase):
             self.assertEqual(marker.stat().st_ino, foreign_inode)
             self.assertEqual(marker.read_text(encoding="utf-8").strip(), run_id)
 
-    def test_pidfd_unavailable_fails_closed_without_os_kill(self) -> None:
+    def test_non_linux_without_pidfds_fails_closed_without_os_kill(self) -> None:
         with (
             mock.patch.object(lifecycle, "process_identity_alive", return_value=True),
+            mock.patch.object(lifecycle.sys, "platform", "darwin"),
             mock.patch.object(lifecycle.os, "pidfd_open", None, create=True),
             mock.patch.object(lifecycle.signal, "pidfd_send_signal", None, create=True),
             mock.patch.object(lifecycle.os, "kill") as unsafe_kill,
