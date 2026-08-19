@@ -160,6 +160,7 @@ class _Audit:
         self.runtime: Mapping[str, Any] | None = None
         self.batch_multiple: int | None = None
         self.staleness_threshold: float | None = None
+        self.trainer_world_size: int | None = None
         self.counts: dict[str, int] = {
             "scheduled_episodes": 0,
             "complete_learner_updates": 0,
@@ -390,6 +391,11 @@ class _Audit:
                 self.launch.get("budget") == budget,
                 "launch budget does not match the verified resolved config",
             )
+            trainer_world_size = _positive_int(budget.get("trainer_gpus"))
+            if trainer_world_size is None:
+                self.errors.append("verified trainer world size is invalid")
+            else:
+                self.trainer_world_size = trainer_world_size
         raw_staleness = _at(resolved, "async_training.staleness_threshold")
         if (
             isinstance(raw_staleness, bool)
@@ -1296,7 +1302,8 @@ class _Audit:
                 isinstance(evidence, Mapping)
                 and evidence.get("changed") is True
                 and _finite_positive(evidence.get("changed_elements"))
-                and _finite_positive(evidence.get("sampled_elements")),
+                and _finite_positive(evidence.get("sampled_elements"))
+                and evidence.get("worker_count") == self.trainer_world_size,
                 f"native trainer latest {role} parameter-update probe failed",
             )
 
@@ -1383,6 +1390,10 @@ class _Audit:
     def audit_checkpoint(self) -> None:
         if self.expected is None:
             return
+        if self.trainer_world_size is None:
+            self.errors.append("checkpoint trainer world size is unavailable")
+            return
+        world_size = self.trainer_world_size
         expected_step = int(self.expected["publication_cycles"])
         root = self.run_dir / "checkpoints"
         tracker = root / "latest_checkpointed_iteration.txt"
@@ -1407,8 +1418,8 @@ class _Audit:
             role_dir = target / role
             missing: list[str] = []
             for kind in ("model", "optim", "extra_state"):
-                for rank in range(4):
-                    filename = f"{kind}_world_size_4_rank_{rank}.pt"
+                for rank in range(world_size):
+                    filename = f"{kind}_world_size_{world_size}_rank_{rank}.pt"
                     path = role_dir / filename
                     if (
                         not path.is_file()

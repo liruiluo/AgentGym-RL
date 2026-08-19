@@ -7,6 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import yaml
+from agentmemorygym_verl.config_contract import verify_resolved_config
 from agentmemorygym_verl.finalizer import finalize_run
 from finalizer_fixture import build_valid_run, mutate_json, sha256
 
@@ -993,6 +994,58 @@ class TestFinalizerRollouts(FinalizerTestCase):
 
 
 class TestFinalizerConfigAndCheckpoint(FinalizerTestCase):
+    def test_six_trainer_checkpoint_and_probe_world_size_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+            config = yaml.safe_load(
+                fixture["resolved_path"].read_text(encoding="utf-8")
+            )
+            config["trainer"]["n_gpus_per_node"] = 6
+            config["rollout"]["n_gpus_per_node"] = 2
+            config["actor_rollout_ref"]["actor"]["ppo_mini_batch_size"] = 510
+            config["critic"]["ppo_mini_batch_size"] = 510
+            config["async_training"]["require_batches"] = 64 / 510
+            text = yaml.safe_dump(config, sort_keys=True)
+            fixture["resolved_path"].write_text(text, encoding="utf-8")
+            fixture["hydra_path"].write_text(text, encoding="utf-8")
+
+            launch = json.loads(
+                fixture["launch_path"].read_text(encoding="utf-8")
+            )
+            launch["budget"] = verify_resolved_config(
+                config,
+                mode="gate",
+                expected_budget=launch["budget_contract"],
+            )
+            launch["resolved_config"]["sha256"] = sha256(
+                fixture["resolved_path"]
+            )
+            fixture["launch_path"].write_text(
+                json.dumps(launch, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+            checkpoint = fixture["checkpoint_root"] / "global_step_1"
+            for role in ("actor", "critic"):
+                role_dir = checkpoint / role
+                for path in role_dir.glob("*_world_size_4_rank_*.pt"):
+                    path.unlink()
+                for kind in ("model", "optim", "extra_state"):
+                    for rank in range(6):
+                        (role_dir / f"{kind}_world_size_6_rank_{rank}.pt").write_bytes(
+                            f"{role}:{kind}:{rank}".encode()
+                        )
+
+            def set_worker_count(stats: dict) -> None:
+                for evidence in stats["latest_parameter_update_probe"].values():
+                    evidence["worker_count"] = 6
+
+            mutate_runtime_statistics(fixture, "trainer", set_worker_count)
+
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+
+            self.assertEqual(verdict["status"], "pass", verdict)
+
     def test_hydra_interpolation_is_resolved_before_drift_comparison(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.build(Path(directory))
