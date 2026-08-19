@@ -458,6 +458,8 @@ def build_valid_run(run_dir: Path, mode: str = "gate") -> dict:
                     "data": {
                         "actor/grad_norm": 1.0,
                         "critic/grad_norm": 1.0,
+                        "fully_async/count/current_param_version": publication,
+                        "fully_async/count/stale_trajectory_processed": 0,
                         "fully_async/count/terminal_underfill_samples": 0,
                         "rollout_corr/bypass_real_token_count": real_token_count,
                         "rollout_corr/bypass_max_abs_diff": 0.0,

@@ -144,6 +144,16 @@ def _positive_int(value: Any) -> int | None:
     return value
 
 
+def _nonnegative_integral(value: Any) -> int | None:
+    """Normalize JSON integer metrics, including FileLogger's integral floats."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value) or value < 0 or int(value) != value:
+        return None
+    return int(value)
+
+
 def _lcm(left: int, right: int) -> int:
     return abs(left * right) // math.gcd(left, right)
 
@@ -168,6 +178,7 @@ class _Audit:
             "real_action_rows": 0,
             "derived_padding_action_rows": 0,
             "real_response_tokens": 0,
+            "stale_action_rows": 0,
             "policy_version_min": 0,
             "policy_version_max": 0,
             "validation_events": 0,
@@ -494,6 +505,8 @@ class _Audit:
         actor_probe_rows = 0
         critic_probe_rows = 0
         bypass_real_tokens = 0
+        current_param_versions: dict[int, int] = {}
+        native_stale_action_rows: dict[int, int] = {}
         observed_steps: list[int] = []
         rows_by_step: dict[int, list[Mapping[str, Any]]] = {}
         for index, row in enumerate(rows):
@@ -620,6 +633,42 @@ class _Audit:
                     and critic_probes[0] in (True, 1, 1.0)
                 )
 
+                current_versions = [
+                    value
+                    for key, value in items
+                    if key == "fully_async/count/current_param_version"
+                ]
+                current_version = (
+                    _nonnegative_integral(current_versions[0])
+                    if len(current_versions) == 1
+                    else None
+                )
+                self.check(
+                    current_version is not None,
+                    f"FileLogger publication step {step} has no unique integral "
+                    "current parameter version",
+                )
+                if current_version is not None:
+                    current_param_versions[step] = current_version
+
+                stale_counts = [
+                    value
+                    for key, value in items
+                    if key == "fully_async/count/stale_trajectory_processed"
+                ]
+                stale_count = (
+                    _nonnegative_integral(stale_counts[0])
+                    if len(stale_counts) == 1
+                    else None
+                )
+                self.check(
+                    stale_count is not None,
+                    f"FileLogger publication step {step} has no unique integral "
+                    "native stale action-row count",
+                )
+                if stale_count is not None:
+                    native_stale_action_rows[step] = stale_count
+
             self.check(
                 bypass_evidence_rows == publications,
                 "FileLogger old/rollout logprob evidence does not cover every publication cycle",
@@ -632,13 +681,37 @@ class _Audit:
                 critic_probe_rows == publications,
                 "FileLogger critic parameter-update probe does not cover every publication cycle",
             )
+            if len(current_param_versions) == publications:
+                self.check(
+                    [current_param_versions[step] for step in range(1, publications + 1)]
+                    == list(range(publications)),
+                    "FileLogger current parameter versions do not match publication order",
+                )
+            if len(native_stale_action_rows) == publications:
+                stale_sequence = [
+                    native_stale_action_rows[step]
+                    for step in range(1, publications + 1)
+                ]
+                self.check(
+                    stale_sequence == sorted(stale_sequence),
+                    "FileLogger native stale action-row count is not cumulative",
+                )
         self.counts["validation_events"] += validation_metrics
+        current_param_versions_by_update: dict[int, int] = {}
+        if self.expected is not None:
+            trigger = int(self.expected["trigger_parameter_sync_step"])
+            for publication, version in current_param_versions.items():
+                first_update = (publication - 1) * trigger + 1
+                for update in range(first_update, first_update + trigger):
+                    current_param_versions_by_update[update] = version
         self._file_logger_summary = {
             "rows": len(rows),
             "bypass_evidence_rows": bypass_evidence_rows,
             "actor_probe_rows": actor_probe_rows,
             "critic_probe_rows": critic_probe_rows,
             "bypass_real_tokens": bypass_real_tokens,
+            "current_param_versions_by_update": current_param_versions_by_update,
+            "native_stale_action_rows_by_publication": native_stale_action_rows,
         }
 
     @staticmethod
@@ -908,6 +981,9 @@ class _Audit:
         real_rows = 0
         derived_padding_rows = 0
         real_tokens = 0
+        stale_action_rows = 0
+        stale_action_rows_by_publication: dict[int, int] = {}
+        staleness_diffs: Counter[int] = Counter()
         version_pairs: Counter[str] = Counter()
         versions: set[int] = set()
         terminal_ids: list[str] = []
@@ -915,6 +991,17 @@ class _Audit:
         seen_uids: set[str] = set()
         samples_per_update = (
             int(self.expected["samples_per_update"]) if self.expected else 0
+        )
+        trigger = (
+            int(self.expected["trigger_parameter_sync_step"])
+            if self.expected
+            else 0
+        )
+        file_logger_summary = getattr(self, "_file_logger_summary", None)
+        current_versions_by_update = (
+            file_logger_summary.get("current_param_versions_by_update", {})
+            if isinstance(file_logger_summary, Mapping)
+            else {}
         )
 
         for ordinal, path in enumerate(paths, start=1):
@@ -928,6 +1015,11 @@ class _Audit:
                 file_step_values == {ordinal},
                 f"rollout JSONL {path.name} has unexpected optimizer step(s)",
             )
+            current_version = current_versions_by_update.get(ordinal)
+            if current_version is None:
+                self.errors.append(
+                    f"rollout update {ordinal} has no FileLogger current parameter version"
+                )
             episodes_by_uid: dict[
                 str, list[tuple[Mapping[str, Any], Mapping[str, Any]]]
             ] = {}
@@ -985,6 +1077,15 @@ class _Audit:
                 else:
                     versions.update((minimum, maximum))
                     version_pairs[f"{minimum}:{maximum}"] += 1
+                    if current_version is not None:
+                        staleness = current_version - maximum
+                        self.check(
+                            staleness >= 0,
+                            f"rollout update {ordinal} contains a future policy version",
+                        )
+                        if staleness >= 0:
+                            staleness_diffs[staleness] += 1
+                            stale_action_rows += int(staleness >= 1)
 
                 uid = record.get("trajectory_uid")
                 order = record.get("trajectory_row_order")
@@ -1072,6 +1173,8 @@ class _Audit:
                 memory_chain_updates.append(ordinal)
             if self.batch_multiple is not None:
                 derived_padding_rows += (-real_rows_in_file) % self.batch_multiple
+            if trigger > 0 and ordinal % trigger == 0:
+                stale_action_rows_by_publication[ordinal // trigger] = stale_action_rows
 
         if versions and self.expected is not None:
             publication_cycles = int(self.expected["publication_cycles"])
@@ -1079,12 +1182,21 @@ class _Audit:
                 min(versions) >= 0 and max(versions) <= publication_cycles,
                 "rollout policy-version span exceeds the published learner horizon",
             )
-        file_logger_summary = getattr(self, "_file_logger_summary", None)
         if isinstance(file_logger_summary, Mapping):
             self.check(
                 file_logger_summary.get("bypass_real_tokens") == real_tokens,
                 "FileLogger old/rollout logprob real-token total differs from rollout data",
             )
+            native_stale = file_logger_summary.get(
+                "native_stale_action_rows_by_publication"
+            )
+            if isinstance(native_stale, Mapping):
+                for publication, reconstructed in stale_action_rows_by_publication.items():
+                    self.check(
+                        native_stale.get(publication) == reconstructed,
+                        "FileLogger/native stale action-row count mismatch at "
+                        f"publication {publication}",
+                    )
 
         memory_chains = len(memory_chain_updates)
         self.check(
@@ -1107,6 +1219,7 @@ class _Audit:
             real_action_rows=real_rows,
             derived_padding_action_rows=derived_padding_rows,
             real_response_tokens=real_tokens,
+            stale_action_rows=stale_action_rows,
             memory_chains=memory_chains,
             late_memory_chains=late_memory_chains,
         )
@@ -1117,6 +1230,9 @@ class _Audit:
             "real_rows": real_rows,
             "derived_padding_rows": derived_padding_rows,
             "real_tokens": real_tokens,
+            "stale_action_rows": stale_action_rows,
+            "stale_action_rows_by_publication": stale_action_rows_by_publication,
+            "staleness_diffs": dict(sorted(staleness_diffs.items())),
             "version_pairs": dict(sorted(version_pairs.items())),
             "versions": sorted(versions),
             "terminal_ids": terminal_ids,
@@ -1282,11 +1398,23 @@ class _Audit:
                 f"native trainer {field} mismatch",
             )
         stale_processed = trainer.get("stale_trajectory_processed")
-        self.check(
+        valid_stale_processed = (
             isinstance(stale_processed, int)
             and not isinstance(stale_processed, bool)
-            and 0 <= stale_processed <= episodes,
-            "native trainer stale_trajectory_processed is invalid",
+            and 0 <= stale_processed <= self.counts["real_action_rows"]
+        )
+        self.check(
+            valid_stale_processed,
+            "native trainer stale_trajectory_processed is not a valid action-row count",
+        )
+        # veRL retains the historical field name, but AMG expands every trajectory
+        # into action rows before PPO.  Upstream therefore evaluates one
+        # trajectory_param_versions entry per action row here.
+        self.check(
+            valid_stale_processed
+            and stale_processed == self.counts["stale_action_rows"],
+            "native trainer stale_trajectory_processed differs from the "
+            "independently reconstructed stale action-row count",
         )
         bypass = trainer.get("latest_bypass_log_prob_evidence")
         self.check(

@@ -1681,7 +1681,11 @@ def run_gpu_monitor(
             while not stopped and time.monotonic() < deadline:
                 if not process_identity_alive(parent_pid, parent_start_ticks):
                     break
-                time.sleep(min(0.1, deadline - time.monotonic()))
+                sleep_seconds = min(
+                    0.1, max(0.0, deadline - time.monotonic())
+                )
+                if sleep_seconds > 0:
+                    time.sleep(sleep_seconds)
     status = (
         "pass"
         if active_sampler_process_groups == 0 and sampler_cleanup_uncertain == 0

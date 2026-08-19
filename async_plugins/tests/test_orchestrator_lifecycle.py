@@ -1903,6 +1903,59 @@ class TestAtomicPublication(unittest.TestCase):
 
 
 class TestGpuMonitorFailClosed(unittest.TestCase):
+    def test_deadline_crossing_never_requests_a_negative_sleep(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            identities = iter((True, True, True, False))
+            monotonic_values = iter((0.0, 0.0, 0.0, 0.05, 0.11, 0.12))
+            sleeps: list[float] = []
+
+            def record_sleep(seconds: float) -> None:
+                self.assertGreaterEqual(seconds, 0.0)
+                sleeps.append(seconds)
+
+            sample = subprocess.CompletedProcess(
+                args=["nvidia-smi"], returncode=0, stdout="ok\n", stderr=""
+            )
+            with (
+                mock.patch.object(
+                    lifecycle,
+                    "process_identity_alive",
+                    side_effect=lambda *_args: next(identities, False),
+                ),
+                mock.patch.object(
+                    lifecycle,
+                    "_run_gpu_sample",
+                    return_value=(sample, False, []),
+                ),
+                mock.patch.object(
+                    lifecycle.time,
+                    "monotonic",
+                    side_effect=lambda: next(monotonic_values),
+                ),
+                mock.patch.object(
+                    lifecycle.time,
+                    "sleep",
+                    side_effect=record_sleep,
+                ),
+            ):
+                rc = lifecycle.run_gpu_monitor(
+                    parent_pid=1,
+                    parent_start_ticks="1",
+                    output_path=root / "gpu.csv",
+                    stderr_path=root / "gpu.stderr",
+                    ready_path=root / "ready.json",
+                    receipt_path=root / "receipt.json",
+                    nvidia_smi="nvidia-smi",
+                    interval_seconds=0.1,
+                    command_timeout_seconds=0.01,
+                )
+
+            report = json.loads((root / "receipt.json").read_text(encoding="utf-8"))
+            self.assertEqual(rc, 0)
+            self.assertEqual(report["status"], "pass")
+            self.assertTrue(all(seconds >= 0 for seconds in sleeps))
+
     def test_unknown_sampler_exception_cannot_emit_pass(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

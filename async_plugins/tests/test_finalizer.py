@@ -99,6 +99,57 @@ def rewrite_metrics(fixture: dict, mutation: JsonMutation) -> None:
     )
 
 
+def make_post_initial_action_rows_stale(fixture: dict) -> int:
+    """Make every action row after update 1 exactly one policy version stale."""
+
+    stale_action_rows = 0
+    stale_cumulative_by_update: dict[int, int] = {}
+    for path in sorted(
+        fixture["rollout_dir"].glob("*.jsonl"), key=lambda item: int(item.stem)
+    ):
+        update = int(path.stem)
+        documents = [
+            json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+        ]
+        current_version = update - 1
+        for document in documents:
+            record = json.loads(document["step_record_json"])
+            if update > 1:
+                record["min_global_steps"] = current_version - 1
+                record["max_global_steps"] = current_version - 1
+                stale_action_rows += 1
+            document["step_record_json"] = json.dumps(record, sort_keys=True)
+        path.write_text(
+            "\n".join(json.dumps(document, sort_keys=True) for document in documents)
+            + "\n",
+            encoding="utf-8",
+        )
+        stale_cumulative_by_update[update] = stale_action_rows
+
+    metric_rows = [
+        json.loads(line)
+        for line in fixture["metrics_path"].read_text(encoding="utf-8").splitlines()
+    ]
+    for row in metric_rows:
+        update = int(row["step"])
+        row["data"]["fully_async/count/current_param_version"] = update - 1
+        row["data"]["fully_async/count/stale_trajectory_processed"] = (
+            stale_cumulative_by_update[update]
+        )
+    fixture["metrics_path"].write_text(
+        "\n".join(json.dumps(row, sort_keys=True) for row in metric_rows) + "\n",
+        encoding="utf-8",
+    )
+    mutate_runtime_statistics(
+        fixture,
+        "trainer",
+        lambda statistics: statistics.update(
+            stale_trajectory_processed=stale_action_rows
+        ),
+    )
+    return stale_action_rows
+
+
 class FinalizerTestCase(unittest.TestCase):
     def build(self, root: Path, mode: str = "gate") -> dict:
         return build_valid_run(root / "run", mode=mode)
@@ -296,6 +347,19 @@ class TestFinalizerMissingArtifacts(FinalizerTestCase):
 
 
 class TestFinalizerRuntimeReceipt(FinalizerTestCase):
+    def test_native_stale_counter_tracks_action_rows_not_episodes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory), mode="formal")
+            stale_action_rows = make_post_initial_action_rows_stale(fixture)
+
+            self.assertGreater(stale_action_rows, len(fixture["schedule_rows"]))
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+
+            self.assertEqual(verdict["status"], "pass", verdict)
+            self.assertEqual(
+                verdict["counts"]["stale_action_rows"], stale_action_rows
+            )
+
     def test_wrapper_and_terminal_metadata_mismatches_fail(self):
         wrapper_cases: tuple[tuple[str, JsonMutation], ...] = (
             ("wrapper step", lambda wrapper: wrapper.update(step=0)),
@@ -607,6 +671,18 @@ class TestFinalizerFileLogger(FinalizerTestCase):
             (
                 "critic update metric",
                 lambda row: row["data"].update(**{"critic/grad_norm": 0.0}),
+            ),
+            (
+                "current parameter versions",
+                lambda row: row["data"].update(
+                    **{"fully_async/count/current_param_version": 1}
+                ),
+            ),
+            (
+                "stale action-row count mismatch",
+                lambda row: row["data"].update(
+                    **{"fully_async/count/stale_trajectory_processed": 1}
+                ),
             ),
         )
         for expected, mutation in cases:
