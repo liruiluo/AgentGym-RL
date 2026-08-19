@@ -219,6 +219,33 @@ stop_exact_child() {
   printf -v "$ticks_var" ''
 }
 
+wait_trainer_with_marker_watcher() {
+  local watcher_failure=0 trainer_rc=125
+  while process_alive_exact "$TRAIN_PID" "$TRAIN_TICKS"; do
+    if ! process_alive_exact "$MARKER_WATCH_PID" "$MARKER_WATCH_TICKS"; then
+      echo "marker watcher died while trainer was active" >&2
+      watcher_failure=1
+      CLEANUP_STATUS=fail
+      stop_exact_child trainer TRAIN_PID TRAIN_TICKS 30
+      break
+    fi
+    sleep 0.5
+  done
+  if [ "$watcher_failure" -eq 1 ]; then
+    return 125
+  fi
+  if ! process_alive_exact "$MARKER_WATCH_PID" "$MARKER_WATCH_TICKS"; then
+    echo "marker watcher died before trainer completion was reaped" >&2
+    watcher_failure=1
+    CLEANUP_STATUS=fail
+  fi
+  if wait "$TRAIN_PID"; then trainer_rc=0; else trainer_rc=$?; fi
+  TRAIN_PID=
+  TRAIN_TICKS=
+  if [ "$watcher_failure" -eq 1 ]; then return 125; fi
+  return "$trainer_rc"
+}
+
 select_latest_publication() {
   local output=$1
   "$PY" "$LIFECYCLE" select-latest-publication \
@@ -306,7 +333,16 @@ cleanup_runtime() {
   restore_marker_transaction || true
   if [ "$CLEANUP_STATUS" = pass ]; then
     RUNTIME_CLEANED=1
+    return 0
   fi
+  return 1
+}
+
+cleanup_before_publication() {
+  cleanup_runtime || return 125
+  [ "$RUNTIME_CLEANED" -eq 1 ] || return 125
+  [ "$CLEANUP_STATUS" = pass ] || return 125
+  return 0
 }
 
 cleanup() {
@@ -511,7 +547,7 @@ nohup "$PY" "$LIFECYCLE" marker-watch \
   --state "$MARKER_STATE" --lock "$MARKER_LOCK" \
   --parent-pid "$PARENT_PID" --parent-start-ticks "$PARENT_TICKS" \
   --ready "$MARKER_WATCH_READY" --receipt "$MARKER_WATCH_RECEIPT" \
-  --poll-seconds 0.5 --restore-timeout-seconds 300 \
+  --poll-seconds 0.1 --restore-timeout-seconds 300 \
   </dev/null >> "$RUN_DIR/marker-transaction/watcher.log" 2>&1 &
 MARKER_WATCH_PID=$!
 capture_ticks "$MARKER_WATCH_PID" MARKER_WATCH_TICKS
@@ -521,8 +557,17 @@ for _ in $(seq 1 100); do
   sleep 0.1
 done
 grep -q '"status": "ready"' "$MARKER_WATCH_READY"
+grep -q '"signal_handlers_installed": true' "$MARKER_WATCH_READY"
+process_alive_exact "$MARKER_WATCH_PID" "$MARKER_WATCH_TICKS" || {
+  echo "marker watcher died after readiness handoff" >&2
+  exit 125
+}
 "$PY" "$LIFECYCLE" marker-acquire --state "$MARKER_STATE" --lock "$MARKER_LOCK"
 "$PY" "$LIFECYCLE" marker-status --state "$MARKER_STATE" --require acquired
+process_alive_exact "$MARKER_WATCH_PID" "$MARKER_WATCH_TICKS" || {
+  echo "marker watcher died during marker acquisition" >&2
+  exit 125
+}
 for _ in $(seq 1 120); do
   grep -q 'mode=yield' /tmp/crg-holder.state 2>/dev/null && break
   sleep 0.25
@@ -607,15 +652,12 @@ printf '%s\n' "$(date -u +%FT%TZ)" > "$RUN_DIR/trainer-started-at"
 TRAIN_PID=$!
 capture_ticks "$TRAIN_PID" TRAIN_TICKS
 printf '%s %s\n' "$TRAIN_PID" "$TRAIN_TICKS" > "$RUN_DIR/train.identity"
-if wait "$TRAIN_PID"; then TRAIN_RC=0; else TRAIN_RC=$?; fi
-TRAIN_PID=
-TRAIN_TICKS=
+if wait_trainer_with_marker_watcher; then TRAIN_RC=0; else TRAIN_RC=$?; fi
 printf '%s\n' "$TRAIN_RC" > "$RUN_DIR/trainer-exit-code"
 [ "$TRAIN_RC" -eq 0 ] || exit "$TRAIN_RC"
 
 curl -fsS -m 30 "$ENV_ADDR/metadata" > "$RUN_DIR/endpoint-metadata-after.json"
-cleanup_runtime
-[ "$RUNTIME_CLEANED" -eq 1 ] && [ "$CLEANUP_STATUS" = pass ]
+cleanup_before_publication || exit $?
 [ "$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' \
   "$RUN_DIR/finalization.json")" = pass ]
 

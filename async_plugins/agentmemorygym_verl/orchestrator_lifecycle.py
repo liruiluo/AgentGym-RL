@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ctypes
+import errno
 import fcntl
 import glob
 import hashlib
@@ -24,7 +26,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -108,7 +110,9 @@ def process_identity_alive(pid: int, start_ticks: str) -> bool:
     )
 
 
-def _read_marker(path: Path) -> str | None:
+def _read_marker_with_metadata(
+    path: Path,
+) -> tuple[str | None, os.stat_result | None]:
     if path.is_symlink():
         raise LifecycleError(f"marker must not be a symlink: {path}")
     flags = os.O_RDONLY | os.O_NONBLOCK
@@ -119,12 +123,12 @@ def _read_marker(path: Path) -> str | None:
     try:
         descriptor = os.open(path, flags)
     except FileNotFoundError:
-        return None
+        return None, None
     except OSError as error:
         raise LifecycleError(f"cannot open marker {path}: {error}") from error
     try:
-        mode = os.fstat(descriptor).st_mode
-        if not stat.S_ISREG(mode):
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
             raise LifecycleError(f"marker must be a regular file: {path}")
         raw = os.read(descriptor, 4097)
         if len(raw) > 4096:
@@ -139,7 +143,88 @@ def _read_marker(path: Path) -> str | None:
         os.close(descriptor)
     if not value:
         raise LifecycleError(f"marker must not be empty: {path}")
+    return value, metadata
+
+
+def _read_marker(path: Path) -> str | None:
+    value, _metadata = _read_marker_with_metadata(path)
     return value
+
+
+def _marker_file_type(mode: int) -> str:
+    if stat.S_ISREG(mode):
+        return "regular"
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    if stat.S_ISFIFO(mode):
+        return "fifo"
+    if stat.S_ISDIR(mode):
+        return "directory"
+    return "other"
+
+
+def _add_marker_metadata(observed: dict[str, Any], metadata: os.stat_result) -> None:
+    observed.update(
+        {
+            "exists": True,
+            "device": metadata.st_dev,
+            "inode": metadata.st_ino,
+            "mode": stat.S_IMODE(metadata.st_mode),
+            "uid": metadata.st_uid,
+            "gid": metadata.st_gid,
+            "size": metadata.st_size,
+            "mtime_ns": metadata.st_mtime_ns,
+            "ctime_ns": metadata.st_ctime_ns,
+            "file_type": _marker_file_type(metadata.st_mode),
+        }
+    )
+
+
+def _marker_observation(path: Path) -> dict[str, Any]:
+    """Atomically read a regular marker's value plus opened-inode metadata."""
+
+    observed: dict[str, Any] = {"path": str(path), "exists": False, "value": None}
+    try:
+        value, metadata = _read_marker_with_metadata(path)
+    except LifecycleError as error:
+        observed["error"] = f"{type(error).__name__}: {error}"
+        try:
+            diagnostic_metadata = os.lstat(path)
+        except OSError:
+            return observed
+        _add_marker_metadata(observed, diagnostic_metadata)
+        return observed
+    observed["value"] = value
+    if metadata is not None:
+        _add_marker_metadata(observed, metadata)
+    return observed
+
+
+def _owned_marker_identity(observation: dict[str, Any]) -> dict[str, int]:
+    required = ("device", "inode", "ctime_ns")
+    if observation.get("value") is None or not all(
+        isinstance(observation.get(key), int) for key in required
+    ):
+        raise LifecycleError(
+            f"cannot record owned marker identity: {observation.get('path')}"
+        )
+    return {key: int(observation[key]) for key in required}
+
+
+def _marker_identity_matches(
+    observation: Mapping[str, Any],
+    expected: Mapping[str, Any] | None,
+    *,
+    include_ctime: bool,
+) -> bool:
+    if expected is None:
+        return True
+    keys = ("device", "inode", "ctime_ns") if include_ctime else ("device", "inode")
+    return all(
+        isinstance(expected.get(key), int)
+        and observation.get(key) == expected[key]
+        for key in keys
+    )
 
 
 def _write_marker(path: Path, value: str) -> None:
@@ -148,49 +233,263 @@ def _write_marker(path: Path, value: str) -> None:
     _atomic_write_text(path, value + "\n", mode=0o600)
 
 
-def _create_marker_exclusive(path: Path, value: str) -> None:
+def _marker_transition_token(transition_id: str) -> str:
+    return hashlib.sha256(transition_id.encode("utf-8")).hexdigest()[:24]
+
+
+def _marker_transition_backup(path: Path, transition_id: str) -> Path:
+    token = _marker_transition_token(transition_id)
+    return path.with_name(f".{path.name}.{token}.transition")
+
+
+def _marker_transition_claim(path: Path, transition_id: str) -> Path:
+    token = _marker_transition_token(transition_id)
+    return path.with_name(f".{path.name}.{token}.claim")
+
+
+def _inode_identity(observation: Mapping[str, Any]) -> dict[str, int]:
+    required = ("device", "inode")
+    if not all(isinstance(observation.get(key), int) for key in required):
+        raise LifecycleError(
+            f"cannot record marker inode identity: {observation.get('path')}"
+        )
+    return {key: int(observation[key]) for key in required}
+
+
+def _create_marker_claim(
+    path: Path,
+    value: str,
+    *,
+    transition_id: str,
+) -> dict[str, int]:
+    """Create a fully-written retained claim without touching ``path``.
+
+    The deterministic claim pathname must be absent.  A random staging hardlink
+    is deliberately retained as another inode pin: cleanup by pathname would
+    reintroduce the exact check/unlink race this transaction is designed to
+    avoid.  These run-scoped files are tiny forensic evidence.
+    """
+
     if not value or "\n" in value:
         raise LifecycleError(f"invalid marker value for {path}: {value!r}")
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, raw_temp = tempfile.mkstemp(
-        prefix=f".{path.name}.claim.", dir=path.parent
+    claim = _marker_transition_claim(path, transition_id)
+    claim_observation = _marker_observation(claim)
+    if claim_observation.get("exists") or claim_observation.get("error"):
+        raise LifecycleError(
+            f"marker transition claim already exists or is invalid: "
+            f"{claim_observation!r}"
+        )
+
+    token = _marker_transition_token(transition_id)
+    descriptor, raw_stage = tempfile.mkstemp(
+        prefix=f".{path.name}.{token}.claim-stage.", dir=path.parent
     )
-    temp = Path(raw_temp)
+    stage = Path(raw_stage)
     try:
         os.fchmod(descriptor, 0o600)
-        stream = os.fdopen(descriptor, "wb")
-        descriptor = -1
-        with stream:
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
             stream.write((value + "\n").encode("utf-8"))
             stream.flush()
             os.fsync(stream.fileno())
         try:
             try:
-                os.link(temp, path, follow_symlinks=False)
-            except TypeError:  # pragma: no cover - Python without follow_symlinks
-                os.link(temp, path)
+                os.link(stage, claim, follow_symlinks=False)
+            except TypeError:  # pragma: no cover - old Python compatibility
+                os.link(stage, claim)
         except FileExistsError as error:
             raise LifecycleError(
-                f"marker appeared during exclusive claim: {path}"
+                f"marker transition claim appeared during creation: {claim}"
             ) from error
         _fsync_directory(path.parent)
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-        with contextlib.suppress(FileNotFoundError):
-            temp.unlink()
-        _fsync_directory(path.parent)
+        # Retain ``stage``.  Removing a pathname after an identity check would
+        # permit a non-cooperating writer to swap in a foreign inode first.
+
+    claim_observation = _marker_observation(claim)
+    if (
+        claim_observation.get("value") != value
+        or not _same_inode(stage, claim)
+        or claim_observation.get("error")
+    ):
+        raise LifecycleError(
+            f"marker transition claim changed during creation: "
+            f"{claim_observation!r}"
+        )
+    return _inode_identity(claim_observation)
 
 
-def _restore_quarantined_marker(backup: Path, path: Path) -> None:
+def _verify_marker_claim(
+    path: Path,
+    value: str,
+    *,
+    transition_id: str,
+    expected_identity: Mapping[str, Any],
+) -> tuple[Path, dict[str, Any]]:
+    claim = _marker_transition_claim(path, transition_id)
+    observation = _marker_observation(claim)
+    if (
+        observation.get("value") != value
+        or observation.get("error")
+        or not _marker_identity_matches(
+            observation, expected_identity, include_ctime=False
+        )
+    ):
+        raise LifecycleError(
+            f"marker transition claim mismatch for {path}: "
+            f"wanted={value!r}/{dict(expected_identity)!r}, "
+            f"observed={observation!r}"
+        )
+    return claim, observation
+
+
+def _install_marker_claim(
+    path: Path,
+    value: str,
+    *,
+    transition_id: str,
+    claim_identity: Mapping[str, Any],
+) -> dict[str, int]:
+    """Install the exact pre-recorded claim inode at an absent marker path."""
+
+    claim, _claim_observation = _verify_marker_claim(
+        path,
+        value,
+        transition_id=transition_id,
+        expected_identity=claim_identity,
+    )
+    current = _marker_observation(path)
+    if current.get("exists") or current.get("error"):
+        if (
+            current.get("value") == value
+            and not current.get("error")
+            and _marker_identity_matches(
+                current, claim_identity, include_ctime=False
+            )
+        ):
+            return _owned_marker_identity(current)
+        raise LifecycleError(
+            f"foreign marker appeared during exact claim install: {current!r}"
+        )
     try:
-        os.link(backup, path)
+        try:
+            os.link(claim, path, follow_symlinks=False)
+        except TypeError:  # pragma: no cover - old Python compatibility
+            os.link(claim, path)
+    except FileExistsError as error:
+        current = _marker_observation(path)
+        if not (
+            current.get("value") == value
+            and not current.get("error")
+            and _marker_identity_matches(
+                current, claim_identity, include_ctime=False
+            )
+        ):
+            raise LifecycleError(
+                f"foreign marker won exact claim install: {current!r}"
+            ) from error
+    _fsync_directory(path.parent)
+    installed = _marker_observation(path)
+    # Re-read both names after the link.  A writer may replace either pathname
+    # between the precheck and link; never accept a same-value foreign inode.
+    _verify_marker_claim(
+        path,
+        value,
+        transition_id=transition_id,
+        expected_identity=claim_identity,
+    )
+    if (
+        installed.get("value") != value
+        or installed.get("error")
+        or not _marker_identity_matches(
+            installed, claim_identity, include_ctime=False
+        )
+    ):
+        raise LifecycleError(
+            f"exact marker claim identity changed during install: {installed!r}"
+        )
+    return _owned_marker_identity(installed)
+
+
+def _rename_noreplace(source: Path, destination: Path) -> None:
+    """Atomically move ``source`` only when ``destination`` is absent.
+
+    A marker writer that ignores our advisory lock can replace the pathname at
+    any time.  Linux ``renameat2(RENAME_NOREPLACE)`` and Darwin
+    ``renamex_np(RENAME_EXCL)`` make pathname removal and quarantine install one
+    kernel operation.  The caller validates the inode the kernel actually moved
+    and never performs a later pathname unlink.
+    """
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_raw = os.fsencode(source)
+    destination_raw = os.fsencode(destination)
+    if sys.platform.startswith("linux"):
+        function = getattr(libc, "renameat2", None)
+        if function is None:
+            raise LifecycleError(
+                "renameat2(RENAME_NOREPLACE) is required for marker safety"
+            )
+        function.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        function.restype = ctypes.c_int
+        result = function(-100, source_raw, -100, destination_raw, 1)
+    elif sys.platform == "darwin":
+        function = getattr(libc, "renamex_np", None)
+        if function is None:  # pragma: no cover - all supported macOS has it
+            raise LifecycleError("renamex_np(RENAME_EXCL) is unavailable")
+        function.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
+        function.restype = ctypes.c_int
+        result = function(source_raw, destination_raw, 0x00000004)
+    else:  # pragma: no cover - production and development are Linux/Darwin
+        raise LifecycleError(
+            f"no atomic no-replace rename primitive on {sys.platform}"
+        )
+    if result == 0:
+        _fsync_directory(source.parent)
+        if destination.parent != source.parent:
+            _fsync_directory(destination.parent)
+        return
+    error_number = ctypes.get_errno()
+    if error_number == errno.EEXIST:
+        raise FileExistsError(error_number, os.strerror(error_number), destination)
+    if error_number == errno.ENOENT:
+        raise FileNotFoundError(error_number, os.strerror(error_number), source)
+    raise OSError(
+        error_number,
+        f"atomic no-replace rename failed: {source} -> {destination}: "
+        f"{os.strerror(error_number)}",
+    )
+
+
+def _restore_quarantined_marker(
+    backup: Path,
+    path: Path,
+    *,
+    moved_identity: Mapping[str, Any] | None = None,
+) -> None:
+    try:
+        _rename_noreplace(backup, path)
     except FileExistsError as error:
         raise LifecycleError(
             f"foreign marker appeared while restoring quarantined marker: {path}"
         ) from error
-    backup.unlink()
-    _fsync_directory(path.parent)
+    if moved_identity is not None:
+        restored = _marker_observation(path)
+        if not _marker_identity_matches(
+            restored, moved_identity, include_ctime=False
+        ):
+            raise LifecycleError(
+                f"quarantined marker identity changed during restore: {restored!r}"
+            )
 
 
 def _same_inode(left: Path, right: Path) -> bool:
@@ -208,39 +507,40 @@ def _same_inode(left: Path, right: Path) -> bool:
 
 
 def _quarantine_marker_noreplace(path: Path, backup: Path) -> None:
-    """Move a marker to quarantine without replacing an existing backup.
-
-    The hard-link is the no-replace linearization point.  The source name stays
-    present until both names are proven to reference the same inode, so a
-    concurrent exclusive claimant cannot enter between quarantine preparation
-    and source unlink.  A crash while both links exist is resumed by
-    :func:`_cas_marker`.
-    """
+    """Atomically retain the current marker inode at a run-scoped path."""
 
     try:
-        try:
-            os.link(path, backup, follow_symlinks=False)
-        except TypeError:  # pragma: no cover - Python without follow_symlinks
-            os.link(path, backup)
-    except FileExistsError:
-        raise
-    except FileNotFoundError:
+        _rename_noreplace(path, backup)
+    except (FileExistsError, FileNotFoundError):
         raise
     except OSError as error:
         raise LifecycleError(
             f"cannot quarantine marker without replacement {path}: {error}"
         ) from error
-    if not _same_inode(path, backup):
-        raise LifecycleError(
-            f"marker quarantine inode verification failed: {path} -> {backup}"
+
+
+def _transition_backup_observation(
+    path: Path,
+    *,
+    transition_id: str,
+    expected: str,
+    expected_identity: Mapping[str, Any],
+) -> tuple[Path, dict[str, Any]]:
+    backup = _marker_transition_backup(path, transition_id)
+    observation = _marker_observation(backup)
+    if (
+        observation.get("value") != expected
+        or observation.get("error")
+        or not _marker_identity_matches(
+            observation, expected_identity, include_ctime=False
         )
-    path.unlink()
-    _fsync_directory(path.parent)
-
-
-def _marker_transition_backup(path: Path, transition_id: str) -> Path:
-    token = hashlib.sha256(transition_id.encode("utf-8")).hexdigest()[:24]
-    return path.with_name(f".{path.name}.{token}.transition")
+    ):
+        raise LifecycleError(
+            f"marker transition backup mismatch for {path}: "
+            f"expected={expected!r}/{dict(expected_identity)!r}, "
+            f"backup={observation!r}"
+        )
+    return backup, observation
 
 
 def _cas_marker(
@@ -249,99 +549,203 @@ def _cas_marker(
     replacement: str | None,
     *,
     transition_id: str = "default",
-) -> None:
-    """Transition a marker without ever overwriting a concurrent writer.
+    expected_identity: Mapping[str, Any] | None = None,
+    replacement_claim_identity: Mapping[str, Any] | None = None,
+) -> dict[str, int] | None:
+    """Apply or recover an inode-authenticated marker transition.
 
-    POSIX regular files do not expose compare-and-swap.  For a present marker,
-    move the current inode to a deterministic quarantine path, validate it,
-    then create the replacement with O_EXCL.  A concurrent non-cooperating
-    writer can make the transition fail, but its claim is never overwritten.
-    The quarantine path also makes a crash between rename and create
-    recoverable and idempotent.
+    A replacement claim is created and its inode persisted by the transaction
+    state *before* this function is called.  Source markers are retained at a
+    deterministic quarantine pathname.  Neither pathname is unlinked, so a
+    non-cooperating writer cannot swap in a foreign inode that cleanup deletes.
+    The retained source plus retained claim make the operation idempotent across
+    a crash after either quarantine or commit.
     """
 
-    backup = _marker_transition_backup(path, transition_id)
-    if backup.is_symlink():
-        raise LifecycleError(f"marker transition backup is a symlink: {backup}")
-
-    if backup.exists():
-        observed_backup = _read_marker(backup)
-        if observed_backup != expected:
-            if _read_marker(path) is None:
-                _restore_quarantined_marker(backup, path)
-            raise LifecycleError(
-                f"marker transition backup mismatch for {path}: "
-                f"expected={expected!r}, backup={observed_backup!r}"
-            )
-        current = _read_marker(path)
-        if current == expected and _same_inode(path, backup):
-            path.unlink()
-            _fsync_directory(path.parent)
-            current = None
-        if current is None:
-            if replacement is not None:
-                _create_marker_exclusive(path, replacement)
-        elif current != replacement:
-            raise LifecycleError(
-                f"foreign marker appeared during transition for {path}: {current!r}"
-            )
-        backup.unlink()
-        _fsync_directory(path.parent)
-        if _read_marker(path) != replacement:
-            raise LifecycleError(
-                f"marker transition recovery verification failed: {path}"
-            )
-        return
-
-    current = _read_marker(path)
-    if current == replacement and expected != replacement:
-        return
-    if current != expected:
+    if expected is not None and expected_identity is None:
         raise LifecycleError(
-            f"marker CAS mismatch for {path}: expected={expected!r}, "
-            f"current={current!r}"
+            f"present marker transition requires expected inode identity: {path}"
         )
-    if expected is None:
-        if replacement is not None:
-            _create_marker_exclusive(path, replacement)
-    else:
-        try:
-            _quarantine_marker_noreplace(path, backup)
-        except FileExistsError as error:
-            raise LifecycleError(
-                f"marker transition backup appeared before quarantine: {backup}"
-            ) from error
-        except FileNotFoundError as error:
-            raise LifecycleError(
-                f"marker disappeared before quarantine: {path}"
-            ) from error
-        _fsync_directory(path.parent)
-        observed_backup = _read_marker(backup)
-        if observed_backup != expected:
-            try:
-                _restore_quarantined_marker(backup, path)
-            finally:
+    if replacement is not None and replacement_claim_identity is None:
+        raise LifecycleError(
+            f"marker replacement requires a pre-recorded claim identity: {path}"
+        )
+    if replacement is not None:
+        _verify_marker_claim(
+            path,
+            replacement,
+            transition_id=transition_id,
+            expected_identity=replacement_claim_identity or {},
+        )
+
+    backup = _marker_transition_backup(path, transition_id)
+    backup_observation = _marker_observation(backup)
+    if backup_observation.get("error"):
+        raise LifecycleError(
+            f"invalid marker transition backup for {path}: {backup_observation!r}"
+        )
+    backup_exists = bool(backup_observation.get("exists"))
+    current_observation = _marker_observation(path)
+    if current_observation.get("error"):
+        raise LifecycleError(
+            f"invalid current marker during CAS for {path}: {current_observation!r}"
+        )
+
+    replacement_already_installed = replacement is not None and (
+        current_observation.get("value") == replacement
+        and _marker_identity_matches(
+            current_observation,
+            replacement_claim_identity,
+            include_ctime=False,
+        )
+    )
+    deletion_already_installed = replacement is None and not current_observation.get(
+        "exists", False
+    )
+
+    # Idempotent crash recovery after commit.  A present source must still have
+    # the exact quarantined source inode; an originally absent source has no
+    # backup and is authenticated solely by the retained claim inode.
+    if replacement_already_installed or deletion_already_installed:
+        if expected is None:
+            if backup_exists:
                 raise LifecycleError(
-                    f"marker changed before quarantine for {path}: "
-                    f"expected={expected!r}, observed={observed_backup!r}"
+                    f"unexpected backup for absent-source transition: {backup}"
                 )
-        try:
-            if replacement is not None:
-                _create_marker_exclusive(path, replacement)
-        except Exception:
-            # Never replace a concurrently created foreign marker.  Retain the
-            # quarantine file as exact forensic/recovery evidence.
-            if _read_marker(path) is None:
-                _restore_quarantined_marker(backup, path)
-            raise
-        backup.unlink()
-        _fsync_directory(path.parent)
-    observed = _read_marker(path)
-    if observed != replacement:
+        else:
+            _transition_backup_observation(
+                path,
+                transition_id=transition_id,
+                expected=expected,
+                expected_identity=expected_identity or {},
+            )
+        if replacement is None:
+            return None
+        _verify_marker_claim(
+            path,
+            replacement,
+            transition_id=transition_id,
+            expected_identity=replacement_claim_identity or {},
+        )
+        return _owned_marker_identity(current_observation)
+
+    if backup_exists:
+        if expected is None:
+            raise LifecycleError(
+                f"unexpected transition backup for absent source marker: {backup}"
+            )
+        _transition_backup_observation(
+            path,
+            transition_id=transition_id,
+            expected=expected,
+            expected_identity=expected_identity or {},
+        )
+        if current_observation.get("exists", False):
+            raise LifecycleError(
+                f"marker transition recovery is ambiguous for {path}; "
+                f"preserving current={current_observation!r} and backup={backup}"
+            )
+    else:
+        current = current_observation.get("value")
+        if current != expected or (
+            expected is not None
+            and not _marker_identity_matches(
+                current_observation, expected_identity, include_ctime=True
+            )
+        ):
+            raise LifecycleError(
+                f"marker CAS mismatch for {path}: "
+                f"expected={expected!r}/{expected_identity!r}, "
+                f"current={current_observation!r}"
+            )
+        if expected is not None:
+            moved_identity = _owned_marker_identity(current_observation)
+            try:
+                _quarantine_marker_noreplace(path, backup)
+            except FileExistsError as error:
+                raise LifecycleError(
+                    f"marker transition backup appeared before quarantine: {backup}"
+                ) from error
+            except FileNotFoundError as error:
+                raise LifecycleError(
+                    f"marker disappeared before quarantine: {path}"
+                ) from error
+            moved_observation = _marker_observation(backup)
+            if (
+                moved_observation.get("value") != expected
+                or moved_observation.get("error")
+                or not _marker_identity_matches(
+                    moved_observation, moved_identity, include_ctime=False
+                )
+            ):
+                try:
+                    if moved_observation.get("exists", False) and not _marker_observation(
+                        path
+                    ).get("exists", False):
+                        _restore_quarantined_marker(
+                            backup,
+                            path,
+                            moved_identity=_inode_identity(moved_observation),
+                        )
+                finally:
+                    raise LifecycleError(
+                        f"marker changed before quarantine for {path}: "
+                        f"expected={expected!r}/{moved_identity!r}, "
+                        f"observed={moved_observation!r}"
+                    )
+            # Persistently retaining this inode is the commit witness.
+            _transition_backup_observation(
+                path,
+                transition_id=transition_id,
+                expected=expected,
+                expected_identity=moved_identity,
+            )
+
+    if replacement is not None:
+        installed_identity = _install_marker_claim(
+            path,
+            replacement,
+            transition_id=transition_id,
+            claim_identity=replacement_claim_identity or {},
+        )
+    else:
+        installed_identity = None
+
+    final_observation = _marker_observation(path)
+    if replacement is None:
+        if final_observation.get("exists") or final_observation.get("error"):
+            raise LifecycleError(
+                f"marker deletion transition did not remain absent: "
+                f"{final_observation!r}"
+            )
+    elif (
+        final_observation.get("value") != replacement
+        or final_observation.get("error")
+        or not _marker_identity_matches(
+            final_observation, replacement_claim_identity, include_ctime=False
+        )
+    ):
         raise LifecycleError(
             f"marker CAS verification failed for {path}: "
-            f"wanted={replacement!r}, observed={observed!r}"
+            f"wanted={replacement!r}/{replacement_claim_identity!r}, "
+            f"observed={final_observation!r}"
         )
+
+    if expected is not None:
+        _transition_backup_observation(
+            path,
+            transition_id=transition_id,
+            expected=expected,
+            expected_identity=expected_identity or {},
+        )
+    if replacement is not None:
+        _verify_marker_claim(
+            path,
+            replacement,
+            transition_id=transition_id,
+            expected_identity=replacement_claim_identity or {},
+        )
+    return installed_identity
 
 
 def _acquire_lock_descriptor(path: Path, operation: int) -> int:
@@ -438,12 +842,21 @@ def prepare_marker_transaction(
         for raw in markers:
             marker = dict(raw)
             path = Path(marker["path"])
-            current = _read_marker(path)
+            observation = _marker_observation(path)
+            if observation.get("error"):
+                raise LifecycleError(
+                    f"cannot inspect marker during prepare for {path}: "
+                    f"{observation['error']}"
+                )
+            current = observation.get("value")
             if current != marker["original_value"]:
                 raise LifecycleError(
                     f"marker changed before prepare for {path}: "
                     f"expected={marker['original_value']!r}, current={current!r}"
                 )
+            marker["original_file_identity"] = (
+                _owned_marker_identity(observation) if current is not None else None
+            )
             identity = marker["original_identity"]
             if marker["original_value"] is not None and not process_identity_alive(
                 int(identity["pid"]), str(identity["start_ticks"])
@@ -489,107 +902,224 @@ def _restore_target(marker: dict[str, Any]) -> str | None:
     return None
 
 
+def _ensure_marker_claim_locked(
+    state_path: Path,
+    state: dict[str, Any],
+    marker: dict[str, Any],
+    *,
+    phase: str,
+    value: str | None,
+) -> Mapping[str, Any] | None:
+    if value is None:
+        return None
+    identity_key = f"{phase}_claim_identity"
+    path_key = f"{phase}_claim_path"
+    transition_id = f"{state['run_id']}:{marker['name']}:{phase}"
+    identity = marker.get(identity_key)
+    if identity is None:
+        identity = _create_marker_claim(
+            Path(marker["path"]), value, transition_id=transition_id
+        )
+        marker[identity_key] = identity
+        marker[path_key] = str(
+            _marker_transition_claim(Path(marker["path"]), transition_id)
+        )
+        # This save is intentionally before any mutation of the canonical
+        # marker.  A post-commit crash can then authenticate the exact claim.
+        _save_marker_state(state_path, state)
+    _verify_marker_claim(
+        Path(marker["path"]),
+        value,
+        transition_id=transition_id,
+        expected_identity=identity,
+    )
+    return identity
+
+
+def _restore_one_marker_locked(
+    state_path: Path,
+    state: dict[str, Any],
+    marker: dict[str, Any],
+) -> None:
+    path = Path(marker["path"])
+    acquire_transition_id = f"{state['run_id']}:{marker['name']}:acquire"
+    current_observation = _marker_observation(path)
+    if current_observation.get("error"):
+        raise LifecycleError(
+            f"cannot inspect marker during recovery: {current_observation!r}"
+        )
+
+    # Recover an acquisition that committed after ``acquire_started`` was saved
+    # but before ``owned_identity``/``acquired`` reached the state file.
+    if marker.get("acquire_started", False) and not marker["acquired"]:
+        backup_observation = _marker_observation(
+            _marker_transition_backup(path, acquire_transition_id)
+        )
+        if backup_observation.get("error"):
+            raise LifecycleError(
+                f"invalid acquisition backup during recovery: "
+                f"{backup_observation!r}"
+            )
+        claim_identity = marker.get("acquire_claim_identity")
+        current_is_exact_claim = bool(
+            claim_identity
+            and current_observation.get("value") == state["run_id"]
+            and _marker_identity_matches(
+                current_observation, claim_identity, include_ctime=False
+            )
+        )
+        mutation_evidence = bool(
+            current_is_exact_claim or backup_observation.get("exists", False)
+        )
+        if mutation_evidence:
+            if claim_identity is None:
+                raise LifecycleError(
+                    f"acquisition changed marker without a recorded claim: {path}"
+                )
+            installed_identity = _cas_marker(
+                path,
+                marker["original_value"],
+                state["run_id"],
+                transition_id=acquire_transition_id,
+                expected_identity=marker.get("original_file_identity"),
+                replacement_claim_identity=claim_identity,
+            )
+            if installed_identity is None:
+                raise LifecycleError(
+                    f"acquisition recovery omitted marker identity: {path}"
+                )
+            marker["owned_identity"] = installed_identity
+            marker["acquired"] = True
+            _save_marker_state(state_path, state)
+            current_observation = _marker_observation(path)
+        else:
+            original = marker["original_value"]
+            if current_observation.get("value") != original or (
+                original is not None
+                and not _marker_identity_matches(
+                    current_observation,
+                    marker.get("original_file_identity"),
+                    include_ctime=True,
+                )
+            ):
+                raise LifecycleError(
+                    f"acquisition state is ambiguous for {path}: "
+                    f"observed={current_observation!r}"
+                )
+
+    if not marker["restore_target_set"]:
+        marker["restore_target"] = _restore_target(marker)
+        marker["restore_target_set"] = True
+        _save_marker_state(state_path, state)
+    target = marker["restore_target"]
+    current_observation = _marker_observation(path)
+    if current_observation.get("error"):
+        raise LifecycleError(
+            f"cannot inspect marker before restore: {current_observation!r}"
+        )
+
+    if marker["restored"]:
+        if current_observation.get("value") != target or (
+            target is not None
+            and not _marker_identity_matches(
+                current_observation,
+                marker.get("restored_identity"),
+                include_ctime=True,
+            )
+        ):
+            raise LifecycleError(
+                f"already-restored marker drifted for {path}: "
+                f"target={target!r}, observed={current_observation!r}"
+            )
+        return
+
+    if marker["acquired"]:
+        expected = state["run_id"]
+        expected_identity = marker.get("owned_identity")
+    else:
+        expected = marker["original_value"]
+        expected_identity = marker.get("original_file_identity")
+        if current_observation.get("value") != expected or (
+            expected is not None
+            and not _marker_identity_matches(
+                current_observation, expected_identity, include_ctime=True
+            )
+        ):
+            raise LifecycleError(
+                f"unacquired marker drifted for {path}: "
+                f"expected={expected!r}/{expected_identity!r}, "
+                f"observed={current_observation!r}"
+            )
+        if target == expected:
+            marker["restored_identity"] = expected_identity
+            marker["restored"] = True
+            marker.pop("restore_error", None)
+            _save_marker_state(state_path, state)
+            return
+
+    restore_claim_identity = _ensure_marker_claim_locked(
+        state_path,
+        state,
+        marker,
+        phase="restore",
+        value=target,
+    )
+    if not marker.get("restore_started", False):
+        marker["restore_started"] = True
+        _save_marker_state(state_path, state)
+    restored_identity = _cas_marker(
+        path,
+        expected,
+        target,
+        transition_id=f"{state['run_id']}:{marker['name']}:restore",
+        expected_identity=expected_identity,
+        replacement_claim_identity=restore_claim_identity,
+    )
+    marker["restored_identity"] = restored_identity
+    marker["restored"] = True
+    marker.pop("restore_error", None)
+    _save_marker_state(state_path, state)
+
+
 def _restore_markers_locked(state_path: Path, state: dict[str, Any]) -> dict[str, Any]:
     state["status"] = "restoring"
     _save_marker_state(state_path, state)
-    try:
-        for marker in state["markers"]:
-            path = Path(marker["path"])
-            acquire_transition_id = f"{state['run_id']}:{marker['name']}:acquire"
-            acquire_backup = _marker_transition_backup(path, acquire_transition_id)
-            current = _read_marker(path)
-            if (
-                marker.get("acquire_started", False)
-                and not marker["acquired"]
-                and (
-                    acquire_backup.exists()
-                    or acquire_backup.is_symlink()
-                    or current == state["run_id"]
-                )
-            ):
-                _cas_marker(
-                    path,
-                    marker["original_value"],
-                    state["run_id"],
-                    transition_id=acquire_transition_id,
-                )
-                marker["acquired"] = True
-                _save_marker_state(state_path, state)
-            if not marker["restore_target_set"]:
-                marker["restore_target"] = _restore_target(marker)
-                marker["restore_target_set"] = True
-                _save_marker_state(state_path, state)
-            target = marker["restore_target"]
-            current = _read_marker(path)
-            if marker["restored"]:
-                if current != target:
-                    raise LifecycleError(
-                        f"already-restored marker drifted for {path}: "
-                        f"expected={target!r}, current={current!r}"
-                    )
-                continue
-            # A SIGKILL can land after the filesystem CAS commits but before
-            # the state receipt records ``restored=True``.  Treat an exact
-            # target value as committed and make the retry idempotent.
-            if current == target:
-                commit_was_intended = marker.get("restore_started", False)
-                never_mutated = (
-                    not marker["acquired"] and current == marker["original_value"]
-                )
-                if not commit_was_intended and not never_mutated:
-                    raise LifecycleError(
-                        "owned marker disappeared or changed before restore CAS: "
-                        f"{path}"
-                    )
-                marker["restored"] = True
-                _save_marker_state(state_path, state)
-                continue
-            changed_by_transaction = marker["acquired"] or (
-                marker.get("acquire_started", False) and current == state["run_id"]
-            )
-            if changed_by_transaction:
-                marker["restore_started"] = True
-                _save_marker_state(state_path, state)
-                _cas_marker(
-                    path,
-                    state["run_id"],
-                    target,
-                    transition_id=f"{state['run_id']}:{marker['name']}:restore",
-                )
-                marker["acquired"] = True
-            else:
-                if current != marker["original_value"]:
-                    raise LifecycleError(
-                        f"unacquired marker drifted for {path}: "
-                        f"expected={marker['original_value']!r}, current={current!r}"
-                    )
-                if current != target:
-                    marker["restore_started"] = True
-                    _save_marker_state(state_path, state)
-                    _cas_marker(
-                        path,
-                        current,
-                        target,
-                        transition_id=f"{state['run_id']}:{marker['name']}:restore",
-                    )
-            marker["restored"] = True
+    errors: list[str] = []
+    for marker in state["markers"]:
+        try:
+            _restore_one_marker_locked(state_path, state, marker)
+        except Exception as error:
+            error_text = f"{type(error).__name__}: {error}"
+            marker["restore_error"] = error_text
+            errors.append(f"{marker['name']}: {error_text}")
             _save_marker_state(state_path, state)
-        for marker in state["markers"]:
+
+    for marker in state["markers"]:
+        try:
             observed = _read_marker(Path(marker["path"]))
-            if observed != marker["restore_target"]:
-                raise LifecycleError(
-                    f"marker restoration verification failed for {marker['path']}: "
-                    f"expected={marker['restore_target']!r}, observed={observed!r}"
-                )
-        state["status"] = "restored"
-        state.pop("last_error", None)
-        _save_marker_state(state_path, state)
-        return state
-    except Exception as error:
+        except Exception as error:
+            error_text = f"{type(error).__name__}: {error}"
+            if marker.get("restore_error") != error_text:
+                errors.append(f"{marker['name']} verification: {error_text}")
+            continue
+        if observed != marker["restore_target"]:
+            error_text = (
+                f"marker restoration verification failed for {marker['path']}: "
+                f"expected={marker['restore_target']!r}, observed={observed!r}"
+            )
+            if marker.get("restore_error") != f"LifecycleError: {error_text}":
+                errors.append(f"{marker['name']} verification: {error_text}")
+
+    if errors:
         state["status"] = "restore_failed"
-        state["last_error"] = f"{type(error).__name__}: {error}"
+        state["last_error"] = "; ".join(errors)
         _save_marker_state(state_path, state)
-        raise
+        raise LifecycleError(state["last_error"])
+
+    state["status"] = "restored"
+    state.pop("last_error", None)
+    _save_marker_state(state_path, state)
+    return state
 
 
 def acquire_marker_transaction(state_path: Path, lock_path: Path) -> dict[str, Any]:
@@ -608,14 +1138,35 @@ def acquire_marker_transaction(state_path: Path, lock_path: Path) -> dict[str, A
         _save_marker_state(state_path, state)
         try:
             for marker in state["markers"]:
+                claim_identity = _ensure_marker_claim_locked(
+                    state_path,
+                    state,
+                    marker,
+                    phase="acquire",
+                    value=state["run_id"],
+                )
                 marker["acquire_started"] = True
                 _save_marker_state(state_path, state)
-                _cas_marker(
+                installed_identity = _cas_marker(
                     Path(marker["path"]),
                     marker["original_value"],
                     state["run_id"],
                     transition_id=f"{state['run_id']}:{marker['name']}:acquire",
+                    expected_identity=marker.get("original_file_identity"),
+                    replacement_claim_identity=claim_identity,
                 )
+                observation = _marker_observation(Path(marker["path"]))
+                if observation.get("value") != state["run_id"] or not (
+                    installed_identity
+                    and _marker_identity_matches(
+                        observation, installed_identity, include_ctime=True
+                    )
+                ):
+                    raise LifecycleError(
+                        f"owned marker verification failed after acquisition: "
+                        f"{marker['path']}"
+                    )
+                marker["owned_identity"] = installed_identity
                 marker["acquired"] = True
                 _save_marker_state(state_path, state)
             state["status"] = "acquired"
@@ -649,8 +1200,147 @@ def restore_marker_transaction(state_path: Path, lock_path: Path) -> dict[str, A
 
 
 def _marker_state_status(state_path: Path, lock_path: Path) -> str:
-    with _exclusive_lock(lock_path):
+    with _shared_lock(lock_path):
         return str(_load_marker_state(state_path)["status"])
+
+
+def _owned_marker_drifts(state: dict[str, Any]) -> list[dict[str, Any]]:
+    if state["status"] != "acquired":
+        return []
+    drifts: list[dict[str, Any]] = []
+    for marker in state["markers"]:
+        if not marker.get("acquired", False) or marker.get("restored", False):
+            continue
+        observation = _marker_observation(Path(marker["path"]))
+        expected_identity = marker.get("owned_identity") or {}
+        identity_mismatch = any(
+            observation.get(key) != value for key, value in expected_identity.items()
+        )
+        value_mismatch = observation.get("value") != state["run_id"]
+        if value_mismatch or identity_mismatch or observation.get("error"):
+            drifts.append(
+                {
+                    "name": marker["name"],
+                    "path": marker["path"],
+                    "expected_value": state["run_id"],
+                    "expected_identity": expected_identity,
+                    "value_mismatch": value_mismatch,
+                    "identity_mismatch": identity_mismatch,
+                    "observation": observation,
+                }
+            )
+    return drifts
+
+
+def _record_marker_ownership_loss(
+    state_path: Path,
+    lock_path: Path,
+) -> dict[str, Any] | None:
+    with _exclusive_lock(lock_path):
+        state = _load_marker_state(state_path)
+        if state["status"] == "ownership_lost":
+            loss = state.get("ownership_loss")
+            return loss if isinstance(loss, dict) else None
+        drifts = _owned_marker_drifts(state)
+        if not drifts:
+            return None
+        loss = {
+            "schema": "amg_marker_ownership_loss_v1",
+            "status": "fail",
+            "run_id": state["run_id"],
+            "detected_unix": time.time(),
+            "parent": state["parent"],
+            "markers": drifts,
+        }
+        state["status"] = "ownership_lost"
+        state["ownership_loss"] = loss
+        state["last_error"] = "marker ownership changed while launcher was active"
+        _save_marker_state(state_path, state)
+        return loss
+
+
+def _signal_process_identity(
+    pid: int,
+    start_ticks: str,
+    signum: int,
+) -> bool:
+    """Signal only the Linux process instance named by PID plus start ticks."""
+
+    if not sys.platform.startswith("linux"):
+        raise LifecycleError("exact process signalling requires Linux pidfds")
+    descriptor = -1
+    try:
+        pidfd_open = getattr(os, "pidfd_open", None)
+        if callable(pidfd_open):
+            descriptor = pidfd_open(pid, 0)
+        else:
+            libc = ctypes.CDLL(None, use_errno=True)
+            syscall = libc.syscall
+            syscall.restype = ctypes.c_long
+            descriptor = int(syscall(434, pid, 0))
+            if descriptor < 0:
+                error_number = ctypes.get_errno()
+                if error_number == errno.ESRCH:
+                    return False
+                raise LifecycleError(
+                    "pidfd_open syscall failed: "
+                    f"pid={pid} errno={error_number} {os.strerror(error_number)}"
+                )
+        if not process_identity_alive(pid, start_ticks):
+            return False
+        pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+        if callable(pidfd_send_signal):
+            pidfd_send_signal(descriptor, signum, None, 0)
+        else:
+            libc = ctypes.CDLL(None, use_errno=True)
+            syscall = libc.syscall
+            syscall.restype = ctypes.c_long
+            result = int(
+                syscall(424, descriptor, signum, ctypes.c_void_p(0), 0)
+            )
+            if result != 0:
+                error_number = ctypes.get_errno()
+                if error_number == errno.ESRCH:
+                    return False
+                raise LifecycleError(
+                    "pidfd_send_signal syscall failed: "
+                    f"pid={pid} errno={error_number} {os.strerror(error_number)}"
+                )
+    except ProcessLookupError:
+        return False
+    except PermissionError as error:
+        raise LifecycleError(f"pidfd signalling permission denied for pid {pid}") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    return True
+
+
+def _write_marker_watcher_receipt(
+    receipt_path: Path,
+    *,
+    status: str,
+    mode: str,
+    error: str | None,
+    state_status: str,
+    ownership_loss: dict[str, Any] | None = None,
+    termination_signal_sent: bool | None = None,
+    phase: str = "final",
+) -> None:
+    payload: dict[str, Any] = {
+        "schema": "amg_marker_watcher_exit_v1",
+        "status": status,
+        "mode": mode,
+        "phase": phase,
+        "error": error,
+        "pid": os.getpid(),
+        "state_status": state_status,
+    }
+    if ownership_loss is not None:
+        payload["ownership_loss"] = ownership_loss
+    if termination_signal_sent is not None:
+        payload["termination_signal_sent"] = termination_signal_sent
+    _atomic_write_json(receipt_path, payload)
 
 
 def watch_marker_transaction(
@@ -671,18 +1361,6 @@ def watch_marker_transaction(
     }:
         raise LifecycleError("marker watcher parent identity does not match state")
     watcher_ticks = process_start_ticks(os.getpid())
-    _atomic_write_json(
-        ready_path,
-        {
-            "schema": "amg_marker_watcher_start_v1",
-            "status": "ready",
-            "pid": os.getpid(),
-            "start_ticks": watcher_ticks,
-            "parent_pid": parent_pid,
-            "parent_start_ticks": str(parent_start_ticks),
-            "state_path": str(state_path),
-        },
-    )
     stop_requested = False
 
     def request_stop(_signum: int, _frame: Any) -> None:
@@ -691,15 +1369,82 @@ def watch_marker_transaction(
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
+    _atomic_write_json(
+        ready_path,
+        {
+            "schema": "amg_marker_watcher_start_v1",
+            "status": "ready",
+            "pid": os.getpid(),
+            "start_ticks": watcher_ticks,
+            "signal_handlers_installed": True,
+            "parent_pid": parent_pid,
+            "parent_start_ticks": str(parent_start_ticks),
+            "state_path": str(state_path),
+        },
+    )
     mode = ""
     error_text: str | None = None
     deadline: float | None = None
+    ownership_loss: dict[str, Any] | None = None
+    termination_signal_sent: bool | None = None
     while True:
+        if ownership_loss is None:
+            ownership_loss = _record_marker_ownership_loss(state_path, lock_path)
+            if ownership_loss is not None:
+                mode = "marker_ownership_lost"
+                termination_signal_sent = _signal_process_identity(
+                    parent_pid, str(parent_start_ticks), signal.SIGTERM
+                )
+                deadline = time.monotonic() + restore_timeout_seconds
+                _write_marker_watcher_receipt(
+                    receipt_path,
+                    status="fail",
+                    mode=mode,
+                    phase="detected",
+                    error="marker ownership changed while launcher was active",
+                    state_status=_marker_state_status(state_path, lock_path),
+                    ownership_loss=ownership_loss,
+                    termination_signal_sent=termination_signal_sent,
+                )
+
         status = _marker_state_status(state_path, lock_path)
+        parent_alive = process_identity_alive(parent_pid, parent_start_ticks)
+        if ownership_loss is not None:
+            if parent_alive:
+                if deadline is not None and time.monotonic() >= deadline:
+                    error_text = "launcher did not exit after marker ownership loss"
+                    _write_marker_watcher_receipt(
+                        receipt_path,
+                        status="fail",
+                        mode=mode,
+                        error=error_text,
+                        state_status=status,
+                        ownership_loss=ownership_loss,
+                        termination_signal_sent=termination_signal_sent,
+                    )
+                    return 1
+                time.sleep(poll_seconds)
+                continue
+            try:
+                restore_marker_transaction(state_path, lock_path)
+            except Exception as error:
+                error_text = f"{type(error).__name__}: {error}"
+            status = _marker_state_status(state_path, lock_path)
+            _write_marker_watcher_receipt(
+                receipt_path,
+                status="fail",
+                mode=mode,
+                error=error_text or "marker ownership was lost during the run",
+                state_status=status,
+                ownership_loss=ownership_loss,
+                termination_signal_sent=termination_signal_sent,
+            )
+            return 1
+
         if status in {"restored", "acquisition_rolled_back"}:
             mode = "explicit_restore"
             break
-        if not process_identity_alive(parent_pid, parent_start_ticks):
+        if not parent_alive:
             mode = "parent_death_restore"
             if deadline is None:
                 deadline = time.monotonic() + restore_timeout_seconds
@@ -710,42 +1455,32 @@ def watch_marker_transaction(
             except Exception as error:  # retry a transient partial restore
                 error_text = f"{type(error).__name__}: {error}"
                 if time.monotonic() >= deadline:
-                    _atomic_write_json(
+                    _write_marker_watcher_receipt(
                         receipt_path,
-                        {
-                            "schema": "amg_marker_watcher_exit_v1",
-                            "status": "fail",
-                            "mode": mode,
-                            "error": error_text,
-                            "pid": os.getpid(),
-                        },
+                        status="fail",
+                        mode=mode,
+                        error=error_text,
+                        state_status=_marker_state_status(state_path, lock_path),
                     )
                     return 1
         elif stop_requested:
             mode = "signal_before_restore"
             error_text = "watcher was signalled while launcher still owned markers"
-            _atomic_write_json(
+            _write_marker_watcher_receipt(
                 receipt_path,
-                {
-                    "schema": "amg_marker_watcher_exit_v1",
-                    "status": "fail",
-                    "mode": mode,
-                    "error": error_text,
-                    "pid": os.getpid(),
-                },
+                status="fail",
+                mode=mode,
+                error=error_text,
+                state_status=status,
             )
             return 1
         time.sleep(poll_seconds)
-    _atomic_write_json(
+    _write_marker_watcher_receipt(
         receipt_path,
-        {
-            "schema": "amg_marker_watcher_exit_v1",
-            "status": "pass",
-            "mode": mode,
-            "error": error_text,
-            "pid": os.getpid(),
-            "state_status": _marker_state_status(state_path, lock_path),
-        },
+        status="pass",
+        mode=mode,
+        error=error_text,
+        state_status=_marker_state_status(state_path, lock_path),
     )
     return 0
 

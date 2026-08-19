@@ -56,7 +56,7 @@ class TestMarkerTransactions(unittest.TestCase):
                 ) -> None:
                     if path == gpu and replacement == "test-run":
                         raise lifecycle.LifecycleError("injected second-marker failure")
-                    original_cas(path, expected, replacement, **kwargs)
+                    return original_cas(path, expected, replacement, **kwargs)
 
                 with mock.patch.object(
                     lifecycle, "_cas_marker", side_effect=fail_second
@@ -75,21 +75,30 @@ class TestMarkerTransactions(unittest.TestCase):
             root = Path(raw)
             marker = root / "marker"
             marker.write_text("known-owner\n", encoding="utf-8")
-            original_create = lifecycle._create_marker_exclusive
+            transition_id = "foreign-race"
+            expected_identity = lifecycle._owned_marker_identity(
+                lifecycle._marker_observation(marker)
+            )
+            claim_identity = lifecycle._create_marker_claim(
+                marker, "our-run", transition_id=transition_id
+            )
+            original_install = lifecycle._install_marker_claim
 
-            def race(path: Path, value: str) -> None:
-                original_create(path, "foreign-owner")
-                original_create(path, value)
+            def race(path: Path, value: str, **kwargs):
+                path.write_text("foreign-owner\n", encoding="utf-8")
+                return original_install(path, value, **kwargs)
 
             with mock.patch.object(
-                lifecycle, "_create_marker_exclusive", side_effect=race
+                lifecycle, "_install_marker_claim", side_effect=race
             ):
                 with self.assertRaises(lifecycle.LifecycleError):
                     lifecycle._cas_marker(
                         marker,
                         "known-owner",
                         "our-run",
-                        transition_id="foreign-race",
+                        transition_id=transition_id,
+                        expected_identity=expected_identity,
+                        replacement_claim_identity=claim_identity,
                     )
             self.assertEqual(
                 marker.read_text(encoding="utf-8").strip(), "foreign-owner"
@@ -107,6 +116,12 @@ class TestMarkerTransactions(unittest.TestCase):
             marker.write_text("known-owner\n", encoding="utf-8")
             transition_id = "foreign-backup-race"
             backup = lifecycle._marker_transition_backup(marker, transition_id)
+            expected_identity = lifecycle._owned_marker_identity(
+                lifecycle._marker_observation(marker)
+            )
+            claim_identity = lifecycle._create_marker_claim(
+                marker, "our-run", transition_id=transition_id
+            )
             original_quarantine = lifecycle._quarantine_marker_noreplace
 
             def race(path: Path, destination: Path) -> None:
@@ -122,27 +137,49 @@ class TestMarkerTransactions(unittest.TestCase):
                         "known-owner",
                         "our-run",
                         transition_id=transition_id,
+                        expected_identity=expected_identity,
+                        replacement_claim_identity=claim_identity,
                     )
             self.assertEqual(marker.read_text(encoding="utf-8").strip(), "known-owner")
             self.assertEqual(
                 backup.read_text(encoding="utf-8").strip(), "foreign-backup"
             )
 
-    def test_exclusive_claim_is_fully_written_before_public_install(self) -> None:
+    def test_transition_claim_is_fully_written_before_public_install(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             marker = Path(raw) / "marker"
+            transition_id = "fully-written-claim"
+            claim = lifecycle._marker_transition_claim(marker, transition_id)
             original_link = lifecycle.os.link
+            observed_destinations: list[Path] = []
 
             def inspect_then_link(source, destination, **kwargs):
-                self.assertFalse(marker.exists())
+                destination = Path(destination)
+                observed_destinations.append(destination)
                 self.assertEqual(Path(source).read_text(encoding="utf-8"), "our-run\n")
+                if destination == claim:
+                    self.assertFalse(marker.exists())
                 return original_link(source, destination, **kwargs)
 
             with mock.patch.object(lifecycle.os, "link", side_effect=inspect_then_link):
-                lifecycle._create_marker_exclusive(marker, "our-run")
+                claim_identity = lifecycle._create_marker_claim(
+                    marker, "our-run", transition_id=transition_id
+                )
+                lifecycle._install_marker_claim(
+                    marker,
+                    "our-run",
+                    transition_id=transition_id,
+                    claim_identity=claim_identity,
+                )
 
             self.assertEqual(marker.read_text(encoding="utf-8"), "our-run\n")
-            self.assertEqual(list(marker.parent.glob(".marker.claim.*")), [])
+            self.assertIn(claim, observed_destinations)
+            self.assertIn(marker, observed_destinations)
+            self.assertTrue(claim.exists())
+            self.assertTrue(
+                list(marker.parent.glob(".marker.*.claim-stage.*")),
+                "retained claim stage must pin the expected inode",
+            )
 
     def test_restore_retry_recovers_crash_after_marker_commit(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -197,8 +234,7 @@ class TestMarkerTransactions(unittest.TestCase):
             lock = root / "lock"
             run_id = "acquire-quarantine-crash"
             transition_id = f"{run_id}:cpu:acquire"
-            token = hashlib.sha256(transition_id.encode("utf-8")).hexdigest()[:24]
-            backup = marker.with_name(f".{marker.name}.{token}.transition")
+            backup = lifecycle._marker_transition_backup(marker, transition_id)
             with mock.patch.object(
                 lifecycle, "process_identity_alive", return_value=True
             ):
@@ -211,18 +247,26 @@ class TestMarkerTransactions(unittest.TestCase):
                     markers=(self._marker("cpu", marker, "cpu-owner"),),
                 )
                 state = json.loads(state_path.read_text(encoding="utf-8"))
+                claim_identity = lifecycle._create_marker_claim(
+                    marker, run_id, transition_id=transition_id
+                )
                 state["status"] = "acquiring"
+                state["markers"][0]["acquire_claim_identity"] = claim_identity
+                state["markers"][0]["acquire_claim_path"] = str(
+                    lifecycle._marker_transition_claim(marker, transition_id)
+                )
                 state["markers"][0]["acquire_started"] = True
                 lifecycle._atomic_write_json(state_path, state)
-                os.rename(marker, backup)
+                lifecycle._rename_noreplace(marker, backup)
 
                 restored = lifecycle.restore_marker_transaction(state_path, lock)
 
             self.assertEqual(restored["status"], "restored")
             self.assertEqual(marker.read_text(encoding="utf-8").strip(), "cpu-owner")
-            self.assertFalse(backup.exists())
+            self.assertTrue(backup.exists())
+            self.assertEqual(backup.read_text(encoding="utf-8").strip(), "cpu-owner")
 
-    def test_restore_unstrands_foreign_acquire_quarantine(self) -> None:
+    def test_restore_preserves_foreign_acquire_quarantine(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             marker = root / "cpu"
@@ -231,8 +275,7 @@ class TestMarkerTransactions(unittest.TestCase):
             lock = root / "lock"
             run_id = "foreign-acquire-quarantine"
             transition_id = f"{run_id}:cpu:acquire"
-            token = hashlib.sha256(transition_id.encode("utf-8")).hexdigest()[:24]
-            backup = marker.with_name(f".{marker.name}.{token}.transition")
+            backup = lifecycle._marker_transition_backup(marker, transition_id)
             with mock.patch.object(
                 lifecycle, "process_identity_alive", return_value=True
             ):
@@ -245,19 +288,29 @@ class TestMarkerTransactions(unittest.TestCase):
                     markers=(self._marker("cpu", marker, "cpu-owner"),),
                 )
                 state = json.loads(state_path.read_text(encoding="utf-8"))
+                claim_identity = lifecycle._create_marker_claim(
+                    marker, run_id, transition_id=transition_id
+                )
                 state["status"] = "acquiring"
+                state["markers"][0]["acquire_claim_identity"] = claim_identity
+                state["markers"][0]["acquire_claim_path"] = str(
+                    lifecycle._marker_transition_claim(marker, transition_id)
+                )
                 state["markers"][0]["acquire_started"] = True
                 lifecycle._atomic_write_json(state_path, state)
                 marker.unlink()
                 backup.write_text("foreign-owner\n", encoding="utf-8")
+                foreign_inode = backup.stat().st_ino
 
                 with self.assertRaises(lifecycle.LifecycleError):
                     lifecycle.restore_marker_transaction(state_path, lock)
 
+            self.assertFalse(marker.exists())
+            self.assertTrue(backup.exists())
+            self.assertEqual(backup.stat().st_ino, foreign_inode)
             self.assertEqual(
-                marker.read_text(encoding="utf-8").strip(), "foreign-owner"
+                backup.read_text(encoding="utf-8").strip(), "foreign-owner"
             )
-            self.assertFalse(backup.exists())
 
     def test_restore_rejects_missing_owned_marker(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -286,6 +339,414 @@ class TestMarkerTransactions(unittest.TestCase):
                     lifecycle.restore_marker_transaction(state, lock)
             saved = json.loads(state.read_text(encoding="utf-8"))
             self.assertEqual(saved["status"], "restore_failed")
+            self.assertFalse(saved["markers"][0]["restored"])
+            self.assertTrue(saved["markers"][1]["restored"])
+            self.assertFalse(gpu.exists())
+
+    def test_same_value_inode_replacement_is_detected_as_ownership_loss(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            marker = root / "marker"
+            state_path = root / "state.json"
+            lock = root / "lock"
+            with mock.patch.object(
+                lifecycle, "process_identity_alive", return_value=True
+            ):
+                lifecycle.prepare_marker_transaction(
+                    state_path=state_path,
+                    lock_path=lock,
+                    run_id="test-run",
+                    parent_pid=999,
+                    parent_start_ticks="1",
+                    markers=(self._marker("cpu", marker, None),),
+                )
+                lifecycle.acquire_marker_transaction(state_path, lock)
+            original = json.loads(state_path.read_text(encoding="utf-8"))
+            replacement = root / "replacement"
+            replacement.write_text("test-run\n", encoding="utf-8")
+            os.replace(replacement, marker)
+
+            drifts = lifecycle._owned_marker_drifts(original)
+
+            self.assertEqual(len(drifts), 1)
+            self.assertFalse(drifts[0]["value_mismatch"])
+            self.assertTrue(drifts[0]["identity_mismatch"])
+            self.assertEqual(drifts[0]["observation"]["value"], "test-run")
+
+    def test_same_value_claim_after_prepare_is_not_adopted(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            marker = root / "marker"
+            state = root / "state.json"
+            lock = root / "lock"
+            with mock.patch.object(
+                lifecycle, "process_identity_alive", return_value=True
+            ):
+                lifecycle.prepare_marker_transaction(
+                    state_path=state,
+                    lock_path=lock,
+                    run_id="test-run",
+                    parent_pid=999,
+                    parent_start_ticks="1",
+                    markers=(self._marker("cpu", marker, None),),
+                )
+                marker.write_text("test-run\n", encoding="utf-8")
+                foreign_inode = marker.stat().st_ino
+                with self.assertRaises(lifecycle.LifecycleError):
+                    lifecycle.acquire_marker_transaction(state, lock)
+            self.assertTrue(marker.exists())
+            self.assertEqual(marker.stat().st_ino, foreign_inode)
+            self.assertEqual(marker.read_text(encoding="utf-8").strip(), "test-run")
+
+    def test_same_value_replacement_before_restore_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            marker = root / "marker"
+            state = root / "state.json"
+            lock = root / "lock"
+            with mock.patch.object(
+                lifecycle, "process_identity_alive", return_value=True
+            ):
+                lifecycle.prepare_marker_transaction(
+                    state_path=state,
+                    lock_path=lock,
+                    run_id="test-run",
+                    parent_pid=999,
+                    parent_start_ticks="1",
+                    markers=(self._marker("cpu", marker, None),),
+                )
+                acquired = lifecycle.acquire_marker_transaction(state, lock)
+                owned_inode = acquired["markers"][0]["owned_identity"]["inode"]
+                replacement = root / "replacement"
+                replacement.write_text("test-run\n", encoding="utf-8")
+                foreign_inode = replacement.stat().st_ino
+                self.assertNotEqual(owned_inode, foreign_inode)
+                os.replace(replacement, marker)
+                with self.assertRaises(lifecycle.LifecycleError):
+                    lifecycle.restore_marker_transaction(state, lock)
+            self.assertTrue(marker.exists())
+            self.assertEqual(marker.stat().st_ino, foreign_inode)
+            self.assertEqual(marker.read_text(encoding="utf-8").strip(), "test-run")
+
+    def test_foreign_replacement_before_atomic_quarantine_is_preserved(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            marker = root / "marker"
+            marker.write_text("known-owner\n", encoding="utf-8")
+            transition_id = "unlink-window"
+            expected_identity = lifecycle._owned_marker_identity(
+                lifecycle._marker_observation(marker)
+            )
+            claim_identity = lifecycle._create_marker_claim(
+                marker, "our-run", transition_id=transition_id
+            )
+            original_rename = lifecycle._rename_noreplace
+            evidence: dict[str, int] = {}
+
+            def race(source: Path, destination: Path) -> None:
+                if source == marker:
+                    replacement = root / "foreign"
+                    replacement.write_text("foreign-owner\n", encoding="utf-8")
+                    evidence["inode"] = replacement.stat().st_ino
+                    os.replace(replacement, source)
+                original_rename(source, destination)
+
+            with mock.patch.object(
+                lifecycle, "_rename_noreplace", side_effect=race
+            ):
+                with self.assertRaises(lifecycle.LifecycleError):
+                    lifecycle._cas_marker(
+                        marker,
+                        "known-owner",
+                        "our-run",
+                        transition_id=transition_id,
+                        expected_identity=expected_identity,
+                        replacement_claim_identity=claim_identity,
+                    )
+            self.assertTrue(marker.exists())
+            self.assertEqual(marker.stat().st_ino, evidence["inode"])
+            self.assertEqual(
+                marker.read_text(encoding="utf-8").strip(), "foreign-owner"
+            )
+
+    def test_foreign_backup_replacement_after_install_is_never_unlinked(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            marker = root / "marker"
+            marker.write_text("known-owner\n", encoding="utf-8")
+            transition_id = "post-install-backup-race"
+            backup = lifecycle._marker_transition_backup(marker, transition_id)
+            expected_identity = lifecycle._owned_marker_identity(
+                lifecycle._marker_observation(marker)
+            )
+            claim_identity = lifecycle._create_marker_claim(
+                marker, "our-run", transition_id=transition_id
+            )
+            original_install = lifecycle._install_marker_claim
+            evidence: dict[str, int] = {}
+
+            def replace_backup_after_install(path: Path, value: str, **kwargs):
+                identity = original_install(path, value, **kwargs)
+                foreign = root / "foreign-backup"
+                foreign.write_text("foreign-backup\n", encoding="utf-8")
+                evidence["inode"] = foreign.stat().st_ino
+                os.replace(foreign, backup)
+                return identity
+
+            with mock.patch.object(
+                lifecycle,
+                "_install_marker_claim",
+                side_effect=replace_backup_after_install,
+            ):
+                with self.assertRaises(lifecycle.LifecycleError):
+                    lifecycle._cas_marker(
+                        marker,
+                        "known-owner",
+                        "our-run",
+                        transition_id=transition_id,
+                        expected_identity=expected_identity,
+                        replacement_claim_identity=claim_identity,
+                    )
+
+            self.assertTrue(backup.exists())
+            self.assertEqual(backup.stat().st_ino, evidence["inode"])
+            self.assertEqual(
+                backup.read_text(encoding="utf-8").strip(), "foreign-backup"
+            )
+
+    def test_foreign_backup_replacement_during_recovery_is_never_unlinked(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            marker = root / "marker"
+            marker.write_text("known-owner\n", encoding="utf-8")
+            transition_id = "recovery-backup-race"
+            backup = lifecycle._marker_transition_backup(marker, transition_id)
+            expected_identity = lifecycle._owned_marker_identity(
+                lifecycle._marker_observation(marker)
+            )
+            claim_identity = lifecycle._create_marker_claim(
+                marker, "our-run", transition_id=transition_id
+            )
+            lifecycle._rename_noreplace(marker, backup)
+            original_install = lifecycle._install_marker_claim
+            evidence: dict[str, int] = {}
+
+            def replace_backup_after_install(path: Path, value: str, **kwargs):
+                identity = original_install(path, value, **kwargs)
+                foreign = root / "foreign-backup"
+                foreign.write_text("foreign-backup\n", encoding="utf-8")
+                evidence["inode"] = foreign.stat().st_ino
+                os.replace(foreign, backup)
+                return identity
+
+            with mock.patch.object(
+                lifecycle,
+                "_install_marker_claim",
+                side_effect=replace_backup_after_install,
+            ):
+                with self.assertRaises(lifecycle.LifecycleError):
+                    lifecycle._cas_marker(
+                        marker,
+                        "known-owner",
+                        "our-run",
+                        transition_id=transition_id,
+                        expected_identity=expected_identity,
+                        replacement_claim_identity=claim_identity,
+                    )
+
+            self.assertTrue(backup.exists())
+            self.assertEqual(backup.stat().st_ino, evidence["inode"])
+            self.assertEqual(
+                backup.read_text(encoding="utf-8").strip(), "foreign-backup"
+            )
+
+    def test_restore_recovers_crash_after_acquire_commit_before_state_save(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            marker = root / "marker"
+            state = root / "state.json"
+            lock = root / "lock"
+            with mock.patch.object(
+                lifecycle, "process_identity_alive", return_value=True
+            ):
+                lifecycle.prepare_marker_transaction(
+                    state_path=state,
+                    lock_path=lock,
+                    run_id="acquire-postcommit-crash",
+                    parent_pid=999,
+                    parent_start_ticks="1",
+                    markers=(self._marker("cpu", marker, None),),
+                )
+                original_cas = lifecycle._cas_marker
+
+                def crash_after_acquire_commit(
+                    path: Path,
+                    expected: str | None,
+                    replacement: str | None,
+                    **kwargs,
+                ):
+                    result = original_cas(path, expected, replacement, **kwargs)
+                    if replacement == "acquire-postcommit-crash":
+                        raise SystemExit(137)
+                    return result
+
+                with mock.patch.object(
+                    lifecycle, "_cas_marker", side_effect=crash_after_acquire_commit
+                ):
+                    with self.assertRaises(SystemExit):
+                        lifecycle.acquire_marker_transaction(state, lock)
+
+                saved_after_crash = json.loads(state.read_text(encoding="utf-8"))
+                self.assertTrue(saved_after_crash["markers"][0]["acquire_started"])
+                self.assertFalse(saved_after_crash["markers"][0]["acquired"])
+                self.assertEqual(
+                    marker.read_text(encoding="utf-8").strip(),
+                    "acquire-postcommit-crash",
+                )
+
+                restored = lifecycle.restore_marker_transaction(state, lock)
+
+            self.assertEqual(restored["status"], "restored")
+            self.assertFalse(marker.exists())
+
+    def test_acquire_postcommit_recovery_rejects_same_value_foreign_inode(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            marker = root / "marker"
+            state = root / "state.json"
+            lock = root / "lock"
+            run_id = "acquire-postcommit-foreign"
+            with mock.patch.object(
+                lifecycle, "process_identity_alive", return_value=True
+            ):
+                lifecycle.prepare_marker_transaction(
+                    state_path=state,
+                    lock_path=lock,
+                    run_id=run_id,
+                    parent_pid=999,
+                    parent_start_ticks="1",
+                    markers=(self._marker("cpu", marker, None),),
+                )
+                original_cas = lifecycle._cas_marker
+
+                def crash_after_acquire_commit(
+                    path: Path,
+                    expected: str | None,
+                    replacement: str | None,
+                    **kwargs,
+                ):
+                    result = original_cas(path, expected, replacement, **kwargs)
+                    if replacement == run_id:
+                        raise SystemExit(137)
+                    return result
+
+                with mock.patch.object(
+                    lifecycle, "_cas_marker", side_effect=crash_after_acquire_commit
+                ):
+                    with self.assertRaises(SystemExit):
+                        lifecycle.acquire_marker_transaction(state, lock)
+
+                foreign = root / "foreign"
+                foreign.write_text(f"{run_id}\n", encoding="utf-8")
+                foreign_inode = foreign.stat().st_ino
+                os.replace(foreign, marker)
+                with self.assertRaises(lifecycle.LifecycleError):
+                    lifecycle.restore_marker_transaction(state, lock)
+
+            self.assertTrue(marker.exists())
+            self.assertEqual(marker.stat().st_ino, foreign_inode)
+            self.assertEqual(marker.read_text(encoding="utf-8").strip(), run_id)
+
+    def test_pidfd_unavailable_fails_closed_without_os_kill(self) -> None:
+        with (
+            mock.patch.object(lifecycle, "process_identity_alive", return_value=True),
+            mock.patch.object(lifecycle.os, "pidfd_open", None, create=True),
+            mock.patch.object(lifecycle.signal, "pidfd_send_signal", None, create=True),
+            mock.patch.object(lifecycle.os, "kill") as unsafe_kill,
+        ):
+            with self.assertRaises(lifecycle.LifecycleError):
+                lifecycle._signal_process_identity(999, "1", signal.SIGTERM)
+        unsafe_kill.assert_not_called()
+
+    def test_pidfd_syscall_error_fails_closed_without_os_kill(self) -> None:
+        class FailingSyscall:
+            restype = None
+
+            def __call__(self, *_args):
+                lifecycle.ctypes.set_errno(lifecycle.errno.ENOSYS)
+                return -1
+
+        fake_libc = SimpleNamespace(syscall=FailingSyscall())
+        with (
+            mock.patch.object(lifecycle.sys, "platform", "linux"),
+            mock.patch.object(lifecycle.os, "pidfd_open", None, create=True),
+            mock.patch.object(lifecycle.ctypes, "CDLL", return_value=fake_libc),
+            mock.patch.object(lifecycle.os, "kill") as unsafe_kill,
+        ):
+            with self.assertRaisesRegex(lifecycle.LifecycleError, "pidfd_open"):
+                lifecycle._signal_process_identity(999, "1", signal.SIGTERM)
+        unsafe_kill.assert_not_called()
+
+    def test_watcher_installs_signal_handlers_before_ready_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            state = root / "state.json"
+            lock = root / "lock"
+            ready = root / "ready.json"
+            receipt = root / "receipt.json"
+            lifecycle._atomic_write_json(
+                state,
+                {
+                    "schema": "amg_marker_transaction_v1",
+                    "run_id": "handler-order",
+                    "status": "prepared",
+                    "parent": {"pid": 999, "start_ticks": "1"},
+                    "lock_path": str(lock),
+                    "markers": [self._marker("cpu", root / "cpu", None)],
+                },
+            )
+            order: list[str] = []
+            original_write = lifecycle._atomic_write_json
+
+            def record_write(path: Path, value, mode: int = 0o600):
+                if path == ready:
+                    order.append("ready")
+                    self.assertTrue(value["signal_handlers_installed"])
+                    raise RuntimeError("stop after ready")
+                return original_write(path, value, mode=mode)
+
+            def record_handler(_signal, _handler):
+                order.append("handler")
+
+            with (
+                mock.patch.object(lifecycle, "process_start_ticks", return_value="2"),
+                mock.patch.object(lifecycle.signal, "signal", side_effect=record_handler),
+                mock.patch.object(
+                    lifecycle, "_atomic_write_json", side_effect=record_write
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "stop after ready"):
+                    lifecycle.watch_marker_transaction(
+                        state_path=state,
+                        lock_path=lock,
+                        parent_pid=999,
+                        parent_start_ticks="1",
+                        ready_path=ready,
+                        receipt_path=receipt,
+                        poll_seconds=0.01,
+                        restore_timeout_seconds=1,
+                    )
+            self.assertEqual(order, ["handler", "handler", "ready"])
 
     def _run_marker_cas(
         self, marker: Path, transition_id: str
@@ -296,9 +757,22 @@ class TestMarkerTransactions(unittest.TestCase):
             "from pathlib import Path\n"
             "import sys\n"
             "from agentmemorygym_verl import orchestrator_lifecycle as lifecycle\n"
+            "path = Path(sys.argv[1])\n"
+            "transition_id = sys.argv[2]\n"
+            "observation = lifecycle._marker_observation(path)\n"
+            "expected_identity = (\n"
+            "    lifecycle._owned_marker_identity(observation)\n"
+            "    if observation.get('value') == 'known-owner' and not observation.get('error')\n"
+            "    else {'device': -1, 'inode': -1, 'ctime_ns': -1}\n"
+            ")\n"
+            "claim_identity = lifecycle._create_marker_claim(\n"
+            "    path, 'our-run', transition_id=transition_id\n"
+            ")\n"
             "lifecycle._cas_marker(\n"
-            "    Path(sys.argv[1]), 'known-owner', 'our-run',\n"
-            "    transition_id=sys.argv[2],\n"
+            "    path, 'known-owner', 'our-run',\n"
+            "    transition_id=transition_id,\n"
+            "    expected_identity=expected_identity,\n"
+            "    replacement_claim_identity=claim_identity,\n"
             ")\n"
         )
         return subprocess.run(
@@ -341,6 +815,162 @@ class TestMarkerTransactions(unittest.TestCase):
             self.assertFalse(
                 lifecycle._marker_transition_backup(marker, transition_id).exists()
             )
+
+    @unittest.skipUnless(Path("/proc/self/stat").is_file(), "requires Linux /proc")
+    def test_live_marker_takeover_stops_parent_and_preserves_foreign_owner(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            cpu = root / "cpu"
+            gpu = root / "gpu"
+            state = root / "state.json"
+            lock = root / "lock"
+            ready = root / "ready.json"
+            receipt = root / "receipt.json"
+            parent = subprocess.Popen(["sleep", "60"])
+            watcher: subprocess.Popen[str] | None = None
+            try:
+                ticks = lifecycle.process_start_ticks(parent.pid)
+                self.assertIsNotNone(ticks)
+                markers = (
+                    lifecycle._marker_record("cpu", cpu, None, 0, ""),
+                    lifecycle._marker_record("gpu", gpu, None, 0, ""),
+                )
+                lifecycle.prepare_marker_transaction(
+                    state_path=state,
+                    lock_path=lock,
+                    run_id="watcher-run",
+                    parent_pid=parent.pid,
+                    parent_start_ticks=str(ticks),
+                    markers=markers,
+                )
+                watcher = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(MODULE),
+                        "marker-watch",
+                        "--state",
+                        str(state),
+                        "--lock",
+                        str(lock),
+                        "--parent-pid",
+                        str(parent.pid),
+                        "--parent-start-ticks",
+                        str(ticks),
+                        "--ready",
+                        str(ready),
+                        "--receipt",
+                        str(receipt),
+                        "--poll-seconds",
+                        "0.05",
+                        "--restore-timeout-seconds",
+                        "1",
+                    ],
+                    text=True,
+                )
+                deadline = time.monotonic() + 5
+                while not ready.is_file() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(ready.is_file())
+                lifecycle.acquire_marker_transaction(state, lock)
+                cpu.write_text("foreign-run\n", encoding="utf-8")
+
+                self.assertEqual(parent.wait(timeout=5), -signal.SIGTERM)
+                self.assertNotEqual(watcher.wait(timeout=5), 0)
+                report = json.loads(receipt.read_text(encoding="utf-8"))
+                self.assertEqual(report["status"], "fail")
+                self.assertEqual(report["mode"], "marker_ownership_lost")
+                loss = report["ownership_loss"]
+                self.assertEqual(loss["run_id"], "watcher-run")
+                self.assertEqual(loss["markers"][0]["name"], "cpu")
+                self.assertEqual(loss["markers"][0]["expected_value"], "watcher-run")
+                self.assertEqual(
+                    loss["markers"][0]["observation"]["value"], "foreign-run"
+                )
+                self.assertEqual(cpu.read_text(encoding="utf-8").strip(), "foreign-run")
+                self.assertFalse(gpu.exists())
+                saved = json.loads(state.read_text(encoding="utf-8"))
+                self.assertEqual(saved["status"], "restore_failed")
+                self.assertFalse(saved["markers"][0]["restored"])
+                self.assertTrue(saved["markers"][1]["restored"])
+            finally:
+                if parent.poll() is None:
+                    parent.kill()
+                    parent.wait()
+                if watcher is not None and watcher.poll() is None:
+                    watcher.kill()
+                    watcher.wait()
+
+    @unittest.skipUnless(Path("/proc/self/stat").is_file(), "requires Linux /proc")
+    def test_normal_restore_and_watcher_exit_do_not_signal_live_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            cpu = root / "cpu"
+            gpu = root / "gpu"
+            state = root / "state.json"
+            lock = root / "lock"
+            ready = root / "ready.json"
+            receipt = root / "receipt.json"
+            parent = subprocess.Popen(["sleep", "60"])
+            watcher: subprocess.Popen[str] | None = None
+            try:
+                ticks = lifecycle.process_start_ticks(parent.pid)
+                self.assertIsNotNone(ticks)
+                lifecycle.prepare_marker_transaction(
+                    state_path=state,
+                    lock_path=lock,
+                    run_id="normal-restore",
+                    parent_pid=parent.pid,
+                    parent_start_ticks=str(ticks),
+                    markers=(
+                        lifecycle._marker_record("cpu", cpu, None, 0, ""),
+                        lifecycle._marker_record("gpu", gpu, None, 0, ""),
+                    ),
+                )
+                watcher = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(MODULE),
+                        "marker-watch",
+                        "--state",
+                        str(state),
+                        "--lock",
+                        str(lock),
+                        "--parent-pid",
+                        str(parent.pid),
+                        "--parent-start-ticks",
+                        str(ticks),
+                        "--ready",
+                        str(ready),
+                        "--receipt",
+                        str(receipt),
+                        "--poll-seconds",
+                        "0.01",
+                        "--restore-timeout-seconds",
+                        "1",
+                    ],
+                    text=True,
+                )
+                deadline = time.monotonic() + 5
+                while not ready.is_file() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.is_file())
+                lifecycle.acquire_marker_transaction(state, lock)
+                restored = lifecycle.restore_marker_transaction(state, lock)
+                self.assertEqual(restored["status"], "restored")
+                self.assertEqual(watcher.wait(timeout=5), 0)
+                self.assertIsNone(parent.poll())
+                report = json.loads(receipt.read_text(encoding="utf-8"))
+                self.assertEqual(report["status"], "pass")
+                self.assertEqual(report["mode"], "explicit_restore")
+            finally:
+                if parent.poll() is None:
+                    parent.kill()
+                    parent.wait()
+                if watcher is not None and watcher.poll() is None:
+                    watcher.kill()
+                    watcher.wait()
 
     @unittest.skipUnless(Path("/proc/self/stat").is_file(), "requires Linux /proc")
     def test_parent_death_watcher_restores_both_markers(self) -> None:
@@ -1337,6 +1967,102 @@ class TestShellOrchestratorContract(unittest.TestCase):
         alive_function = text[alive_start:alive_end]
         self.assertIn('"$PY" "$LIFECYCLE" process-identity-alive', alive_function)
         self.assertEqual(text.count('--registry-root "$PUBLICATION_REGISTRY_ROOT"'), 2)
+
+    def test_cleanup_failure_hard_stops_before_prepublication(self) -> None:
+        script = MODULE.parent.parent / "scripts/orchestrate_openmle_fully_async.sh"
+        text = script.read_text(encoding="utf-8")
+        cleanup_call = text.index("cleanup_before_publication || exit $?")
+        prepublication = text.index("PERSIST=$PERSIST_ROOT/$RUN_ID")
+        self.assertLess(cleanup_call, prepublication)
+        self.assertNotIn(
+            '[ "$RUNTIME_CLEANED" -eq 1 ] && [ "$CLEANUP_STATUS" = pass ]',
+            text,
+        )
+        cleanup_start = text.index("cleanup_runtime() {")
+        cleanup_end = text.index(
+            "\n}\n\ncleanup_before_publication()", cleanup_start
+        )
+        cleanup_body = text[cleanup_start:cleanup_end]
+        self.assertIn('if [ "$CLEANUP_STATUS" = pass ]; then', cleanup_body)
+        self.assertTrue(cleanup_body.rstrip().endswith("return 1"))
+
+    def test_cleanup_failure_exits_125_before_publication_at_runtime(self) -> None:
+        script = MODULE.parent.parent / "scripts/orchestrate_openmle_fully_async.sh"
+        text = script.read_text(encoding="utf-8")
+        start = text.index("cleanup_before_publication() {")
+        end = text.index("\n}\n\ncleanup()", start) + 2
+        function = text[start:end]
+        program = f"""#!/usr/bin/env bash
+set +e
+{function}
+cleanup_runtime() {{ return 1; }}
+RUNTIME_CLEANED=0
+CLEANUP_STATUS=fail
+cleanup_before_publication
+rc=$?
+printf 'rc=%s\\n' "$rc"
+if [ "$rc" -eq 0 ]; then touch "$1"; fi
+exit "$rc"
+"""
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            probe = root / "probe.sh"
+            sentinel = root / "published"
+            probe.write_text(program, encoding="utf-8")
+            result = subprocess.run(
+                ["bash", str(probe), str(sentinel)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 125, result.stderr)
+            self.assertEqual(result.stdout.strip(), "rc=125")
+            self.assertFalse(sentinel.exists())
+
+    def test_dead_marker_watcher_stops_live_trainer_at_runtime(self) -> None:
+        script = MODULE.parent.parent / "scripts/orchestrate_openmle_fully_async.sh"
+        text = script.read_text(encoding="utf-8")
+        start = text.index("wait_trainer_with_marker_watcher() {")
+        end = text.index("\n}\n\nstop_endpoint()", start) + 2
+        function = text[start:end]
+        program = f"""#!/usr/bin/env bash
+set +e
+{function}
+process_alive_exact() {{ kill -0 "$1" 2>/dev/null; }}
+stop_exact_child() {{
+  local _name=$1 pid_var=$2 ticks_var=$3
+  local pid=${{!pid_var}}
+  kill -TERM "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  printf -v "$pid_var" ''
+  printf -v "$ticks_var" ''
+}}
+CLEANUP_STATUS=pass
+sleep 30 & TRAIN_PID=$!
+ORIGINAL_TRAIN_PID=$TRAIN_PID
+trap 'kill -KILL "$ORIGINAL_TRAIN_PID" 2>/dev/null || true' EXIT
+TRAIN_TICKS=unused
+sleep 0.05 & MARKER_WATCH_PID=$!
+MARKER_WATCH_TICKS=unused
+wait_trainer_with_marker_watcher
+rc=$?
+if kill -0 "$ORIGINAL_TRAIN_PID" 2>/dev/null; then alive=1; else alive=0; fi
+printf 'rc=%s cleanup=%s trainer_alive=%s\\n' "$rc" "$CLEANUP_STATUS" "$alive"
+exit "$rc"
+"""
+        with tempfile.TemporaryDirectory() as raw:
+            probe = Path(raw) / "probe.sh"
+            probe.write_text(program, encoding="utf-8")
+            result = subprocess.run(
+                ["bash", str(probe)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            self.assertEqual(result.returncode, 125, result.stderr)
+            self.assertIn("cleanup=fail", result.stdout)
+            self.assertIn("trainer_alive=0", result.stdout)
 
     def test_shell_marker_reads_use_nonblocking_lifecycle_cli(self) -> None:
         script = MODULE.parent.parent / "scripts/orchestrate_openmle_fully_async.sh"
