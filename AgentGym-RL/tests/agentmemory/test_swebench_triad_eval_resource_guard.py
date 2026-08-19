@@ -475,6 +475,24 @@ class CgroupV1CellEnvelopeTest(unittest.TestCase):
         with self.assertRaisesRegex(ResourceGuardError, "escaped"):
             self.envelope.verify_descendants(container_init_pid=101)
 
+    def test_kubernetes_prefix_preserves_owned_subtree_membership(self) -> None:
+        self.envelope.prepare()
+        prefix = "/kubepods/burstable/pod-test/container-test"
+        for membership in self.backend.snapshot_value["memberships"].values():
+            for controller in ("memory", "pids"):
+                membership[controller] = prefix + membership[controller]
+
+        verified = self.envelope.verify_descendants(container_init_pid=101)
+
+        self.assertEqual(verified["descendant_pids"], [101, 102])
+        self.backend.snapshot_value["memberships"]["102"]["memory"] = (
+            prefix
+            + "/amg-external-eval-container-runtime-v1-shadow/"
+            "swebench-triad-v1/0000-native"
+        )
+        with self.assertRaisesRegex(ResourceGuardError, "escaped"):
+            self.envelope.verify_descendants(container_init_pid=101)
+
     def test_peak_and_failure_counters_are_recorded_before_empty_teardown(self) -> None:
         self.envelope.prepare()
         self.envelope.verify_descendants(container_init_pid=101)

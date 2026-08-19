@@ -315,9 +315,29 @@ class CgroupV1CellEnvelope:
 
 
 def _cgroup_path_is_within(path: str, parent: str) -> bool:
-    normalized = "/" + path.strip("/")
-    expected = "/" + parent.strip("/")
-    return normalized == expected or normalized.startswith(expected + "/")
+    def canonical_parts(value: str) -> tuple[str, ...] | None:
+        if not isinstance(value, str) or not value.startswith("/"):
+            return None
+        stripped = value.strip("/")
+        if not stripped:
+            return ()
+        parts = tuple(stripped.split("/"))
+        if any(not part or part in {".", ".."} for part in parts):
+            return None
+        return parts
+
+    actual = canonical_parts(path)
+    expected = canonical_parts(parent)
+    if actual is None or not expected or len(actual) < len(expected):
+        return False
+    # /proc/<pid>/cgroup reports the host-global Kubernetes prefix, while the
+    # private daemon mount namespace exposes the same owned subtree as its root.
+    # Match the complete owned path-segment sequence at any ancestor depth.
+    width = len(expected)
+    return any(
+        actual[offset : offset + width] == expected
+        for offset in range(len(actual) - width + 1)
+    )
 
 
 class MountNamespaceCgroupV1Backend:
