@@ -460,55 +460,6 @@ export OPENMLE_FAST_PYTHON=$PY
 export AGENTMEMORY_PROCESS_OWNER=$PROCESS_OWNER
 export AGENTMEMORY_RUN_ID=$RUN_ID
 
-"$START_ENDPOINT" "$ENDPOINT_CONTRACT" > "$RUN_DIR/endpoint-supervisor.log" 2>&1 &
-ENDPOINT_PID=$!
-capture_ticks "$ENDPOINT_PID" ENDPOINT_TICKS || {
-  tail -n 100 "$RUN_DIR/endpoint-supervisor.log" >&2 || true
-  exit 72
-}
-for _ in $(seq 1 1200); do
-  [ -s "$RUN_DIR/endpoints/ready.json" ] && break
-  process_alive_exact "$ENDPOINT_PID" "$ENDPOINT_TICKS" || {
-    tail -n 100 "$RUN_DIR/endpoint-supervisor.log" >&2 || true
-    exit 73
-  }
-  sleep 0.25
-done
-[ -s "$RUN_DIR/endpoints/ready.json" ]
-grep -q '"status":"ready"' "$RUN_DIR/endpoints/ready.json"
-
-eval "$("$PY" - "$LOCK" "$PREFLIGHT" <<'PY'
-import json, shlex, sys
-x=json.load(open(sys.argv[1])); p=json.load(open(sys.argv[2])); vals={
-'MANIFEST':p['manifest_path'],
-'MANIFEST_SHA':p['manifest_sha256'],
-'OUTER_COMMIT':x['runtime_source']['outer_commit'],
-'INNER_COMMIT':x['runtime_source']['inner_commit'],
-'PROMPT_SHA':x['runtime_source']['policy_prompt_sha256']}
-for k,v in vals.items(): print(f'{k}={shlex.quote(str(v))}')
-PY
-)"
-if [ "$MODE" = gate ]; then
-  PROBE_INDICES=0,63
-else
-  PROBE_INDICES=$("$PY" - "$FIX/formal100-schedule-certificate.json" <<'PY'
-import json, sys
-x=json.load(open(sys.argv[1])); indices=x['endpoint_probe_indices']
-if not isinstance(indices,list) or len(indices)!=2 or any(not isinstance(i,int) or i<0 for i in indices):
-    raise SystemExit('invalid endpoint_probe_indices')
-print(','.join(str(i) for i in indices))
-PY
-)
-fi
-"$PY" "$ENDPOINT_OUTER/AgentGym-RL/scripts/agentmemory/verify_openmle_fast_resident_endpoint.py" \
-  --base-url "$ENV_ADDR" --manifest "$MANIFEST" --manifest-sha256 "$MANIFEST_SHA" \
-  --indices "$PROBE_INDICES" --expected-outer-commit "$OUTER_COMMIT" \
-  --expected-inner-commit "$INNER_COMMIT" --expected-prompt-sha256 "$PROMPT_SHA" \
-  --client-timeout-seconds 200 --timeout-margin-seconds 5 \
-  --forbidden-canaries-file "$RUN_DIR/endpoints/private/forbidden-canaries.json" \
-  --output "$RUN_DIR/resident-endpoint-probe.json" \
-  | tee "$RUN_DIR/resident-endpoint-probe.log"
-
 ORIGINAL_CPU_OWNER=$("$PY" "$LIFECYCLE" marker-read --path "$CPU_MARKER")
 if [ -n "$ORIGINAL_CPU_OWNER" ]; then
   [ "$ORIGINAL_CPU_OWNER" = "$KNOWN_CPU_OWNER" ] || {
@@ -582,11 +533,80 @@ process_alive_exact "$MARKER_WATCH_PID" "$MARKER_WATCH_TICKS" || {
   echo "marker watcher died during marker acquisition" >&2
   exit 125
 }
+# The 96-worker CPU holder materially delayed resident endpoint probes in
+# r21/r22.  Acquire both canonical markers and observe both holder state
+# machines before starting the endpoint; raw marker writes are forbidden.
+CPU_HOLDER_STATE=
+for _ in $(seq 1 120); do
+  CPU_HOLDER_STATE=$("$PY" -c \
+    'import json,sys; print(json.load(open(sys.argv[1])).get("state", ""))' \
+    /tmp/amg-cpu-holder/status.json 2>/dev/null || true)
+  [ "$CPU_HOLDER_STATE" = yielded ] && break
+  sleep 0.25
+done
+[ "$CPU_HOLDER_STATE" = yielded ] || {
+  echo "CPU holder did not reach state=yielded before endpoint startup" >&2
+  exit 75
+}
 for _ in $(seq 1 120); do
   grep -q 'mode=yield' /tmp/crg-holder.state 2>/dev/null && break
   sleep 0.25
 done
-grep -q 'mode=yield' /tmp/crg-holder.state
+grep -q 'mode=yield' /tmp/crg-holder.state || {
+  echo "GPU holder did not reach mode=yield before endpoint startup" >&2
+  exit 75
+}
+
+
+"$START_ENDPOINT" "$ENDPOINT_CONTRACT" > "$RUN_DIR/endpoint-supervisor.log" 2>&1 &
+ENDPOINT_PID=$!
+capture_ticks "$ENDPOINT_PID" ENDPOINT_TICKS || {
+  tail -n 100 "$RUN_DIR/endpoint-supervisor.log" >&2 || true
+  exit 72
+}
+for _ in $(seq 1 1200); do
+  [ -s "$RUN_DIR/endpoints/ready.json" ] && break
+  process_alive_exact "$ENDPOINT_PID" "$ENDPOINT_TICKS" || {
+    tail -n 100 "$RUN_DIR/endpoint-supervisor.log" >&2 || true
+    exit 73
+  }
+  sleep 0.25
+done
+[ -s "$RUN_DIR/endpoints/ready.json" ]
+grep -q '"status":"ready"' "$RUN_DIR/endpoints/ready.json"
+
+eval "$("$PY" - "$LOCK" "$PREFLIGHT" <<'PY'
+import json, shlex, sys
+x=json.load(open(sys.argv[1])); p=json.load(open(sys.argv[2])); vals={
+'MANIFEST':p['manifest_path'],
+'MANIFEST_SHA':p['manifest_sha256'],
+'OUTER_COMMIT':x['runtime_source']['outer_commit'],
+'INNER_COMMIT':x['runtime_source']['inner_commit'],
+'PROMPT_SHA':x['runtime_source']['policy_prompt_sha256']}
+for k,v in vals.items(): print(f'{k}={shlex.quote(str(v))}')
+PY
+)"
+if [ "$MODE" = gate ]; then
+  PROBE_INDICES=0,63
+else
+  PROBE_INDICES=$("$PY" - "$FIX/formal100-schedule-certificate.json" <<'PY'
+import json, sys
+x=json.load(open(sys.argv[1])); indices=x['endpoint_probe_indices']
+if not isinstance(indices,list) or len(indices)!=2 or any(not isinstance(i,int) or i<0 for i in indices):
+    raise SystemExit('invalid endpoint_probe_indices')
+print(','.join(str(i) for i in indices))
+PY
+)
+fi
+"$PY" "$ENDPOINT_OUTER/AgentGym-RL/scripts/agentmemory/verify_openmle_fast_resident_endpoint.py" \
+  --base-url "$ENV_ADDR" --manifest "$MANIFEST" --manifest-sha256 "$MANIFEST_SHA" \
+  --indices "$PROBE_INDICES" --expected-outer-commit "$OUTER_COMMIT" \
+  --expected-inner-commit "$INNER_COMMIT" --expected-prompt-sha256 "$PROMPT_SHA" \
+  --client-timeout-seconds 200 --timeout-margin-seconds 5 \
+  --forbidden-canaries-file "$RUN_DIR/endpoints/private/forbidden-canaries.json" \
+  --output "$RUN_DIR/resident-endpoint-probe.json" \
+  | tee "$RUN_DIR/resident-endpoint-probe.log"
+
 
 nohup "$PY" "$PROCESS_GUARD" --mode watch-parent --owner "$PROCESS_OWNER" \
   --run-id "$RUN_ID" --parent-pid "$PARENT_PID" --poll-interval 2 \

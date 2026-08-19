@@ -1930,7 +1930,7 @@ class TestShellOrchestratorContract(unittest.TestCase):
         script = MODULE.parent.parent / "scripts/orchestrate_openmle_fully_async.sh"
         text = script.read_text(encoding="utf-8")
         probe_start = text.index('eval "$("$PY" - "$LOCK" "$PREFLIGHT"')
-        probe_end = text.index("ORIGINAL_CPU_OWNER=", probe_start)
+        probe_end = text.index('if [ "$MODE" = gate ]; then', probe_start)
         probe = text[probe_start:probe_end]
         self.assertIn("'MANIFEST':p['manifest_path']", probe)
         self.assertIn("'MANIFEST_SHA':p['manifest_sha256']", probe)
@@ -1944,6 +1944,14 @@ class TestShellOrchestratorContract(unittest.TestCase):
         acquire = text.index('"$PY" "$LIFECYCLE" marker-acquire')
         self.assertLess(prepare, watcher)
         self.assertLess(watcher, acquire)
+        cpu_yield = text.index("CPU holder did not reach state=yielded")
+        gpu_yield = text.index("GPU holder did not reach mode=yield")
+        endpoint_start = text.index('"$START_ENDPOINT" "$ENDPOINT_CONTRACT"')
+        endpoint_probe = text.index("verify_openmle_fast_resident_endpoint.py")
+        self.assertLess(acquire, cpu_yield)
+        self.assertLess(cpu_yield, gpu_yield)
+        self.assertLess(gpu_yield, endpoint_start)
+        self.assertLess(endpoint_start, endpoint_probe)
         capacity = text.index('--output "$RUN_DIR/capacity-pretrainer.json"')
         reselect = text.index('"$PY" "$LIFECYCLE" exec-after-publication-check')
         trainer = text.index(
