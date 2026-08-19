@@ -244,7 +244,12 @@ class ProductionReceiptAdapterTest(unittest.TestCase):
             "schema": "amg_swebench_task4_live_negative_probes_v1",
             "status": "PASS",
             "network_downloads": 0,
-            "memory_probe": {"teardown": {"memory_failcnt": 1}},
+            "memory_probe": {
+                "teardown": {
+                    "memory_failcnt": 0,
+                    "memory_memsw_failcnt": 1,
+                }
+            },
             "pids_probe": {"teardown": {"pids_max_events": 1}},
             "byte_quota_probe": {"outcome": {"errno": 28}},
             "inode_quota_probe": {"outcome": {"errno": 28}},
@@ -263,6 +268,16 @@ class ProductionReceiptAdapterTest(unittest.TestCase):
         self.assertTrue(summary["inode_quota_blocked"])
         self.assertTrue(summary["rootfs_mutation_detected"])
 
+        receipt["memory_probe"] = {
+            "teardown": {
+                "memory_failcnt": 0,
+                "memory_memsw_failcnt": 0,
+            }
+        }
+        with self.assertRaisesRegex(ValueError, "memory exhaustion"):
+            summarize_task4_receipt(receipt, receipt_sha256="a" * 64)
+
+        receipt["memory_probe"] = {"teardown": {"memory_failcnt": 1}}
         receipt["pids_probe"] = {"teardown": {"pids_max_events": 0}}
         with self.assertRaisesRegex(ValueError, "fork exhaustion"):
             summarize_task4_receipt(receipt, receipt_sha256="a" * 64)

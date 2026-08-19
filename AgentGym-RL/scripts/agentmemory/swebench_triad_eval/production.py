@@ -1072,9 +1072,13 @@ def summarize_task4_receipt(
 
     memory = object_value(receipt.get("memory_probe"), "memory probe")
     memory_teardown = object_value(memory.get("teardown"), "memory teardown")
-    if not isinstance(memory_teardown.get("memory_failcnt"), int) or (
-        memory_teardown["memory_failcnt"] <= 0
-    ):
+    memory_counters = []
+    for field in ("memory_failcnt", "memory_memsw_failcnt"):
+        value = memory_teardown.get(field, 0)
+        if type(value) is not int or value < 0:
+            raise ValueError("memory exhaustion counter is invalid")
+        memory_counters.append(value)
+    if not any(value > 0 for value in memory_counters):
         raise ValueError("memory exhaustion was not blocked")
 
     pids = object_value(receipt.get("pids_probe"), "pids probe")

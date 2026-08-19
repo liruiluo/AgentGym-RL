@@ -297,15 +297,18 @@ class CgroupV1NamespaceHelperTest(unittest.TestCase):
                     "101\n" if directory.name == "docker-cell" else "",
                     encoding="ascii",
                 )
-            for directory, peak, failures in (
-                (memory, 1024, 0),
-                (memory_child, 4096, 3),
+            for directory, peak, failures, memsw_failures in (
+                (memory, 1024, 0, 0),
+                (memory_child, 4096, 3, 5),
             ):
                 (directory / "memory.max_usage_in_bytes").write_text(
                     str(peak), encoding="ascii"
                 )
                 (directory / "memory.failcnt").write_text(
                     str(failures), encoding="ascii"
+                )
+                (directory / "memory.memsw.failcnt").write_text(
+                    str(memsw_failures), encoding="ascii"
                 )
             (memory / "memory.limit_in_bytes").write_text(
                 str(8 * 1024 * 1024), encoding="ascii"
@@ -345,6 +348,7 @@ class CgroupV1NamespaceHelperTest(unittest.TestCase):
 
             self.assertEqual(snapshot["memory"]["max_usage_in_bytes"], 4096)
             self.assertEqual(snapshot["memory"]["failcnt"], 3)
+            self.assertEqual(snapshot["memory"]["memsw_failcnt"], 5)
             self.assertEqual(snapshot["pids"]["max_events"], 2)
 
     def test_prepare_rejects_a_path_outside_the_exact_owned_hierarchy(self) -> None:
@@ -376,6 +380,7 @@ class FakeCgroupBackend:
                 "memsw_limit_in_bytes": 8 * 1024 * 1024,
                 "max_usage_in_bytes": 7 * 1024 * 1024,
                 "failcnt": 3,
+                "memsw_failcnt": 5,
             },
             "pids": {
                 "tasks": [101, 102],
@@ -573,6 +578,7 @@ class CgroupV1CellEnvelopeTest(unittest.TestCase):
 
         self.assertEqual(receipt["memory_peak_bytes"], 7 * 1024 * 1024)
         self.assertEqual(receipt["memory_failcnt"], 3)
+        self.assertEqual(receipt["memory_memsw_failcnt"], 5)
         self.assertEqual(receipt["pids_peak"], 2)
         self.assertEqual(receipt["pids_max_events"], 4)
         self.assertTrue(receipt["memory_tasks_empty"])
@@ -584,12 +590,14 @@ class CgroupV1CellEnvelopeTest(unittest.TestCase):
         observed = self.envelope.observe()
 
         self.assertEqual(observed["memory_failcnt"], 3)
+        self.assertEqual(observed["memory_memsw_failcnt"], 5)
         self.assertEqual(observed["pids_max_events"], 4)
 
         self.backend.snapshot_value["memory"]["tasks"] = []
         self.backend.snapshot_value["memory"]["cgroup_procs"] = []
         self.backend.snapshot_value["memory"]["max_usage_in_bytes"] = 0
         self.backend.snapshot_value["memory"]["failcnt"] = 0
+        self.backend.snapshot_value["memory"]["memsw_failcnt"] = 0
         self.backend.snapshot_value["pids"]["tasks"] = []
         self.backend.snapshot_value["pids"]["cgroup_procs"] = []
         self.backend.snapshot_value["pids"]["current"] = 0
@@ -600,6 +608,7 @@ class CgroupV1CellEnvelopeTest(unittest.TestCase):
 
         self.assertEqual(receipt["memory_peak_bytes"], 7 * 1024 * 1024)
         self.assertEqual(receipt["memory_failcnt"], 3)
+        self.assertEqual(receipt["memory_memsw_failcnt"], 5)
         self.assertEqual(receipt["pids_peak"], 2)
         self.assertEqual(receipt["pids_max_events"], 4)
         self.assertTrue(self.backend.removed)

@@ -140,6 +140,7 @@ class CgroupV1CellEnvelope:
         self._prepare_receipt: Mapping[str, Any] | None = None
         self._observed_memory_peak = 0
         self._observed_memory_failcnt = 0
+        self._observed_memory_memsw_failcnt = 0
         self._observed_pids_peak = 0
         self._observed_pids_max_events = 0
 
@@ -236,6 +237,7 @@ class CgroupV1CellEnvelope:
             "relative_path": self.relative_path,
             "memory_peak_bytes": self._observed_memory_peak,
             "memory_failcnt": self._observed_memory_failcnt,
+            "memory_memsw_failcnt": self._observed_memory_memsw_failcnt,
             "pids_current": snapshot["pids_current"],
             "pids_peak": self._observed_pids_peak,
             "pids_max_events": self._observed_pids_max_events,
@@ -276,6 +278,7 @@ class CgroupV1CellEnvelope:
             "relative_path": self.relative_path,
             "memory_peak_bytes": self._observed_memory_peak,
             "memory_failcnt": self._observed_memory_failcnt,
+            "memory_memsw_failcnt": self._observed_memory_memsw_failcnt,
             "pids_peak": self._observed_pids_peak,
             "pids_max_events": self._observed_pids_max_events,
             "memory_tasks_empty": True,
@@ -290,6 +293,10 @@ class CgroupV1CellEnvelope:
         )
         self._observed_memory_failcnt = max(
             self._observed_memory_failcnt, snapshot["memory_failcnt"]
+        )
+        self._observed_memory_memsw_failcnt = max(
+            self._observed_memory_memsw_failcnt,
+            snapshot["memory_memsw_failcnt"],
         )
         self._observed_pids_peak = max(
             self._observed_pids_peak, snapshot["pids_current"]
@@ -339,6 +346,9 @@ class CgroupV1CellEnvelope:
                 memory.get("max_usage_in_bytes"), "memory peak"
             ),
             "memory_failcnt": _integer_counter(memory.get("failcnt"), "memory failcnt"),
+            "memory_memsw_failcnt": _integer_counter(
+                memory.get("memsw_failcnt"), "memory+swap failcnt"
+            ),
             "pids_current": _integer_counter(pids.get("current"), "pids current"),
             "pids_max_events": _integer_counter(
                 pids.get("max_events"), "pids max events"
@@ -1235,6 +1245,9 @@ def _helper_snapshot(request: Mapping[str, Any]) -> dict[str, Any]:
                 memory, "memory.max_usage_in_bytes"
             ),
             "failcnt": _sum_descendant_counter(memory, "memory.failcnt"),
+            "memsw_failcnt": _sum_descendant_counter(
+                memory, "memory.memsw.failcnt"
+            ),
         },
         "pids": {
             "tasks": pids_tasks,
