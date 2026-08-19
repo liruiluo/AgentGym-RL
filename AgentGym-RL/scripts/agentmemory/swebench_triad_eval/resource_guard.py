@@ -1106,9 +1106,8 @@ def _helper_prepare(request: Mapping[str, Any]) -> dict[str, Any]:
         raise
 
 
-def _descendant_pid_lists(root: Path) -> tuple[list[int], list[int]]:
-    tasks: set[int] = set()
-    processes: set[int] = set()
+def _descendant_cgroup_directories(root: Path) -> list[Path]:
+    directories: list[Path] = []
     try:
         for current, directory_names, _ in os.walk(root, followlinks=False):
             current_path = Path(current)
@@ -1119,11 +1118,33 @@ def _descendant_pid_lists(root: Path) -> tuple[list[int], list[int]]:
                     raise ResourceGuardError("cgroup tree contains a symlink")
                 retained.append(name)
             directory_names[:] = retained
-            tasks.update(_read_pid_file(current_path / "tasks"))
-            processes.update(_read_pid_file(current_path / "cgroup.procs"))
+            directories.append(current_path)
     except OSError as error:
         raise ResourceGuardError("cannot enumerate cgroup descendants") from error
+    return directories
+
+
+def _descendant_pid_lists(root: Path) -> tuple[list[int], list[int]]:
+    tasks: set[int] = set()
+    processes: set[int] = set()
+    for current_path in _descendant_cgroup_directories(root):
+        tasks.update(_read_pid_file(current_path / "tasks"))
+        processes.update(_read_pid_file(current_path / "cgroup.procs"))
     return sorted(tasks), sorted(processes)
+
+
+def _sum_descendant_counter(root: Path, filename: str) -> int:
+    return sum(
+        int(_cgroup_read(directory / filename))
+        for directory in _descendant_cgroup_directories(root)
+    )
+
+
+def _max_descendant_counter(root: Path, filename: str) -> int:
+    return max(
+        int(_cgroup_read(directory / filename))
+        for directory in _descendant_cgroup_directories(root)
+    )
 
 
 def _pid_memberships(pid: int) -> dict[str, str]:
@@ -1178,17 +1199,20 @@ def _helper_snapshot(request: Mapping[str, Any]) -> dict[str, Any]:
             "memsw_limit_in_bytes": int(
                 _cgroup_read(memory / "memory.memsw.limit_in_bytes")
             ),
-            "max_usage_in_bytes": int(
-                _cgroup_read(memory / "memory.max_usage_in_bytes")
+            "max_usage_in_bytes": _max_descendant_counter(
+                memory, "memory.max_usage_in_bytes"
             ),
-            "failcnt": int(_cgroup_read(memory / "memory.failcnt")),
+            "failcnt": _sum_descendant_counter(memory, "memory.failcnt"),
         },
         "pids": {
             "tasks": pids_tasks,
             "cgroup_procs": pids_procs,
             "max": int(_cgroup_read(pids / "pids.max")),
-            "current": int(_cgroup_read(pids / "pids.current")),
-            "max_events": _read_pids_events(pids / "pids.events"),
+            "current": _max_descendant_counter(pids, "pids.current"),
+            "max_events": sum(
+                _read_pids_events(directory / "pids.events")
+                for directory in _descendant_cgroup_directories(pids)
+            ),
         },
         "memberships": {str(pid): _pid_memberships(pid) for pid in processes},
     }

@@ -280,6 +280,73 @@ class CgroupV1NamespaceHelperTest(unittest.TestCase):
                 ).exists()
             )
 
+    def test_snapshot_aggregates_nested_failure_counters(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            memory = root / "memory"
+            pids = root / "pids"
+            memory_child = memory / "docker-cell"
+            pids_child = pids / "docker-cell"
+            for directory in (memory, pids, memory_child, pids_child):
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / "tasks").write_text(
+                    "101\n" if directory.name == "docker-cell" else "",
+                    encoding="ascii",
+                )
+                (directory / "cgroup.procs").write_text(
+                    "101\n" if directory.name == "docker-cell" else "",
+                    encoding="ascii",
+                )
+            for directory, peak, failures in (
+                (memory, 1024, 0),
+                (memory_child, 4096, 3),
+            ):
+                (directory / "memory.max_usage_in_bytes").write_text(
+                    str(peak), encoding="ascii"
+                )
+                (directory / "memory.failcnt").write_text(
+                    str(failures), encoding="ascii"
+                )
+            (memory / "memory.limit_in_bytes").write_text(
+                str(8 * 1024 * 1024), encoding="ascii"
+            )
+            (memory / "memory.memsw.limit_in_bytes").write_text(
+                str(8 * 1024 * 1024), encoding="ascii"
+            )
+            for directory, current, events in (
+                (pids, 1, 0),
+                (pids_child, 1, 2),
+            ):
+                (directory / "pids.current").write_text(
+                    str(current), encoding="ascii"
+                )
+                (directory / "pids.events").write_text(
+                    f"max {events}\n", encoding="ascii"
+                )
+            (pids / "pids.max").write_text("16", encoding="ascii")
+
+            def cgroup_directory(controller, _relative):
+                return {"memory": memory, "pids": pids}[controller]
+
+            with (
+                mock.patch.object(
+                    resource_guard, "_cgroup_directory", side_effect=cgroup_directory
+                ),
+                mock.patch.object(
+                    resource_guard,
+                    "_pid_memberships",
+                    return_value={
+                        "memory": "/owned/docker-cell",
+                        "pids": "/owned/docker-cell",
+                    },
+                ),
+            ):
+                snapshot = resource_guard._helper_snapshot(self.request)
+
+            self.assertEqual(snapshot["memory"]["max_usage_in_bytes"], 4096)
+            self.assertEqual(snapshot["memory"]["failcnt"], 3)
+            self.assertEqual(snapshot["pids"]["max_events"], 2)
+
     def test_prepare_rejects_a_path_outside_the_exact_owned_hierarchy(self) -> None:
         with mock.patch.object(resource_guard, "_cgroup_directory") as directory:
             with self.assertRaisesRegex(ResourceGuardError, "outside the owned scope"):
