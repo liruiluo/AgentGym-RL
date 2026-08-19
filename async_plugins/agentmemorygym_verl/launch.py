@@ -295,7 +295,7 @@ def build_overrides(
         "rollout.n=1",
         f"rollout.total_rollout_steps={total_episodes}",
         "async_training.staleness_threshold=0.1",
-        f"async_training.require_batches={require_batches:.12g}",
+        f"async_training.require_batches={require_batches:.17g}",
         f"async_training.trigger_parameter_sync_step={trigger_parameter_sync_step}",
         "async_training.partial_rollout=True",
         "async_training.use_trainer_do_validate=False",

@@ -175,6 +175,11 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                 places=11,
             )
             self.assertEqual(
+                int(values["actor_rollout_ref.actor.ppo_mini_batch_size"])
+                * float(values["async_training.require_batches"]),
+                identity["budget_contract"]["samples_per_update"],
+            )
+            self.assertEqual(
                 int(values["actor_rollout_ref.actor.ppo_mini_batch_size"]) % 6,
                 0,
             )
