@@ -54,6 +54,22 @@ def _positive_int(value: Any, *, field: str) -> int:
     return integer
 
 
+_PPO_MINI_BATCH_TARGET = 512
+
+
+def resolve_ppo_mini_batch_size(trainer_gpus: Any) -> int:
+    """Keep the 512-row target while satisfying veRL's native DP alignment."""
+
+    dp_size = _positive_int(trainer_gpus, field="trainer GPU DP size")
+    mini_batch_size = _PPO_MINI_BATCH_TARGET - (_PPO_MINI_BATCH_TARGET % dp_size)
+    if mini_batch_size <= 0:
+        raise ValueError(
+            "trainer GPU DP size cannot exceed the PPO mini-batch target: "
+            f"{dp_size} > {_PPO_MINI_BATCH_TARGET}"
+        )
+    return mini_batch_size
+
+
 def _finite_number(value: Any, *, field: str) -> float:
     if isinstance(value, bool):
         raise TypeError(f"{field} must be numeric, got bool")
@@ -268,6 +284,7 @@ def verify_resolved_config(
         "torch",
     )
 
+    ppo_mini_batch_size = resolve_ppo_mini_batch_size(trainer_gpus)
     for path, expected_value in {
         "data.train_batch_size": 0,
         "data.gen_batch_size": 1,
@@ -278,7 +295,7 @@ def verify_resolved_config(
         "data.return_raw_chat": True,
         "actor_rollout_ref.model.enable_gradient_checkpointing": True,
         "critic.model.enable_gradient_checkpointing": True,
-        "actor_rollout_ref.actor.ppo_mini_batch_size": 512,
+        "actor_rollout_ref.actor.ppo_mini_batch_size": ppo_mini_batch_size,
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu": 8,
         "actor_rollout_ref.actor.ppo_epochs": 1,
         "actor_rollout_ref.actor.shuffle": False,
@@ -287,7 +304,7 @@ def verify_resolved_config(
         "actor_rollout_ref.actor.fsdp_config.strategy": "fsdp2",
         "actor_rollout_ref.actor.fsdp_config.param_offload": False,
         "actor_rollout_ref.actor.fsdp_config.optimizer_offload": False,
-        "critic.ppo_mini_batch_size": 512,
+        "critic.ppo_mini_batch_size": ppo_mini_batch_size,
         "critic.ppo_micro_batch_size_per_gpu": 8,
         "critic.ppo_epochs": 1,
         "critic.shuffle": False,

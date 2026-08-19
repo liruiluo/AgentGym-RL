@@ -240,6 +240,9 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         config = _config(mode="gate")
         config["trainer"]["n_gpus_per_node"] = 6
         config["rollout"]["n_gpus_per_node"] = 2
+        config["actor_rollout_ref"]["actor"]["ppo_mini_batch_size"] = 510
+        config["critic"]["ppo_mini_batch_size"] = 510
+        config["async_training"]["require_batches"] = 64 / 510
         config["actor_rollout_ref"]["model"]["use_fused_kernels"] = True
 
         report = _verify(config, mode="gate")

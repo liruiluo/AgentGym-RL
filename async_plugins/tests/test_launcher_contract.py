@@ -166,6 +166,19 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             self.assertEqual(values["trainer.n_gpus_per_node"], "6")
             self.assertEqual(values["rollout.n_gpus_per_node"], "2")
             self.assertEqual(
+                values["actor_rollout_ref.actor.ppo_mini_batch_size"], "510"
+            )
+            self.assertEqual(values["critic.ppo_mini_batch_size"], "510")
+            self.assertAlmostEqual(
+                float(values["async_training.require_batches"]),
+                identity["budget_contract"]["samples_per_update"] / 510,
+                places=11,
+            )
+            self.assertEqual(
+                int(values["actor_rollout_ref.actor.ppo_mini_batch_size"]) % 6,
+                0,
+            )
+            self.assertEqual(
                 values["actor_rollout_ref.model.use_fused_kernels"], "True"
             )
             self.assertEqual(values["critic.model.use_fused_kernels"], "False")

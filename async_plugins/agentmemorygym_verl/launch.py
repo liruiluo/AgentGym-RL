@@ -13,7 +13,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .config_contract import inspect_schedule, verify_resolved_config
+from .config_contract import (
+    inspect_schedule,
+    resolve_ppo_mini_batch_size,
+    verify_resolved_config,
+)
 from .finalizer import finalize_run
 from .identity import (
     EXPECTED_VERL_COMMIT,
@@ -40,7 +44,6 @@ _ENDPOINT_ENV_FIELDS = {
 }
 _MAX_OBSERVATION_TOKENS = 8192
 _UPSTREAM_ENTRYPOINT = "verl.experimental.fully_async_policy.fully_async_main"
-_PPO_MINI_BATCH_SIZE = 512
 _ASYNC_TUNING = {
     "gate": {"trigger_parameter_sync_step": 1, "save_freq": 1},
     "formal": {"trigger_parameter_sync_step": 4, "save_freq": 10},
@@ -115,10 +118,11 @@ def build_overrides(
         raise ValueError(
             "publication budget does not match the reviewed checkpoint cadence"
         )
-    require_batches = samples_per_update / _PPO_MINI_BATCH_SIZE
+    ppo_mini_batch_size = resolve_ppo_mini_batch_size(inputs.trainer_gpus)
+    require_batches = samples_per_update / ppo_mini_batch_size
     if (
         require_batches <= 0
-        or int(_PPO_MINI_BATCH_SIZE * require_batches) != samples_per_update
+        or int(ppo_mini_batch_size * require_batches) != samples_per_update
     ):
         raise ValueError(
             "publication samples_per_update cannot be represented by require_batches"
@@ -188,7 +192,7 @@ def build_overrides(
         "actor_rollout_ref.actor.fsdp_config.strategy=fsdp2",
         "actor_rollout_ref.actor.fsdp_config.param_offload=False",
         "actor_rollout_ref.actor.fsdp_config.optimizer_offload=False",
-        f"actor_rollout_ref.actor.ppo_mini_batch_size={_PPO_MINI_BATCH_SIZE}",
+        f"actor_rollout_ref.actor.ppo_mini_batch_size={ppo_mini_batch_size}",
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8",
         "actor_rollout_ref.actor.ppo_epochs=1",
         "actor_rollout_ref.actor.shuffle=False",
@@ -215,7 +219,7 @@ def build_overrides(
         "critic.fsdp.strategy=fsdp2",
         "critic.fsdp.param_offload=False",
         "critic.fsdp.optimizer_offload=False",
-        f"critic.ppo_mini_batch_size={_PPO_MINI_BATCH_SIZE}",
+        f"critic.ppo_mini_batch_size={ppo_mini_batch_size}",
         "critic.ppo_micro_batch_size_per_gpu=8",
         "critic.ppo_epochs=1",
         "critic.shuffle=False",
