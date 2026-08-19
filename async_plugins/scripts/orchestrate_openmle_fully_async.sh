@@ -11,7 +11,8 @@ Usage: orchestrate_openmle_fully_async.sh \
   --known-cpu-session NAME --known-cpu-start-command COMMAND \
   --known-cpu-script PATH --known-cpu-script-sha256 SHA \
   --known-gpu-owner ID --known-gpu-script PATH \
-  --known-gpu-script-sha256 SHA --known-gpu-process-command COMMAND
+  --known-gpu-script-sha256 SHA --known-gpu-process-command COMMAND \
+  [--trainer-gpus 4|6 --standalone-rollout-gpus 4|2 --use-fused-kernels]
 EOF
   exit 64
 }
@@ -39,6 +40,9 @@ KNOWN_GPU_SCRIPT_SHA256=
 KNOWN_GPU_PROCESS_COMMAND=
 PORT=65524
 EXPECTED_CHECKPOINT_BYTES=108992339992
+TRAINER_GPUS=4
+STANDALONE_ROLLOUT_GPUS=4
+USE_FUSED_KERNELS=0
 
 while (($#)); do
   case "$1" in
@@ -65,6 +69,9 @@ while (($#)); do
     --known-gpu-process-command) KNOWN_GPU_PROCESS_COMMAND=${2:?}; shift 2 ;;
     --port) PORT=${2:?}; shift 2 ;;
     --expected-checkpoint-bytes) EXPECTED_CHECKPOINT_BYTES=${2:?}; shift 2 ;;
+    --trainer-gpus) TRAINER_GPUS=${2:?}; shift 2 ;;
+    --standalone-rollout-gpus) STANDALONE_ROLLOUT_GPUS=${2:?}; shift 2 ;;
+    --use-fused-kernels) USE_FUSED_KERNELS=1; shift ;;
     *) usage ;;
   esac
 done
@@ -99,6 +106,10 @@ case "$RUN_ID" in
 esac
 case "$EXPECTED_CHECKPOINT_BYTES" in
   *[!0-9]*|'') echo "invalid checkpoint byte estimate" >&2; exit 64 ;;
+esac
+case "$TRAINER_GPUS:$STANDALONE_ROLLOUT_GPUS" in
+  4:4|6:2) ;;
+  *) echo "unsupported Hybrid + Standalone topology: $TRAINER_GPUS+$STANDALONE_ROLLOUT_GPUS" >&2; exit 64 ;;
 esac
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
@@ -628,6 +639,13 @@ export VLLM_USE_DEEP_GEMM=0
 export VLLM_MOE_USE_DEEP_GEMM=0
 export VLLM_USE_DEEP_GEMM_E8M0=0
 printf '%s\n' "$(date -u +%FT%TZ)" > "$RUN_DIR/trainer-started-at"
+LAUNCH_TUNING_ARGS=(
+  --trainer-gpus "$TRAINER_GPUS"
+  --standalone-rollout-gpus "$STANDALONE_ROLLOUT_GPUS"
+)
+if [ "$USE_FUSED_KERNELS" -eq 1 ]; then
+  LAUNCH_TUNING_ARGS+=(--use-fused-kernels)
+fi
 # Re-select the live publication and exec the trainer from the same process.
 # This removes the shell scheduling window between the final selection and the
 # trainer process boundary; no custom queue/trainer logic is introduced.
@@ -648,6 +666,7 @@ printf '%s\n' "$(date -u +%FT%TZ)" > "$RUN_DIR/trainer-started-at"
   --endpoint-source-lock "$LOCK" --endpoint-contract-tool "$TOOL" \
   --publication-receipt "$FIX/publication-receipt.json" \
   --formal-schedule-certificate "$FIX/formal100-schedule-certificate.json" \
+  "${LAUNCH_TUNING_ARGS[@]}" \
   > "$RUN_DIR/train.log" 2>&1 &
 TRAIN_PID=$!
 capture_ticks "$TRAIN_PID" TRAIN_TICKS

@@ -113,6 +113,8 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
             "model": {
                 "path": PUBLICATION_TRAINING_RUNTIME["base_model"],
                 "enable_gradient_checkpointing": True,
+                "use_fused_kernels": False,
+                "fused_kernel_options": {"impl_backend": "torch"},
             },
             "actor": {
                 "ppo_mini_batch_size": 512,
@@ -156,6 +158,8 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
             "model": {
                 "path": PUBLICATION_TRAINING_RUNTIME["base_model"],
                 "enable_gradient_checkpointing": True,
+                "use_fused_kernels": False,
+                "fused_kernel_options": {"impl_backend": "torch"},
             },
         },
         "algorithm": {

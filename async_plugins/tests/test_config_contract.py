@@ -70,6 +70,8 @@ def _config(*, mode: str = "formal") -> dict:
             "model": {
                 "path": "/models/Qwen3.5-4B",
                 "enable_gradient_checkpointing": True,
+                "use_fused_kernels": False,
+                "fused_kernel_options": {"impl_backend": "torch"},
             },
             "actor": {
                 "ppo_mini_batch_size": 512,
@@ -113,6 +115,8 @@ def _config(*, mode: str = "formal") -> dict:
             "model": {
                 "path": "/models/Qwen3.5-4B",
                 "enable_gradient_checkpointing": True,
+                "use_fused_kernels": False,
+                "fused_kernel_options": {"impl_backend": "torch"},
             },
         },
         "algorithm": {
@@ -231,6 +235,28 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         self.assertEqual(
             report["gradient_checkpointing"], {"actor": True, "critic": True}
         )
+
+    def test_fused_six_plus_two_topology_is_resolved_and_reported(self):
+        config = _config(mode="gate")
+        config["trainer"]["n_gpus_per_node"] = 6
+        config["rollout"]["n_gpus_per_node"] = 2
+        config["actor_rollout_ref"]["model"]["use_fused_kernels"] = True
+        config["critic"]["model"]["use_fused_kernels"] = True
+
+        report = _verify(config, mode="gate")
+
+        self.assertEqual(report["trainer_gpus"], 6)
+        self.assertEqual(report["standalone_rollout_gpus"], 2)
+        self.assertEqual(
+            report["fused_kernels"],
+            {"actor": True, "critic": True, "impl_backend": "torch"},
+        )
+
+    def test_rejects_actor_critic_fused_kernel_drift(self):
+        config = _config()
+        config["actor_rollout_ref"]["model"]["use_fused_kernels"] = True
+        with self.assertRaisesRegex(ValueError, "same boolean use_fused_kernels"):
+            _verify(config, mode="formal")
 
     def test_one_update_budget(self):
         report = _verify(_config(mode="gate"), mode="gate")

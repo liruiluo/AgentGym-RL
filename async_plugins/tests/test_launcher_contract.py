@@ -4,6 +4,7 @@ import hashlib
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 import zipfile
 from pathlib import Path
 
@@ -141,6 +142,40 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             )
             self.assertEqual(
                 json.loads(values["data.agentgym.expected_role"]), "train_pool"
+            )
+
+    def test_fused_six_plus_two_uses_only_upstream_native_overrides(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inputs, identity = self._identity(Path(directory), "gate")
+            inputs = replace(
+                inputs,
+                trainer_gpus=6,
+                standalone_rollout_gpus=2,
+                use_fused_kernels=True,
+            )
+            values = self._values(
+                build_overrides(
+                    inputs,
+                    effective_schedule=inputs.schedule,
+                    endpoint_client_config=identity["client_config"],
+                    budget_contract=identity["budget_contract"],
+                    training_runtime=identity["training_runtime"],
+                )
+            )
+            self.assertEqual(values["trainer.n_gpus_per_node"], "6")
+            self.assertEqual(values["rollout.n_gpus_per_node"], "2")
+            self.assertEqual(
+                values["actor_rollout_ref.model.use_fused_kernels"], "True"
+            )
+            self.assertEqual(values["critic.model.use_fused_kernels"], "True")
+            self.assertEqual(
+                values[
+                    "actor_rollout_ref.model.fused_kernel_options.impl_backend"
+                ],
+                "torch",
+            )
+            self.assertEqual(
+                values["critic.model.fused_kernel_options.impl_backend"], "torch"
             )
 
     def test_gate_role_and_budget_are_derived_from_publication(self):

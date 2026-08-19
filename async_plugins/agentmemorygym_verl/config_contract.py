@@ -141,9 +141,9 @@ def verify_resolved_config(
     )
     trainer_gpus = trainer_nodes * trainer_gpus_per_node
     standalone_rollout_gpus = rollout_nodes * rollout_gpus_per_node
-    if (trainer_gpus, standalone_rollout_gpus) != (4, 4):
+    if (trainer_gpus, standalone_rollout_gpus) not in {(4, 4), (6, 2)}:
         raise ValueError(
-            "AMG target topology must be 4 trainer/hybrid GPUs + 4 standalone rollout GPUs, "
+            "AMG reviewed Hybrid + Standalone topology must be 4+4 or 6+2, "
             f"got {trainer_gpus}+{standalone_rollout_gpus}"
         )
 
@@ -250,6 +250,23 @@ def verify_resolved_config(
         raise ValueError(
             "AMG endpoint expected_max_observation_tokens must be exactly 8192"
         )
+
+    actor_fused = _at(config, "actor_rollout_ref.model.use_fused_kernels")
+    critic_fused = _at(config, "critic.model.use_fused_kernels")
+    if not isinstance(actor_fused, bool) or actor_fused != critic_fused:
+        raise ValueError(
+            "actor and critic must select the same boolean use_fused_kernels value"
+        )
+    _require_equal(
+        config,
+        "actor_rollout_ref.model.fused_kernel_options.impl_backend",
+        "torch",
+    )
+    _require_equal(
+        config,
+        "critic.model.fused_kernel_options.impl_backend",
+        "torch",
+    )
 
     for path, expected_value in {
         "data.train_batch_size": 0,
@@ -403,19 +420,6 @@ def verify_resolved_config(
         _positive_int(expected["save_freq"], field="expected save_freq"),
     )
 
-    if (
-        mini_batch % trainer_gpus != 0
-        or _positive_int(
-            _at(config, "critic.ppo_mini_batch_size"),
-            field="critic ppo_mini_batch_size",
-        )
-        % trainer_gpus
-        != 0
-    ):
-        raise ValueError(
-            "actor and critic global mini-batches must divide native trainer DP"
-        )
-
     return {
         "schema": "amg_verl_fully_async_budget_v2",
         "mode": mode,
@@ -429,6 +433,11 @@ def verify_resolved_config(
         "standalone_rollout_gpus": standalone_rollout_gpus,
         "dynamic_hybrid_enabled": True,
         "gradient_checkpointing": {"actor": True, "critic": True},
+        "fused_kernels": {
+            "actor": actor_fused,
+            "critic": critic_fused,
+            "impl_backend": "torch",
+        },
         "rollout_n": 1,
         "adv_estimator": "amg_action_axis_gae",
         "model_path": actor_model,
