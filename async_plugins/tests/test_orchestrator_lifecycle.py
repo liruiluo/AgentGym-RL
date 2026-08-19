@@ -1081,6 +1081,99 @@ class TestProcessIdentity(unittest.TestCase):
 
 
 class TestCapacityAdmission(unittest.TestCase):
+    def test_memory_cgroup_headroom_is_recorded_and_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            volatile = root / "volatile"
+            persistent = root / "persistent"
+            volatile.mkdir()
+            persistent.mkdir()
+            usage_path = root / "memory.usage_in_bytes"
+            limit_path = root / "memory.limit_in_bytes"
+            usage_path.write_text("800\n", encoding="utf-8")
+            limit_path.write_text("1000\n", encoding="utf-8")
+            output = root / "capacity.json"
+            usage = shutil_usage(total=10_000, used=1_000, free=9_000)
+            with mock.patch.object(lifecycle.shutil, "disk_usage", return_value=usage):
+                with self.assertRaises(lifecycle.LifecycleError):
+                    lifecycle.capacity_admission(
+                        volatile_path=volatile,
+                        persistent_path=persistent,
+                        checkpoint_bytes=100,
+                        volatile_checkpoint_copies=1,
+                        persistent_checkpoint_copies=0,
+                        volatile_margin_bytes=0,
+                        persistent_margin_bytes=0,
+                        memory_cgroup_usage_path=usage_path,
+                        memory_cgroup_limit_path=limit_path,
+                        memory_cgroup_checkpoint_copies=2,
+                        memory_cgroup_margin_bytes=1,
+                        output_path=output,
+                    )
+            report = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "fail")
+            self.assertEqual(report["memory_cgroup"]["usage_bytes"], 800)
+            self.assertEqual(report["memory_cgroup"]["limit_bytes"], 1000)
+            self.assertEqual(report["memory_cgroup"]["headroom_bytes"], 200)
+            self.assertEqual(
+                report["memory_cgroup"]["required_headroom_bytes"], 201
+            )
+            self.assertIn("memory cgroup headroom=200 required=201", report["failures"])
+
+    def test_memory_cgroup_headroom_passes_independently_of_filesystem(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            volatile = root / "volatile"
+            persistent = root / "persistent"
+            volatile.mkdir()
+            persistent.mkdir()
+            usage_path = root / "memory.usage_in_bytes"
+            limit_path = root / "memory.limit_in_bytes"
+            usage_path.write_text("500\n", encoding="utf-8")
+            limit_path.write_text("1000\n", encoding="utf-8")
+            output = root / "capacity.json"
+            usage = shutil_usage(total=10_000, used=1_000, free=9_000)
+            with mock.patch.object(lifecycle.shutil, "disk_usage", return_value=usage):
+                report = lifecycle.capacity_admission(
+                    volatile_path=volatile,
+                    persistent_path=persistent,
+                    checkpoint_bytes=100,
+                    volatile_checkpoint_copies=1,
+                    persistent_checkpoint_copies=0,
+                    volatile_margin_bytes=0,
+                    persistent_margin_bytes=0,
+                    memory_cgroup_usage_path=usage_path,
+                    memory_cgroup_limit_path=limit_path,
+                    memory_cgroup_checkpoint_copies=2,
+                    memory_cgroup_margin_bytes=100,
+                    output_path=output,
+                )
+            self.assertEqual(report["status"], "pass")
+            self.assertEqual(report["memory_cgroup"]["headroom_bytes"], 500)
+            self.assertEqual(
+                report["memory_cgroup"]["required_headroom_bytes"], 300
+            )
+
+    def test_memory_cgroup_paths_must_be_supplied_together(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            usage_path = root / "memory.usage_in_bytes"
+            usage_path.write_text("0\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                lifecycle.LifecycleError, "usage and limit paths"
+            ):
+                lifecycle.capacity_admission(
+                    volatile_path=root,
+                    persistent_path=root,
+                    checkpoint_bytes=100,
+                    volatile_checkpoint_copies=0,
+                    persistent_checkpoint_copies=0,
+                    volatile_margin_bytes=0,
+                    persistent_margin_bytes=0,
+                    memory_cgroup_usage_path=usage_path,
+                    output_path=root / "capacity.json",
+                )
+
     def test_enospc_is_recorded_and_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -1924,6 +2017,18 @@ class TestBoundedGpuMonitor(unittest.TestCase):
 
 
 class TestShellOrchestratorContract(unittest.TestCase):
+    def test_formal_capacity_models_two_checkpoint_peak_and_memory_cgroup(self) -> None:
+        script = MODULE.parent.parent / "scripts/orchestrate_openmle_fully_async.sh"
+        text = script.read_text(encoding="utf-8")
+        self.assertIn("VOLATILE_CHECKPOINT_COPIES=2", text)
+        self.assertNotIn("VOLATILE_CHECKPOINT_COPIES=3", text)
+        self.assertIn("MEMORY_CGROUP_CHECKPOINT_COPIES=2", text)
+        self.assertIn("MEMORY_CGROUP_RUNTIME_MARGIN_BYTES=274877906944", text)
+        self.assertEqual(text.count("--memory-cgroup-usage-path"), 2)
+        self.assertEqual(text.count("--memory-cgroup-limit-path"), 2)
+        self.assertEqual(text.count("--memory-cgroup-checkpoint-copies"), 2)
+        self.assertEqual(text.count("--memory-cgroup-margin-bytes"), 2)
+
     def test_resident_probe_reuses_mode_specific_runtime_preflight_manifest(
         self,
     ) -> None:

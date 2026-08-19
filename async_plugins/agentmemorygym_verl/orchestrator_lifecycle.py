@@ -1762,6 +1762,18 @@ def _filesystem_identity(path: Path) -> dict[str, str] | None:
     return max(candidates, key=lambda item: len(item["mountpoint"]))
 
 
+def _read_cgroup_byte_counter(path: Path, *, label: str) -> int:
+    if not path.is_file():
+        raise LifecycleError(f"{label} must be a readable cgroup file: {path}")
+    try:
+        value = int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError) as exc:
+        raise LifecycleError(f"cannot read {label} from {path}: {exc}") from exc
+    if value < 0:
+        raise LifecycleError(f"{label} must be non-negative, got {value}")
+    return value
+
+
 def capacity_admission(
     *,
     volatile_path: Path,
@@ -1772,6 +1784,10 @@ def capacity_admission(
     volatile_margin_bytes: int,
     persistent_margin_bytes: int,
     output_path: Path,
+    memory_cgroup_usage_path: Path | None = None,
+    memory_cgroup_limit_path: Path | None = None,
+    memory_cgroup_checkpoint_copies: int = 0,
+    memory_cgroup_margin_bytes: int = 0,
     require_distinct_filesystems: bool = False,
     expected_persistent_filesystem_types: Sequence[str] = (),
 ) -> dict[str, Any]:
@@ -1781,9 +1797,21 @@ def capacity_admission(
         (persistent_checkpoint_copies, "persistent_checkpoint_copies"),
         (volatile_margin_bytes, "volatile_margin_bytes"),
         (persistent_margin_bytes, "persistent_margin_bytes"),
+        (memory_cgroup_checkpoint_copies, "memory_cgroup_checkpoint_copies"),
+        (memory_cgroup_margin_bytes, "memory_cgroup_margin_bytes"),
     ):
         if number < 0:
             raise LifecycleError(f"{label} must be non-negative")
+    if (memory_cgroup_usage_path is None) != (memory_cgroup_limit_path is None):
+        raise LifecycleError(
+            "memory cgroup usage and limit paths must be provided together"
+        )
+    if memory_cgroup_usage_path is None and (
+        memory_cgroup_checkpoint_copies or memory_cgroup_margin_bytes
+    ):
+        raise LifecycleError(
+            "memory cgroup capacity was requested without usage and limit paths"
+        )
     _probe_writable_directory(volatile_path)
     _probe_writable_directory(persistent_path)
     volatile_usage = shutil.disk_usage(volatile_path)
@@ -1799,7 +1827,7 @@ def capacity_admission(
         checkpoint_bytes * persistent_checkpoint_copies + persistent_margin_bytes
     )
     report = {
-        "schema": "amg_persistence_capacity_admission_v1",
+        "schema": "amg_persistence_capacity_admission_v2",
         "status": "pass",
         "checkpoint_bytes": checkpoint_bytes,
         "shared_filesystem": shared_filesystem,
@@ -1830,6 +1858,40 @@ def capacity_admission(
         },
     }
     failures = []
+    if memory_cgroup_usage_path is not None:
+        memory_usage = _read_cgroup_byte_counter(
+            memory_cgroup_usage_path, label="memory cgroup usage"
+        )
+        memory_limit = _read_cgroup_byte_counter(
+            memory_cgroup_limit_path, label="memory cgroup limit"
+        )
+        if memory_limit <= 0:
+            raise LifecycleError(
+                f"memory cgroup limit must be positive, got {memory_limit}"
+            )
+        memory_headroom = max(0, memory_limit - memory_usage)
+        memory_required = (
+            checkpoint_bytes * memory_cgroup_checkpoint_copies
+            + memory_cgroup_margin_bytes
+        )
+        report["memory_cgroup"] = {
+            "usage_path": str(memory_cgroup_usage_path),
+            "limit_path": str(memory_cgroup_limit_path),
+            "usage_bytes": memory_usage,
+            "limit_bytes": memory_limit,
+            "headroom_bytes": memory_headroom,
+            "checkpoint_copies": memory_cgroup_checkpoint_copies,
+            "margin_bytes": memory_cgroup_margin_bytes,
+            "required_headroom_bytes": memory_required,
+        }
+        if memory_usage > memory_limit:
+            failures.append(
+                f"memory cgroup usage={memory_usage} exceeds limit={memory_limit}"
+            )
+        elif memory_headroom < memory_required:
+            failures.append(
+                f"memory cgroup headroom={memory_headroom} required={memory_required}"
+            )
     if require_distinct_filesystems and shared_filesystem:
         failures.append("volatile and persistent paths resolve to the same filesystem")
     if expected_persistent_filesystem_types:
@@ -2411,6 +2473,18 @@ def _cmd_capacity(args: argparse.Namespace) -> None:
         volatile_margin_bytes=args.volatile_margin_bytes,
         persistent_margin_bytes=args.persistent_margin_bytes,
         output_path=Path(args.output),
+        memory_cgroup_usage_path=(
+            Path(args.memory_cgroup_usage_path)
+            if args.memory_cgroup_usage_path
+            else None
+        ),
+        memory_cgroup_limit_path=(
+            Path(args.memory_cgroup_limit_path)
+            if args.memory_cgroup_limit_path
+            else None
+        ),
+        memory_cgroup_checkpoint_copies=args.memory_cgroup_checkpoint_copies,
+        memory_cgroup_margin_bytes=args.memory_cgroup_margin_bytes,
         require_distinct_filesystems=args.require_distinct_filesystems,
         expected_persistent_filesystem_types=args.expected_persistent_fs_type,
     )
@@ -2577,6 +2651,10 @@ def build_parser() -> argparse.ArgumentParser:
     capacity.add_argument("--persistent-checkpoint-copies", type=int, required=True)
     capacity.add_argument("--volatile-margin-bytes", type=int, required=True)
     capacity.add_argument("--persistent-margin-bytes", type=int, required=True)
+    capacity.add_argument("--memory-cgroup-usage-path")
+    capacity.add_argument("--memory-cgroup-limit-path")
+    capacity.add_argument("--memory-cgroup-checkpoint-copies", type=int, default=0)
+    capacity.add_argument("--memory-cgroup-margin-bytes", type=int, default=0)
     capacity.add_argument("--output", required=True)
     capacity.add_argument("--require-distinct-filesystems", action="store_true")
     capacity.add_argument("--expected-persistent-fs-type", action="append", default=[])

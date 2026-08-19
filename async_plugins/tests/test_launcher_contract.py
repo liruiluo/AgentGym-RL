@@ -118,6 +118,8 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             self.assertEqual(values["trainer.val_before_train"], "False")
             self.assertEqual(values["trainer.test_freq"], "-1")
             self.assertEqual(values["trainer.resume_mode"], "disable")
+            self.assertEqual(values["trainer.max_actor_ckpt_to_keep"], "1")
+            self.assertEqual(values["trainer.max_critic_ckpt_to_keep"], "1")
             self.assertEqual(values["trainer.logger"], "[console,file]")
             self.assertEqual(values["actor_rollout_ref.hybrid_engine"], "False")
             self.assertEqual(

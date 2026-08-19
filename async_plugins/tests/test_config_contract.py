@@ -39,6 +39,8 @@ def _budget(mode: str) -> dict:
         "samples_per_update": 64,
         "episodes": 6400 if formal else 64,
         "save_freq": 10 if formal else 1,
+        "max_actor_ckpt_to_keep": 1,
+        "max_critic_ckpt_to_keep": 1,
         "model_path": "/models/Qwen3.5-4B",
         "task_count": 762 if formal else 64,
         "source_family_count": 664 if formal else 64,
@@ -188,6 +190,8 @@ def _config(*, mode: str = "formal") -> dict:
             "resume_mode": "disable",
             "resume_from_path": None,
             "save_freq": 10 if formal else 1,
+            "max_actor_ckpt_to_keep": 1,
+            "max_critic_ckpt_to_keep": 1,
             "rollout_data_dir": "/run/rollout_data",
         },
         "rollout": {
@@ -290,6 +294,12 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         config = _config()
         config["trainer"]["total_training_steps"] = 25
         with self.assertRaisesRegex(ValueError, "publication cycles"):
+            _verify(config, mode="formal")
+
+    def test_rejects_checkpoint_retention_drift(self):
+        config = _config()
+        config["trainer"]["max_actor_ckpt_to_keep"] = 3
+        with self.assertRaisesRegex(ValueError, "max_actor_ckpt_to_keep"):
             _verify(config, mode="formal")
 
     def test_rejects_missing_continuous_token_or_memory_loop(self):

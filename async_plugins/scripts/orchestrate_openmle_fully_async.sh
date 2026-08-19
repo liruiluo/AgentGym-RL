@@ -41,6 +41,9 @@ KNOWN_GPU_SCRIPT_SHA256=
 KNOWN_GPU_PROCESS_COMMAND=
 PORT=65524
 EXPECTED_CHECKPOINT_BYTES=108992339992
+MEMORY_CGROUP_USAGE_PATH=/sys/fs/cgroup/memory/memory.usage_in_bytes
+MEMORY_CGROUP_LIMIT_PATH=/sys/fs/cgroup/memory/memory.limit_in_bytes
+MEMORY_CGROUP_RUNTIME_MARGIN_BYTES=274877906944
 TRAINER_GPUS=4
 STANDALONE_ROLLOUT_GPUS=4
 ACTOR_USE_FUSED_KERNELS=0
@@ -93,13 +96,15 @@ case "$MODE" in
     LAUNCH_MODE=gate
     SCHEDULE=$FIX/g64-gate-single-pass.jsonl
     VOLATILE_CHECKPOINT_COPIES=1
+    MEMORY_CGROUP_CHECKPOINT_COPIES=1
     PERSISTENT_CHECKPOINT_COPIES=0
     ;;
   formal)
     ENDPOINT_CONTRACT=formal100
     LAUNCH_MODE=formal
     SCHEDULE=$FIX/formal100-schedule.jsonl
-    VOLATILE_CHECKPOINT_COPIES=3
+    VOLATILE_CHECKPOINT_COPIES=2
+    MEMORY_CGROUP_CHECKPOINT_COPIES=2
     PERSISTENT_CHECKPOINT_COPIES=1
     ;;
   *) usage ;;
@@ -417,6 +422,10 @@ select_latest_publication "$RUN_DIR/latest-publication-selection.json"
   --volatile-checkpoint-copies "$VOLATILE_CHECKPOINT_COPIES" \
   --persistent-checkpoint-copies "$PERSISTENT_CHECKPOINT_COPIES" \
   --volatile-margin-bytes 85899345920 --persistent-margin-bytes 34359738368 \
+  --memory-cgroup-usage-path "$MEMORY_CGROUP_USAGE_PATH" \
+  --memory-cgroup-limit-path "$MEMORY_CGROUP_LIMIT_PATH" \
+  --memory-cgroup-checkpoint-copies "$MEMORY_CGROUP_CHECKPOINT_COPIES" \
+  --memory-cgroup-margin-bytes "$MEMORY_CGROUP_RUNTIME_MARGIN_BYTES" \
   --require-distinct-filesystems --expected-persistent-fs-type nfs \
   --output "$RUN_DIR/capacity-preendpoint.json"
 
@@ -650,6 +659,10 @@ grep -q '"status": "ready"' "$RUN_DIR/gpu-monitor/ready.json"
   --volatile-checkpoint-copies "$VOLATILE_CHECKPOINT_COPIES" \
   --persistent-checkpoint-copies "$PERSISTENT_CHECKPOINT_COPIES" \
   --volatile-margin-bytes 85899345920 --persistent-margin-bytes 34359738368 \
+  --memory-cgroup-usage-path "$MEMORY_CGROUP_USAGE_PATH" \
+  --memory-cgroup-limit-path "$MEMORY_CGROUP_LIMIT_PATH" \
+  --memory-cgroup-checkpoint-copies "$MEMORY_CGROUP_CHECKPOINT_COPIES" \
+  --memory-cgroup-margin-bytes "$MEMORY_CGROUP_RUNTIME_MARGIN_BYTES" \
   --require-distinct-filesystems --expected-persistent-fs-type nfs \
   --output "$RUN_DIR/capacity-pretrainer.json"
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7

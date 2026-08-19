@@ -108,6 +108,8 @@ def verify_resolved_config(
         "samples_per_update",
         "episodes",
         "save_freq",
+        "max_actor_ckpt_to_keep",
+        "max_critic_ckpt_to_keep",
         "model_path",
     )
     missing_budget_fields = [
@@ -437,6 +439,22 @@ def verify_resolved_config(
         "trainer.save_freq",
         _positive_int(expected["save_freq"], field="expected save_freq"),
     )
+    _require_equal(
+        config,
+        "trainer.max_actor_ckpt_to_keep",
+        _positive_int(
+            expected["max_actor_ckpt_to_keep"],
+            field="expected max_actor_ckpt_to_keep",
+        ),
+    )
+    _require_equal(
+        config,
+        "trainer.max_critic_ckpt_to_keep",
+        _positive_int(
+            expected["max_critic_ckpt_to_keep"],
+            field="expected max_critic_ckpt_to_keep",
+        ),
+    )
 
     return {
         "schema": "amg_verl_fully_async_budget_v2",
@@ -462,6 +480,14 @@ def verify_resolved_config(
         "model_path": actor_model,
         "env_addr": env_addr,
         "save_freq": _positive_int(expected["save_freq"], field="expected save_freq"),
+        "max_actor_ckpt_to_keep": _positive_int(
+            expected["max_actor_ckpt_to_keep"],
+            field="expected max_actor_ckpt_to_keep",
+        ),
+        "max_critic_ckpt_to_keep": _positive_int(
+            expected["max_critic_ckpt_to_keep"],
+            field="expected max_critic_ckpt_to_keep",
+        ),
         "task_count": expected.get("task_count"),
         "source_family_count": expected.get("source_family_count"),
         "schedule_sha256": expected.get("schedule_sha256"),

@@ -45,8 +45,18 @@ _ENDPOINT_ENV_FIELDS = {
 _MAX_OBSERVATION_TOKENS = 8192
 _UPSTREAM_ENTRYPOINT = "verl.experimental.fully_async_policy.fully_async_main"
 _ASYNC_TUNING = {
-    "gate": {"trigger_parameter_sync_step": 1, "save_freq": 1},
-    "formal": {"trigger_parameter_sync_step": 1, "save_freq": 10},
+    "gate": {
+        "trigger_parameter_sync_step": 1,
+        "save_freq": 1,
+        "max_actor_ckpt_to_keep": 1,
+        "max_critic_ckpt_to_keep": 1,
+    },
+    "formal": {
+        "trigger_parameter_sync_step": 1,
+        "save_freq": 10,
+        "max_actor_ckpt_to_keep": 1,
+        "max_critic_ckpt_to_keep": 1,
+    },
 }
 
 
@@ -110,6 +120,14 @@ def build_overrides(
     save_freq = _require_positive_int(
         budget_contract.get("save_freq"), field="budget save_freq"
     )
+    max_actor_ckpt_to_keep = _require_positive_int(
+        budget_contract.get("max_actor_ckpt_to_keep"),
+        field="budget max_actor_ckpt_to_keep",
+    )
+    max_critic_ckpt_to_keep = _require_positive_int(
+        budget_contract.get("max_critic_ckpt_to_keep"),
+        field="budget max_critic_ckpt_to_keep",
+    )
     if trigger_parameter_sync_step != tuning["trigger_parameter_sync_step"]:
         raise ValueError(
             "publication budget does not match the reviewed async sync cadence"
@@ -117,6 +135,13 @@ def build_overrides(
     if save_freq != tuning["save_freq"]:
         raise ValueError(
             "publication budget does not match the reviewed checkpoint cadence"
+        )
+    if (
+        max_actor_ckpt_to_keep != tuning["max_actor_ckpt_to_keep"]
+        or max_critic_ckpt_to_keep != tuning["max_critic_ckpt_to_keep"]
+    ):
+        raise ValueError(
+            "publication budget does not match the reviewed checkpoint retention"
         )
     ppo_mini_batch_size = resolve_ppo_mini_batch_size(inputs.trainer_gpus)
     require_batches = samples_per_update / ppo_mini_batch_size
@@ -283,8 +308,8 @@ def build_overrides(
         "trainer.resume_mode=disable",
         "trainer.resume_from_path=null",
         f"trainer.save_freq={save_freq}",
-        "trainer.max_actor_ckpt_to_keep=3",
-        "trainer.max_critic_ckpt_to_keep=3",
+        f"trainer.max_actor_ckpt_to_keep={max_actor_ckpt_to_keep}",
+        f"trainer.max_critic_ckpt_to_keep={max_critic_ckpt_to_keep}",
         "trainer.logger=[console,file]",
         "trainer.project_name=agentmemorygym",
         f"trainer.experiment_name={_string(inputs.experiment_name)}",
@@ -753,6 +778,8 @@ def _load_endpoint_identity(
         "samples_per_update": samples_per_update,
         "episodes": expected_schedule_count,
         "save_freq": tuning["save_freq"],
+        "max_actor_ckpt_to_keep": tuning["max_actor_ckpt_to_keep"],
+        "max_critic_ckpt_to_keep": tuning["max_critic_ckpt_to_keep"],
         "model_path": training_runtime["base_model"],
         "task_count": task_count,
         "source_family_count": source_family_count,
