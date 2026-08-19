@@ -190,7 +190,7 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
         },
         "async_training": {
             "staleness_threshold": 0.1,
-            "trigger_parameter_sync_step": 4 if formal else 1,
+            "trigger_parameter_sync_step": 1,
             "require_batches": 0.125,
             "partial_rollout": True,
             "use_trainer_do_validate": False,
@@ -213,7 +213,7 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
         "trainer": {
             "nnodes": 1,
             "n_gpus_per_node": 4,
-            "total_training_steps": 25 if formal else 1,
+            "total_training_steps": 100 if formal else 1,
             "total_epochs": 1,
             "val_before_train": False,
             "test_freq": -1,
@@ -381,8 +381,8 @@ def build_valid_run(run_dir: Path, mode: str = "gate") -> dict:
     role = "gate_only" if mode == "gate" else "train_pool"
     episodes = len(schedule_rows)
     collections = 1 if mode == "gate" else 100
-    publication_cycles = 1 if mode == "gate" else 25
-    collections_per_publication = 1 if mode == "gate" else 4
+    publication_cycles = 1 if mode == "gate" else 100
+    collections_per_publication = 1
 
     config = resolved_config(mode, run_dir, schedule_path)
     resolved_path = run_dir / "resolved-config.yaml"

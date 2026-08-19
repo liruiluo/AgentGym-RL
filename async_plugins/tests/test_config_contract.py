@@ -33,8 +33,8 @@ def _budget(mode: str) -> dict:
         "schema": "amg_verl_publication_budget_contract_v1",
         "mode": mode,
         "role": "train_pool" if formal else "gate_only",
-        "publication_cycles": 25 if formal else 1,
-        "trigger_parameter_sync_step": 4 if formal else 1,
+        "publication_cycles": 100 if formal else 1,
+        "trigger_parameter_sync_step": 1,
         "optimizer_updates": 100 if formal else 1,
         "samples_per_update": 64,
         "episodes": 6400 if formal else 64,
@@ -158,7 +158,7 @@ def _config(*, mode: str = "formal") -> dict:
         },
         "async_training": {
             "staleness_threshold": 0.1,
-            "trigger_parameter_sync_step": 4 if formal else 1,
+            "trigger_parameter_sync_step": 1,
             "require_batches": 0.125,
             "partial_rollout": True,
             "use_trainer_do_validate": False,
@@ -181,7 +181,7 @@ def _config(*, mode: str = "formal") -> dict:
         "trainer": {
             "nnodes": 1,
             "n_gpus_per_node": 4,
-            "total_training_steps": 25 if formal else 1,
+            "total_training_steps": 100 if formal else 1,
             "total_epochs": 1,
             "val_before_train": False,
             "test_freq": -1,
@@ -228,7 +228,7 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
     def test_formal100_budget_and_topology(self):
         report = _verify(_config(mode="formal"), mode="formal")
         self.assertEqual(report["optimizer_updates"], 100)
-        self.assertEqual(report["publication_cycles"], 25)
+        self.assertEqual(report["publication_cycles"], 100)
         self.assertEqual(report["episodes"], 6400)
         self.assertEqual(report["samples_per_update"], 64)
         self.assertEqual(report["trainer_gpus"], 4)
@@ -288,7 +288,7 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
 
     def test_rejects_wrong_publication_math(self):
         config = _config()
-        config["trainer"]["total_training_steps"] = 100
+        config["trainer"]["total_training_steps"] = 25
         with self.assertRaisesRegex(ValueError, "publication cycles"):
             _verify(config, mode="formal")
 
@@ -331,11 +331,11 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
 
     def test_budget_is_derived_not_fixed_to_one_publication(self):
         config = _config(mode="formal")
-        config["trainer"]["total_training_steps"] = 2
+        config["trainer"]["total_training_steps"] = 8
         config["rollout"]["total_rollout_steps"] = 512
         budget = _budget("formal")
         budget.update(
-            publication_cycles=2,
+            publication_cycles=8,
             optimizer_updates=8,
             episodes=512,
             task_count=70,

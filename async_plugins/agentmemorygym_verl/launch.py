@@ -46,7 +46,7 @@ _MAX_OBSERVATION_TOKENS = 8192
 _UPSTREAM_ENTRYPOINT = "verl.experimental.fully_async_policy.fully_async_main"
 _ASYNC_TUNING = {
     "gate": {"trigger_parameter_sync_step": 1, "save_freq": 1},
-    "formal": {"trigger_parameter_sync_step": 4, "save_freq": 10},
+    "formal": {"trigger_parameter_sync_step": 1, "save_freq": 10},
 }
 
 

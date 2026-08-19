@@ -158,16 +158,16 @@ class TestFinalizerSuccess(FinalizerTestCase):
             )
             verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
 
-            self.assertEqual(len(metric_rows), 25)
+            self.assertEqual(len(metric_rows), 100)
             self.assertEqual(verdict["status"], "pass", verdict)
             self.assertEqual(verdict["role"], "train_pool")
             self.assertEqual(
                 verdict["counts"]["scheduled_episodes"], len(fixture["schedule_rows"])
             )
             self.assertEqual(verdict["counts"]["complete_learner_updates"], 100)
-            self.assertEqual(verdict["counts"]["publication_cycles"], 25)
+            self.assertEqual(verdict["counts"]["publication_cycles"], 100)
             self.assertEqual(verdict["counts"]["policy_version_min"], 0)
-            self.assertEqual(verdict["counts"]["policy_version_max"], 24)
+            self.assertEqual(verdict["counts"]["policy_version_max"], 99)
             self.assertEqual(verdict["counts"]["validation_events"], 0)
 
 
