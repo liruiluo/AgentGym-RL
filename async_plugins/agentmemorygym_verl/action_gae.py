@@ -14,6 +14,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import verl.utils.torch_functional as verl_F
 from verl.trainer.ppo.core_algos import register_adv_est
 
 TRAJECTORY_UID = "trajectory_uid"
@@ -202,19 +203,21 @@ def compute_amg_action_gae(
         raise ValueError(
             "AMG action GAE reward tolerance must be finite and non-negative"
         )
-    if normalization != "none":
+    if normalization not in {"none", "upstream_masked_whiten"}:
         raise ValueError(
-            "AMG action GAE currently requires amg_advantage_normalization='none'; "
-            f"got {normalization!r}"
+            "AMG action GAE amg_advantage_normalization must be 'none' or "
+            f"'upstream_masked_whiten', got {normalization!r}"
         )
 
     accumulator_dtype = torch.promote_types(rewards.dtype, values.dtype)
     if accumulator_dtype in (torch.float16, torch.bfloat16):
         accumulator_dtype = torch.float32
+    real_policy_mask = valid_token_mask.clone()
     trajectories: dict[str, list[dict[str, Any]]] = defaultdict(list)
     seen_row_uids: set[str] = set()
     for physical_row in range(row_count):
         if _as_bool(is_padding[physical_row], field=IS_PADDING, row=physical_row):
+            real_policy_mask[physical_row] = False
             continue
 
         trajectory_uid = str(trajectory_uids[physical_row])
@@ -343,5 +346,9 @@ def compute_amg_action_gae(
                 advantages[physical_row, row["token_indices"]] = action_advantage
                 returns[physical_row, row["token_indices"]] = action_return
                 next_advantage = action_advantage
+
+    if normalization == "upstream_masked_whiten":
+        advantages = verl_F.masked_whiten(advantages, real_policy_mask)
+        advantages = advantages * real_policy_mask.to(dtype=advantages.dtype)
 
     return advantages, returns

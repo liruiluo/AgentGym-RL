@@ -262,6 +262,7 @@ def build_overrides(
         f"actor_rollout_ref.rollout.agent.agent_loop_config_path={loop_config}",
         "actor_rollout_ref.hybrid_engine=False",
         "algorithm.adv_estimator=amg_action_axis_gae",
+        "++algorithm.amg_advantage_normalization=upstream_masked_whiten",
         "algorithm.gamma=1.0",
         "algorithm.lam=1.0",
         "algorithm.use_kl_in_reward=False",

@@ -164,6 +164,7 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
         },
         "algorithm": {
             "adv_estimator": "amg_action_axis_gae",
+            "amg_advantage_normalization": "upstream_masked_whiten",
             "gamma": 1.0,
             "lam": 1.0,
             "use_kl_in_reward": False,

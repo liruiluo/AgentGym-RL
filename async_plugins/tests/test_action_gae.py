@@ -103,6 +103,49 @@ class TestAMGActionGAE(unittest.TestCase):
         torch.testing.assert_close(advantages, expected_advantages)
         torch.testing.assert_close(returns, expected_returns)
 
+    def test_upstream_masked_whitening_zero_centers_only_real_policy_tokens(self):
+        batch, non_tensor_batch, config = self._fixture()
+        config["amg_advantage_normalization"] = "upstream_masked_whiten"
+        # Exercise the synthetic-row exclusion directly: the padding row looks
+        # like a finite sampled response before ``is_padding`` removes it from
+        # the whitening population.
+        batch["response_mask"][3] = torch.tensor([1, 1, 0], dtype=torch.long)
+        batch["rollout_log_probs"][3] = torch.tensor(
+            [-0.7, -0.8, 0.0], dtype=torch.float32
+        )
+        batch["old_log_probs"] = batch["rollout_log_probs"].clone()
+
+        advantages, returns = compute_amg_action_gae(
+            batch=batch,
+            non_tensor_batch=non_tensor_batch,
+            config=config,
+        )
+
+        self.assertEqual(int(batch["response_mask"][3].sum().item()), 2)
+        real_policy_mask = batch["response_mask"].to(dtype=torch.bool).clone()
+        real_policy_mask[3] = False
+        selected = advantages[real_policy_mask]
+        self.assertAlmostEqual(float(selected.mean().item()), 0.0, places=6)
+        self.assertAlmostEqual(
+            float(selected.var(unbiased=True).item()), 1.0, delta=1e-5
+        )
+        self.assertEqual(float(advantages[3].abs().sum().item()), 0.0)
+        self.assertEqual(float(advantages[1, 2].item()), 0.0)
+        self.assertEqual(float(advantages[2, 1:].abs().sum().item()), 0.0)
+        self.assertEqual(float(advantages[0].var(unbiased=False).item()), 0.0)
+        self.assertEqual(float(advantages[1, :2].var(unbiased=False).item()), 0.0)
+
+        expected_returns = torch.tensor(
+            [
+                [2.485, 2.485, 2.485],
+                [2.0, 2.0, 0.0],
+                [3.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ],
+            dtype=torch.float32,
+        )
+        torch.testing.assert_close(returns, expected_returns)
+
     def test_rejects_reward_packing_that_does_not_conserve_action_reward(self):
         batch, non_tensor_batch, config = self._fixture()
         batch["token_level_rewards"][0, 1] = 0.75
