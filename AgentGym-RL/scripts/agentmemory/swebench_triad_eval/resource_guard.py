@@ -138,7 +138,10 @@ class CgroupV1CellEnvelope:
         self.docker_parent = f"/{self.relative_path}"
         self._state = "new"
         self._prepare_receipt: Mapping[str, Any] | None = None
+        self._observed_memory_peak = 0
+        self._observed_memory_failcnt = 0
         self._observed_pids_peak = 0
+        self._observed_pids_max_events = 0
 
     def prepare(self) -> Mapping[str, Any]:
         if self._state != "new":
@@ -190,10 +193,7 @@ class CgroupV1CellEnvelope:
         if self._state not in {"prepared", "verified"}:
             raise ResourceGuardError("cgroup is not prepared")
         init_pid = _positive_integer(container_init_pid, "container init PID")
-        snapshot = self._validated_snapshot(self.backend.snapshot(self.relative_path))
-        self._observed_pids_peak = max(
-            self._observed_pids_peak, snapshot["pids_current"]
-        )
+        snapshot = self._observe_snapshot()
         memory_tasks = snapshot["memory_tasks"]
         pids_tasks = snapshot["pids_tasks"]
         memory_procs = snapshot["memory_procs"]
@@ -226,13 +226,29 @@ class CgroupV1CellEnvelope:
             "all_descendants_inherited": True,
         }
 
+    def observe(self) -> dict[str, Any]:
+        """Capture live counters before Docker removes its child cgroup."""
+        if self._state not in {"prepared", "verified"}:
+            raise ResourceGuardError("cgroup is not prepared")
+        snapshot = self._observe_snapshot()
+        return {
+            "schema": "swebench_cgroup_v1_observation_v1",
+            "relative_path": self.relative_path,
+            "memory_peak_bytes": self._observed_memory_peak,
+            "memory_failcnt": self._observed_memory_failcnt,
+            "pids_current": snapshot["pids_current"],
+            "pids_peak": self._observed_pids_peak,
+            "pids_max_events": self._observed_pids_max_events,
+            "memory_tasks": snapshot["memory_tasks"],
+            "memory_procs": snapshot["memory_procs"],
+            "pids_tasks": snapshot["pids_tasks"],
+            "pids_procs": snapshot["pids_procs"],
+        }
+
     def teardown(self) -> dict[str, Any]:
         if self._state not in {"prepared", "verified"}:
             raise ResourceGuardError("cgroup envelope is not open")
-        snapshot = self._validated_snapshot(self.backend.snapshot(self.relative_path))
-        self._observed_pids_peak = max(
-            self._observed_pids_peak, snapshot["pids_current"]
-        )
+        snapshot = self._observe_snapshot()
         if any(
             (
                 snapshot["memory_tasks"],
@@ -258,14 +274,30 @@ class CgroupV1CellEnvelope:
         return {
             "schema": "swebench_cgroup_v1_teardown_v1",
             "relative_path": self.relative_path,
-            "memory_peak_bytes": snapshot["memory_peak_bytes"],
-            "memory_failcnt": snapshot["memory_failcnt"],
+            "memory_peak_bytes": self._observed_memory_peak,
+            "memory_failcnt": self._observed_memory_failcnt,
             "pids_peak": self._observed_pids_peak,
-            "pids_max_events": snapshot["pids_max_events"],
+            "pids_max_events": self._observed_pids_max_events,
             "memory_tasks_empty": True,
             "pids_tasks_empty": True,
             "removed": True,
         }
+
+    def _observe_snapshot(self) -> dict[str, Any]:
+        snapshot = self._validated_snapshot(self.backend.snapshot(self.relative_path))
+        self._observed_memory_peak = max(
+            self._observed_memory_peak, snapshot["memory_peak_bytes"]
+        )
+        self._observed_memory_failcnt = max(
+            self._observed_memory_failcnt, snapshot["memory_failcnt"]
+        )
+        self._observed_pids_peak = max(
+            self._observed_pids_peak, snapshot["pids_current"]
+        )
+        self._observed_pids_max_events = max(
+            self._observed_pids_max_events, snapshot["pids_max_events"]
+        )
+        return snapshot
 
     def _validated_snapshot(self, value: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(value, Mapping) or value.get("schema") != (

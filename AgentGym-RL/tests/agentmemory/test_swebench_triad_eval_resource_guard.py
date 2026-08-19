@@ -579,6 +579,31 @@ class CgroupV1CellEnvelopeTest(unittest.TestCase):
         self.assertTrue(receipt["pids_tasks_empty"])
         self.assertTrue(self.backend.removed)
 
+    def test_live_counter_observation_survives_child_cgroup_removal(self) -> None:
+        self.envelope.prepare()
+        observed = self.envelope.observe()
+
+        self.assertEqual(observed["memory_failcnt"], 3)
+        self.assertEqual(observed["pids_max_events"], 4)
+
+        self.backend.snapshot_value["memory"]["tasks"] = []
+        self.backend.snapshot_value["memory"]["cgroup_procs"] = []
+        self.backend.snapshot_value["memory"]["max_usage_in_bytes"] = 0
+        self.backend.snapshot_value["memory"]["failcnt"] = 0
+        self.backend.snapshot_value["pids"]["tasks"] = []
+        self.backend.snapshot_value["pids"]["cgroup_procs"] = []
+        self.backend.snapshot_value["pids"]["current"] = 0
+        self.backend.snapshot_value["pids"]["max_events"] = 0
+        self.backend.snapshot_value["memberships"] = {}
+
+        receipt = self.envelope.teardown()
+
+        self.assertEqual(receipt["memory_peak_bytes"], 7 * 1024 * 1024)
+        self.assertEqual(receipt["memory_failcnt"], 3)
+        self.assertEqual(receipt["pids_peak"], 2)
+        self.assertEqual(receipt["pids_max_events"], 4)
+        self.assertTrue(self.backend.removed)
+
     def test_nonempty_memory_or_pids_group_forbids_removal(self) -> None:
         self.envelope.prepare()
         with self.assertRaisesRegex(ResourceGuardError, "nonempty"):
