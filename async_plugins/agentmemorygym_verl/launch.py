@@ -62,7 +62,8 @@ class LaunchInputs:
     formal_schedule_certificate: Path
     trainer_gpus: int = 4
     standalone_rollout_gpus: int = 4
-    use_fused_kernels: bool = False
+    actor_use_fused_kernels: bool = False
+    critic_use_fused_kernels: bool = False
 
 
 def _string(value: str | Path) -> str:
@@ -169,7 +170,8 @@ def build_overrides(
         f"actor_rollout_ref.model.path={model_path}",
         "actor_rollout_ref.model.trust_remote_code=True",
         "actor_rollout_ref.model.use_remove_padding=True",
-        f"actor_rollout_ref.model.use_fused_kernels={inputs.use_fused_kernels}",
+        "actor_rollout_ref.model.use_fused_kernels="
+        f"{inputs.actor_use_fused_kernels}",
         "actor_rollout_ref.model.fused_kernel_options.impl_backend=torch",
         # Keep veRL's native HF/FSDP gradient checkpointing enabled. The
         # synchronous comparator used the upstream default successfully;
@@ -179,7 +181,7 @@ def build_overrides(
         f"critic.model.tokenizer_path={model_path}",
         "critic.model.trust_remote_code=True",
         "critic.model.use_remove_padding=True",
-        f"critic.model.use_fused_kernels={inputs.use_fused_kernels}",
+        f"critic.model.use_fused_kernels={inputs.critic_use_fused_kernels}",
         "critic.model.fused_kernel_options.impl_backend=torch",
         "critic.model.enable_gradient_checkpointing=True",
         "actor_rollout_ref.actor.strategy=fsdp2",
@@ -1196,7 +1198,8 @@ def prepare_launch(
             "run_dir": str(inputs.run_dir),
             "trainer_gpus": inputs.trainer_gpus,
             "standalone_rollout_gpus": inputs.standalone_rollout_gpus,
-            "use_fused_kernels": inputs.use_fused_kernels,
+            "actor_use_fused_kernels": inputs.actor_use_fused_kernels,
+            "critic_use_fused_kernels": inputs.critic_use_fused_kernels,
         },
         "source": source_report_runtime,
         "plugin_manifest": _production_manifest(inputs.outer_root),
@@ -1242,7 +1245,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--formal-schedule-certificate", type=Path, required=True)
     parser.add_argument("--trainer-gpus", type=int, default=4)
     parser.add_argument("--standalone-rollout-gpus", type=int, default=4)
-    parser.add_argument("--use-fused-kernels", action="store_true")
+    parser.add_argument("--actor-use-fused-kernels", action="store_true")
+    parser.add_argument("--critic-use-fused-kernels", action="store_true")
     parser.add_argument("--resolve-only", action="store_true")
     parser.add_argument("--skip-endpoint-preflight", action="store_true")
     return parser.parse_args(argv)
@@ -1264,7 +1268,8 @@ def main(argv: list[str] | None = None) -> int:
         formal_schedule_certificate=args.formal_schedule_certificate.resolve(),
         trainer_gpus=args.trainer_gpus,
         standalone_rollout_gpus=args.standalone_rollout_gpus,
-        use_fused_kernels=args.use_fused_kernels,
+        actor_use_fused_kernels=args.actor_use_fused_kernels,
+        critic_use_fused_kernels=args.critic_use_fused_kernels,
     )
     command, env, receipt = prepare_launch(
         inputs,

@@ -236,12 +236,11 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
             report["gradient_checkpointing"], {"actor": True, "critic": True}
         )
 
-    def test_fused_six_plus_two_topology_is_resolved_and_reported(self):
+    def test_actor_only_fused_six_plus_two_is_resolved_and_reported(self):
         config = _config(mode="gate")
         config["trainer"]["n_gpus_per_node"] = 6
         config["rollout"]["n_gpus_per_node"] = 2
         config["actor_rollout_ref"]["model"]["use_fused_kernels"] = True
-        config["critic"]["model"]["use_fused_kernels"] = True
 
         report = _verify(config, mode="gate")
 
@@ -249,13 +248,13 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         self.assertEqual(report["standalone_rollout_gpus"], 2)
         self.assertEqual(
             report["fused_kernels"],
-            {"actor": True, "critic": True, "impl_backend": "torch"},
+            {"actor": True, "critic": False, "impl_backend": "torch"},
         )
 
-    def test_rejects_actor_critic_fused_kernel_drift(self):
+    def test_rejects_non_boolean_fused_kernel_selection(self):
         config = _config()
-        config["actor_rollout_ref"]["model"]["use_fused_kernels"] = True
-        with self.assertRaisesRegex(ValueError, "same boolean use_fused_kernels"):
+        config["critic"]["model"]["use_fused_kernels"] = "false"
+        with self.assertRaisesRegex(ValueError, "critic use_fused_kernels"):
             _verify(config, mode="formal")
 
     def test_one_update_budget(self):

@@ -253,10 +253,10 @@ def verify_resolved_config(
 
     actor_fused = _at(config, "actor_rollout_ref.model.use_fused_kernels")
     critic_fused = _at(config, "critic.model.use_fused_kernels")
-    if not isinstance(actor_fused, bool) or actor_fused != critic_fused:
-        raise ValueError(
-            "actor and critic must select the same boolean use_fused_kernels value"
-        )
+    if not isinstance(actor_fused, bool):
+        raise ValueError("actor use_fused_kernels must be boolean")
+    if not isinstance(critic_fused, bool):
+        raise ValueError("critic use_fused_kernels must be boolean")
     _require_equal(
         config,
         "actor_rollout_ref.model.fused_kernel_options.impl_backend",

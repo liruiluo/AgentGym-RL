@@ -144,14 +144,15 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                 json.loads(values["data.agentgym.expected_role"]), "train_pool"
             )
 
-    def test_fused_six_plus_two_uses_only_upstream_native_overrides(self):
+    def test_actor_only_fused_six_plus_two_uses_upstream_native_overrides(self):
         with tempfile.TemporaryDirectory() as directory:
             inputs, identity = self._identity(Path(directory), "gate")
             inputs = replace(
                 inputs,
                 trainer_gpus=6,
                 standalone_rollout_gpus=2,
-                use_fused_kernels=True,
+                actor_use_fused_kernels=True,
+                critic_use_fused_kernels=False,
             )
             values = self._values(
                 build_overrides(
@@ -167,7 +168,7 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             self.assertEqual(
                 values["actor_rollout_ref.model.use_fused_kernels"], "True"
             )
-            self.assertEqual(values["critic.model.use_fused_kernels"], "True")
+            self.assertEqual(values["critic.model.use_fused_kernels"], "False")
             self.assertEqual(
                 values[
                     "actor_rollout_ref.model.fused_kernel_options.impl_backend"
@@ -336,10 +337,17 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
         parsed = _parse_args(common)
         for name in ("expected_verl_commit", "model_path", "episodes", "task_count"):
             self.assertFalse(hasattr(parsed, name))
+        actor_only = _parse_args(common + ["--actor-use-fused-kernels"])
+        self.assertTrue(actor_only.actor_use_fused_kernels)
+        self.assertFalse(actor_only.critic_use_fused_kernels)
+        critic_only = _parse_args(common + ["--critic-use-fused-kernels"])
+        self.assertFalse(critic_only.actor_use_fused_kernels)
+        self.assertTrue(critic_only.critic_use_fused_kernels)
         for forbidden in (
             ["--expected-verl-commit", "0" * 40],
             ["--model-path", "/tmp/model"],
             ["--episodes", "64"],
+            ["--use-fused-kernels"],
         ):
             with self.subTest(forbidden=forbidden), self.assertRaises(SystemExit):
                 _parse_args(common + forbidden)

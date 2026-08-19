@@ -12,7 +12,8 @@ Usage: orchestrate_openmle_fully_async.sh \
   --known-cpu-script PATH --known-cpu-script-sha256 SHA \
   --known-gpu-owner ID --known-gpu-script PATH \
   --known-gpu-script-sha256 SHA --known-gpu-process-command COMMAND \
-  [--trainer-gpus 4|6 --standalone-rollout-gpus 4|2 --use-fused-kernels]
+  [--trainer-gpus 4|6 --standalone-rollout-gpus 4|2] \
+  [--actor-use-fused-kernels] [--critic-use-fused-kernels]
 EOF
   exit 64
 }
@@ -42,7 +43,8 @@ PORT=65524
 EXPECTED_CHECKPOINT_BYTES=108992339992
 TRAINER_GPUS=4
 STANDALONE_ROLLOUT_GPUS=4
-USE_FUSED_KERNELS=0
+ACTOR_USE_FUSED_KERNELS=0
+CRITIC_USE_FUSED_KERNELS=0
 
 while (($#)); do
   case "$1" in
@@ -71,7 +73,8 @@ while (($#)); do
     --expected-checkpoint-bytes) EXPECTED_CHECKPOINT_BYTES=${2:?}; shift 2 ;;
     --trainer-gpus) TRAINER_GPUS=${2:?}; shift 2 ;;
     --standalone-rollout-gpus) STANDALONE_ROLLOUT_GPUS=${2:?}; shift 2 ;;
-    --use-fused-kernels) USE_FUSED_KERNELS=1; shift ;;
+    --actor-use-fused-kernels) ACTOR_USE_FUSED_KERNELS=1; shift ;;
+    --critic-use-fused-kernels) CRITIC_USE_FUSED_KERNELS=1; shift ;;
     *) usage ;;
   esac
 done
@@ -643,8 +646,11 @@ LAUNCH_TUNING_ARGS=(
   --trainer-gpus "$TRAINER_GPUS"
   --standalone-rollout-gpus "$STANDALONE_ROLLOUT_GPUS"
 )
-if [ "$USE_FUSED_KERNELS" -eq 1 ]; then
-  LAUNCH_TUNING_ARGS+=(--use-fused-kernels)
+if [ "$ACTOR_USE_FUSED_KERNELS" -eq 1 ]; then
+  LAUNCH_TUNING_ARGS+=(--actor-use-fused-kernels)
+fi
+if [ "$CRITIC_USE_FUSED_KERNELS" -eq 1 ]; then
+  LAUNCH_TUNING_ARGS+=(--critic-use-fused-kernels)
 fi
 # Re-select the live publication and exec the trainer from the same process.
 # This removes the shell scheduling window between the final selection and the
