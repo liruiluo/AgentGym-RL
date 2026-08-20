@@ -13,7 +13,8 @@ Usage: orchestrate_openmle_fully_async.sh \
   --known-gpu-owner ID --known-gpu-script PATH \
   --known-gpu-script-sha256 SHA --known-gpu-process-command COMMAND \
   [--trainer-gpus 4|6 --standalone-rollout-gpus 4|2] \
-  [--actor-use-fused-kernels] [--critic-use-fused-kernels]
+  [--actor-use-fused-kernels] [--critic-use-fused-kernels] \
+  [--concurrent-samples-per-replica N]
 EOF
   exit 64
 }
@@ -48,6 +49,7 @@ TRAINER_GPUS=4
 STANDALONE_ROLLOUT_GPUS=4
 ACTOR_USE_FUSED_KERNELS=0
 CRITIC_USE_FUSED_KERNELS=0
+CONCURRENT_SAMPLES_PER_REPLICA=16
 
 while (($#)); do
   case "$1" in
@@ -78,6 +80,7 @@ while (($#)); do
     --standalone-rollout-gpus) STANDALONE_ROLLOUT_GPUS=${2:?}; shift 2 ;;
     --actor-use-fused-kernels) ACTOR_USE_FUSED_KERNELS=1; shift ;;
     --critic-use-fused-kernels) CRITIC_USE_FUSED_KERNELS=1; shift ;;
+    --concurrent-samples-per-replica) CONCURRENT_SAMPLES_PER_REPLICA=${2:?}; shift 2 ;;
     *) usage ;;
   esac
 done
@@ -119,6 +122,13 @@ case "$TRAINER_GPUS:$STANDALONE_ROLLOUT_GPUS" in
   4:4|6:2) ;;
   *) echo "unsupported Hybrid + Standalone topology: $TRAINER_GPUS+$STANDALONE_ROLLOUT_GPUS" >&2; exit 64 ;;
 esac
+case "$CONCURRENT_SAMPLES_PER_REPLICA" in
+  *[!0-9]*|'') echo "invalid concurrent samples per replica: $CONCURRENT_SAMPLES_PER_REPLICA" >&2; exit 64 ;;
+esac
+[ "$CONCURRENT_SAMPLES_PER_REPLICA" -gt 0 ] || {
+  echo "concurrent samples per replica must be positive" >&2
+  exit 64
+}
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 PLUGIN_OUTER=$(cd -- "$SCRIPT_DIR/../.." && pwd -P)
@@ -678,6 +688,7 @@ printf '%s\n' "$(date -u +%FT%TZ)" > "$RUN_DIR/trainer-started-at"
 LAUNCH_TUNING_ARGS=(
   --trainer-gpus "$TRAINER_GPUS"
   --standalone-rollout-gpus "$STANDALONE_ROLLOUT_GPUS"
+  --concurrent-samples-per-replica "$CONCURRENT_SAMPLES_PER_REPLICA"
 )
 if [ "$ACTOR_USE_FUSED_KERNELS" -eq 1 ]; then
   LAUNCH_TUNING_ARGS+=(--actor-use-fused-kernels)

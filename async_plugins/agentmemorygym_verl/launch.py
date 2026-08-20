@@ -77,6 +77,7 @@ class LaunchInputs:
     standalone_rollout_gpus: int = 4
     actor_use_fused_kernels: bool = False
     critic_use_fused_kernels: bool = False
+    concurrent_samples_per_replica: int = 16
 
 
 def _string(value: str | Path) -> str:
@@ -98,6 +99,8 @@ def build_overrides(
 
     if inputs.mode not in {"gate", "formal"}:
         raise ValueError(f"unsupported launch mode {inputs.mode!r}")
+    if inputs.concurrent_samples_per_replica <= 0:
+        raise ValueError("concurrent_samples_per_replica must be positive")
     if (inputs.trainer_gpus, inputs.standalone_rollout_gpus) not in {(4, 4), (6, 2)}:
         raise ValueError(
             "reviewed AMG Hybrid + Standalone topologies are 4+4 and 6+2, got "
@@ -329,7 +332,8 @@ def build_overrides(
         "async_training.dynamic_schedule_policy=default",
         "async_training.dynamic_schedule_deactivate_ratio=0.6",
         "async_training.dynamic_schedule_enable_rebalance=True",
-        "async_training.concurrent_samples_per_replica=16",
+        "async_training.concurrent_samples_per_replica="
+        f"{inputs.concurrent_samples_per_replica}",
         f"async_training.runtime_receipt_path={run_dir}/native-runtime-receipt.json",
         "async_training.rollout_data_non_tensor_keys=[step_record_json]",
         "async_training.rollout_data_non_tensor_max_keys=1",
@@ -1232,6 +1236,7 @@ def prepare_launch(
             "standalone_rollout_gpus": inputs.standalone_rollout_gpus,
             "actor_use_fused_kernels": inputs.actor_use_fused_kernels,
             "critic_use_fused_kernels": inputs.critic_use_fused_kernels,
+            "concurrent_samples_per_replica": inputs.concurrent_samples_per_replica,
         },
         "source": source_report_runtime,
         "plugin_manifest": _production_manifest(inputs.outer_root),
@@ -1279,6 +1284,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--standalone-rollout-gpus", type=int, default=4)
     parser.add_argument("--actor-use-fused-kernels", action="store_true")
     parser.add_argument("--critic-use-fused-kernels", action="store_true")
+    parser.add_argument("--concurrent-samples-per-replica", type=int, default=16)
     parser.add_argument("--resolve-only", action="store_true")
     parser.add_argument("--skip-endpoint-preflight", action="store_true")
     return parser.parse_args(argv)
@@ -1302,6 +1308,7 @@ def main(argv: list[str] | None = None) -> int:
         standalone_rollout_gpus=args.standalone_rollout_gpus,
         actor_use_fused_kernels=args.actor_use_fused_kernels,
         critic_use_fused_kernels=args.critic_use_fused_kernels,
+        concurrent_samples_per_replica=args.concurrent_samples_per_replica,
     )
     command, env, receipt = prepare_launch(
         inputs,

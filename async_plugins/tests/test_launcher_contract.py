@@ -159,6 +159,7 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                 standalone_rollout_gpus=2,
                 actor_use_fused_kernels=True,
                 critic_use_fused_kernels=False,
+                concurrent_samples_per_replica=32,
             )
             values = self._values(
                 build_overrides(
@@ -171,6 +172,9 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             )
             self.assertEqual(values["trainer.n_gpus_per_node"], "6")
             self.assertEqual(values["rollout.n_gpus_per_node"], "2")
+            self.assertEqual(
+                values["async_training.concurrent_samples_per_replica"], "32"
+            )
             self.assertEqual(
                 values["actor_rollout_ref.actor.ppo_mini_batch_size"], "510"
             )
@@ -359,6 +363,11 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             str(FIXTURES / "formal100-schedule-certificate.json"),
         ]
         parsed = _parse_args(common)
+        self.assertEqual(parsed.concurrent_samples_per_replica, 16)
+        concurrency32 = _parse_args(
+            common + ["--concurrent-samples-per-replica", "32"]
+        )
+        self.assertEqual(concurrency32.concurrent_samples_per_replica, 32)
         for name in ("expected_verl_commit", "model_path", "episodes", "task_count"):
             self.assertFalse(hasattr(parsed, name))
         actor_only = _parse_args(common + ["--actor-use-fused-kernels"])
@@ -375,6 +384,39 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
         ):
             with self.subTest(forbidden=forbidden), self.assertRaises(SystemExit):
                 _parse_args(common + forbidden)
+
+    def test_nonpositive_rollout_concurrency_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inputs, identity = self._identity(Path(directory), "gate")
+            inputs = replace(inputs, concurrent_samples_per_replica=0)
+            with self.assertRaisesRegex(
+                ValueError, "concurrent_samples_per_replica must be positive"
+            ):
+                build_overrides(
+                    inputs,
+                    effective_schedule=inputs.schedule,
+                    endpoint_client_config=identity["client_config"],
+                    budget_contract=identity["budget_contract"],
+                    training_runtime=identity["training_runtime"],
+                )
+
+    def test_orchestrator_plumbs_native_rollout_concurrency(self):
+        script = (
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "orchestrate_openmle_fully_async.sh"
+        )
+        text = script.read_text(encoding="utf-8")
+        self.assertIn("CONCURRENT_SAMPLES_PER_REPLICA=16", text)
+        self.assertIn(
+            "--concurrent-samples-per-replica) "
+            "CONCURRENT_SAMPLES_PER_REPLICA=${2:?}",
+            text,
+        )
+        self.assertIn(
+            '--concurrent-samples-per-replica "$CONCURRENT_SAMPLES_PER_REPLICA"',
+            text,
+        )
 
     def test_shell_launcher_selects_python_from_publication(self):
         script = (
