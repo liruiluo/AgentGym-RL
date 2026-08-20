@@ -71,7 +71,7 @@ def _config(*, mode: str = "formal") -> dict:
             },
             "model": {
                 "path": "/models/Qwen3.5-4B",
-                "enable_gradient_checkpointing": True,
+                "enable_gradient_checkpointing": False,
                 "use_fused_kernels": False,
                 "fused_kernel_options": {"impl_backend": "torch"},
             },
@@ -238,7 +238,7 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         self.assertEqual(report["trainer_gpus"], 4)
         self.assertEqual(report["standalone_rollout_gpus"], 4)
         self.assertEqual(
-            report["gradient_checkpointing"], {"actor": True, "critic": True}
+            report["gradient_checkpointing"], {"actor": False, "critic": True}
         )
 
     def test_actor_only_fused_six_plus_two_is_resolved_and_reported(self):
@@ -311,11 +311,14 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Continuous Token"):
             _verify(config, mode="formal")
 
-    def test_rejects_disabling_upstream_gradient_checkpointing(self):
-        for role in ("actor_rollout_ref", "critic"):
+    def test_rejects_role_specific_gradient_checkpointing_drift(self):
+        for role, drifted_value in (
+            ("actor_rollout_ref", True),
+            ("critic", False),
+        ):
             with self.subTest(role=role):
                 config = _config()
-                config[role]["model"]["enable_gradient_checkpointing"] = False
+                config[role]["model"]["enable_gradient_checkpointing"] = drifted_value
                 with self.assertRaisesRegex(
                     ValueError, "enable_gradient_checkpointing"
                 ):
