@@ -98,6 +98,11 @@ def _config(*, mode: str = "formal") -> dict:
                 "calculate_log_probs": True,
                 "gpu_memory_utilization": 0.35,
                 "standalone_gpu_memory_utilization": 0.8,
+                "checkpoint_engine": {
+                    "backend": "nccl",
+                    "update_weights_bucket_megabytes": 2048,
+                    "engine_kwargs": {"nccl": {"multi_sender": True}},
+                },
                 "multi_turn": {"enable": True},
                 "agent": {
                     "default_agent_loop": "amg_task_neutral_async",
@@ -240,6 +245,18 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         self.assertEqual(
             report["gradient_checkpointing"], {"actor": True, "critic": True}
         )
+        self.assertEqual(
+            report["checkpoint_engine"],
+            {"backend": "nccl", "bucket_megabytes": 2048, "multi_sender": True},
+        )
+
+    def test_rejects_disabling_node_local_multi_sender(self):
+        config = _config()
+        config["actor_rollout_ref"]["rollout"]["checkpoint_engine"][
+            "engine_kwargs"
+        ]["nccl"]["multi_sender"] = False
+        with self.assertRaisesRegex(ValueError, "multi_sender"):
+            _verify(config, mode="formal")
 
     def test_actor_only_fused_six_plus_two_is_resolved_and_reported(self):
         config = _config(mode="gate")

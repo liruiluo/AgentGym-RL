@@ -282,6 +282,9 @@ def build_overrides(
         "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True",
         "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=131072",
         "actor_rollout_ref.rollout.checkpoint_engine.backend=nccl",
+        # Upstream node-local NCCL relays widen the standalone-rollout weight
+        # broadcast without changing learner, rollout, or PPO semantics.
+        "++actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.nccl.multi_sender=True",
         "actor_rollout_ref.rollout.agent.num_workers=64",
         "actor_rollout_ref.rollout.agent.default_agent_loop=amg_task_neutral_async",
         f"actor_rollout_ref.rollout.agent.agent_loop_config_path={loop_config}",

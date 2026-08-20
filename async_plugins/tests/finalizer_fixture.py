@@ -139,6 +139,11 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
                 "calculate_log_probs": True,
                 "gpu_memory_utilization": 0.35,
                 "standalone_gpu_memory_utilization": 0.8,
+                "checkpoint_engine": {
+                    "backend": "nccl",
+                    "update_weights_bucket_megabytes": 2048,
+                    "engine_kwargs": {"nccl": {"multi_sender": True}},
+                },
                 "multi_turn": {"enable": True},
                 "agent": {
                     "default_agent_loop": "amg_task_neutral_async",
