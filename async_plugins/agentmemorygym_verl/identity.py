@@ -17,7 +17,7 @@ from typing import Any
 # Updated only after the generic veRL runtime-evidence, fused-forward
 # instance-scope, upstream masked fused-head, and variable-response alignment
 # patches are reviewed and committed. It is intentionally not caller-selectable.
-EXPECTED_VERL_COMMIT = "88e17fbb07088b6085c5949e33cdc3b0f0ebc53d"
+EXPECTED_VERL_COMMIT = "51dcef7ade753547851b20e3caf04bf51b8fe954"
 
 # Files needed to load the exact Qwen3.5-4B text model and tokenizer.  The model
 # root itself comes from the publication's training_runtime section, so a newer
