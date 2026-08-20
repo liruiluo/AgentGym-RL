@@ -22,6 +22,10 @@ FIXTURES = Path("/tmp/openmle-v8-launch-fixtures-20260818")
 class TestAMGFullyAsyncIdentity(unittest.TestCase):
     def test_only_reviewed_verl_and_model_bytes_are_module_constants(self):
         self.assertRegex(EXPECTED_VERL_COMMIT, r"^[0-9a-f]{40}$")
+        self.assertEqual(
+            EXPECTED_VERL_COMMIT,
+            "60b50dcf743803def55686f9687506bfe73f9804",
+        )
         self.assertGreaterEqual(len(LOCKED_MODEL_FILE_SHA256), 7)
         for relative, digest in LOCKED_MODEL_FILE_SHA256.items():
             self.assertFalse(Path(relative).is_absolute())
