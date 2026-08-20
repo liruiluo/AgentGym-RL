@@ -14,9 +14,10 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-# Updated only after the generic veRL runtime-evidence patch is reviewed and
-# committed.  It is intentionally not caller-selectable.
-EXPECTED_VERL_COMMIT = "6830af416503c4b732a77416fabf8af9c33c9fb8"
+# Updated only after the generic veRL runtime-evidence and fused-forward
+# instance-scope patches are reviewed and committed. It is intentionally not
+# caller-selectable.
+EXPECTED_VERL_COMMIT = "9c8458e83a20ac05781a28b45c7f4ac3253450bd"
 
 # Files needed to load the exact Qwen3.5-4B text model and tokenizer.  The model
 # root itself comes from the publication's training_runtime section, so a newer
