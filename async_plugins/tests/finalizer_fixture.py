@@ -112,7 +112,7 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
             "agentgym": dict(agentgym),
             "model": {
                 "path": PUBLICATION_TRAINING_RUNTIME["base_model"],
-                "enable_gradient_checkpointing": True,
+                "enable_gradient_checkpointing": False,
                 "use_fused_kernels": False,
                 "fused_kernel_options": {"impl_backend": "torch"},
             },

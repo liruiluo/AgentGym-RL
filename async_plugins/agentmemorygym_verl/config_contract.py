@@ -295,7 +295,7 @@ def verify_resolved_config(
         "data.max_prompt_length": 16384,
         "data.max_response_length": 2048,
         "data.return_raw_chat": True,
-        "actor_rollout_ref.model.enable_gradient_checkpointing": True,
+        "actor_rollout_ref.model.enable_gradient_checkpointing": False,
         "critic.model.enable_gradient_checkpointing": True,
         "actor_rollout_ref.actor.ppo_mini_batch_size": ppo_mini_batch_size,
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu": 8,
@@ -468,7 +468,7 @@ def verify_resolved_config(
         "trainer_gpus": trainer_gpus,
         "standalone_rollout_gpus": standalone_rollout_gpus,
         "dynamic_hybrid_enabled": True,
-        "gradient_checkpointing": {"actor": True, "critic": True},
+        "gradient_checkpointing": {"actor": False, "critic": True},
         "fused_kernels": {
             "actor": actor_fused,
             "critic": critic_fused,
