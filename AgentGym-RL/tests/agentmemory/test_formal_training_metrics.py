@@ -33,8 +33,20 @@ def record(
     advanced=False,
     done=False,
     execution="executed",
+    status=None,
+    info_wrapper_evidence=None,
 ):
     op = action.split(None, 1)[0]
+    info = {
+        "reward_components": [
+            {"name": name, "value": value} for name, value in components
+        ],
+        "memory_ops": list(memory_ops),
+    }
+    if status is not None:
+        info["status"] = status
+    if info_wrapper_evidence is not None:
+        info["wrapper_evidence"] = dict(info_wrapper_evidence)
     return {
         "action": action,
         "action_execution": (
@@ -52,12 +64,7 @@ def record(
         "session_advanced": advanced,
         "done": done,
         "outcome": "success" if done and accepted else "running",
-        "env_info_after": {
-            "reward_components": [
-                {"name": name, "value": value} for name, value in components
-            ],
-            "memory_ops": list(memory_ops),
-        },
+        "env_info_after": info,
     }
 
 
@@ -370,6 +377,63 @@ class FormalTrainingMetricsTests(unittest.TestCase):
                     terminal=True,
                 ),
             ]
+        )
+        self.assertEqual(summary["invalid_action_count"], 1.0)
+
+    def test_invalid_status_and_wrapper_evidence_are_authoritative(self) -> None:
+        rows = []
+        for index, step in enumerate(
+            (
+                record(
+                    "plain answer",
+                    before=0,
+                    after=0,
+                    status="invalid_action",
+                    execution=None,
+                ),
+                record(
+                    "malformed tool",
+                    before=0,
+                    after=0,
+                    info_wrapper_evidence={"invalid_action": True},
+                    execution=None,
+                ),
+            )
+        ):
+            rows.append(
+                row(
+                    f"authoritative-{index}",
+                    0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    step,
+                    terminal=True,
+                )
+            )
+        summary = summarize_formal_training_rows(rows)
+        self.assertEqual(summary["invalid_action_count"], 2.0)
+
+    def test_task_neutral_server_invalid_evidence_is_counted_once(self) -> None:
+        step = record(
+            "malformed tool",
+            before=0,
+            after=0,
+            components=(("invalid_action", 0.0),),
+            status="invalid_action",
+            info_wrapper_evidence={"invalid_action": True},
+            execution=None,
+        )
+        step["schema_version"] = "task_neutral_policy_step_v1"
+        step["env_info_before"] = {"current_subtask_index": 0}
+        step["env_info_after"]["current_subtask_index"] = 0
+        step["wrapper_evidence"] = {"event": "native_action"}
+        step["wrapper_evidence"]["server_wrapper_evidence"] = {
+            "invalid_action": True
+        }
+        summary = summarize_formal_training_rows(
+            [row("task-neutral-invalid", 0, 0.0, 0.0, 0.0, 0.0, step, terminal=True)]
         )
         self.assertEqual(summary["invalid_action_count"], 1.0)
 

@@ -39,6 +39,42 @@ def _component_names(record: dict[str, Any]) -> set[str]:
     }
 
 
+def _has_authoritative_invalid_action(
+    record: dict[str, Any], *, component_names: set[str]
+) -> bool:
+    """Read invalid-action status from the environment receipt.
+
+    LiteResearcher keeps parser outcomes in ``status`` and
+    ``wrapper_evidence``.  Older native receipts only exposed the reward
+    component, while task-neutral rows may wrap the server evidence one level
+    deeper.  These are alternate encodings of one action, so combine them with
+    ``or`` rather than incrementing once per source.
+    """
+
+    info = record.get("env_info_after")
+    if not isinstance(info, dict):
+        return "invalid_action" in component_names
+
+    if str(info.get("status", "")).lower() == "invalid_action":
+        return True
+
+    info_evidence = info.get("wrapper_evidence")
+    if isinstance(info_evidence, dict) and info_evidence.get("invalid_action") is True:
+        return True
+
+    row_evidence = record.get("wrapper_evidence")
+    if isinstance(row_evidence, dict):
+        if row_evidence.get("invalid_action") is True:
+            return True
+        server_evidence = row_evidence.get("server_wrapper_evidence")
+        if isinstance(server_evidence, dict) and server_evidence.get(
+            "invalid_action"
+        ) is True:
+            return True
+
+    return "invalid_action" in component_names
+
+
 def _current_memory_ops(record: dict[str, Any]) -> list[dict[str, Any]]:
     info = record.get("env_info_after")
     if not isinstance(info, dict):
@@ -636,9 +672,11 @@ def summarize_formal_training_rows(rows: list[dict[str, Any]]) -> dict[str, floa
                         )
                 previous_workspace_snapshot = after_snapshot
                 previous_workspace_audit_count = after_audit_count
-            # Native records may omit action_execution. The environment ledger is
-            # the authoritative parser outcome for the current action.
-            if "invalid_action" in component_names:
+            # Native records may omit action_execution. The environment receipt
+            # is authoritative; legacy reward components remain compatible.
+            if _has_authoritative_invalid_action(
+                record, component_names=component_names
+            ):
                 counts["invalid_action_count"] += 1
             write_ops = [
                 memory_op

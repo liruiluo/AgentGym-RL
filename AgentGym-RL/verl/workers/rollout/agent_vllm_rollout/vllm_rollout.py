@@ -1670,6 +1670,11 @@ class vLLMRollout(BaseRollout):
                         _,
                         horizon_wrapper_evidence,
                     ) = receipt_parts(horizon_output, "")
+                    # Horizon grading is a task-neutral terminal transition.
+                    # Keep the sampled action/tokens untouched, but bind the
+                    # authoritative post-state to the final row so ``done``
+                    # cannot disagree with an ``active`` environment receipt.
+                    steps[-1]["env_info_after"] = horizon_env_info
                     steps[-1]["score"] += float(horizon_output.reward)
                     steps[-1]["immediate_reward"] = steps[-1]["score"]
                     steps[-1]["done"] = True

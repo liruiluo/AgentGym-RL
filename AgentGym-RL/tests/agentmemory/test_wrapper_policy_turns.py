@@ -825,6 +825,7 @@ class SharedRolloutRuntimeTest(unittest.TestCase):
         self.assertTrue(compaction["done"])
         self.assertEqual(compaction["outcome"], "success")
         self.assertEqual(compaction["horizon_finalization"]["reward"], 0.5)
+        self.assertTrue(compaction["env_info_after"]["resolved"])
         self.assertEqual(
             research_compaction["wrapper_evidence"]["event"],
             "context_compaction",
@@ -839,6 +840,7 @@ class SharedRolloutRuntimeTest(unittest.TestCase):
         self.assertEqual(
             research_compaction["horizon_finalization"]["reward"], 0.25
         )
+        self.assertTrue(research_compaction["env_info_after"]["resolved"])
         self.assertEqual(webshop.native_calls, ["click[Buy Now]"])
         self.assertEqual(len(swesmith.native_calls), 1)
         self.assertEqual(len(literesearcher.native_calls), 1)
