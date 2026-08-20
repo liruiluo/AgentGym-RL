@@ -249,11 +249,13 @@ def build_overrides(
         "critic.ppo_epochs=1",
         "critic.shuffle=False",
         "critic.use_dynamic_bsz=True",
-        # G64 r6/r8/r9/r11 showed that mechanically lowering this target while
-        # gradient checkpointing was disabled did not control the activation
-        # peak. Retain the conservative 32,768 target for the first gate with
-        # upstream checkpointing restored; tune only from measured headroom.
-        "critic.ppo_max_token_len_per_gpu=32768",
+        # The accepted r13 path has upstream gradient checkpointing restored.
+        # Raise only the native dynamic-batch token pack from 32K to 64K: this
+        # reduces critic microbatch/FSDP overhead without changing samples,
+        # PPO epochs, minibatch order, rewards, or update semantics.  The
+        # synchronous OpenMLE path already runs a larger 160K critic pack; 64K
+        # is the bounded first async candidate for the smaller trainer pool.
+        "critic.ppo_max_token_len_per_gpu=65536",
         "critic.forward_max_token_len_per_gpu=262144",
         "critic.optim.lr=1e-5",
         "critic.optim.weight_decay=0.01",
