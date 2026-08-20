@@ -6,11 +6,14 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
+import stat
 import subprocess
 import sys
+import zipfile
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .config_contract import (
@@ -21,6 +24,8 @@ from .config_contract import (
 from .finalizer import finalize_run
 from .identity import (
     EXPECTED_VERL_COMMIT,
+    LIGER_WHEEL_RELATIVE_PATH,
+    LIGER_WHEEL_SHA256,
     LOCKED_MODEL_FILE_SHA256,
     TRL_WHEEL_RELATIVE_PATH,
     TRL_WHEEL_SHA256,
@@ -364,8 +369,10 @@ def build_runtime_env(
     base_env: dict[str, str] | None = None,
 ) -> dict[str, str]:
     env = dict(os.environ if base_env is None else base_env)
+    liger_runtime = inputs.run_dir / "runtime-deps" / "liger_kernel-0.8.2"
     python_entries = [
         inputs.outer_root / TRL_WHEEL_RELATIVE_PATH,
+        liger_runtime,
         inputs.outer_root / "async_plugins",
         inputs.verl_root,
         inputs.outer_root / "AgentGym" / "agentenv",
@@ -373,10 +380,22 @@ def build_runtime_env(
     ]
     closed_pythonpath = os.pathsep.join(str(entry) for entry in python_entries)
     inherited_pythonpath = env.get("PYTHONPATH")
+    bootstrap_pythonpath = os.pathsep.join(
+        str(entry)
+        for entry in [
+            inputs.outer_root / TRL_WHEEL_RELATIVE_PATH,
+            inputs.outer_root / LIGER_WHEEL_RELATIVE_PATH,
+            inputs.outer_root / "async_plugins",
+            inputs.verl_root,
+            inputs.outer_root / "AgentGym" / "agentenv",
+            inputs.outer_root / "AgentGym" / "agentenv-openmle-fast",
+        ]
+    )
     environment_to_check = dict(env)
-    if inherited_pythonpath == closed_pythonpath:
-        # The shell wrapper needs this exact closed path to import the launcher;
-        # it is recomputed here rather than treated as caller-selected identity.
+    if inherited_pythonpath in {closed_pythonpath, bootstrap_pythonpath}:
+        # The shell wrapper needs the exact wheel path to import the launcher
+        # before the run-local Liger extraction exists. Both paths are
+        # recomputed here rather than treated as caller-selected identity.
         environment_to_check.pop("PYTHONPATH")
     reject_ambient_identity(environment_to_check)
     env["PYTHONPATH"] = closed_pythonpath
@@ -402,6 +421,74 @@ def build_runtime_env(
     env["HYDRA_FULL_ERROR"] = "1"
     env["RAY_DEDUP_LOGS"] = "0"
     return env
+
+
+def _materialize_liger_wheel(inputs: LaunchInputs) -> dict[str, str]:
+    """Extract the locked upstream wheel for namespace-package compatibility.
+
+    Python's zip importer does not resolve Liger's implicit
+    ``ops.experimental`` namespace from the wheel file itself. A normal pip
+    install extracts the same bytes; this local, dependency-free equivalent
+    keeps the publication runtime immutable while giving every Ray worker one
+    closed filesystem path.
+    """
+
+    wheel = inputs.outer_root / LIGER_WHEEL_RELATIVE_PATH
+    destination = inputs.run_dir / "runtime-deps" / "liger_kernel-0.8.2"
+    marker = destination / ".upstream-wheel-sha256"
+    required = (
+        destination / "liger_kernel" / "transformers" / "monkey_patch.py",
+        destination / "liger_kernel-0.8.2.dist-info" / "METADATA",
+    )
+    if destination.exists():
+        observed = (
+            marker.read_text(encoding="utf-8").strip() if marker.is_file() else ""
+        )
+        if observed != LIGER_WHEEL_SHA256 or not all(
+            path.is_file() for path in required
+        ):
+            raise RuntimeError("existing run-local Liger materialization is incomplete")
+        return {
+            "path": str(destination),
+            "wheel_sha256": observed,
+            "status": "reused",
+        }
+
+    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+    if temporary.exists():
+        shutil.rmtree(temporary)
+    temporary.mkdir(parents=True)
+    try:
+        with zipfile.ZipFile(wheel) as archive:
+            for info in archive.infolist():
+                relative = PurePosixPath(info.filename)
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise RuntimeError(f"unsafe Liger wheel path: {info.filename!r}")
+                mode = info.external_attr >> 16
+                if stat.S_ISLNK(mode):
+                    raise RuntimeError(
+                        f"Liger wheel contains symlink: {info.filename!r}"
+                    )
+            archive.extractall(temporary)
+        extracted_required = (
+            temporary / "liger_kernel" / "transformers" / "monkey_patch.py",
+            temporary / "liger_kernel-0.8.2.dist-info" / "METADATA",
+        )
+        if not all(path.is_file() for path in extracted_required):
+            raise RuntimeError("locked Liger wheel omitted required runtime files")
+        (temporary / ".upstream-wheel-sha256").write_text(
+            LIGER_WHEEL_SHA256 + "\n", encoding="utf-8"
+        )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(temporary, destination)
+    except BaseException:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+    return {
+        "path": str(destination),
+        "wheel_sha256": LIGER_WHEEL_SHA256,
+        "status": "materialized",
+    }
 
 
 def _sha256(path: Path) -> str:
@@ -989,6 +1076,10 @@ def _verify_source(
         inputs.outer_root,
         {TRL_WHEEL_RELATIVE_PATH: TRL_WHEEL_SHA256},
     )
+    liger_wheel = verify_hash_manifest(
+        inputs.outer_root,
+        {LIGER_WHEEL_RELATIVE_PATH: LIGER_WHEEL_SHA256},
+    )
     model_path = Path(training_runtime["base_model"])
     model_files = verify_hash_manifest(model_path, LOCKED_MODEL_FILE_SHA256)
 
@@ -1007,6 +1098,7 @@ def _verify_source(
         "selected_inner_files_sha256": verified_inner_files,
         "training_runtime": training_runtime,
         "trl_wheel_sha256": trl_wheel,
+        "liger_wheel_sha256": liger_wheel,
         "model_files_sha256": model_files,
     }
 
@@ -1074,6 +1166,8 @@ def _runtime_preflight(
 import json
 import shutil
 import trl
+from importlib.metadata import version
+from liger_kernel.transformers.monkey_patch import MODEL_TYPE_TO_APPLY_LIGER_FN
 from trl import AutoModelForCausalLMWithValueHead
 from agentmemorygym_verl.agent_loop import AMGTaskNeutralAgentLoop
 from agentmemorygym_verl.dataset import AMGTrajectoryDataset
@@ -1098,12 +1192,19 @@ if not isinstance(framing, list) or not framing:
 ninja_path = shutil.which("ninja")
 if ninja_path is None:
     raise RuntimeError("publication runtime PATH does not provide ninja")
+liger_version = version("liger-kernel")
+if liger_version != "0.8.2":
+    raise RuntimeError(f"unexpected Liger version: {liger_version}")
+if "qwen3_5" not in MODEL_TYPE_TO_APPLY_LIGER_FN:
+    raise RuntimeError("locked Liger wheel does not support qwen3_5")
 print(json.dumps({
     "adv_estimator": fn.__name__,
     "agent_loop": AMGTaskNeutralAgentLoop.__name__,
     "dataset": AMGTrajectoryDataset.__name__,
     "policy_framing_messages": len(framing),
     "ninja_path": ninja_path,
+    "liger_qwen3_5_supported": True,
+    "liger_version": liger_version,
     "trl_version": trl.__version__,
     "value_head_class": AutoModelForCausalLMWithValueHead.__name__,
 }, sort_keys=True))
@@ -1169,6 +1270,7 @@ def prepare_launch(
         require_outer_clean=not resolve_only,
         endpoint_identity=endpoint_identity,
     )
+    liger_runtime = _materialize_liger_wheel(inputs)
     env = build_runtime_env(inputs, training_runtime=training_runtime)
     env.update(endpoint_identity["environment"])
     env["AMG_ENDPOINT_CLIENT_CONFIG_JSON"] = json.dumps(
@@ -1238,6 +1340,7 @@ def prepare_launch(
             "critic_use_fused_kernels": inputs.critic_use_fused_kernels,
         },
         "source": source_report_runtime,
+        "liger_runtime": liger_runtime,
         "plugin_manifest": _production_manifest(inputs.outer_root),
         "schedule": schedule_report,
         "endpoint_publication": endpoint_identity,

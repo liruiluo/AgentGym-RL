@@ -11,12 +11,15 @@ from pathlib import Path
 from agentmemorygym_verl.config_contract import inspect_schedule
 from agentmemorygym_verl.identity import (
     EXPECTED_VERL_COMMIT,
+    LIGER_WHEEL_RELATIVE_PATH,
+    LIGER_WHEEL_SHA256,
     TRL_WHEEL_RELATIVE_PATH,
     TRL_WHEEL_SHA256,
 )
 from agentmemorygym_verl.launch import (
     LaunchInputs,
     _load_endpoint_identity,
+    _materialize_liger_wheel,
     _parse_args,
     _partition_selected_file_hashes,
     build_overrides,
@@ -292,6 +295,25 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
         self.assertIn("Name: trl\n", metadata)
         self.assertIn("Version: 0.9.6\n", metadata)
 
+    def test_locked_liger_wheel_is_exact_upstream_runtime_dependency(self):
+        checkout = Path(__file__).resolve().parents[2]
+        wheel = checkout / LIGER_WHEEL_RELATIVE_PATH
+        self.assertTrue(wheel.is_file())
+        self.assertFalse(wheel.is_symlink())
+        self.assertEqual(
+            hashlib.sha256(wheel.read_bytes()).hexdigest(), LIGER_WHEEL_SHA256
+        )
+        with zipfile.ZipFile(wheel) as archive:
+            metadata = archive.read(
+                "liger_kernel-0.8.2.dist-info/METADATA"
+            ).decode("utf-8")
+            monkey_patch = archive.read(
+                "liger_kernel/transformers/monkey_patch.py"
+            ).decode("utf-8")
+        self.assertIn("Name: liger_kernel\n", metadata)
+        self.assertIn("Version: 0.8.2\n", metadata)
+        self.assertIn('"qwen3_5"', monkey_patch)
+
     def test_runtime_env_is_closed_and_pins_native_artifact_paths(self):
         with tempfile.TemporaryDirectory() as directory:
             inputs = self._inputs(Path(directory), mode="gate")
@@ -308,6 +330,11 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                         / "async_plugins"
                         / "vendor"
                         / "trl-0.9.6-py3-none-any.whl"
+                    ),
+                    str(
+                        inputs.run_dir
+                        / "runtime-deps"
+                        / "liger_kernel-0.8.2"
                     ),
                     str(inputs.outer_root / "async_plugins"),
                     str(inputs.verl_root),
@@ -336,6 +363,36 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                     training_runtime=self.source_lock["training_runtime"],
                     base_env={"PYTHONPATH": "/caller"},
                 )
+
+    def test_liger_wheel_materializes_to_run_local_closed_path(self):
+        checkout = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inputs = replace(
+                self._inputs(root, mode="gate"),
+                outer_root=checkout,
+            )
+            first = _materialize_liger_wheel(inputs)
+            second = _materialize_liger_wheel(inputs)
+            destination = Path(first["path"])
+            self.assertEqual(first["status"], "materialized")
+            self.assertEqual(second["status"], "reused")
+            self.assertEqual(first["wheel_sha256"], LIGER_WHEEL_SHA256)
+            self.assertEqual(
+                (destination / ".upstream-wheel-sha256")
+                .read_text(encoding="utf-8")
+                .strip(),
+                LIGER_WHEEL_SHA256,
+            )
+            self.assertTrue(
+                (
+                    destination
+                    / "liger_kernel"
+                    / "ops"
+                    / "experimental"
+                    / "embedding.py"
+                ).is_file()
+            )
 
     def test_cli_has_no_commit_model_or_budget_identity_override(self):
         common = [
@@ -389,6 +446,8 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
         self.assertIn("--endpoint-source-lock", text)
         self.assertIn("PYTHONPATH is an identity conflict", text)
         self.assertIn("trl-0.9.6-py3-none-any.whl", text)
+        self.assertIn("liger_kernel-0.8.2-py3-none-any.whl", text)
+        self.assertIn("locked upstream Liger wheel is missing", text)
         self.assertNotIn("/dev/shm/qwen35-runtime", text)
         self.assertNotIn("${PYTHONPATH:+", text)
         self.assertIn(EXPECTED_VERL_COMMIT, EXPECTED_VERL_COMMIT)

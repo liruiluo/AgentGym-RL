@@ -70,5 +70,10 @@ if [[ ! -f ${TRL_WHEEL} || -L ${TRL_WHEEL} ]]; then
   echo "launch_amg_fully_async.sh: locked veRL TRL wheel is missing" >&2
   exit 66
 fi
-export PYTHONPATH="${TRL_WHEEL}:${OUTER_ROOT}/async_plugins:${VERL_ROOT}:${OUTER_ROOT}/AgentGym/agentenv:${OUTER_ROOT}/AgentGym/agentenv-openmle-fast"
+LIGER_WHEEL="${OUTER_ROOT}/async_plugins/vendor/liger_kernel-0.8.2-py3-none-any.whl"
+if [[ ! -f ${LIGER_WHEEL} || -L ${LIGER_WHEEL} ]]; then
+  echo "launch_amg_fully_async.sh: locked upstream Liger wheel is missing" >&2
+  exit 66
+fi
+export PYTHONPATH="${TRL_WHEEL}:${LIGER_WHEEL}:${OUTER_ROOT}/async_plugins:${VERL_ROOT}:${OUTER_ROOT}/AgentGym/agentenv:${OUTER_ROOT}/AgentGym/agentenv-openmle-fast"
 exec "${PUBLICATION_PYTHON}" -m agentmemorygym_verl.launch --outer-root "${OUTER_ROOT}" "$@"

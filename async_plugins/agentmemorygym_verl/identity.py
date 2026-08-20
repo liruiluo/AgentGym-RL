@@ -26,6 +26,12 @@ TRL_WHEEL_RELATIVE_PATH = "async_plugins/vendor/trl-0.9.6-py3-none-any.whl"
 TRL_WHEEL_SHA256 = (
     "4753f190c94c11488fcc46ec74b2128e53fbc61d51f0887b7204ec4dc333af4b"
 )
+LIGER_WHEEL_RELATIVE_PATH = (
+    "async_plugins/vendor/liger_kernel-0.8.2-py3-none-any.whl"
+)
+LIGER_WHEEL_SHA256 = (
+    "84c0a7bc9bf4d4cf8ea5ba89ff84d28686afc94215b220851d9f57dc87852741"
+)
 
 
 LOCKED_MODEL_FILE_SHA256 = {
@@ -215,6 +221,8 @@ def verify_hash_manifest(
 
 __all__ = [
     "EXPECTED_VERL_COMMIT",
+    "LIGER_WHEEL_RELATIVE_PATH",
+    "LIGER_WHEEL_SHA256",
     "LOCKED_MODEL_FILE_SHA256",
     "TRL_WHEEL_RELATIVE_PATH",
     "TRL_WHEEL_SHA256",
