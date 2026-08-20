@@ -225,8 +225,8 @@ def build_overrides(
         "actor_rollout_ref.actor.ppo_epochs=1",
         "actor_rollout_ref.actor.shuffle=False",
         "actor_rollout_ref.actor.use_dynamic_bsz=True",
-        # Reuse the packed-token budget already validated by synchronous r20.
-        # The six-way async learner must still pass the B200 one-update gate.
+        # Reuse only the actor packed-token budget validated by synchronous
+        # r20; the fully-async critic retains its r6-safe value-head budget.
         "actor_rollout_ref.actor.ppo_max_token_len_per_gpu="
         f"{ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU}",
         "actor_rollout_ref.actor.use_rollout_log_probs=True",

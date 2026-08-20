@@ -56,12 +56,12 @@ def _positive_int(value: Any, *, field: str) -> int:
 
 _PPO_MINI_BATCH_TARGET = 512
 
-# Reuse the largest packed-token budgets already validated by the matched
-# eight-way synchronous OpenMLE PPO lineage. The six-way learner keeps
-# gradient checkpointing enabled and must re-prove these values on B200 before
-# a fresh formal lineage is admitted.
+# Reuse the larger actor packed-token budget validated by the matched
+# eight-way synchronous OpenMLE PPO lineage. Keep the fully-async critic at
+# r6's proven budget: its TRL value head materializes full-vocabulary logits,
+# and the synchronous critic budget OOMed before the first update on B200.
 ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU = 131_072
-CRITIC_PPO_MAX_TOKEN_LEN_PER_GPU = 163_840
+CRITIC_PPO_MAX_TOKEN_LEN_PER_GPU = 32_768
 CRITIC_FORWARD_MAX_TOKEN_LEN_PER_GPU = 262_144
 
 

@@ -111,7 +111,7 @@ def _config(*, mode: str = "formal") -> dict:
             "strategy": "fsdp2",
             "ppo_mini_batch_size": 512,
             "ppo_micro_batch_size_per_gpu": 8,
-            "ppo_max_token_len_per_gpu": 163840,
+            "ppo_max_token_len_per_gpu": 32768,
             "forward_max_token_len_per_gpu": 262144,
             "ppo_epochs": 1,
             "shuffle": False,
@@ -240,7 +240,7 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
             report["token_budgets"],
             {
                 "actor_ppo_max_token_len_per_gpu": 131072,
-                "critic_ppo_max_token_len_per_gpu": 163840,
+                "critic_ppo_max_token_len_per_gpu": 32768,
                 "critic_forward_max_token_len_per_gpu": 262144,
             },
         )
@@ -325,7 +325,7 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
     def test_rejects_packed_token_budget_drift(self):
         for path, drifted_value in (
             (("actor_rollout_ref", "actor", "ppo_max_token_len_per_gpu"), 65536),
-            (("critic", "ppo_max_token_len_per_gpu"), 32768),
+            (("critic", "ppo_max_token_len_per_gpu"), 163840),
             (("critic", "forward_max_token_len_per_gpu"), 131072),
         ):
             with self.subTest(path=path):

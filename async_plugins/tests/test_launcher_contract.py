@@ -137,7 +137,7 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                 "131072",
             )
             self.assertEqual(
-                values["critic.ppo_max_token_len_per_gpu"], "163840"
+                values["critic.ppo_max_token_len_per_gpu"], "32768"
             )
             self.assertEqual(
                 values["critic.forward_max_token_len_per_gpu"], "262144"
