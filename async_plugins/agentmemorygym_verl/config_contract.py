@@ -275,6 +275,12 @@ def verify_resolved_config(
         raise ValueError("actor use_fused_kernels must be boolean")
     if not isinstance(critic_fused, bool):
         raise ValueError("critic use_fused_kernels must be boolean")
+    actor_liger = _at(config, "actor_rollout_ref.model.use_liger")
+    critic_liger = _at(config, "critic.model.use_liger")
+    if not isinstance(actor_liger, bool):
+        raise ValueError("actor use_liger must be boolean")
+    if not isinstance(critic_liger, bool):
+        raise ValueError("critic use_liger must be boolean")
     _require_equal(
         config,
         "actor_rollout_ref.model.fused_kernel_options.impl_backend",
@@ -297,6 +303,8 @@ def verify_resolved_config(
         "data.return_raw_chat": True,
         "actor_rollout_ref.model.enable_gradient_checkpointing": True,
         "critic.model.enable_gradient_checkpointing": True,
+        "actor_rollout_ref.model.use_liger": False,
+        "critic.model.use_liger": True,
         "actor_rollout_ref.actor.ppo_mini_batch_size": ppo_mini_batch_size,
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu": 8,
         "actor_rollout_ref.actor.ppo_epochs": 1,
@@ -469,6 +477,7 @@ def verify_resolved_config(
         "standalone_rollout_gpus": standalone_rollout_gpus,
         "dynamic_hybrid_enabled": True,
         "gradient_checkpointing": {"actor": True, "critic": True},
+        "liger": {"actor": actor_liger, "critic": critic_liger},
         "fused_kernels": {
             "actor": actor_fused,
             "critic": critic_fused,

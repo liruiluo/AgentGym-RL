@@ -113,6 +113,7 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
             "model": {
                 "path": PUBLICATION_TRAINING_RUNTIME["base_model"],
                 "enable_gradient_checkpointing": True,
+                "use_liger": False,
                 "use_fused_kernels": False,
                 "fused_kernel_options": {"impl_backend": "torch"},
             },
@@ -158,6 +159,7 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
             "model": {
                 "path": PUBLICATION_TRAINING_RUNTIME["base_model"],
                 "enable_gradient_checkpointing": True,
+                "use_liger": True,
                 "use_fused_kernels": False,
                 "fused_kernel_options": {"impl_backend": "torch"},
             },

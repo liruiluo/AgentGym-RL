@@ -72,6 +72,7 @@ def _config(*, mode: str = "formal") -> dict:
             "model": {
                 "path": "/models/Qwen3.5-4B",
                 "enable_gradient_checkpointing": True,
+                "use_liger": False,
                 "use_fused_kernels": False,
                 "fused_kernel_options": {"impl_backend": "torch"},
             },
@@ -117,6 +118,7 @@ def _config(*, mode: str = "formal") -> dict:
             "model": {
                 "path": "/models/Qwen3.5-4B",
                 "enable_gradient_checkpointing": True,
+                "use_liger": True,
                 "use_fused_kernels": False,
                 "fused_kernel_options": {"impl_backend": "torch"},
             },
@@ -240,6 +242,7 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         self.assertEqual(
             report["gradient_checkpointing"], {"actor": True, "critic": True}
         )
+        self.assertEqual(report["liger"], {"actor": False, "critic": True})
 
     def test_actor_only_fused_six_plus_two_is_resolved_and_reported(self):
         config = _config(mode="gate")
@@ -264,6 +267,14 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         config["critic"]["model"]["use_fused_kernels"] = "false"
         with self.assertRaisesRegex(ValueError, "critic use_fused_kernels"):
             _verify(config, mode="formal")
+
+    def test_rejects_role_specific_liger_drift(self):
+        for role, drifted_value in (("actor_rollout_ref", True), ("critic", False)):
+            with self.subTest(role=role):
+                config = _config()
+                config[role]["model"]["use_liger"] = drifted_value
+                with self.assertRaisesRegex(ValueError, "use_liger"):
+                    _verify(config, mode="formal")
 
     def test_one_update_budget(self):
         report = _verify(_config(mode="gate"), mode="gate")

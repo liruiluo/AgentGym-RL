@@ -132,6 +132,8 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             self.assertEqual(
                 values["critic.model.enable_gradient_checkpointing"], "True"
             )
+            self.assertEqual(values["actor_rollout_ref.model.use_liger"], "False")
+            self.assertEqual(values["critic.model.use_liger"], "True")
             self.assertEqual(
                 values["actor_rollout_ref.actor.ppo_max_token_len_per_gpu"],
                 "65536",

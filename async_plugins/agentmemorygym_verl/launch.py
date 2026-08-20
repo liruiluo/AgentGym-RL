@@ -202,6 +202,7 @@ def build_overrides(
         "actor_rollout_ref.model.use_fused_kernels="
         f"{inputs.actor_use_fused_kernels}",
         "actor_rollout_ref.model.fused_kernel_options.impl_backend=torch",
+        "actor_rollout_ref.model.use_liger=False",
         # Keep veRL's native HF/FSDP gradient checkpointing enabled. The
         # synchronous comparator used the upstream default successfully;
         # disabling it made the four-way async critic retain full activations.
@@ -212,6 +213,9 @@ def build_overrides(
         "critic.model.use_remove_padding=True",
         f"critic.model.use_fused_kernels={inputs.critic_use_fused_kernels}",
         "critic.model.fused_kernel_options.impl_backend=torch",
+        # Native role-isolated Liger gate. Actor keeps the accepted veRL fused
+        # path; critic uses upstream Liger RMSNorm/SwiGLU with checkpointing.
+        "critic.model.use_liger=True",
         "critic.model.enable_gradient_checkpointing=True",
         "actor_rollout_ref.actor.strategy=fsdp2",
         "actor_rollout_ref.actor.fsdp_config.strategy=fsdp2",
