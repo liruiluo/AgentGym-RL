@@ -2394,7 +2394,7 @@ def atomic_publish_run(
         raise LifecycleError(f"run directory is missing or symlinked: {run_dir}")
     if persist_root.is_symlink() or not persist_root.is_dir():
         raise LifecycleError(f"persistent root is missing or symlinked: {persist_root}")
-    launcher_values = _validate_launcher_exit(run_dir, run_id)
+    _validate_launcher_exit(run_dir, run_id)
     _validate_source_tree(run_dir)
     if discard_gate_checkpoints:
         if mode != "gate" or checkpoint_step is not None:
@@ -2444,11 +2444,8 @@ def atomic_publish_run(
                 _manifest_text(target_rows),
                 mode=0o600,
             )
-        staged_symlinks = _find_symlinks(stage_path)
-        if staged_symlinks:
-            raise LifecycleError(
-                f"staged tree contains symlinks: {staged_symlinks[:20]}"
-            )
+        _validate_source_tree(stage_path)
+        launcher_values = _validate_launcher_exit(stage_path, run_id)
         terminal_receipt = {
             "schema": "amg_terminal_publisher_v1",
             "status": "complete_when_public",
@@ -2456,7 +2453,7 @@ def atomic_publish_run(
             "linearization_point": "atomic_directory_rename",
             "post_rename_work": "none",
             "process_transition": "os._exit(0)_immediately_after_rename",
-            "launcher_exit_sha256": _sha256(run_dir / "launcher-exit.env"),
+            "launcher_exit_sha256": _sha256(stage_path / "launcher-exit.env"),
         }
         if "recovery_commit_sha256" in launcher_values:
             terminal_receipt["recovery_commit_sha256"] = launcher_values[
@@ -2500,8 +2497,18 @@ def atomic_publish_run(
             observed = _sha256(stage_path / relative)
             if observed != digest:
                 raise LifecycleError(f"staged tree hash mismatch: {relative}")
-        if _find_symlinks(stage_path):
-            raise LifecycleError("staged tree gained a symlink before publication")
+        _validate_source_tree(stage_path)
+        final_launcher_values = _validate_launcher_exit(stage_path, run_id)
+        if final_launcher_values != launcher_values:
+            raise LifecycleError(
+                "staged launcher exit receipt changed during publication"
+            )
+        if terminal_receipt["launcher_exit_sha256"] != _sha256(
+            stage_path / "launcher-exit.env"
+        ):
+            raise LifecycleError(
+                "terminal publisher receipt is not bound to staged launcher"
+            )
         report = {
             **metadata,
             "persistent_path": str(final_path),

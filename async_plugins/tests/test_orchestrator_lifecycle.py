@@ -1930,6 +1930,79 @@ class TestAtomicPublication(unittest.TestCase):
                 )
             self.assertFalse((persist / "extra-recovery-file-run").exists())
 
+    def test_recovery_artifact_drift_during_staging_never_publishes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            run_id = "staging-drift-recovery-run"
+            run = self._make_run(root, run_id)
+            self._make_recovery_ready(run, run_id)
+            persist = root / "persist"
+            persist.mkdir()
+            real_rsync = lifecycle._run_rsync
+            mutated = False
+
+            def mutate_before_first_copy(arguments):
+                nonlocal mutated
+                if not mutated:
+                    mutated = True
+                    (run / "recovery/RECOVERY-RECEIPT.json").write_text(
+                        json.dumps({"run_id": run_id, "status": "fail"}) + "\n",
+                        encoding="utf-8",
+                    )
+                real_rsync(arguments)
+
+            with mock.patch.object(
+                lifecycle, "_run_rsync", side_effect=mutate_before_first_copy
+            ), mock.patch.object(lifecycle.os, "_exit") as exit_process:
+                with self.assertRaises(lifecycle.LifecycleError):
+                    lifecycle.atomic_publish_run(
+                        run_dir=run,
+                        persist_root=persist,
+                        run_id=run_id,
+                        mode="formal",
+                        checkpoint_step=1,
+                        discard_gate_checkpoints=False,
+                        terminal_exit=True,
+                    )
+            self.assertTrue(mutated)
+            exit_process.assert_not_called()
+            self.assertFalse((persist / run_id).exists())
+
+    def test_recovery_manifest_growth_during_staging_never_publishes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            run_id = "staging-growth-recovery-run"
+            run = self._make_run(root, run_id)
+            self._make_recovery_ready(run, run_id)
+            persist = root / "persist"
+            persist.mkdir()
+            real_rsync = lifecycle._run_rsync
+            mutated = False
+
+            def mutate_before_first_copy(arguments):
+                nonlocal mutated
+                if not mutated:
+                    mutated = True
+                    (run / "recovery/unmanifested-after-validation.txt").write_text(
+                        "not committed\n", encoding="utf-8"
+                    )
+                real_rsync(arguments)
+
+            with mock.patch.object(
+                lifecycle, "_run_rsync", side_effect=mutate_before_first_copy
+            ):
+                with self.assertRaises(lifecycle.LifecycleError):
+                    lifecycle.atomic_publish_run(
+                        run_dir=run,
+                        persist_root=persist,
+                        run_id=run_id,
+                        mode="formal",
+                        checkpoint_step=1,
+                        discard_gate_checkpoints=False,
+                    )
+            self.assertTrue(mutated)
+            self.assertFalse((persist / run_id).exists())
+
     def test_recovery_publication_binds_commit_into_receipts(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -2021,6 +2094,10 @@ class TestAtomicPublication(unittest.TestCase):
             )
             self.assertEqual(receipt["linearization_point"], "atomic_directory_rename")
             self.assertEqual(receipt["post_rename_work"], "none")
+            self.assertEqual(
+                receipt["launcher_exit_sha256"],
+                lifecycle._sha256(final / "launcher-exit.env"),
+            )
             self.assertFalse(
                 any(
                     p.name.startswith(".terminal-run.publish")
