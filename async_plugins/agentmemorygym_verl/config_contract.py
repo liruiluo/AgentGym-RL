@@ -56,6 +56,14 @@ def _positive_int(value: Any, *, field: str) -> int:
 
 _PPO_MINI_BATCH_TARGET = 512
 
+# Reuse the largest packed-token budgets already validated by the matched
+# eight-way synchronous OpenMLE PPO lineage. The six-way learner keeps
+# gradient checkpointing enabled and must re-prove these values on B200 before
+# a fresh formal lineage is admitted.
+ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU = 131_072
+CRITIC_PPO_MAX_TOKEN_LEN_PER_GPU = 163_840
+CRITIC_FORWARD_MAX_TOKEN_LEN_PER_GPU = 262_144
+
 
 def resolve_ppo_mini_batch_size(trainer_gpus: Any) -> int:
     """Keep the 512-row target while satisfying veRL's native DP alignment."""
@@ -299,6 +307,9 @@ def verify_resolved_config(
         "critic.model.enable_gradient_checkpointing": True,
         "actor_rollout_ref.actor.ppo_mini_batch_size": ppo_mini_batch_size,
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu": 8,
+        "actor_rollout_ref.actor.ppo_max_token_len_per_gpu": (
+            ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU
+        ),
         "actor_rollout_ref.actor.ppo_epochs": 1,
         "actor_rollout_ref.actor.shuffle": False,
         "actor_rollout_ref.actor.use_dynamic_bsz": True,
@@ -308,6 +319,10 @@ def verify_resolved_config(
         "actor_rollout_ref.actor.fsdp_config.optimizer_offload": False,
         "critic.ppo_mini_batch_size": ppo_mini_batch_size,
         "critic.ppo_micro_batch_size_per_gpu": 8,
+        "critic.ppo_max_token_len_per_gpu": CRITIC_PPO_MAX_TOKEN_LEN_PER_GPU,
+        "critic.forward_max_token_len_per_gpu": (
+            CRITIC_FORWARD_MAX_TOKEN_LEN_PER_GPU
+        ),
         "critic.ppo_epochs": 1,
         "critic.shuffle": False,
         "critic.use_dynamic_bsz": True,
@@ -469,6 +484,17 @@ def verify_resolved_config(
         "standalone_rollout_gpus": standalone_rollout_gpus,
         "dynamic_hybrid_enabled": True,
         "gradient_checkpointing": {"actor": True, "critic": True},
+        "token_budgets": {
+            "actor_ppo_max_token_len_per_gpu": (
+                ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU
+            ),
+            "critic_ppo_max_token_len_per_gpu": (
+                CRITIC_PPO_MAX_TOKEN_LEN_PER_GPU
+            ),
+            "critic_forward_max_token_len_per_gpu": (
+                CRITIC_FORWARD_MAX_TOKEN_LEN_PER_GPU
+            ),
+        },
         "fused_kernels": {
             "actor": actor_fused,
             "critic": critic_fused,

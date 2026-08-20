@@ -78,6 +78,7 @@ def _config(*, mode: str = "formal") -> dict:
             "actor": {
                 "ppo_mini_batch_size": 512,
                 "ppo_micro_batch_size_per_gpu": 8,
+                "ppo_max_token_len_per_gpu": 131072,
                 "ppo_epochs": 1,
                 "shuffle": False,
                 "use_dynamic_bsz": True,
@@ -110,6 +111,8 @@ def _config(*, mode: str = "formal") -> dict:
             "strategy": "fsdp2",
             "ppo_mini_batch_size": 512,
             "ppo_micro_batch_size_per_gpu": 8,
+            "ppo_max_token_len_per_gpu": 163840,
+            "forward_max_token_len_per_gpu": 262144,
             "ppo_epochs": 1,
             "shuffle": False,
             "use_dynamic_bsz": True,
@@ -233,6 +236,14 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         report = _verify(_config(mode="formal"), mode="formal")
         self.assertEqual(report["optimizer_updates"], 100)
         self.assertEqual(report["publication_cycles"], 100)
+        self.assertEqual(
+            report["token_budgets"],
+            {
+                "actor_ppo_max_token_len_per_gpu": 131072,
+                "critic_ppo_max_token_len_per_gpu": 163840,
+                "critic_forward_max_token_len_per_gpu": 262144,
+            },
+        )
         self.assertEqual(report["episodes"], 6400)
         self.assertEqual(report["samples_per_update"], 64)
         self.assertEqual(report["trainer_gpus"], 4)
@@ -310,6 +321,21 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "Continuous Token"):
             _verify(config, mode="formal")
+
+    def test_rejects_packed_token_budget_drift(self):
+        for path, drifted_value in (
+            (("actor_rollout_ref", "actor", "ppo_max_token_len_per_gpu"), 65536),
+            (("critic", "ppo_max_token_len_per_gpu"), 32768),
+            (("critic", "forward_max_token_len_per_gpu"), 131072),
+        ):
+            with self.subTest(path=path):
+                config = _config()
+                value = config
+                for component in path[:-1]:
+                    value = value[component]
+                value[path[-1]] = drifted_value
+                with self.assertRaisesRegex(ValueError, path[-1]):
+                    _verify(config, mode="formal")
 
     def test_rejects_disabling_upstream_gradient_checkpointing(self):
         for role in ("actor_rollout_ref", "critic"):

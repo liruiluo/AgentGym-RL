@@ -14,6 +14,9 @@ from pathlib import Path
 from typing import Any
 
 from .config_contract import (
+    ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU,
+    CRITIC_FORWARD_MAX_TOKEN_LEN_PER_GPU,
+    CRITIC_PPO_MAX_TOKEN_LEN_PER_GPU,
     inspect_schedule,
     resolve_ppo_mini_batch_size,
     verify_resolved_config,
@@ -222,10 +225,10 @@ def build_overrides(
         "actor_rollout_ref.actor.ppo_epochs=1",
         "actor_rollout_ref.actor.shuffle=False",
         "actor_rollout_ref.actor.use_dynamic_bsz=True",
-        # Four-way FSDP leaves less activation headroom than the historical
-        # eight-way synchronous trainer. Keep microbatch=8 but bound packed
-        # training tokens; formal tuning may raise these after measured headroom.
-        "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=65536",
+        # Reuse the packed-token budget already validated by synchronous r20.
+        # The six-way async learner must still pass the B200 one-update gate.
+        "actor_rollout_ref.actor.ppo_max_token_len_per_gpu="
+        f"{ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU}",
         "actor_rollout_ref.actor.use_rollout_log_probs=True",
         "actor_rollout_ref.actor.optim.lr=1e-6",
         "actor_rollout_ref.actor.optim.weight_decay=0.01",
@@ -249,12 +252,13 @@ def build_overrides(
         "critic.ppo_epochs=1",
         "critic.shuffle=False",
         "critic.use_dynamic_bsz=True",
-        # G64 r6/r8/r9/r11 showed that mechanically lowering this target while
-        # gradient checkpointing was disabled did not control the activation
-        # peak. Retain the conservative 32,768 target for the first gate with
-        # upstream checkpointing restored; tune only from measured headroom.
-        "critic.ppo_max_token_len_per_gpu=32768",
-        "critic.forward_max_token_len_per_gpu=262144",
+        # Reuse r20's validated critic packing while retaining the unchanged
+        # forward cap; gradient checkpointing remains enabled for activation
+        # headroom on the six-way async learner.
+        "critic.ppo_max_token_len_per_gpu="
+        f"{CRITIC_PPO_MAX_TOKEN_LEN_PER_GPU}",
+        "critic.forward_max_token_len_per_gpu="
+        f"{CRITIC_FORWARD_MAX_TOKEN_LEN_PER_GPU}",
         "critic.optim.lr=1e-5",
         "critic.optim.weight_decay=0.01",
         "critic.optim.lr_warmup_steps=0",

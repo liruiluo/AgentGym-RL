@@ -119,6 +119,7 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
             "actor": {
                 "ppo_mini_batch_size": 512,
                 "ppo_micro_batch_size_per_gpu": 8,
+                "ppo_max_token_len_per_gpu": 131072,
                 "ppo_epochs": 1,
                 "shuffle": False,
                 "use_dynamic_bsz": True,
@@ -151,6 +152,8 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
             "strategy": "fsdp2",
             "ppo_mini_batch_size": 512,
             "ppo_micro_batch_size_per_gpu": 8,
+            "ppo_max_token_len_per_gpu": 163840,
+            "forward_max_token_len_per_gpu": 262144,
             "ppo_epochs": 1,
             "shuffle": False,
             "use_dynamic_bsz": True,
