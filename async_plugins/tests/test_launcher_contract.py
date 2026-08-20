@@ -203,6 +203,25 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                 values["critic.model.fused_kernel_options.impl_backend"], "torch"
             )
 
+    def test_fsdp2_forward_prefetch_is_enabled_for_actor_and_critic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inputs, identity = self._identity(Path(directory), "formal")
+            values = self._values(
+                build_overrides(
+                    inputs,
+                    effective_schedule=inputs.schedule,
+                    endpoint_client_config=identity["client_config"],
+                    budget_contract=identity["budget_contract"],
+                    training_runtime=identity["training_runtime"],
+                )
+            )
+
+            self.assertEqual(
+                values["actor_rollout_ref.actor.fsdp_config.forward_prefetch"],
+                "True",
+            )
+            self.assertEqual(values["critic.fsdp.forward_prefetch"], "True")
+
     def test_gate_role_and_budget_are_derived_from_publication(self):
         with tempfile.TemporaryDirectory() as directory:
             inputs, identity = self._identity(Path(directory), "gate")
