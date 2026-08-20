@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import hashlib
 import json
 import os
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -2003,6 +2005,104 @@ class TestAtomicPublication(unittest.TestCase):
             self.assertTrue(mutated)
             self.assertFalse((persist / run_id).exists())
 
+    def test_checkpoint_stage_drift_before_locked_rename_never_publishes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            run_id = "locked-stage-drift-recovery-run"
+            run = self._make_run(root, run_id)
+            self._make_recovery_ready(run, run_id)
+            persist = root / "persist"
+            persist.mkdir()
+            real_lock = lifecycle._exclusive_lock
+            mutated = False
+
+            @contextlib.contextmanager
+            def mutate_before_locked_rename(lock_path: Path):
+                nonlocal mutated
+                stage = persist / f".{run_id}.publish.tmp.{os.getpid()}"
+                actor = stage / "checkpoints/global_step_1/actor.bin"
+                self.assertTrue(actor.is_file())
+                actor.chmod(0o600)
+                actor.write_bytes(b"other")
+                mutated = True
+                with real_lock(lock_path):
+                    yield
+
+            with mock.patch.object(
+                lifecycle, "_exclusive_lock", new=mutate_before_locked_rename
+            ):
+                with self.assertRaises(lifecycle.LifecycleError):
+                    lifecycle.atomic_publish_run(
+                        run_dir=run,
+                        persist_root=persist,
+                        run_id=run_id,
+                        mode="formal",
+                        checkpoint_step=1,
+                        discard_gate_checkpoints=False,
+                    )
+            self.assertTrue(mutated)
+            self.assertFalse((persist / run_id).exists())
+
+    def test_lock_wait_stage_drift_never_acquires_public_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            run_id = "lock-wait-stage-drift-run"
+            run = self._make_run(root, run_id)
+            self._make_recovery_ready(run, run_id)
+            persist = root / "persist"
+            persist.mkdir()
+            lock_path = persist / ".amg-atomic-publication.lock"
+            lock_descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+            program = (
+                "import sys\n"
+                "from pathlib import Path\n"
+                "from agentmemorygym_verl import orchestrator_lifecycle as lifecycle\n"
+                "lifecycle.atomic_publish_run(\n"
+                "    run_dir=Path(sys.argv[1]), persist_root=Path(sys.argv[2]),\n"
+                "    run_id=sys.argv[3], mode='formal', checkpoint_step=1,\n"
+                "    discard_gate_checkpoints=False)\n"
+            )
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = str(MODULE.parent.parent)
+            child = subprocess.Popen(
+                [sys.executable, "-c", program, str(run), str(persist), run_id],
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                stage = persist / f".{run_id}.publish.tmp.{child.pid}"
+                receipt = stage / "recovery/RECOVERY-RECEIPT.json"
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    if (
+                        receipt.is_file()
+                        and (stage / "TREE-SHA256SUMS").is_file()
+                        and not (stat.S_IMODE(receipt.stat().st_mode) & 0o222)
+                    ):
+                        break
+                    if child.poll() is not None:
+                        self.fail("publisher exited before waiting for the lock")
+                    time.sleep(0.01)
+                else:
+                    self.fail("publisher did not seal the stage before timeout")
+                receipt.chmod(0o600)
+                receipt.write_text(
+                    json.dumps({"run_id": run_id, "status": "fail"}) + "\n",
+                    encoding="utf-8",
+                )
+            finally:
+                fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+                os.close(lock_descriptor)
+            _stdout, stderr = child.communicate(timeout=10)
+            self.assertNotEqual(child.returncode, 0)
+            self.assertIn("recovery artifact hash mismatch", stderr)
+            self.assertFalse((persist / run_id).exists())
+
     def test_recovery_publication_binds_commit_into_receipts(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -2098,6 +2198,9 @@ class TestAtomicPublication(unittest.TestCase):
                 receipt["launcher_exit_sha256"],
                 lifecycle._sha256(final / "launcher-exit.env"),
             )
+            for path in final.rglob("*"):
+                if path != final and (path.is_file() or path.is_dir()):
+                    self.assertFalse(stat.S_IMODE(path.stat().st_mode) & 0o222)
             self.assertFalse(
                 any(
                     p.name.startswith(".terminal-run.publish")

@@ -2132,6 +2132,78 @@ def _manifest_text(rows: Sequence[tuple[str, str]]) -> str:
     return "".join(f"{digest}  {relative}\n" for digest, relative in rows)
 
 
+def _seal_tree_read_only(root: Path) -> None:
+    _validate_source_tree(root)
+    files = _regular_files(root)
+    directories = [root]
+    for directory, names, _files in os.walk(root, followlinks=False):
+        base = Path(directory)
+        directories.extend(base / name for name in names)
+    for path in files:
+        mode = stat.S_IMODE(os.lstat(path).st_mode)
+        path.chmod((mode & ~0o222) | stat.S_IRUSR)
+    for path in sorted(
+        (item for item in directories if item != root),
+        key=lambda item: len(item.parts),
+        reverse=True,
+    ):
+        mode = stat.S_IMODE(os.lstat(path).st_mode)
+        path.chmod((mode & ~0o222) | stat.S_IRUSR | stat.S_IXUSR)
+    # Keep the stage root owner-writable because macOS rejects renaming a
+    # non-writable source directory even when its parent is writable.  All
+    # payload files and child directories remain sealed read-only.
+    mode = stat.S_IMODE(os.lstat(root).st_mode)
+    root.chmod((mode & ~0o022) | stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+
+
+def _tree_metadata_snapshot(root: Path) -> dict[str, tuple[int, ...]]:
+    _validate_source_tree(root)
+    paths = [root, *_regular_files(root)]
+    for directory, names, _files in os.walk(root, followlinks=False):
+        base = Path(directory)
+        paths.extend(base / name for name in names)
+    snapshot: dict[str, tuple[int, ...]] = {}
+    for path in paths:
+        metadata = os.lstat(path)
+        relative = "." if path == root else str(path.relative_to(root))
+        snapshot[relative] = (
+            stat.S_IFMT(metadata.st_mode),
+            stat.S_IMODE(metadata.st_mode),
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        )
+    return snapshot
+
+
+def _verify_staged_tree(
+    root: Path,
+    rows: Sequence[tuple[str, str]],
+    manifest_path: Path,
+    manifest_sha256: str,
+) -> None:
+    files = _regular_files(root)
+    expected = {relative for _digest, relative in rows} | {
+        str(manifest_path.relative_to(root))
+    }
+    actual = {str(path.relative_to(root)) for path in files}
+    if actual != expected:
+        raise LifecycleError(
+            "staged tree manifest is not exhaustive: "
+            f"missing={sorted(actual - expected)} extra={sorted(expected - actual)}"
+        )
+    if _sha256(manifest_path) != manifest_sha256:
+        raise LifecycleError("staged tree SHA256 manifest changed")
+    for digest, relative in rows:
+        if relative.startswith("checkpoints/global_step_"):
+            continue
+        observed = _sha256(root / relative)
+        if observed != digest:
+            raise LifecycleError(f"staged tree hash mismatch: {relative}")
+
+
 def _run_rsync(arguments: Sequence[str]) -> None:
     command = ["rsync", "-a", *arguments]
     result = subprocess.run(command, check=False, text=True, capture_output=True)
@@ -2489,30 +2561,16 @@ def atomic_publish_run(
             digest = rows_by_relative.get(relative) or _sha256(path)
             tree_rows.append((digest, relative))
         _atomic_write_text(manifest_path, _manifest_text(tree_rows), mode=0o600)
-        # Verify all small files and rely on the already repeated source/target
-        # checkpoint pass for the large checkpoint subtree.
-        for digest, relative in tree_rows:
-            if relative.startswith("checkpoints/global_step_"):
-                continue
-            observed = _sha256(stage_path / relative)
-            if observed != digest:
-                raise LifecycleError(f"staged tree hash mismatch: {relative}")
-        _validate_source_tree(stage_path)
-        final_launcher_values = _validate_launcher_exit(stage_path, run_id)
-        if final_launcher_values != launcher_values:
-            raise LifecycleError(
-                "staged launcher exit receipt changed during publication"
-            )
-        if terminal_receipt["launcher_exit_sha256"] != _sha256(
-            stage_path / "launcher-exit.env"
-        ):
-            raise LifecycleError(
-                "terminal publisher receipt is not bound to staged launcher"
-            )
+        manifest_sha256 = _sha256(manifest_path)
+        _verify_staged_tree(
+            stage_path, tree_rows, manifest_path, manifest_sha256
+        )
+        _seal_tree_read_only(stage_path)
+        sealed_snapshot = _tree_metadata_snapshot(stage_path)
         report = {
             **metadata,
             "persistent_path": str(final_path),
-            "tree_manifest_sha256": _sha256(manifest_path),
+            "tree_manifest_sha256": manifest_sha256,
         }
         _fsync_directory(stage_path)
         lock_path = persist_root / ".amg-atomic-publication.lock"
@@ -2520,6 +2578,25 @@ def atomic_publish_run(
             if final_path.exists() or final_path.is_symlink():
                 raise LifecycleError(
                     f"persistent destination appeared during publication: {final_path}"
+                )
+            _validate_source_tree(stage_path)
+            final_launcher_values = _validate_launcher_exit(stage_path, run_id)
+            if final_launcher_values != launcher_values:
+                raise LifecycleError(
+                    "staged launcher exit receipt changed during publication"
+                )
+            if terminal_receipt["launcher_exit_sha256"] != _sha256(
+                stage_path / "launcher-exit.env"
+            ):
+                raise LifecycleError(
+                    "terminal publisher receipt is not bound to staged launcher"
+                )
+            _verify_staged_tree(
+                stage_path, tree_rows, manifest_path, manifest_sha256
+            )
+            if _tree_metadata_snapshot(stage_path) != sealed_snapshot:
+                raise LifecycleError(
+                    "sealed staged tree changed before atomic publication"
                 )
             os.rename(stage_path, final_path)
             if terminal_exit:
