@@ -202,9 +202,8 @@ def build_overrides(
         "actor_rollout_ref.model.use_fused_kernels="
         f"{inputs.actor_use_fused_kernels}",
         "actor_rollout_ref.model.fused_kernel_options.impl_backend=torch",
-        # Keep veRL's native HF/FSDP gradient checkpointing enabled. The
-        # synchronous comparator used the upstream default successfully;
-        # disabling it made the four-way async critic retain full activations.
+        # Role-isolated infra gate: keep actor recomputation unchanged while
+        # measuring whether the six-way critic fits without checkpointing.
         "actor_rollout_ref.model.enable_gradient_checkpointing=True",
         f"critic.model.path={model_path}",
         f"critic.model.tokenizer_path={model_path}",
@@ -212,7 +211,7 @@ def build_overrides(
         "critic.model.use_remove_padding=True",
         f"critic.model.use_fused_kernels={inputs.critic_use_fused_kernels}",
         "critic.model.fused_kernel_options.impl_backend=torch",
-        "critic.model.enable_gradient_checkpointing=True",
+        "critic.model.enable_gradient_checkpointing=False",
         "actor_rollout_ref.actor.strategy=fsdp2",
         "actor_rollout_ref.actor.fsdp_config.strategy=fsdp2",
         "actor_rollout_ref.actor.fsdp_config.param_offload=False",
