@@ -1720,6 +1720,104 @@ class TestAtomicPublication(unittest.TestCase):
         )
         return run
 
+    def _make_recovery_ready(self, run: Path, run_id: str) -> str:
+        recovery = run / "recovery"
+        recovery.mkdir()
+        receipt = recovery / "RECOVERY-RECEIPT.json"
+        receipt.write_text(
+            json.dumps(
+                {
+                    "schema": "amg_test_recovery_receipt_v1",
+                    "status": "pass",
+                    "run_id": run_id,
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        receipt_digest = lifecycle._sha256(receipt)
+        post = recovery / "POST-RECOVERY-STATE.json"
+        post.write_text(
+            json.dumps(
+                {
+                    "schema": "amg_test_recovery_post_state_v1",
+                    "status": "ready_for_atomic_publication",
+                    "run_id": run_id,
+                    "recovery_receipt_sha256": receipt_digest,
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (recovery / "sealed-original.txt").write_text(
+            "original\n", encoding="utf-8"
+        )
+        (run / "finalization.json").write_text(
+            '{"errors": [], "status": "pass"}\n', encoding="utf-8"
+        )
+        (run / "trainer-exit-code").write_text("0\n", encoding="utf-8")
+        (run / "persistent-evidence-path").write_text(
+            f"/persist/{run_id}\n", encoding="utf-8"
+        )
+        manifest = recovery / "RECOVERY-SHA256SUMS"
+        manifest_rows = []
+        for path in sorted(
+            item
+            for item in recovery.rglob("*")
+            if item.is_file()
+            and item.name not in {"RECOVERY-SHA256SUMS", "RECOVERY-COMMIT.json"}
+        ):
+            manifest_rows.append(
+                f"{lifecycle._sha256(path)}  {path.relative_to(recovery)}\n"
+            )
+        manifest.write_text("".join(manifest_rows), encoding="utf-8")
+        launcher_contract = {
+            "trainer_exit_code": "0",
+            "cleanup_status": "pass",
+            "publication_status": "ready_for_atomic_publication",
+            "run_id": run_id,
+            "recovery_mode": "post_run_evidence_preserving",
+            "recovery_fix_commit": "a" * 40,
+            "recovery_receipt_sha256": receipt_digest,
+        }
+        artifact_paths = {
+            "recovery_receipt": "recovery/RECOVERY-RECEIPT.json",
+            "post_recovery_state": "recovery/POST-RECOVERY-STATE.json",
+            "recovery_manifest": "recovery/RECOVERY-SHA256SUMS",
+            "finalization": "finalization.json",
+            "trainer_exit_code": "trainer-exit-code",
+            "persistent_evidence_path": "persistent-evidence-path",
+        }
+        commit = {
+            "schema": "amg_recovery_publication_commit_v1",
+            "status": "ready_for_atomic_publication",
+            "run_id": run_id,
+            "launcher_contract": launcher_contract,
+            "artifacts": {
+                name: {
+                    "path": relative,
+                    "sha256": lifecycle._sha256(run / relative),
+                }
+                for name, relative in artifact_paths.items()
+            },
+        }
+        commit_path = recovery / "RECOVERY-COMMIT.json"
+        commit_path.write_text(
+            json.dumps(commit, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        commit_digest = lifecycle._sha256(commit_path)
+        launcher = [
+            *(f"{key}={value}" for key, value in launcher_contract.items()),
+            f"recovery_commit_sha256={commit_digest}",
+            "utc=2026-08-20T00:00:00Z",
+        ]
+        (run / "launcher-exit.env").write_text(
+            "\n".join(launcher) + "\n", encoding="utf-8"
+        )
+        return commit_digest
+
     def test_formal_tree_appears_complete_with_internal_hash_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -1766,6 +1864,95 @@ class TestAtomicPublication(unittest.TestCase):
                     discard_gate_checkpoints=False,
                 )
             self.assertFalse((persist / "no-exit-run").exists())
+
+    def test_recovery_launcher_without_commit_never_publishes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            run = self._make_run(root, "unbound-recovery-run")
+            with (run / "launcher-exit.env").open("a", encoding="utf-8") as stream:
+                stream.write(
+                    "recovery_mode=post_run_evidence_preserving\n"
+                    f"recovery_receipt_sha256={'0' * 64}\n"
+                )
+            persist = root / "persist"
+            persist.mkdir()
+            with self.assertRaises(lifecycle.LifecycleError):
+                lifecycle.atomic_publish_run(
+                    run_dir=run,
+                    persist_root=persist,
+                    run_id="unbound-recovery-run",
+                    mode="formal",
+                    checkpoint_step=1,
+                    discard_gate_checkpoints=False,
+                )
+            self.assertFalse((persist / "unbound-recovery-run").exists())
+
+    def test_recovery_artifact_drift_never_publishes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            run = self._make_run(root, "drifted-recovery-run")
+            self._make_recovery_ready(run, "drifted-recovery-run")
+            (run / "recovery/RECOVERY-RECEIPT.json").write_text(
+                '{"run_id":"drifted-recovery-run","status":"fail"}\n',
+                encoding="utf-8",
+            )
+            persist = root / "persist"
+            persist.mkdir()
+            with self.assertRaises(lifecycle.LifecycleError):
+                lifecycle.atomic_publish_run(
+                    run_dir=run,
+                    persist_root=persist,
+                    run_id="drifted-recovery-run",
+                    mode="formal",
+                    checkpoint_step=1,
+                    discard_gate_checkpoints=False,
+                )
+            self.assertFalse((persist / "drifted-recovery-run").exists())
+
+    def test_recovery_manifest_must_cover_every_recovery_file(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            run = self._make_run(root, "extra-recovery-file-run")
+            self._make_recovery_ready(run, "extra-recovery-file-run")
+            (run / "recovery/uncommitted.txt").write_text(
+                "not committed\n", encoding="utf-8"
+            )
+            persist = root / "persist"
+            persist.mkdir()
+            with self.assertRaises(lifecycle.LifecycleError):
+                lifecycle.atomic_publish_run(
+                    run_dir=run,
+                    persist_root=persist,
+                    run_id="extra-recovery-file-run",
+                    mode="formal",
+                    checkpoint_step=1,
+                    discard_gate_checkpoints=False,
+                )
+            self.assertFalse((persist / "extra-recovery-file-run").exists())
+
+    def test_recovery_publication_binds_commit_into_receipts(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            run = self._make_run(root, "bound-recovery-run")
+            commit_digest = self._make_recovery_ready(run, "bound-recovery-run")
+            persist = root / "persist"
+            persist.mkdir()
+            report = lifecycle.atomic_publish_run(
+                run_dir=run,
+                persist_root=persist,
+                run_id="bound-recovery-run",
+                mode="formal",
+                checkpoint_step=1,
+                discard_gate_checkpoints=False,
+            )
+            final = persist / "bound-recovery-run"
+            self.assertEqual(report["recovery_commit_sha256"], commit_digest)
+            publication = json.loads(
+                (final / "PUBLICATION-COMPLETE.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                publication["recovery_commit_sha256"], commit_digest
+            )
 
     def test_source_symlink_never_acquires_public_destination(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

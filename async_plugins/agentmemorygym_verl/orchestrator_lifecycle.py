@@ -2186,16 +2186,169 @@ def _audit_and_discard_gate_checkpoints(run_dir: Path) -> dict[str, Any]:
     return receipt
 
 
-def _validate_launcher_exit(run_dir: Path, run_id: str) -> None:
-    path = run_dir / "launcher-exit.env"
-    if path.is_symlink() or not path.is_file():
-        raise LifecycleError(f"launcher exit receipt is missing or symlinked: {path}")
+def _parse_launcher_exit(text: str) -> dict[str, str]:
     values: dict[str, str] = {}
-    for raw in path.read_text(encoding="utf-8").splitlines():
+    for raw in text.splitlines():
         key, separator, value = raw.partition("=")
         if not separator or not key or key in values:
             raise LifecycleError(f"invalid launcher exit receipt line: {raw!r}")
         values[key] = value
+    return values
+
+
+def _safe_recovery_artifact(run_dir: Path, relative: str) -> Path:
+    candidate = Path(relative)
+    if (
+        candidate.is_absolute()
+        or not candidate.parts
+        or any(part in {"", ".", ".."} for part in candidate.parts)
+    ):
+        raise LifecycleError(f"unsafe recovery artifact path: {relative!r}")
+    path = run_dir / candidate
+    if path.is_symlink() or not path.is_file():
+        raise LifecycleError(
+            f"recovery artifact is missing, non-regular, or symlinked: {path}"
+        )
+    return path
+
+
+def _validate_recovery_manifest(run_dir: Path, manifest_path: Path) -> None:
+    recovery_root = run_dir / "recovery"
+    expected: dict[str, str] = {}
+    for raw in manifest_path.read_text(encoding="utf-8").splitlines():
+        digest, separator, relative = raw.partition("  ")
+        if (
+            not separator
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+            or relative in expected
+        ):
+            raise LifecycleError(f"invalid recovery manifest row: {raw!r}")
+        path = _safe_recovery_artifact(recovery_root, relative)
+        observed = _sha256(path)
+        if observed != digest:
+            raise LifecycleError(
+                f"recovery manifest hash mismatch for {relative}: "
+                f"expected={digest} observed={observed}"
+            )
+        expected[relative] = digest
+    excluded = {"RECOVERY-SHA256SUMS", "RECOVERY-COMMIT.json"}
+    actual = {
+        str(path.relative_to(recovery_root))
+        for path in _regular_files(recovery_root)
+        if str(path.relative_to(recovery_root)) not in excluded
+    }
+    if set(expected) != actual:
+        raise LifecycleError(
+            "recovery manifest is not exhaustive: "
+            f"missing={sorted(actual - set(expected))} "
+            f"extra={sorted(set(expected) - actual)}"
+        )
+
+
+def _validate_recovery_publication_state(
+    run_dir: Path, run_id: str, values: Mapping[str, str]
+) -> None:
+    mode = values.get("recovery_mode")
+    commit_digest = values.get("recovery_commit_sha256")
+    if mode != "post_run_evidence_preserving":
+        raise LifecycleError(f"unsupported recovery publication mode: {mode!r}")
+    if not commit_digest or not re.fullmatch(r"[0-9a-f]{64}", commit_digest):
+        raise LifecycleError("invalid or missing recovery_commit_sha256")
+
+    commit_path = run_dir / "recovery/RECOVERY-COMMIT.json"
+    commit = _load_json(commit_path)
+    if _sha256(commit_path) != commit_digest:
+        raise LifecycleError("recovery commit hash does not match launcher receipt")
+    required_commit = {
+        "schema": "amg_recovery_publication_commit_v1",
+        "status": "ready_for_atomic_publication",
+        "run_id": run_id,
+    }
+    mismatches = {
+        key: {"expected": expected, "observed": commit.get(key)}
+        for key, expected in required_commit.items()
+        if commit.get(key) != expected
+    }
+    if mismatches:
+        raise LifecycleError(f"invalid recovery commit: {mismatches}")
+
+    launcher_contract = commit.get("launcher_contract")
+    if not isinstance(launcher_contract, dict) or not launcher_contract:
+        raise LifecycleError("recovery commit launcher_contract is missing or invalid")
+    required_contract = {
+        "trainer_exit_code": "0",
+        "cleanup_status": "pass",
+        "publication_status": "ready_for_atomic_publication",
+        "run_id": run_id,
+        "recovery_mode": "post_run_evidence_preserving",
+    }
+    for key, expected in required_contract.items():
+        if launcher_contract.get(key) != expected:
+            raise LifecycleError(
+                f"recovery launcher contract mismatch for {key}: "
+                f"expected={expected!r} observed={launcher_contract.get(key)!r}"
+            )
+    for key, expected in launcher_contract.items():
+        if not isinstance(key, str) or not isinstance(expected, str):
+            raise LifecycleError("recovery launcher contract must contain strings")
+        if values.get(key) != expected:
+            raise LifecycleError(
+                f"launcher is not bound to recovery commit for {key}: "
+                f"expected={expected!r} observed={values.get(key)!r}"
+            )
+
+    required_artifacts = {
+        "recovery_receipt": "recovery/RECOVERY-RECEIPT.json",
+        "post_recovery_state": "recovery/POST-RECOVERY-STATE.json",
+        "recovery_manifest": "recovery/RECOVERY-SHA256SUMS",
+        "finalization": "finalization.json",
+        "trainer_exit_code": "trainer-exit-code",
+        "persistent_evidence_path": "persistent-evidence-path",
+    }
+    artifacts = commit.get("artifacts")
+    if not isinstance(artifacts, dict):
+        raise LifecycleError("recovery commit artifacts are missing or invalid")
+    artifact_paths: dict[str, Path] = {}
+    for name, expected_relative in required_artifacts.items():
+        record = artifacts.get(name)
+        if not isinstance(record, dict):
+            raise LifecycleError(f"missing recovery artifact binding: {name}")
+        relative = record.get("path")
+        digest = record.get("sha256")
+        if relative != expected_relative:
+            raise LifecycleError(
+                f"unexpected recovery artifact path for {name}: {relative!r}"
+            )
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise LifecycleError(f"invalid recovery artifact hash for {name}")
+        path = _safe_recovery_artifact(run_dir, relative)
+        observed = _sha256(path)
+        if observed != digest:
+            raise LifecycleError(
+                f"recovery artifact hash mismatch for {name}: "
+                f"expected={digest} observed={observed}"
+            )
+        artifact_paths[name] = path
+
+    receipt_digest = artifacts["recovery_receipt"]["sha256"]
+    if values.get("recovery_receipt_sha256") != receipt_digest:
+        raise LifecycleError("launcher recovery receipt hash is not commit-bound")
+    receipt = _load_json(artifact_paths["recovery_receipt"])
+    if receipt.get("status") != "pass" or receipt.get("run_id") != run_id:
+        raise LifecycleError("recovery receipt is not a passing receipt for this run")
+    post_state = _load_json(artifact_paths["post_recovery_state"])
+    if (
+        post_state.get("status") != "ready_for_atomic_publication"
+        or post_state.get("run_id") != run_id
+        or post_state.get("recovery_receipt_sha256") != receipt_digest
+    ):
+        raise LifecycleError("post-recovery state is not bound to the recovery receipt")
+    _validate_recovery_manifest(run_dir, artifact_paths["recovery_manifest"])
+
+
+def _validate_launcher_exit_values(
+    run_dir: Path, run_id: str, values: Mapping[str, str]
+) -> None:
     required = {
         "trainer_exit_code": "0",
         "cleanup_status": "pass",
@@ -2211,6 +2364,18 @@ def _validate_launcher_exit(run_dir: Path, run_id: str) -> None:
         raise LifecycleError(
             f"launcher exit receipt is not terminally clean: {mismatches}"
         )
+    recovery_keys = {key for key in values if key.startswith("recovery_")}
+    if recovery_keys:
+        _validate_recovery_publication_state(run_dir, run_id, values)
+
+
+def _validate_launcher_exit(run_dir: Path, run_id: str) -> dict[str, str]:
+    path = run_dir / "launcher-exit.env"
+    if path.is_symlink() or not path.is_file():
+        raise LifecycleError(f"launcher exit receipt is missing or symlinked: {path}")
+    values = _parse_launcher_exit(path.read_text(encoding="utf-8"))
+    _validate_launcher_exit_values(run_dir, run_id, values)
+    return values
 
 
 def atomic_publish_run(
@@ -2229,7 +2394,7 @@ def atomic_publish_run(
         raise LifecycleError(f"run directory is missing or symlinked: {run_dir}")
     if persist_root.is_symlink() or not persist_root.is_dir():
         raise LifecycleError(f"persistent root is missing or symlinked: {persist_root}")
-    _validate_launcher_exit(run_dir, run_id)
+    launcher_values = _validate_launcher_exit(run_dir, run_id)
     _validate_source_tree(run_dir)
     if discard_gate_checkpoints:
         if mode != "gate" or checkpoint_step is not None:
@@ -2293,6 +2458,10 @@ def atomic_publish_run(
             "process_transition": "os._exit(0)_immediately_after_rename",
             "launcher_exit_sha256": _sha256(run_dir / "launcher-exit.env"),
         }
+        if "recovery_commit_sha256" in launcher_values:
+            terminal_receipt["recovery_commit_sha256"] = launcher_values[
+                "recovery_commit_sha256"
+            ]
         if terminal_exit:
             _atomic_write_json(stage_path / "TERMINAL-PUBLISHER.json", terminal_receipt)
         metadata = {
@@ -2305,6 +2474,10 @@ def atomic_publish_run(
             "terminal_publisher": terminal_exit,
             "published_unix": time.time(),
         }
+        if "recovery_commit_sha256" in launcher_values:
+            metadata["recovery_commit_sha256"] = launcher_values[
+                "recovery_commit_sha256"
+            ]
         if terminal_exit:
             metadata["terminal_publisher_sha256"] = _sha256(
                 stage_path / "TERMINAL-PUBLISHER.json"
