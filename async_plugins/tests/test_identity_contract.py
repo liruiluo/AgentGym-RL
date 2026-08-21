@@ -20,10 +20,10 @@ FIXTURES = Path("/tmp/openmle-v8-launch-fixtures-20260818")
 
 
 class TestAMGFullyAsyncIdentity(unittest.TestCase):
-    def test_verl_pin_contains_instance_scope_masked_head_and_alignment(self):
+    def test_verl_pin_contains_masked_head_alignment_and_phase_stable_probe(self):
         self.assertEqual(
             EXPECTED_VERL_COMMIT,
-            "88e17fbb07088b6085c5949e33cdc3b0f0ebc53d",
+            "440b5a30d0eb68b3abcc6b80680846945c5b15b6",
         )
 
     def test_only_reviewed_verl_and_model_bytes_are_module_constants(self):

@@ -15,9 +15,10 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 # Updated only after the generic veRL runtime-evidence, fused-forward
-# instance-scope, upstream masked fused-head, and variable-response alignment
-# patches are reviewed and committed. It is intentionally not caller-selectable.
-EXPECTED_VERL_COMMIT = "88e17fbb07088b6085c5949e33cdc3b0f0ebc53d"
+# instance-scope, upstream masked fused-head, variable-response alignment, and
+# FSDP phase-stable update-probe patches are reviewed and committed. It is
+# intentionally not caller-selectable.
+EXPECTED_VERL_COMMIT = "440b5a30d0eb68b3abcc6b80680846945c5b15b6"
 
 # Files needed to load the exact Qwen3.5-4B text model and tokenizer.  The model
 # root itself comes from the publication's training_runtime section, so a newer
