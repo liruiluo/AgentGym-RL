@@ -217,6 +217,9 @@ def build_overrides(
         "actor_rollout_ref.actor.fsdp_config.strategy=fsdp2",
         "actor_rollout_ref.actor.fsdp_config.param_offload=False",
         "actor_rollout_ref.actor.fsdp_config.optimizer_offload=False",
+        # Keep the accepted actor baseline unchanged. The candidate changes only
+        # critic FSDP2 resharding below.
+        "actor_rollout_ref.actor.fsdp_config.reshard_after_forward=True",
         f"actor_rollout_ref.actor.ppo_mini_batch_size={ppo_mini_batch_size}",
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8",
         "actor_rollout_ref.actor.ppo_epochs=1",
@@ -244,6 +247,10 @@ def build_overrides(
         "critic.fsdp.strategy=fsdp2",
         "critic.fsdp.param_offload=False",
         "critic.fsdp.optimizer_offload=False",
+        # Upstream FSDP2 can retain unsharded critic parameters between forward
+        # and backward. B200 memory headroom is traded for fewer parameter
+        # all-gathers; PPO data, losses, and optimizer semantics stay unchanged.
+        "critic.fsdp.reshard_after_forward=False",
         f"critic.ppo_mini_batch_size={ppo_mini_batch_size}",
         "critic.ppo_micro_batch_size_per_gpu=8",
         "critic.ppo_epochs=1",

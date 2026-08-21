@@ -87,6 +87,7 @@ def _config(*, mode: str = "formal") -> dict:
                     "strategy": "fsdp2",
                     "param_offload": False,
                     "optimizer_offload": False,
+                    "reshard_after_forward": True,
                 },
                 "optim": {"lr": 1e-6},
                 "policy_loss": {"loss_mode": "bypass_mode"},
@@ -114,6 +115,12 @@ def _config(*, mode: str = "formal") -> dict:
             "ppo_epochs": 1,
             "shuffle": False,
             "use_dynamic_bsz": True,
+            "fsdp": {
+                "strategy": "fsdp2",
+                "param_offload": False,
+                "optimizer_offload": False,
+                "reshard_after_forward": False,
+            },
             "optim": {"lr": 1e-5},
             "model": {
                 "path": "/models/Qwen3.5-4B",
@@ -241,6 +248,10 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         self.assertEqual(
             report["gradient_checkpointing"], {"actor": True, "critic": True}
         )
+        self.assertEqual(
+            report["fsdp2_reshard_after_forward"],
+            {"actor": True, "critic": False},
+        )
 
     def test_actor_only_fused_six_plus_two_is_resolved_and_reported(self):
         config = _config(mode="gate")
@@ -311,6 +322,22 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "Continuous Token"):
             _verify(config, mode="formal")
+
+    def test_rejects_fsdp2_reshard_treatment_drift(self):
+        for path, wrong in (
+            (("actor_rollout_ref", "actor", "fsdp_config"), False),
+            (("critic", "fsdp"), True),
+        ):
+            with self.subTest(path=path):
+                config = _config()
+                target = config
+                for key in path:
+                    target = target[key]
+                target["reshard_after_forward"] = wrong
+                with self.assertRaisesRegex(
+                    ValueError, "reshard_after_forward"
+                ):
+                    _verify(config, mode="formal")
 
     def test_rejects_disabling_upstream_gradient_checkpointing(self):
         for role in ("actor_rollout_ref", "critic"):
