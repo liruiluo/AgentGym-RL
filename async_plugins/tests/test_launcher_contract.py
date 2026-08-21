@@ -139,6 +139,15 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                 values["critic.model.enable_gradient_checkpointing"], "True"
             )
             self.assertEqual(
+                values[
+                    "actor_rollout_ref.actor.fsdp_config.reshard_after_forward"
+                ],
+                "True",
+            )
+            self.assertEqual(
+                values["critic.fsdp.reshard_after_forward"], "True"
+            )
+            self.assertEqual(
                 values["actor_rollout_ref.actor.ppo_max_token_len_per_gpu"],
                 "65536",
             )
@@ -207,6 +216,29 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             )
             self.assertEqual(
                 values["critic.model.fused_kernel_options.impl_backend"], "torch"
+            )
+
+    def test_phase_matched_control_keeps_actor_and_critic_reshard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inputs, identity = self._identity(Path(directory), "formal")
+            values = self._values(
+                build_overrides(
+                    inputs,
+                    effective_schedule=inputs.schedule,
+                    endpoint_client_config=identity["client_config"],
+                    budget_contract=identity["budget_contract"],
+                    training_runtime=identity["training_runtime"],
+                )
+            )
+
+            self.assertEqual(
+                values[
+                    "actor_rollout_ref.actor.fsdp_config.reshard_after_forward"
+                ],
+                "True",
+            )
+            self.assertEqual(
+                values["critic.fsdp.reshard_after_forward"], "True"
             )
 
     def test_gate_role_and_budget_are_derived_from_publication(self):

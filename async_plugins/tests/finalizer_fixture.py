@@ -128,6 +128,7 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
                     "strategy": "fsdp2",
                     "param_offload": False,
                     "optimizer_offload": False,
+                    "reshard_after_forward": True,
                 },
                 "optim": {"lr": 1e-6},
                 "policy_loss": {"loss_mode": "bypass_mode"},
@@ -155,6 +156,12 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
             "ppo_epochs": 1,
             "shuffle": False,
             "use_dynamic_bsz": True,
+            "fsdp": {
+                "strategy": "fsdp2",
+                "param_offload": False,
+                "optimizer_offload": False,
+                "reshard_after_forward": True,
+            },
             "optim": {"lr": 1e-5},
             "model": {
                 "path": PUBLICATION_TRAINING_RUNTIME["base_model"],

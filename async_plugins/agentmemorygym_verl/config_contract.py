@@ -311,6 +311,8 @@ def verify_resolved_config(
         "actor_rollout_ref.actor.fsdp_config.strategy": "fsdp2",
         "actor_rollout_ref.actor.fsdp_config.param_offload": False,
         "actor_rollout_ref.actor.fsdp_config.optimizer_offload": False,
+        "actor_rollout_ref.actor.fsdp_config.reshard_after_forward": True,
+        "critic.fsdp.reshard_after_forward": True,
         "critic.ppo_mini_batch_size": ppo_mini_batch_size,
         "critic.ppo_micro_batch_size_per_gpu": 8,
         "critic.ppo_epochs": 1,
@@ -474,6 +476,7 @@ def verify_resolved_config(
         "standalone_rollout_gpus": standalone_rollout_gpus,
         "dynamic_hybrid_enabled": True,
         "gradient_checkpointing": {"actor": True, "critic": True},
+        "fsdp2_reshard_after_forward": {"actor": True, "critic": True},
         "fused_kernels": {
             "actor": actor_fused,
             "critic": critic_fused,
