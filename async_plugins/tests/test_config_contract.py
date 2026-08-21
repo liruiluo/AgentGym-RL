@@ -98,6 +98,7 @@ def _config(*, mode: str = "formal") -> dict:
                 "calculate_log_probs": True,
                 "gpu_memory_utilization": 0.35,
                 "standalone_gpu_memory_utilization": 0.8,
+                "engine_kwargs": {"vllm": {"gdn_prefill_backend": "triton"}},
                 "multi_turn": {"enable": True},
                 "agent": {
                     "default_agent_loop": "amg_task_neutral_async",
@@ -325,6 +326,14 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         config = _config()
         config["data"]["apply_chat_template_kwargs"]["enable_thinking"] = True
         with self.assertRaisesRegex(ValueError, "enable_thinking"):
+            _verify(config, mode="formal")
+
+    def test_rejects_non_triton_gdn_prefill_backend(self):
+        config = _config(mode="formal")
+        config["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"][
+            "gdn_prefill_backend"
+        ] = "auto"
+        with self.assertRaisesRegex(ValueError, "gdn_prefill_backend"):
             _verify(config, mode="formal")
 
     def test_rejects_multi_turn_disabled_before_upstream_stamps_single_turn(self):

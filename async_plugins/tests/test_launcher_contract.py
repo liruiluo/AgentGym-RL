@@ -99,6 +99,12 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                 values["algorithm.rollout_correction.loss_type"], "ppo_clip"
             )
             self.assertEqual(values["actor_rollout_ref.rollout.n"], "1")
+            self.assertEqual(
+                values[
+                    "actor_rollout_ref.rollout.engine_kwargs.vllm.gdn_prefill_backend"
+                ],
+                "triton",
+            )
             self.assertEqual(values["critic.enable"], "True")
             self.assertEqual(
                 values["trainer.total_training_steps"],

@@ -270,6 +270,11 @@ def build_overrides(
         "actor_rollout_ref.rollout.max_num_batched_tokens=131072",
         "actor_rollout_ref.rollout.max_num_seqs=32",
         "actor_rollout_ref.rollout.enable_chunked_prefill=True",
+        # Use veRL's native vLLM engine-kwargs pass-through. vLLM's automatic
+        # FlashInfer GDN prefill selection deadlocks on B300 under a real
+        # concurrent batch, while its upstream Triton/FLA backend passes the
+        # same formal-shaped batch without changing PPO or AMG semantics.
+        "+actor_rollout_ref.rollout.engine_kwargs.vllm.gdn_prefill_backend=triton",
         "+actor_rollout_ref.rollout.enable_sleep_mode=True",
         "actor_rollout_ref.rollout.free_cache_engine=True",
         "actor_rollout_ref.rollout.disable_log_stats=False",

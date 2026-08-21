@@ -148,6 +148,11 @@ def verify_resolved_config(
     _require_equal(config, "async_training.dynamic_schedule_enable_rebalance", True)
     _require_equal(config, "actor_rollout_ref.rollout.name", "vllm")
     _require_equal(config, "actor_rollout_ref.rollout.mode", "async")
+    _require_equal(
+        config,
+        "actor_rollout_ref.rollout.engine_kwargs.vllm.gdn_prefill_backend",
+        "triton",
+    )
 
     trainer_nodes = _positive_int(_at(config, "trainer.nnodes"), field="trainer.nnodes")
     trainer_gpus_per_node = _positive_int(
