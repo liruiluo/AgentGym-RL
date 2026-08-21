@@ -217,9 +217,10 @@ def build_overrides(
         "actor_rollout_ref.actor.fsdp_config.strategy=fsdp2",
         "actor_rollout_ref.actor.fsdp_config.param_offload=False",
         "actor_rollout_ref.actor.fsdp_config.optimizer_offload=False",
-        # Keep the accepted actor baseline unchanged. The candidate changes only
-        # critic FSDP2 resharding below.
-        "actor_rollout_ref.actor.fsdp_config.reshard_after_forward=True",
+        # B300 has enough headroom to keep native FSDP2 actor parameters
+        # unsharded between forward and backward. This avoids per-layer
+        # backward all-gathers without adding a custom engine or data path.
+        "actor_rollout_ref.actor.fsdp_config.reshard_after_forward=False",
         f"actor_rollout_ref.actor.ppo_mini_batch_size={ppo_mini_batch_size}",
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8",
         "actor_rollout_ref.actor.ppo_epochs=1",

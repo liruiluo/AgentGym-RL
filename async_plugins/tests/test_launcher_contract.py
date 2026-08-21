@@ -142,7 +142,7 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                 values[
                     "actor_rollout_ref.actor.fsdp_config.reshard_after_forward"
                 ],
-                "True",
+                "False",
             )
             self.assertEqual(
                 values["critic.fsdp.reshard_after_forward"], "False"
@@ -218,7 +218,7 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                 values["critic.model.fused_kernel_options.impl_backend"], "torch"
             )
 
-    def test_critic_no_reshard_is_the_only_fsdp2_reshard_change(self):
+    def test_actor_and_critic_use_native_no_reshard(self):
         with tempfile.TemporaryDirectory() as directory:
             inputs, identity = self._identity(Path(directory), "formal")
             values = self._values(
@@ -235,7 +235,7 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                 values[
                     "actor_rollout_ref.actor.fsdp_config.reshard_after_forward"
                 ],
-                "True",
+                "False",
             )
             self.assertEqual(
                 values["critic.fsdp.reshard_after_forward"], "False"

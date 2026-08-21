@@ -128,7 +128,7 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
                     "strategy": "fsdp2",
                     "param_offload": False,
                     "optimizer_offload": False,
-                    "reshard_after_forward": True,
+                    "reshard_after_forward": False,
                 },
                 "optim": {"lr": 1e-6},
                 "policy_loss": {"loss_mode": "bypass_mode"},

@@ -87,7 +87,7 @@ def _config(*, mode: str = "formal") -> dict:
                     "strategy": "fsdp2",
                     "param_offload": False,
                     "optimizer_offload": False,
-                    "reshard_after_forward": True,
+                    "reshard_after_forward": False,
                 },
                 "optim": {"lr": 1e-6},
                 "policy_loss": {"loss_mode": "bypass_mode"},
@@ -250,7 +250,7 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         )
         self.assertEqual(
             report["fsdp2_reshard_after_forward"],
-            {"actor": True, "critic": False},
+            {"actor": False, "critic": False},
         )
 
     def test_actor_only_fused_six_plus_two_is_resolved_and_reported(self):
@@ -323,9 +323,9 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Continuous Token"):
             _verify(config, mode="formal")
 
-    def test_rejects_fsdp2_reshard_treatment_drift(self):
+    def test_rejects_dual_no_reshard_treatment_drift(self):
         for path, wrong in (
-            (("actor_rollout_ref", "actor", "fsdp_config"), False),
+            (("actor_rollout_ref", "actor", "fsdp_config"), True),
             (("critic", "fsdp"), True),
         ):
             with self.subTest(path=path):
