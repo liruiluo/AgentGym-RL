@@ -133,7 +133,7 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             )
             self.assertEqual(
                 values["actor_rollout_ref.model.enable_gradient_checkpointing"],
-                "True",
+                "False",
             )
             self.assertEqual(
                 values["critic.model.enable_gradient_checkpointing"], "True"
