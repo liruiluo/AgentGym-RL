@@ -16,9 +16,10 @@ from typing import Any
 
 # Updated only after the thin generic latest-veRL adapters for multi-output
 # AgentLoop rows, custom advantage forwarding, loss-neutral batch alignment,
-# and current-cycle metrics are reviewed and committed. It is intentionally
-# not caller-selectable.
-EXPECTED_VERL_COMMIT = "46612729045225436c9b471166e6e41744cd7272"
+# current-cycle metrics, current PPO critic initialization, and instance-scoped
+# fused forward selection are reviewed and committed. It is intentionally not
+# caller-selectable.
+EXPECTED_VERL_COMMIT = "b3b91799743561d5e19347751447963a2b283e6a"
 
 # Files needed to load the exact Qwen3.5-4B text model and tokenizer.  The model
 # root itself comes from the publication's training_runtime section, so a newer
