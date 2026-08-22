@@ -371,6 +371,7 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                 if len(current_prompt_ids) > max_prompt_tokens:
                     raise RuntimeError(
                         "AMG prompt exceeded PPO width before a trainable compaction action: "
+                        f"item_id={item_id!r} data_idx={data_idx} row_order={row_order} "
                         f"tokens={len(current_prompt_ids)} width={max_prompt_tokens}"
                     )
 
@@ -400,6 +401,7 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                 if len(prompt_ids) > max_prompt_tokens:
                     raise RuntimeError(
                         "AMG wrapper control prompt exceeds PPO prompt width: "
+                        f"item_id={item_id!r} data_idx={data_idx} row_order={row_order} "
                         f"tokens={len(prompt_ids)} width={max_prompt_tokens}"
                     )
 
