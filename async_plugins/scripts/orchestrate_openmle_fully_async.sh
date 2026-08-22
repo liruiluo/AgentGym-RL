@@ -13,7 +13,8 @@ Usage: orchestrate_openmle_fully_async.sh \
   --known-gpu-owner ID --known-gpu-script PATH \
   --known-gpu-script-sha256 SHA --known-gpu-process-command COMMAND \
   [--trainer-gpus 4|6 --standalone-rollout-gpus 4|2] \
-  [--actor-use-fused-kernels] [--critic-use-fused-kernels]
+  [--actor-use-fused-kernels] [--critic-use-fused-kernels] \
+  [--actor-ppo-max-tokens-per-gpu N] [--critic-ppo-max-tokens-per-gpu N]
 EOF
   exit 64
 }
@@ -48,6 +49,8 @@ TRAINER_GPUS=6
 STANDALONE_ROLLOUT_GPUS=2
 ACTOR_USE_FUSED_KERNELS=0
 CRITIC_USE_FUSED_KERNELS=0
+ACTOR_PPO_MAX_TOKENS_PER_GPU=65536
+CRITIC_PPO_MAX_TOKENS_PER_GPU=32768
 CUDA_TOOLKIT_ROOT=/dev/shm/cuda-13-b300-toolkit
 
 while (($#)); do
@@ -79,6 +82,8 @@ while (($#)); do
     --standalone-rollout-gpus) STANDALONE_ROLLOUT_GPUS=${2:?}; shift 2 ;;
     --actor-use-fused-kernels) ACTOR_USE_FUSED_KERNELS=1; shift ;;
     --critic-use-fused-kernels) CRITIC_USE_FUSED_KERNELS=1; shift ;;
+    --actor-ppo-max-tokens-per-gpu) ACTOR_PPO_MAX_TOKENS_PER_GPU=${2:?}; shift 2 ;;
+    --critic-ppo-max-tokens-per-gpu) CRITIC_PPO_MAX_TOKENS_PER_GPU=${2:?}; shift 2 ;;
     *) usage ;;
   esac
 done
@@ -691,6 +696,8 @@ printf '%s\n' "$(date -u +%FT%TZ)" > "$RUN_DIR/trainer-started-at"
 LAUNCH_TUNING_ARGS=(
   --trainer-gpus "$TRAINER_GPUS"
   --standalone-rollout-gpus "$STANDALONE_ROLLOUT_GPUS"
+  --actor-ppo-max-tokens-per-gpu "$ACTOR_PPO_MAX_TOKENS_PER_GPU"
+  --critic-ppo-max-tokens-per-gpu "$CRITIC_PPO_MAX_TOKENS_PER_GPU"
 )
 if [ "$ACTOR_USE_FUSED_KERNELS" -eq 1 ]; then
   LAUNCH_TUNING_ARGS+=(--actor-use-fused-kernels)

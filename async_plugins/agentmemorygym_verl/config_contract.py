@@ -111,6 +111,8 @@ def verify_resolved_config(
         "max_actor_ckpt_to_keep",
         "max_critic_ckpt_to_keep",
         "model_path",
+        "actor_ppo_max_tokens_per_gpu",
+        "critic_ppo_max_tokens_per_gpu",
     )
     missing_budget_fields = [
         field for field in required_budget_fields if field not in expected_budget
@@ -337,6 +339,10 @@ def verify_resolved_config(
         "actor_rollout_ref.actor.ppo_mini_batch_size": ppo_mini_batch_size,
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu": 8,
         "actor_rollout_ref.actor.ppo_epochs": 1,
+        "actor_rollout_ref.actor.ppo_max_token_len_per_gpu": _positive_int(
+            expected["actor_ppo_max_tokens_per_gpu"],
+            field="expected actor_ppo_max_tokens_per_gpu",
+        ),
         "actor_rollout_ref.actor.shuffle": False,
         "actor_rollout_ref.actor.use_dynamic_bsz": True,
         "actor_rollout_ref.actor.loss_agg_mode": "token-mean",
@@ -350,6 +356,10 @@ def verify_resolved_config(
         "critic.ppo_mini_batch_size": ppo_mini_batch_size,
         "critic.ppo_micro_batch_size_per_gpu": 8,
         "critic.ppo_epochs": 1,
+        "critic.ppo_max_token_len_per_gpu": _positive_int(
+            expected["critic_ppo_max_tokens_per_gpu"],
+            field="expected critic_ppo_max_tokens_per_gpu",
+        ),
         "critic.shuffle": False,
         "critic.use_dynamic_bsz": True,
         "critic.loss_agg_mode": "token-mean",
@@ -526,6 +536,14 @@ def verify_resolved_config(
         "advantage_normalization": "upstream_masked_whiten",
         "model_path": actor_model,
         "env_addr": env_addr,
+        "actor_ppo_max_tokens_per_gpu": _positive_int(
+            expected["actor_ppo_max_tokens_per_gpu"],
+            field="expected actor_ppo_max_tokens_per_gpu",
+        ),
+        "critic_ppo_max_tokens_per_gpu": _positive_int(
+            expected["critic_ppo_max_tokens_per_gpu"],
+            field="expected critic_ppo_max_tokens_per_gpu",
+        ),
         "save_freq": _positive_int(expected["save_freq"], field="expected save_freq"),
         "max_actor_ckpt_to_keep": _positive_int(
             expected["max_actor_ckpt_to_keep"],

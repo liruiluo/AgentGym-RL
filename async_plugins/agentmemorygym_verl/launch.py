@@ -46,6 +46,8 @@ _MAX_OBSERVATION_TOKENS = 8192
 _UPSTREAM_ENTRYPOINT = "verl.experimental.fully_async_policy.fully_async_main"
 _CUDA13_TOOLKIT_ROOT = Path("/dev/shm/cuda-13-b300-toolkit")
 _EXPECTED_CUDA_VERSION = "13.0"
+_DEFAULT_ACTOR_PPO_MAX_TOKENS_PER_GPU = 65536
+_DEFAULT_CRITIC_PPO_MAX_TOKENS_PER_GPU = 32768
 _ASYNC_TUNING = {
     "gate": {
         "trigger_parameter_sync_step": 1,
@@ -79,6 +81,8 @@ class LaunchInputs:
     standalone_rollout_gpus: int = 2
     actor_use_fused_kernels: bool = False
     critic_use_fused_kernels: bool = False
+    actor_ppo_max_tokens_per_gpu: int = _DEFAULT_ACTOR_PPO_MAX_TOKENS_PER_GPU
+    critic_ppo_max_tokens_per_gpu: int = _DEFAULT_CRITIC_PPO_MAX_TOKENS_PER_GPU
 
 
 def _string(value: str | Path) -> str:
@@ -154,6 +158,14 @@ def build_overrides(
         raise ValueError(
             "publication samples_per_update cannot be represented by require_batches"
         )
+    actor_ppo_max_tokens_per_gpu = _require_positive_int(
+        budget_contract.get("actor_ppo_max_tokens_per_gpu"),
+        field="budget actor_ppo_max_tokens_per_gpu",
+    )
+    critic_ppo_max_tokens_per_gpu = _require_positive_int(
+        budget_contract.get("critic_ppo_max_tokens_per_gpu"),
+        field="budget critic_ppo_max_tokens_per_gpu",
+    )
     model_path = _string(training_runtime["base_model"])
     schedule_path = _string(effective_schedule)
     run_dir = _string(inputs.run_dir)
@@ -230,7 +242,8 @@ def build_overrides(
         # Six-way FSDP leaves less activation headroom than the historical
         # eight-way synchronous trainer. Keep microbatch=8 but bound packed
         # training tokens; formal tuning may raise these after measured headroom.
-        "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=65536",
+        "actor_rollout_ref.actor.ppo_max_token_len_per_gpu="
+        f"{actor_ppo_max_tokens_per_gpu}",
         "actor_rollout_ref.actor.use_rollout_log_probs=True",
         "actor_rollout_ref.actor.optim.lr=1e-6",
         "actor_rollout_ref.actor.optim.weight_decay=0.01",
@@ -267,7 +280,8 @@ def build_overrides(
         # gradient checkpointing was disabled did not control the activation
         # peak. Retain the conservative 32,768 target for the first gate with
         # upstream checkpointing restored; tune only from measured headroom.
-        "critic.ppo_max_token_len_per_gpu=32768",
+        "critic.ppo_max_token_len_per_gpu="
+        f"{critic_ppo_max_tokens_per_gpu}",
         "critic.forward_max_token_len_per_gpu=262144",
         "critic.optim.lr=1e-5",
         "critic.optim.weight_decay=0.01",
@@ -811,6 +825,14 @@ def _load_endpoint_identity(
         "max_actor_ckpt_to_keep": tuning["max_actor_ckpt_to_keep"],
         "max_critic_ckpt_to_keep": tuning["max_critic_ckpt_to_keep"],
         "model_path": training_runtime["base_model"],
+        "actor_ppo_max_tokens_per_gpu": _require_positive_int(
+            inputs.actor_ppo_max_tokens_per_gpu,
+            field="actor_ppo_max_tokens_per_gpu",
+        ),
+        "critic_ppo_max_tokens_per_gpu": _require_positive_int(
+            inputs.critic_ppo_max_tokens_per_gpu,
+            field="critic_ppo_max_tokens_per_gpu",
+        ),
         "task_count": task_count,
         "source_family_count": source_family_count,
         "schedule_sha256": expected_schedule_sha256,
@@ -1372,6 +1394,12 @@ def prepare_launch(
             "standalone_rollout_gpus": inputs.standalone_rollout_gpus,
             "actor_use_fused_kernels": inputs.actor_use_fused_kernels,
             "critic_use_fused_kernels": inputs.critic_use_fused_kernels,
+            "actor_ppo_max_tokens_per_gpu": (
+                inputs.actor_ppo_max_tokens_per_gpu
+            ),
+            "critic_ppo_max_tokens_per_gpu": (
+                inputs.critic_ppo_max_tokens_per_gpu
+            ),
         },
         "source": source_report_runtime,
         "plugin_manifest": _production_manifest(inputs.outer_root),
@@ -1418,6 +1446,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--standalone-rollout-gpus", type=int, default=2)
     parser.add_argument("--actor-use-fused-kernels", action="store_true")
     parser.add_argument("--critic-use-fused-kernels", action="store_true")
+    parser.add_argument(
+        "--actor-ppo-max-tokens-per-gpu",
+        type=int,
+        default=_DEFAULT_ACTOR_PPO_MAX_TOKENS_PER_GPU,
+    )
+    parser.add_argument(
+        "--critic-ppo-max-tokens-per-gpu",
+        type=int,
+        default=_DEFAULT_CRITIC_PPO_MAX_TOKENS_PER_GPU,
+    )
     parser.add_argument("--resolve-only", action="store_true")
     parser.add_argument("--skip-endpoint-preflight", action="store_true")
     return parser.parse_args(argv)
@@ -1441,6 +1479,8 @@ def main(argv: list[str] | None = None) -> int:
         standalone_rollout_gpus=args.standalone_rollout_gpus,
         actor_use_fused_kernels=args.actor_use_fused_kernels,
         critic_use_fused_kernels=args.critic_use_fused_kernels,
+        actor_ppo_max_tokens_per_gpu=args.actor_ppo_max_tokens_per_gpu,
+        critic_ppo_max_tokens_per_gpu=args.critic_ppo_max_tokens_per_gpu,
     )
     command, env, receipt = prepare_launch(
         inputs,

@@ -191,6 +191,7 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             self.assertEqual(
                 values["critic.ppo_max_token_len_per_gpu"], "32768"
             )
+
             self.assertEqual(
                 values["actor_rollout_ref.rollout.multi_turn.enable"], "True"
             )
@@ -200,6 +201,36 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             )
             self.assertEqual(
                 json.loads(values["data.agentgym.expected_role"]), "train_pool"
+            )
+
+    def test_native_dynamic_token_budgets_are_configurable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inputs, identity = self._identity(Path(directory), "formal")
+            inputs = replace(
+                inputs,
+                actor_ppo_max_tokens_per_gpu=131072,
+                critic_ppo_max_tokens_per_gpu=65536,
+            )
+            budget = {
+                **identity["budget_contract"],
+                "actor_ppo_max_tokens_per_gpu": 131072,
+                "critic_ppo_max_tokens_per_gpu": 65536,
+            }
+            values = self._values(
+                build_overrides(
+                    inputs,
+                    effective_schedule=inputs.schedule,
+                    endpoint_client_config=identity["client_config"],
+                    budget_contract=budget,
+                    training_runtime=identity["training_runtime"],
+                )
+            )
+            self.assertEqual(
+                values["actor_rollout_ref.actor.ppo_max_token_len_per_gpu"],
+                "131072",
+            )
+            self.assertEqual(
+                values["critic.ppo_max_token_len_per_gpu"], "65536"
             )
 
     def test_actor_only_fused_six_plus_two_uses_upstream_native_overrides(self):
@@ -506,6 +537,19 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             str(FIXTURES / "formal100-schedule-certificate.json"),
         ]
         parsed = _parse_args(common)
+        self.assertEqual(parsed.actor_ppo_max_tokens_per_gpu, 65536)
+        self.assertEqual(parsed.critic_ppo_max_tokens_per_gpu, 32768)
+        tuned = _parse_args(
+            common
+            + [
+                "--actor-ppo-max-tokens-per-gpu",
+                "131072",
+                "--critic-ppo-max-tokens-per-gpu",
+                "65536",
+            ]
+        )
+        self.assertEqual(tuned.actor_ppo_max_tokens_per_gpu, 131072)
+        self.assertEqual(tuned.critic_ppo_max_tokens_per_gpu, 65536)
         for name in ("expected_verl_commit", "model_path", "episodes", "task_count"):
             self.assertFalse(hasattr(parsed, name))
         actor_only = _parse_args(common + ["--actor-use-fused-kernels"])
