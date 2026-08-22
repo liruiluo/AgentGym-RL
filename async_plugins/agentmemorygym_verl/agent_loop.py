@@ -178,11 +178,6 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
             raise ValueError(
                 "AMG max_rounds and max_observation_tokens must be positive"
             )
-        self.verify_incremental_first_n = int(
-            _get(self.agentgym_config, "verify_continuous_token_first_n", 1)
-        )
-        if self.verify_incremental_first_n < 0:
-            raise ValueError("verify_continuous_token_first_n must be non-negative")
         self._envelope_tokens: int | None = None
 
     def _render_prompt_sync(self, messages: list[dict[str, str]]) -> list[int]:
@@ -217,7 +212,6 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
         action: str,
         action_token_ids: list[int],
         next_messages: list[dict[str, str]],
-        verify: bool,
     ) -> list[int]:
         assistant_messages = prepared_messages + [
             {"role": "assistant", "content": action}
@@ -239,12 +233,6 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                         assistant_runtime,
                     ).token_ids
                 )
-                if verify:
-                    rendered = self._render_prompt_sync(next_messages)
-                    if next_prompt != rendered:
-                        raise RuntimeError(
-                            "Continuous Token incremental AMG prompt differs from full rendering"
-                        )
                 return next_prompt
 
         # replace_messages and preserve-without-observation deliberately rebuild
@@ -556,7 +544,6 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                     action=action,
                     action_token_ids=response_ids,
                     next_messages=next_messages,
-                    verify=row_order < self.verify_incremental_first_n,
                 )
                 current_messages = next_messages
 

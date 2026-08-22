@@ -47,6 +47,24 @@ class _RecordingContinuousBuilder:
         return _MergeResult(list(runtime)[:-1] + list(assistant))
 
 
+class _HistoryNormalizingContinuousBuilder(_RecordingContinuousBuilder):
+    """Mimic Qwen3.5 dropping generation-only thinking markers on rerender."""
+
+    def build_initial_tokens(self, messages):
+        self.initial_calls.append([dict(message) for message in messages])
+        if any(message["role"] == "assistant" for message in messages):
+            return [700, 701]
+        return [700, 702]
+
+    def merge_assistant_tokens(self, runtime, assistant):
+        self.assistant_calls.append((list(runtime), list(assistant)))
+        return _MergeResult(list(runtime) + list(assistant))
+
+    def merge_non_assistant_tokens(self, previous, updated, runtime):
+        self.non_assistant_calls.append((previous, updated, runtime))
+        return _MergeResult(list(runtime) + [703])
+
+
 class _Tokenizer:
     def __init__(self, actions=None):
         self.actions = actions or {}
@@ -310,12 +328,33 @@ class TestPromptRendering(unittest.TestCase):
             action="act",
             action_token_ids=action_ids,
             next_messages=next_messages,
-            verify=True,
         )
 
         self.assertEqual(actual, loop.continuous_token_builder._render(next_messages))
         self.assertEqual(len(loop.continuous_token_builder.assistant_calls), 1)
         self.assertEqual(len(loop.continuous_token_builder.non_assistant_calls), 1)
+
+    def test_append_keeps_continuous_runtime_for_history_normalizing_template(self):
+        loop = self._loop()
+        loop.continuous_token_builder = _HistoryNormalizingContinuousBuilder()
+        prepared = [{"role": "user", "content": "task"}]
+        prompt_ids = loop._render_prompt_sync(prepared)
+        next_messages = prepared + [
+            {"role": "assistant", "content": "act"},
+            {"role": "user", "content": "observation"},
+        ]
+
+        actual = loop._next_prompt_ids(
+            prepared_messages=prepared,
+            prepared_prompt_ids=prompt_ids,
+            action="act",
+            action_token_ids=[11, 12],
+            next_messages=next_messages,
+        )
+
+        self.assertEqual(actual, prompt_ids + [11, 12, 703])
+        self.assertNotEqual(actual, [700, 701])
+        self.assertEqual(loop.continuous_token_builder.initial_calls, [prepared])
 
     def test_replace_messages_forces_full_rebuild(self):
         loop = self._loop()
@@ -332,7 +371,6 @@ class TestPromptRendering(unittest.TestCase):
             action="compact summary",
             action_token_ids=[15],
             next_messages=replacement,
-            verify=True,
         )
 
         self.assertEqual(actual, loop.continuous_token_builder._render(replacement))
@@ -346,7 +384,6 @@ class TestAMGAgentLoop(IsolatedAsyncioTestCase):
         loop.agentgym_config = {"task_name": "openmle_fast"}
         loop.max_policy_turns = max_turns
         loop.max_observation_tokens = 32
-        loop.verify_incremental_first_n = 0
         loop._envelope_tokens = 1
         loop.rollout_config = SimpleNamespace(
             response_length=8,
