@@ -269,6 +269,13 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                 ],
                 "indices",
             )
+            self.assertEqual(
+                values[
+                    "actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs."
+                    "delta_sharded.verify_every"
+                ],
+                "1",
+            )
 
     def test_actor_only_fused_six_plus_two_uses_upstream_native_overrides(self):
         with tempfile.TemporaryDirectory() as directory:

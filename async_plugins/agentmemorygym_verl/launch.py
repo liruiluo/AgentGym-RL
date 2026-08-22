@@ -388,9 +388,16 @@ def build_overrides(
         "hydra.job.chdir=False",
     ]
     if checkpoint_engine_backend == "delta_sharded":
-        overrides.append(
-            "+actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs."
-            "delta_sharded.encoding=indices"
+        overrides.extend(
+            [
+                "+actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs."
+                "delta_sharded.encoding=indices",
+                # Diagnostic-only full equivalence sweep after every steady
+                # delta publication. Remove for the timed candidate once the
+                # Qwen3.5 loader regression is closed.
+                "+actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs."
+                "delta_sharded.verify_every=1",
+            ]
         )
     for prefix in ("actor_rollout_ref", "data"):
         for key, value in agentgym.items():
