@@ -68,6 +68,7 @@ class _HistoryNormalizingContinuousBuilder(_RecordingContinuousBuilder):
 class _Tokenizer:
     def __init__(self, actions=None):
         self.actions = actions or {}
+        self.eos_token_id = 999
 
     def decode(self, token_ids, skip_special_tokens=True):
         del skip_special_tokens
@@ -95,6 +96,7 @@ class _Server:
             log_probs=[-0.01 * (index + 1)],
             routed_experts=None,
             num_preempted=0,
+            stop_reason="stop",
             extra_fields={"min_global_steps": index, "max_global_steps": index + 1},
         )
 
@@ -400,6 +402,29 @@ class TestAMGAgentLoop(IsolatedAsyncioTestCase):
             1 + index for index, _ in enumerate(json.dumps(messages, sort_keys=True))
         ]
         return loop
+
+    async def test_each_policy_action_stops_at_tokenizer_eos_and_records_reason(self):
+        client = _SuccessfulClient()
+        loop = self._loop(["KEPT ACTION"], max_turns=1)
+
+        with mock.patch.object(
+            agent_loop_module, "create_env_client", return_value=client
+        ):
+            outputs = await loop.run(
+                {"max_tokens": 8, "stop_token_ids": [777, 999, 777]},
+                item_id="eos-boundary-task",
+                data_idx=9,
+                uid="trajectory-eos-boundary",
+                raw_prompt=[{"role": "system", "content": "system"}],
+            )
+
+        self.assertEqual(
+            loop.server_manager.calls[0]["sampling_params"]["stop_token_ids"],
+            [777, 999],
+        )
+        record = json.loads(outputs[0].extra_fields["step_record_json"])
+        self.assertEqual(record["generation_stop_reason"], "stop")
+        self.assertEqual(outputs[0].extra_fields["generation_stop_reason"], "stop")
 
     async def test_complete_filesystem_memory_chain_is_one_ordered_ppo_episode(self):
         actions = [

@@ -351,6 +351,23 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
         )
         sampling_params = dict(sampling_params)
         sampling_params["max_tokens"] = response_budget
+        eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+        if eos_token_id is None:
+            raise ValueError("AMG AgentLoop tokenizer must define eos_token_id")
+        existing_stop_ids = sampling_params.get("stop_token_ids") or []
+        if not isinstance(existing_stop_ids, (list, tuple)):
+            raise TypeError("sampling_params.stop_token_ids must be a list or tuple")
+        eos_stop_ids = (
+            eos_token_id if isinstance(eos_token_id, (list, tuple)) else [eos_token_id]
+        )
+        merged_stop_ids: list[int] = []
+        seen_stop_ids: set[int] = set()
+        for token_id in [*existing_stop_ids, *eos_stop_ids]:
+            normalized_token_id = int(token_id)
+            if normalized_token_id not in seen_stop_ids:
+                seen_stop_ids.add(normalized_token_id)
+                merged_stop_ids.append(normalized_token_id)
+        sampling_params["stop_token_ids"] = merged_stop_ids
         if not bool(self.rollout_config.calculate_log_probs):
             raise ValueError(
                 "AMG fully-async PPO requires rollout.calculate_log_probs=true"
@@ -497,6 +514,7 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                     "prompt_token_sha256": _digest_token_ids(prompt_ids),
                     "response_token_count": len(response_ids),
                     "response_token_sha256": _digest_token_ids(response_ids),
+                    "generation_stop_reason": _json_safe(token_output.stop_reason),
                     "min_global_steps": int(token_extra["min_global_steps"]),
                     "max_global_steps": int(token_extra["max_global_steps"]),
                 }
@@ -515,6 +533,7 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                         "data_idx": data_idx,
                         "task_round": row_order + 1,
                         "action_text": action,
+                        "generation_stop_reason": _json_safe(token_output.stop_reason),
                         "context_transition": context_transition,
                         "wrapper_evidence": wrapper_evidence,
                         "env_info_after": env_info,
