@@ -267,7 +267,7 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         config["actor_rollout_ref"]["actor"]["ppo_mini_batch_size"] = 512
         config["critic"]["ppo_mini_batch_size"] = 512
         config["async_training"]["require_batches"] = 64 / 512
-        with self.assertRaisesRegex(ValueError, "formal.*6\+2"):
+        with self.assertRaisesRegex(ValueError, r"formal.*6\+2"):
             _verify(config, mode="formal")
 
     def test_actor_only_fused_six_plus_two_is_resolved_and_reported(self):
