@@ -48,6 +48,7 @@ _CUDA13_TOOLKIT_ROOT = Path("/dev/shm/cuda-13-b300-toolkit")
 _EXPECTED_CUDA_VERSION = "13.0"
 _DEFAULT_ACTOR_PPO_MAX_TOKENS_PER_GPU = 65536
 _DEFAULT_CRITIC_PPO_MAX_TOKENS_PER_GPU = 32768
+_DEFAULT_CRITIC_PPO_INFER_MAX_TOKENS_PER_GPU = 262144
 _ASYNC_TUNING = {
     "gate": {
         "trigger_parameter_sync_step": 1,
@@ -83,6 +84,9 @@ class LaunchInputs:
     critic_use_fused_kernels: bool = False
     actor_ppo_max_tokens_per_gpu: int = _DEFAULT_ACTOR_PPO_MAX_TOKENS_PER_GPU
     critic_ppo_max_tokens_per_gpu: int = _DEFAULT_CRITIC_PPO_MAX_TOKENS_PER_GPU
+    critic_ppo_infer_max_tokens_per_gpu: int = (
+        _DEFAULT_CRITIC_PPO_INFER_MAX_TOKENS_PER_GPU
+    )
 
 
 def _string(value: str | Path) -> str:
@@ -165,6 +169,10 @@ def build_overrides(
     critic_ppo_max_tokens_per_gpu = _require_positive_int(
         budget_contract.get("critic_ppo_max_tokens_per_gpu"),
         field="budget critic_ppo_max_tokens_per_gpu",
+    )
+    critic_ppo_infer_max_tokens_per_gpu = _require_positive_int(
+        budget_contract.get("critic_ppo_infer_max_tokens_per_gpu"),
+        field="budget critic_ppo_infer_max_tokens_per_gpu",
     )
     model_path = _string(training_runtime["base_model"])
     schedule_path = _string(effective_schedule)
@@ -282,7 +290,13 @@ def build_overrides(
         # upstream checkpointing restored; tune only from measured headroom.
         "critic.ppo_max_token_len_per_gpu="
         f"{critic_ppo_max_tokens_per_gpu}",
+        # Current veRL's unified critic worker reads ppo_infer_max_token_len_per_gpu
+        # for the no-grad value forward. forward_max_token_len_per_gpu is deprecated
+        # and is not wired into this FSDP2 path. Keep its prior resolved value and
+        # tune the native active field rather than adding custom batching code.
         "critic.forward_max_token_len_per_gpu=262144",
+        "+critic.ppo_infer_max_token_len_per_gpu="
+        f"{critic_ppo_infer_max_tokens_per_gpu}",
         "critic.optim.lr=1e-5",
         "critic.optim.weight_decay=0.01",
         "critic.optim.lr_warmup_steps=0",
@@ -832,6 +846,10 @@ def _load_endpoint_identity(
         "critic_ppo_max_tokens_per_gpu": _require_positive_int(
             inputs.critic_ppo_max_tokens_per_gpu,
             field="critic_ppo_max_tokens_per_gpu",
+        ),
+        "critic_ppo_infer_max_tokens_per_gpu": _require_positive_int(
+            inputs.critic_ppo_infer_max_tokens_per_gpu,
+            field="critic_ppo_infer_max_tokens_per_gpu",
         ),
         "task_count": task_count,
         "source_family_count": source_family_count,
@@ -1400,6 +1418,9 @@ def prepare_launch(
             "critic_ppo_max_tokens_per_gpu": (
                 inputs.critic_ppo_max_tokens_per_gpu
             ),
+            "critic_ppo_infer_max_tokens_per_gpu": (
+                inputs.critic_ppo_infer_max_tokens_per_gpu
+            ),
         },
         "source": source_report_runtime,
         "plugin_manifest": _production_manifest(inputs.outer_root),
@@ -1456,6 +1477,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=_DEFAULT_CRITIC_PPO_MAX_TOKENS_PER_GPU,
     )
+    parser.add_argument(
+        "--critic-ppo-infer-max-tokens-per-gpu",
+        type=int,
+        default=_DEFAULT_CRITIC_PPO_INFER_MAX_TOKENS_PER_GPU,
+    )
     parser.add_argument("--resolve-only", action="store_true")
     parser.add_argument("--skip-endpoint-preflight", action="store_true")
     return parser.parse_args(argv)
@@ -1481,6 +1507,9 @@ def main(argv: list[str] | None = None) -> int:
         critic_use_fused_kernels=args.critic_use_fused_kernels,
         actor_ppo_max_tokens_per_gpu=args.actor_ppo_max_tokens_per_gpu,
         critic_ppo_max_tokens_per_gpu=args.critic_ppo_max_tokens_per_gpu,
+        critic_ppo_infer_max_tokens_per_gpu=(
+            args.critic_ppo_infer_max_tokens_per_gpu
+        ),
     )
     command, env, receipt = prepare_launch(
         inputs,

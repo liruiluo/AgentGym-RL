@@ -44,6 +44,7 @@ def _budget(mode: str) -> dict:
         "model_path": "/models/Qwen3.5-4B",
         "actor_ppo_max_tokens_per_gpu": 65536,
         "critic_ppo_max_tokens_per_gpu": 32768,
+        "critic_ppo_infer_max_tokens_per_gpu": 262144,
         "task_count": 762 if formal else 64,
         "source_family_count": 664 if formal else 64,
         "schedule_sha256": "2" * 64,
@@ -134,6 +135,7 @@ def _config(*, mode: str = "formal") -> dict:
             "ppo_micro_batch_size_per_gpu": 8,
             "ppo_epochs": 1,
             "ppo_max_token_len_per_gpu": 32768,
+            "ppo_infer_max_token_len_per_gpu": 262144,
             "shuffle": False,
             "use_dynamic_bsz": True,
             "loss_agg_mode": "token-mean",
@@ -263,6 +265,7 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
             report["fsdp2_reshard_after_forward"],
             {"actor": True, "critic": True},
         )
+        self.assertEqual(report["critic_ppo_infer_max_tokens_per_gpu"], 262144)
 
     def test_formal_rejects_every_topology_except_six_plus_two(self):
         config = _config(mode="formal")
@@ -396,6 +399,14 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
                     ValueError, "reshard_after_forward"
                 ):
                     _verify(config, mode="formal")
+
+    def test_rejects_critic_infer_token_budget_drift(self):
+        config = _config()
+        config["critic"]["ppo_infer_max_token_len_per_gpu"] = 32768
+        with self.assertRaisesRegex(
+            ValueError, "ppo_infer_max_token_len_per_gpu"
+        ):
+            _verify(config, mode="formal")
 
     def test_rejects_disabling_upstream_gradient_checkpointing(self):
         for role in ("actor_rollout_ref", "critic"):

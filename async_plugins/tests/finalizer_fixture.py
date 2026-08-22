@@ -173,6 +173,7 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
             "ppo_micro_batch_size_per_gpu": 8,
             "ppo_epochs": 1,
             "ppo_max_token_len_per_gpu": 32768,
+            "ppo_infer_max_token_len_per_gpu": 262144,
             "shuffle": False,
             "use_dynamic_bsz": True,
             "loss_agg_mode": "token-mean",
@@ -523,6 +524,7 @@ def build_valid_run(run_dir: Path, mode: str = "gate") -> dict:
         "model_path": PUBLICATION_TRAINING_RUNTIME["base_model"],
         "actor_ppo_max_tokens_per_gpu": 65536,
         "critic_ppo_max_tokens_per_gpu": 32768,
+        "critic_ppo_infer_max_tokens_per_gpu": 262144,
         "task_count": manifest["task_count"],
         "source_family_count": manifest["source_family_count"],
         "schedule_sha256": sha256(schedule_path),
@@ -573,6 +575,7 @@ def build_valid_run(run_dir: Path, mode: str = "gate") -> dict:
             "run_dir": str(run_dir),
             "actor_ppo_max_tokens_per_gpu": 65536,
             "critic_ppo_max_tokens_per_gpu": 32768,
+        "critic_ppo_infer_max_tokens_per_gpu": 262144,
         },
         "source": {
             "verl_commit": EXPECTED_VERL_COMMIT,

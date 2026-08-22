@@ -360,6 +360,10 @@ def verify_resolved_config(
             expected["critic_ppo_max_tokens_per_gpu"],
             field="expected critic_ppo_max_tokens_per_gpu",
         ),
+        "critic.ppo_infer_max_token_len_per_gpu": _positive_int(
+            expected["critic_ppo_infer_max_tokens_per_gpu"],
+            field="expected critic_ppo_infer_max_tokens_per_gpu",
+        ),
         "critic.shuffle": False,
         "critic.use_dynamic_bsz": True,
         "critic.loss_agg_mode": "token-mean",
@@ -543,6 +547,10 @@ def verify_resolved_config(
         "critic_ppo_max_tokens_per_gpu": _positive_int(
             expected["critic_ppo_max_tokens_per_gpu"],
             field="expected critic_ppo_max_tokens_per_gpu",
+        ),
+        "critic_ppo_infer_max_tokens_per_gpu": _positive_int(
+            expected["critic_ppo_infer_max_tokens_per_gpu"],
+            field="expected critic_ppo_infer_max_tokens_per_gpu",
         ),
         "save_freq": _positive_int(expected["save_freq"], field="expected save_freq"),
         "max_actor_ckpt_to_keep": _positive_int(
