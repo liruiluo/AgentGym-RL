@@ -160,6 +160,11 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
                     }
                 },
                 "multi_turn": {"enable": True},
+                "checkpoint_engine": {
+                    "backend": "nccl",
+                    "update_weights_bucket_megabytes": 1024,
+                    "engine_kwargs": {},
+                },
                 "agent": {
                     "default_agent_loop": "amg_task_neutral_async",
                     "agent_loop_config_path": "/plugin/amg_task_neutral_agent_loop.yaml",
@@ -523,6 +528,7 @@ def build_valid_run(run_dir: Path, mode: str = "gate") -> dict:
         "model_path": PUBLICATION_TRAINING_RUNTIME["base_model"],
         "actor_ppo_max_tokens_per_gpu": 65536,
         "critic_ppo_max_tokens_per_gpu": 32768,
+        "checkpoint_engine_backend": "nccl",
         "task_count": manifest["task_count"],
         "source_family_count": manifest["source_family_count"],
         "schedule_sha256": sha256(schedule_path),
@@ -573,6 +579,7 @@ def build_valid_run(run_dir: Path, mode: str = "gate") -> dict:
             "run_dir": str(run_dir),
             "actor_ppo_max_tokens_per_gpu": 65536,
             "critic_ppo_max_tokens_per_gpu": 32768,
+            "checkpoint_engine_backend": "nccl",
         },
         "source": {
             "verl_commit": EXPECTED_VERL_COMMIT,

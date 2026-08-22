@@ -113,6 +113,7 @@ def verify_resolved_config(
         "model_path",
         "actor_ppo_max_tokens_per_gpu",
         "critic_ppo_max_tokens_per_gpu",
+        "checkpoint_engine_backend",
     )
     missing_budget_fields = [
         field for field in required_budget_fields if field not in expected_budget
@@ -375,8 +376,32 @@ def verify_resolved_config(
         "trainer.resume_from_path": None,
         "async_training.use_trainer_do_validate": False,
         "async_training.partial_rollout": True,
+        "actor_rollout_ref.rollout.checkpoint_engine.backend": expected[
+            "checkpoint_engine_backend"
+        ],
     }.items():
         _require_equal(config, path, expected_value)
+    checkpoint_engine_backend = expected["checkpoint_engine_backend"]
+    if checkpoint_engine_backend not in {"nccl", "delta_sharded"}:
+        raise ValueError(
+            "checkpoint_engine_backend must be nccl or delta_sharded, got "
+            f"{checkpoint_engine_backend!r}"
+        )
+    checkpoint_engine_kwargs = _plain(
+        _at(config, "actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs")
+    )
+    if not isinstance(checkpoint_engine_kwargs, Mapping):
+        raise ValueError("checkpoint engine_kwargs must be a mapping")
+    if checkpoint_engine_backend == "delta_sharded":
+        delta_kwargs = checkpoint_engine_kwargs.get("delta_sharded")
+        if (
+            not isinstance(delta_kwargs, Mapping)
+            or delta_kwargs.get("encoding") != "indices"
+        ):
+            raise ValueError(
+                "delta_sharded must use upstream bit-exact indices encoding"
+            )
+
     rollout_data_dir = _at(config, "trainer.rollout_data_dir")
     if not isinstance(rollout_data_dir, str) or not rollout_data_dir.strip():
         raise ValueError(
@@ -525,6 +550,10 @@ def verify_resolved_config(
         "dynamic_hybrid_enabled": True,
         "gradient_checkpointing": {"actor": True, "critic": True},
         "rollout_backend": "sglang",
+        "checkpoint_engine_backend": checkpoint_engine_backend,
+        "checkpoint_engine_delta_encoding": (
+            "indices" if checkpoint_engine_backend == "delta_sharded" else None
+        ),
         "fsdp2_reshard_after_forward": {"actor": True, "critic": True},
         "fused_kernels": {
             "actor": actor_fused,

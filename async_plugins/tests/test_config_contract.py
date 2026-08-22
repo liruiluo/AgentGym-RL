@@ -44,6 +44,7 @@ def _budget(mode: str) -> dict:
         "model_path": "/models/Qwen3.5-4B",
         "actor_ppo_max_tokens_per_gpu": 65536,
         "critic_ppo_max_tokens_per_gpu": 32768,
+        "checkpoint_engine_backend": "nccl",
         "task_count": 762 if formal else 64,
         "source_family_count": 664 if formal else 64,
         "schedule_sha256": "2" * 64,
@@ -121,6 +122,11 @@ def _config(*, mode: str = "formal") -> dict:
                     }
                 },
                 "multi_turn": {"enable": True},
+                "checkpoint_engine": {
+                    "backend": "nccl",
+                    "update_weights_bucket_megabytes": 1024,
+                    "engine_kwargs": {},
+                },
                 "agent": {
                     "default_agent_loop": "amg_task_neutral_async",
                     "agent_loop_config_path": "/plugin/amg_task_neutral_agent_loop.yaml",
@@ -248,6 +254,34 @@ def _write_schedule(
 
 
 class TestAMGFullyAsyncConfigContract(unittest.TestCase):
+    def test_delta_sharded_backend_and_encoding_are_locked(self):
+        config = _config(mode="formal")
+        config["actor_rollout_ref"]["rollout"]["checkpoint_engine"] = {
+            "backend": "delta_sharded",
+            "update_weights_bucket_megabytes": 1024,
+            "engine_kwargs": {"delta_sharded": {"encoding": "indices"}},
+        }
+        budget = _budget("formal")
+        budget["checkpoint_engine_backend"] = "delta_sharded"
+        report = verify_resolved_config(
+            config,
+            mode="formal",
+            expected_budget=budget,
+        )
+        self.assertEqual(report["checkpoint_engine_backend"], "delta_sharded")
+        self.assertEqual(report["checkpoint_engine_delta_encoding"], "indices")
+
+        broken = copy.deepcopy(config)
+        broken["actor_rollout_ref"]["rollout"]["checkpoint_engine"][
+            "engine_kwargs"
+        ] = {}
+        with self.assertRaisesRegex(ValueError, "bit-exact indices"):
+            verify_resolved_config(
+                broken,
+                mode="formal",
+                expected_budget=budget,
+            )
+
     def test_formal100_budget_and_topology(self):
         report = _verify(_config(mode="formal"), mode="formal")
         self.assertEqual(report["optimizer_updates"], 100)
@@ -256,6 +290,8 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         self.assertEqual(report["samples_per_update"], 64)
         self.assertEqual(report["trainer_gpus"], 6)
         self.assertEqual(report["standalone_rollout_gpus"], 2)
+        self.assertEqual(report["checkpoint_engine_backend"], "nccl")
+        self.assertIsNone(report["checkpoint_engine_delta_encoding"])
         self.assertEqual(
             report["gradient_checkpointing"], {"actor": True, "critic": True}
         )

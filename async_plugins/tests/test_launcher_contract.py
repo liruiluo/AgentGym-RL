@@ -191,6 +191,14 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             self.assertEqual(
                 values["critic.ppo_max_token_len_per_gpu"], "32768"
             )
+            self.assertEqual(
+                values["actor_rollout_ref.rollout.checkpoint_engine.backend"],
+                "nccl",
+            )
+            self.assertNotIn(
+                "actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.delta_sharded.encoding",
+                values,
+            )
 
             self.assertEqual(
                 values["actor_rollout_ref.rollout.multi_turn.enable"], "True"
@@ -231,6 +239,35 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             )
             self.assertEqual(
                 values["critic.ppo_max_token_len_per_gpu"], "65536"
+            )
+
+    def test_delta_sharded_uses_upstream_bit_exact_encoding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inputs, identity = self._identity(Path(directory), "formal")
+            inputs = replace(inputs, checkpoint_engine_backend="delta_sharded")
+            budget = {
+                **identity["budget_contract"],
+                "checkpoint_engine_backend": "delta_sharded",
+            }
+            values = self._values(
+                build_overrides(
+                    inputs,
+                    effective_schedule=inputs.schedule,
+                    endpoint_client_config=identity["client_config"],
+                    budget_contract=budget,
+                    training_runtime=identity["training_runtime"],
+                )
+            )
+            self.assertEqual(
+                values["actor_rollout_ref.rollout.checkpoint_engine.backend"],
+                "delta_sharded",
+            )
+            self.assertEqual(
+                values[
+                    "actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs."
+                    "delta_sharded.encoding"
+                ],
+                "indices",
             )
 
     def test_actor_only_fused_six_plus_two_uses_upstream_native_overrides(self):
@@ -539,6 +576,7 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
         parsed = _parse_args(common)
         self.assertEqual(parsed.actor_ppo_max_tokens_per_gpu, 65536)
         self.assertEqual(parsed.critic_ppo_max_tokens_per_gpu, 32768)
+        self.assertEqual(parsed.checkpoint_engine_backend, "nccl")
         tuned = _parse_args(
             common
             + [
@@ -546,10 +584,13 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                 "131072",
                 "--critic-ppo-max-tokens-per-gpu",
                 "65536",
+                "--checkpoint-engine-backend",
+                "delta_sharded",
             ]
         )
         self.assertEqual(tuned.actor_ppo_max_tokens_per_gpu, 131072)
         self.assertEqual(tuned.critic_ppo_max_tokens_per_gpu, 65536)
+        self.assertEqual(tuned.checkpoint_engine_backend, "delta_sharded")
         for name in ("expected_verl_commit", "model_path", "episodes", "task_count"):
             self.assertFalse(hasattr(parsed, name))
         actor_only = _parse_args(common + ["--actor-use-fused-kernels"])

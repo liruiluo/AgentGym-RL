@@ -2437,6 +2437,16 @@ class TestBoundedGpuMonitor(unittest.TestCase):
 
 
 class TestShellOrchestratorContract(unittest.TestCase):
+    def test_checkpoint_backend_is_a_bounded_native_passthrough(self) -> None:
+        script = MODULE.parent.parent / "scripts/orchestrate_openmle_fully_async.sh"
+        text = script.read_text(encoding="utf-8")
+        self.assertIn("CHECKPOINT_ENGINE_BACKEND=nccl", text)
+        self.assertIn("nccl|delta_sharded)", text)
+        self.assertIn(
+            '--checkpoint-engine-backend "$CHECKPOINT_ENGINE_BACKEND"',
+            text,
+        )
+
     def test_formal_capacity_models_two_checkpoint_peak_and_memory_cgroup(self) -> None:
         script = MODULE.parent.parent / "scripts/orchestrate_openmle_fully_async.sh"
         text = script.read_text(encoding="utf-8")

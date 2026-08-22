@@ -14,7 +14,8 @@ Usage: orchestrate_openmle_fully_async.sh \
   --known-gpu-script-sha256 SHA --known-gpu-process-command COMMAND \
   [--trainer-gpus 4|6 --standalone-rollout-gpus 4|2] \
   [--actor-use-fused-kernels] [--critic-use-fused-kernels] \
-  [--actor-ppo-max-tokens-per-gpu N] [--critic-ppo-max-tokens-per-gpu N]
+  [--actor-ppo-max-tokens-per-gpu N] [--critic-ppo-max-tokens-per-gpu N] \
+  [--checkpoint-engine-backend nccl|delta_sharded]
 EOF
   exit 64
 }
@@ -51,6 +52,7 @@ ACTOR_USE_FUSED_KERNELS=0
 CRITIC_USE_FUSED_KERNELS=0
 ACTOR_PPO_MAX_TOKENS_PER_GPU=65536
 CRITIC_PPO_MAX_TOKENS_PER_GPU=32768
+CHECKPOINT_ENGINE_BACKEND=nccl
 CUDA_TOOLKIT_ROOT=/dev/shm/cuda-13-b300-toolkit
 
 while (($#)); do
@@ -84,6 +86,7 @@ while (($#)); do
     --critic-use-fused-kernels) CRITIC_USE_FUSED_KERNELS=1; shift ;;
     --actor-ppo-max-tokens-per-gpu) ACTOR_PPO_MAX_TOKENS_PER_GPU=${2:?}; shift 2 ;;
     --critic-ppo-max-tokens-per-gpu) CRITIC_PPO_MAX_TOKENS_PER_GPU=${2:?}; shift 2 ;;
+    --checkpoint-engine-backend) CHECKPOINT_ENGINE_BACKEND=${2:?}; shift 2 ;;
     *) usage ;;
   esac
 done
@@ -125,6 +128,10 @@ if [ "$MODE" = formal ] && [ "$TRAINER_GPUS:$STANDALONE_ROLLOUT_GPUS" != 6:2 ]; 
   echo "formal Hybrid + Standalone topology must be 6+2, got $TRAINER_GPUS+$STANDALONE_ROLLOUT_GPUS" >&2
   exit 64
 fi
+case "$CHECKPOINT_ENGINE_BACKEND" in
+  nccl|delta_sharded) ;;
+  *) echo "unsupported checkpoint engine backend: $CHECKPOINT_ENGINE_BACKEND" >&2; exit 64 ;;
+esac
 case "$TRAINER_GPUS:$STANDALONE_ROLLOUT_GPUS" in
   4:4|6:2) ;;
   *) echo "unsupported Hybrid + Standalone topology: $TRAINER_GPUS+$STANDALONE_ROLLOUT_GPUS" >&2; exit 64 ;;
@@ -698,6 +705,7 @@ LAUNCH_TUNING_ARGS=(
   --standalone-rollout-gpus "$STANDALONE_ROLLOUT_GPUS"
   --actor-ppo-max-tokens-per-gpu "$ACTOR_PPO_MAX_TOKENS_PER_GPU"
   --critic-ppo-max-tokens-per-gpu "$CRITIC_PPO_MAX_TOKENS_PER_GPU"
+  --checkpoint-engine-backend "$CHECKPOINT_ENGINE_BACKEND"
 )
 if [ "$ACTOR_USE_FUSED_KERNELS" -eq 1 ]; then
   LAUNCH_TUNING_ARGS+=(--actor-use-fused-kernels)

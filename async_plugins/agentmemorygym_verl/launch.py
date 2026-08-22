@@ -48,6 +48,8 @@ _CUDA13_TOOLKIT_ROOT = Path("/dev/shm/cuda-13-b300-toolkit")
 _EXPECTED_CUDA_VERSION = "13.0"
 _DEFAULT_ACTOR_PPO_MAX_TOKENS_PER_GPU = 65536
 _DEFAULT_CRITIC_PPO_MAX_TOKENS_PER_GPU = 32768
+_DEFAULT_CHECKPOINT_ENGINE_BACKEND = "nccl"
+_CHECKPOINT_ENGINE_BACKENDS = ("nccl", "delta_sharded")
 _ASYNC_TUNING = {
     "gate": {
         "trigger_parameter_sync_step": 1,
@@ -83,6 +85,7 @@ class LaunchInputs:
     critic_use_fused_kernels: bool = False
     actor_ppo_max_tokens_per_gpu: int = _DEFAULT_ACTOR_PPO_MAX_TOKENS_PER_GPU
     critic_ppo_max_tokens_per_gpu: int = _DEFAULT_CRITIC_PPO_MAX_TOKENS_PER_GPU
+    checkpoint_engine_backend: str = _DEFAULT_CHECKPOINT_ENGINE_BACKEND
 
 
 def _string(value: str | Path) -> str:
@@ -166,6 +169,17 @@ def build_overrides(
         budget_contract.get("critic_ppo_max_tokens_per_gpu"),
         field="budget critic_ppo_max_tokens_per_gpu",
     )
+    checkpoint_engine_backend = budget_contract.get("checkpoint_engine_backend")
+    if checkpoint_engine_backend not in _CHECKPOINT_ENGINE_BACKENDS:
+        raise ValueError(
+            "budget checkpoint_engine_backend must be one of "
+            f"{_CHECKPOINT_ENGINE_BACKENDS}, got {checkpoint_engine_backend!r}"
+        )
+    if checkpoint_engine_backend != inputs.checkpoint_engine_backend:
+        raise ValueError(
+            "budget checkpoint_engine_backend differs from launch input: "
+            f"{checkpoint_engine_backend!r} != {inputs.checkpoint_engine_backend!r}"
+        )
     model_path = _string(training_runtime["base_model"])
     schedule_path = _string(effective_schedule)
     run_dir = _string(inputs.run_dir)
@@ -316,7 +330,8 @@ def build_overrides(
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8",
         "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True",
         "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=131072",
-        "actor_rollout_ref.rollout.checkpoint_engine.backend=nccl",
+        "actor_rollout_ref.rollout.checkpoint_engine.backend="
+        f"{checkpoint_engine_backend}",
         "actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=1024",
         "actor_rollout_ref.nccl_timeout=9600",
         "actor_rollout_ref.rollout.agent.num_workers=64",
@@ -372,6 +387,11 @@ def build_overrides(
         "hydra.output_subdir=.hydra",
         "hydra.job.chdir=False",
     ]
+    if checkpoint_engine_backend == "delta_sharded":
+        overrides.append(
+            "+actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs."
+            "delta_sharded.encoding=indices"
+        )
     for prefix in ("actor_rollout_ref", "data"):
         for key, value in agentgym.items():
             rendered = (
@@ -833,6 +853,7 @@ def _load_endpoint_identity(
             inputs.critic_ppo_max_tokens_per_gpu,
             field="critic_ppo_max_tokens_per_gpu",
         ),
+        "checkpoint_engine_backend": inputs.checkpoint_engine_backend,
         "task_count": task_count,
         "source_family_count": source_family_count,
         "schedule_sha256": expected_schedule_sha256,
@@ -1400,6 +1421,7 @@ def prepare_launch(
             "critic_ppo_max_tokens_per_gpu": (
                 inputs.critic_ppo_max_tokens_per_gpu
             ),
+            "checkpoint_engine_backend": inputs.checkpoint_engine_backend,
         },
         "source": source_report_runtime,
         "plugin_manifest": _production_manifest(inputs.outer_root),
@@ -1456,6 +1478,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=_DEFAULT_CRITIC_PPO_MAX_TOKENS_PER_GPU,
     )
+    parser.add_argument(
+        "--checkpoint-engine-backend",
+        choices=_CHECKPOINT_ENGINE_BACKENDS,
+        default=_DEFAULT_CHECKPOINT_ENGINE_BACKEND,
+    )
     parser.add_argument("--resolve-only", action="store_true")
     parser.add_argument("--skip-endpoint-preflight", action="store_true")
     return parser.parse_args(argv)
@@ -1481,6 +1508,7 @@ def main(argv: list[str] | None = None) -> int:
         critic_use_fused_kernels=args.critic_use_fused_kernels,
         actor_ppo_max_tokens_per_gpu=args.actor_ppo_max_tokens_per_gpu,
         critic_ppo_max_tokens_per_gpu=args.critic_ppo_max_tokens_per_gpu,
+        checkpoint_engine_backend=args.checkpoint_engine_backend,
     )
     command, env, receipt = prepare_launch(
         inputs,
