@@ -227,7 +227,9 @@ def build_overrides(
         "critic.model.use_remove_padding=True",
         f"critic.model.use_fused_kernels={inputs.critic_use_fused_kernels}",
         "critic.model.fused_kernel_options.impl_backend=torch",
-        "critic.model.enable_gradient_checkpointing=True",
+        # Isolated B300 infra candidate: retain actor checkpointing but avoid
+        # critic activation recomputation. PPO/reward/rollout semantics stay fixed.
+        "critic.model.enable_gradient_checkpointing=False",
         "actor_rollout_ref.actor.strategy=fsdp2",
         "actor_rollout_ref.actor.fsdp_config.strategy=fsdp2",
         "actor_rollout_ref.actor.fsdp_config.param_offload=False",

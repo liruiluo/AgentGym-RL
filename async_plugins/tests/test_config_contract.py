@@ -146,7 +146,7 @@ def _config(*, mode: str = "formal") -> dict:
             "optim": {"lr": 1e-5},
             "model": {
                 "path": "/models/Qwen3.5-4B",
-                "enable_gradient_checkpointing": True,
+                "enable_gradient_checkpointing": False,
                 "use_fused_kernels": False,
                 "fused_kernel_options": {"impl_backend": "torch"},
             },
@@ -257,7 +257,7 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         self.assertEqual(report["trainer_gpus"], 6)
         self.assertEqual(report["standalone_rollout_gpus"], 2)
         self.assertEqual(
-            report["gradient_checkpointing"], {"actor": True, "critic": True}
+            report["gradient_checkpointing"], {"actor": True, "critic": False}
         )
         self.assertEqual(
             report["fsdp2_reshard_after_forward"],
@@ -397,11 +397,11 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
                 ):
                     _verify(config, mode="formal")
 
-    def test_rejects_disabling_upstream_gradient_checkpointing(self):
-        for role in ("actor_rollout_ref", "critic"):
+    def test_rejects_gradient_checkpointing_drift_from_candidate_contract(self):
+        for role, wrong in (("actor_rollout_ref", False), ("critic", True)):
             with self.subTest(role=role):
                 config = _config()
-                config[role]["model"]["enable_gradient_checkpointing"] = False
+                config[role]["model"]["enable_gradient_checkpointing"] = wrong
                 with self.assertRaisesRegex(
                     ValueError, "enable_gradient_checkpointing"
                 ):
