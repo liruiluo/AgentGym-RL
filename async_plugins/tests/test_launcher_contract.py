@@ -19,6 +19,7 @@ from agentmemorygym_verl.launch import (
     _load_endpoint_identity,
     _parse_args,
     _partition_selected_file_hashes,
+    _validate_accelerator_runtime,
     build_overrides,
     build_runtime_env,
 )
@@ -100,12 +101,31 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             )
             self.assertEqual(values["actor_rollout_ref.rollout.n"], "1")
             self.assertEqual(
+                values["actor_rollout_ref.rollout.name"],
+                "sglang",
+            )
+            self.assertEqual(
                 values[
-                    "actor_rollout_ref.rollout.engine_kwargs.vllm.gdn_prefill_backend"
+                    "actor_rollout_ref.rollout.engine_kwargs.sglang.mamba_scheduler_strategy"
                 ],
-                "triton",
+                "no_buffer",
+            )
+            self.assertEqual(
+                values[
+                    "actor_rollout_ref.rollout.engine_kwargs.sglang.disable_radix_cache"
+                ],
+                "True",
+            )
+            self.assertFalse(
+                any("engine_kwargs.vllm" in key for key in values),
+                values,
             )
             self.assertEqual(values["critic.enable"], "True")
+            self.assertEqual(values["trainer.n_gpus_per_node"], "6")
+            self.assertEqual(values["rollout.n_gpus_per_node"], "2")
+            self.assertEqual(values["actor_rollout_ref.actor.loss_agg_mode"], "token-mean")
+            self.assertEqual(values["actor_rollout_ref.actor.use_prefix_grouper"], "False")
+            self.assertEqual(values["critic.loss_agg_mode"], "token-mean")
             self.assertEqual(
                 values["trainer.total_training_steps"],
                 str(budget["publication_cycles"]),
@@ -119,7 +139,7 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             )
             self.assertEqual(
                 float(values["async_training.require_batches"]),
-                budget["samples_per_update"] / 512,
+                budget["samples_per_update"] / 510,
             )
             self.assertEqual(values["trainer.val_before_train"], "False")
             self.assertEqual(values["trainer.test_freq"], "-1")
@@ -130,6 +150,23 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             self.assertEqual(values["actor_rollout_ref.hybrid_engine"], "False")
             self.assertEqual(
                 values["data.apply_chat_template_kwargs.enable_thinking"], "False"
+            )
+            self.assertFalse(
+                any(key.startswith("data.continuous_token") for key in values),
+                values,
+            )
+            self.assertFalse(
+                any(
+                    key.startswith(
+                        (
+                            "async_training.runtime_receipt_path",
+                            "async_training.rollout_data_non_tensor",
+                            "async_training.parameter_update_probe",
+                        )
+                    )
+                    for key in values
+                ),
+                values,
             )
             self.assertEqual(
                 values["actor_rollout_ref.model.enable_gradient_checkpointing"],
@@ -145,7 +182,7 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                 "True",
             )
             self.assertEqual(
-                values["critic.fsdp.reshard_after_forward"], "False"
+                values["critic.fsdp.reshard_after_forward"], "True"
             )
             self.assertEqual(
                 values["actor_rollout_ref.actor.ppo_max_token_len_per_gpu"],
@@ -218,7 +255,7 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                 values["critic.model.fused_kernel_options.impl_backend"], "torch"
             )
 
-    def test_critic_no_reshard_is_the_only_fsdp2_reshard_change(self):
+    def test_actor_and_critic_keep_upstream_fsdp2_reshard_default(self):
         with tempfile.TemporaryDirectory() as directory:
             inputs, identity = self._identity(Path(directory), "formal")
             values = self._values(
@@ -238,7 +275,7 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                 "True",
             )
             self.assertEqual(
-                values["critic.fsdp.reshard_after_forward"], "False"
+                values["critic.fsdp.reshard_after_forward"], "True"
             )
 
     def test_gate_role_and_budget_are_derived_from_publication(self):
@@ -354,23 +391,95 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             runtime_bin = str(
                 Path(self.source_lock["training_runtime"]["python"]).parent
             )
-            self.assertEqual(env["PATH"].split(":"), [runtime_bin, "/usr/bin"])
+            self.assertEqual(
+                env["PATH"].split(":"),
+                ["/dev/shm/cuda-13-b300-toolkit/bin", runtime_bin, "/usr/bin"],
+            )
+            self.assertEqual(env["CUDA_HOME"], "/dev/shm/cuda-13-b300-toolkit")
+            self.assertEqual(env["CUDA_PATH"], "/dev/shm/cuda-13-b300-toolkit")
+            self.assertEqual(
+                env["LD_LIBRARY_PATH"].split(":"),
+                [
+                    "/dev/shm/cuda-13-b300-toolkit/lib64",
+                    "/usr/local/cuda/lib64/stubs",
+                    str(
+                        Path(self.source_lock["training_runtime"]["site_packages"])
+                        / "nvidia"
+                        / "cu13"
+                        / "lib"
+                    ),
+                ],
+            )
             self.assertEqual(
                 env["VERL_USE_EXTERNAL_MODULES"], "agentmemorygym_verl.action_gae"
             )
             self.assertEqual(
                 env["VERL_FILE_LOGGER_PATH"], str(inputs.run_dir / "metrics.jsonl")
             )
-            self.assertEqual(
-                env["VERL_FULLY_ASYNC_RUNTIME_RECEIPT_PATH"],
-                str(inputs.run_dir / "native-runtime-receipt.json"),
-            )
-            self.assertEqual(env["VLLM_USE_V1"], "1")
+            self.assertNotIn("VERL_FULLY_ASYNC_RUNTIME_RECEIPT_PATH", env)
+            self.assertNotIn("VLLM_USE_V1", env)
+            self.assertNotIn("VLLM_LOGGING_LEVEL", env)
             with self.assertRaisesRegex(RuntimeError, "PYTHONPATH"):
                 build_runtime_env(
                     inputs,
                     training_runtime=self.source_lock["training_runtime"],
                     base_env={"PYTHONPATH": "/caller"},
+                )
+
+    def test_runtime_env_pins_cuda13_toolchain(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inputs = self._inputs(Path(directory), mode="gate")
+            runtime = dict(self.source_lock["training_runtime"])
+            env = build_runtime_env(
+                inputs,
+                training_runtime=runtime,
+                base_env={"PATH": "/usr/bin", "LD_LIBRARY_PATH": "/caller/lib"},
+            )
+            cuda_home = "/dev/shm/cuda-13-b300-toolkit"
+            self.assertEqual(env["CUDA_HOME"], cuda_home)
+            self.assertEqual(env["CUDA_PATH"], cuda_home)
+            self.assertEqual(
+                env["PATH"].split(":"),
+                [cuda_home + "/bin", str(Path(runtime["python"]).parent), "/usr/bin"],
+            )
+            self.assertEqual(
+                env["LD_LIBRARY_PATH"].split(":"),
+                [
+                    cuda_home + "/lib64",
+                    "/usr/local/cuda/lib64/stubs",
+                    runtime["site_packages"] + "/nvidia/cu13/lib",
+                    "/caller/lib",
+                ],
+            )
+
+    def test_accelerator_runtime_must_match_locked_b300_and_cuda13(self):
+        training_runtime = dict(self.source_lock["training_runtime"], gpu_type="B300")
+        observed = {
+            "cuda_home": "/dev/shm/cuda-13-b300-toolkit",
+            "nvcc_path": "/dev/shm/cuda-13-b300-toolkit/bin/nvcc",
+            "nvcc_release": "13.0",
+            "torch_cuda": "13.0",
+            "torch_cuda_available": True,
+            "gpu_count": 8,
+            "gpu_names": ["NVIDIA B300 SXM6 AC"] * 8,
+        }
+        self.assertEqual(
+            _validate_accelerator_runtime(
+                observed, training_runtime=training_runtime
+            )["gpu_count"],
+            8,
+        )
+        for field, wrong in (
+            ("nvcc_release", "12.8"),
+            ("torch_cuda", "12.8"),
+            ("gpu_count", 7),
+            ("gpu_names", ["NVIDIA B200"] * 8),
+        ):
+            mutated = dict(observed)
+            mutated[field] = wrong
+            with self.subTest(field=field), self.assertRaises(RuntimeError):
+                _validate_accelerator_runtime(
+                    mutated, training_runtime=training_runtime
                 )
 
     def test_cli_has_no_commit_model_or_budget_identity_override(self):
@@ -428,6 +537,21 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
         self.assertNotIn("/dev/shm/qwen35-runtime", text)
         self.assertNotIn("${PYTHONPATH:+", text)
         self.assertIn(EXPECTED_VERL_COMMIT, EXPECTED_VERL_COMMIT)
+
+    def test_orchestrator_cutover_covers_sglang_and_drops_vllm_env(self):
+        script = (
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "orchestrate_openmle_fully_async.sh"
+        )
+        text = script.read_text(encoding="utf-8")
+        self.assertIn("SGLang::", text)
+        self.assertIn("sglang\\.(launch_server|serve)", text)
+        self.assertIn("formal Hybrid + Standalone topology must be 6+2", text)
+        self.assertIn("/dev/shm/cuda-13-b300-toolkit", text)
+        self.assertIn("foreign Ray/inference-engine residue", text)
+        self.assertNotIn("export VLLM_", text)
+        self.assertNotIn("PROCESS_OWNER=amg-verl-v090", text)
 
 
 if __name__ == "__main__":

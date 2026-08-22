@@ -23,7 +23,7 @@ class TestAMGFullyAsyncIdentity(unittest.TestCase):
     def test_verl_pin_contains_masked_head_alignment_and_phase_stable_probe(self):
         self.assertEqual(
             EXPECTED_VERL_COMMIT,
-            "440b5a30d0eb68b3abcc6b80680846945c5b15b6",
+            "46612729045225436c9b471166e6e41744cd7272",
         )
 
     def test_only_reviewed_verl_and_model_bytes_are_module_constants(self):
@@ -110,6 +110,8 @@ class TestAMGFullyAsyncIdentity(unittest.TestCase):
             "gpu_type": "B200",
         }
         self.assertEqual(validate_training_runtime_lock(runtime), runtime)
+        b300_runtime = dict(runtime, gpu_type="B300")
+        self.assertEqual(validate_training_runtime_lock(b300_runtime), b300_runtime)
         for field, value in (
             ("python", "relative/python"),
             ("bundle_sha256", "A" * 64),

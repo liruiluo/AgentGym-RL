@@ -57,6 +57,9 @@ def _verify(config: dict, *, mode: str) -> dict:
 def _config(*, mode: str = "formal") -> dict:
     formal = mode == "formal"
     endpoint_identity = _endpoint_identity("train_pool" if formal else "gate_only")
+    trainer_gpus = 6 if formal else 4
+    rollout_gpus = 2 if formal else 4
+    ppo_mini_batch_size = 510 if formal else 512
     return {
         "actor_rollout_ref": {
             "hybrid_engine": False,
@@ -76,11 +79,13 @@ def _config(*, mode: str = "formal") -> dict:
                 "fused_kernel_options": {"impl_backend": "torch"},
             },
             "actor": {
-                "ppo_mini_batch_size": 512,
+                "ppo_mini_batch_size": ppo_mini_batch_size,
                 "ppo_micro_batch_size_per_gpu": 8,
                 "ppo_epochs": 1,
                 "shuffle": False,
                 "use_dynamic_bsz": True,
+                "loss_agg_mode": "token-mean",
+                "use_prefix_grouper": False,
                 "use_rollout_log_probs": True,
                 "strategy": "fsdp2",
                 "fsdp_config": {
@@ -94,12 +99,24 @@ def _config(*, mode: str = "formal") -> dict:
             },
             "rollout": {
                 "n": 1,
-                "name": "vllm",
+                "name": "sglang",
                 "mode": "async",
                 "calculate_log_probs": True,
                 "gpu_memory_utilization": 0.35,
                 "standalone_gpu_memory_utilization": 0.8,
-                "engine_kwargs": {"vllm": {"gdn_prefill_backend": "triton"}},
+                "max_num_seqs": 32,
+                "enforce_eager": False,
+                "free_cache_engine": True,
+                "engine_kwargs": {
+                    "sglang": {
+                        "mamba_scheduler_strategy": "no_buffer",
+                        "disable_radix_cache": True,
+                        "cuda_graph_max_bs": 32,
+                        "max_running_requests": 32,
+                        "chunked_prefill_size": 16384,
+                        "max_prefill_tokens": 16384,
+                    }
+                },
                 "multi_turn": {"enable": True},
                 "agent": {
                     "default_agent_loop": "amg_task_neutral_async",
@@ -110,16 +127,17 @@ def _config(*, mode: str = "formal") -> dict:
         "critic": {
             "enable": True,
             "strategy": "fsdp2",
-            "ppo_mini_batch_size": 512,
+            "ppo_mini_batch_size": ppo_mini_batch_size,
             "ppo_micro_batch_size_per_gpu": 8,
             "ppo_epochs": 1,
             "shuffle": False,
             "use_dynamic_bsz": True,
+            "loss_agg_mode": "token-mean",
             "fsdp": {
                 "strategy": "fsdp2",
                 "param_offload": False,
                 "optimizer_offload": False,
-                "reshard_after_forward": False,
+                "reshard_after_forward": True,
             },
             "optim": {"lr": 1e-5},
             "model": {
@@ -154,7 +172,6 @@ def _config(*, mode: str = "formal") -> dict:
                 "path": "pkg://agentmemorygym_verl.dataset",
                 "name": "AMGTrajectoryDataset",
             },
-            "continuous_token": {"enable": True, "model_family": "qwen35"},
             "apply_chat_template_kwargs": {"enable_thinking": False},
             "agentgym": {
                 "task_name": "openmle_fast",
@@ -169,7 +186,7 @@ def _config(*, mode: str = "formal") -> dict:
         "async_training": {
             "staleness_threshold": 0.1,
             "trigger_parameter_sync_step": 1,
-            "require_batches": 0.125,
+            "require_batches": 64 / ppo_mini_batch_size,
             "partial_rollout": True,
             "use_trainer_do_validate": False,
             "use_dynamic_resource_scheduling": True,
@@ -177,20 +194,10 @@ def _config(*, mode: str = "formal") -> dict:
             "dynamic_schedule_deactivate_ratio": 0.6,
             "dynamic_schedule_enable_rebalance": True,
             "concurrent_samples_per_replica": 16,
-            "runtime_receipt_path": "/run/native-runtime-receipt.json",
-            "rollout_data_non_tensor_keys": ["step_record_json"],
-            "rollout_data_non_tensor_max_keys": 1,
-            "parameter_update_probe": {
-                "enabled": True,
-                "max_parameters": 8,
-                "max_elements_per_parameter": 16,
-                "atol": 0.0,
-                "require_change": True,
-            },
         },
         "trainer": {
             "nnodes": 1,
-            "n_gpus_per_node": 4,
+            "n_gpus_per_node": trainer_gpus,
             "total_training_steps": 100 if formal else 1,
             "total_epochs": 1,
             "val_before_train": False,
@@ -204,7 +211,7 @@ def _config(*, mode: str = "formal") -> dict:
         },
         "rollout": {
             "nnodes": 1,
-            "n_gpus_per_node": 4,
+            "n_gpus_per_node": rollout_gpus,
             "n": 1,
             "total_rollout_steps": 6400 if formal else 64,
         },
@@ -243,15 +250,25 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         self.assertEqual(report["publication_cycles"], 100)
         self.assertEqual(report["episodes"], 6400)
         self.assertEqual(report["samples_per_update"], 64)
-        self.assertEqual(report["trainer_gpus"], 4)
-        self.assertEqual(report["standalone_rollout_gpus"], 4)
+        self.assertEqual(report["trainer_gpus"], 6)
+        self.assertEqual(report["standalone_rollout_gpus"], 2)
         self.assertEqual(
             report["gradient_checkpointing"], {"actor": True, "critic": True}
         )
         self.assertEqual(
             report["fsdp2_reshard_after_forward"],
-            {"actor": True, "critic": False},
+            {"actor": True, "critic": True},
         )
+
+    def test_formal_rejects_every_topology_except_six_plus_two(self):
+        config = _config(mode="formal")
+        config["trainer"]["n_gpus_per_node"] = 4
+        config["rollout"]["n_gpus_per_node"] = 4
+        config["actor_rollout_ref"]["actor"]["ppo_mini_batch_size"] = 512
+        config["critic"]["ppo_mini_batch_size"] = 512
+        config["async_training"]["require_batches"] = 64 / 512
+        with self.assertRaisesRegex(ValueError, "formal.*6\+2"):
+            _verify(config, mode="formal")
 
     def test_actor_only_fused_six_plus_two_is_resolved_and_reported(self):
         config = _config(mode="gate")
@@ -314,19 +331,56 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "max_actor_ckpt_to_keep"):
             _verify(config, mode="formal")
 
-    def test_rejects_missing_continuous_token_or_memory_loop(self):
+    def test_rejects_legacy_continuous_token_config(self):
         config = _config()
-        config["data"]["continuous_token"]["enable"] = False
+        config["data"]["continuous_token"] = {
+            "enable": True,
+            "model_family": "qwen35",
+        }
+        with self.assertRaisesRegex(ValueError, "legacy data.continuous_token"):
+            _verify(config, mode="formal")
+
+    def test_rejects_retired_noop_evidence_config(self):
+        for field, value in (
+            ("runtime_receipt_path", "/run/native-runtime-receipt.json"),
+            ("rollout_data_non_tensor_keys", ["step_record_json"]),
+            ("rollout_data_non_tensor_max_keys", 1),
+            ("parameter_update_probe", {"enabled": True}),
+        ):
+            with self.subTest(field=field):
+                config = _config(mode="gate")
+                config["async_training"][field] = value
+                with self.assertRaisesRegex(ValueError, "legacy no-op async evidence"):
+                    _verify(config, mode="gate")
+
+    def test_rejects_non_amg_agent_loop(self):
+        config = _config()
         config["actor_rollout_ref"]["rollout"]["agent"]["default_agent_loop"] = (
             "single_turn_agent"
         )
-        with self.assertRaisesRegex(ValueError, "Continuous Token"):
+        with self.assertRaisesRegex(ValueError, "default_agent_loop"):
             _verify(config, mode="formal")
 
-    def test_rejects_fsdp2_reshard_treatment_drift(self):
+    def test_rejects_padding_unsafe_loss_or_prefix_grouping(self):
+        mutations = (
+            (("actor_rollout_ref", "actor"), "loss_agg_mode", "seq-mean-token-mean"),
+            (("actor_rollout_ref", "actor"), "use_prefix_grouper", True),
+            (("critic",), "loss_agg_mode", "seq-mean-token-mean"),
+        )
+        for path, key, wrong in mutations:
+            with self.subTest(path=path, key=key):
+                config = _config()
+                target = config
+                for component in path:
+                    target = target[component]
+                target[key] = wrong
+                with self.assertRaisesRegex(ValueError, key):
+                    _verify(config, mode="formal")
+
+    def test_rejects_fsdp2_reshard_drift_from_upstream_default(self):
         for path, wrong in (
             (("actor_rollout_ref", "actor", "fsdp_config"), False),
-            (("critic", "fsdp"), True),
+            (("critic", "fsdp"), False),
         ):
             with self.subTest(path=path):
                 config = _config()
@@ -355,12 +409,20 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "enable_thinking"):
             _verify(config, mode="formal")
 
-    def test_rejects_non_triton_gdn_prefill_backend(self):
+    def test_rejects_vllm_engine_residue_after_sglang_cutover(self):
         config = _config(mode="formal")
-        config["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"][
-            "gdn_prefill_backend"
-        ] = "auto"
-        with self.assertRaisesRegex(ValueError, "gdn_prefill_backend"):
+        config["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"] = {
+            "gdn_prefill_backend": "triton"
+        }
+        with self.assertRaisesRegex(ValueError, "must not retain vLLM"):
+            _verify(config, mode="formal")
+
+    def test_rejects_buffered_mamba_scheduler_for_qwen35(self):
+        config = _config(mode="formal")
+        config["actor_rollout_ref"]["rollout"]["engine_kwargs"]["sglang"][
+            "mamba_scheduler_strategy"
+        ] = "extra_buffer"
+        with self.assertRaisesRegex(ValueError, "mamba_scheduler_strategy"):
             _verify(config, mode="formal")
 
     def test_rejects_multi_turn_disabled_before_upstream_stamps_single_turn(self):

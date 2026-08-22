@@ -277,7 +277,6 @@ class _HorizonClient(_MemoryChainClient):
 class TestPromptRendering(unittest.TestCase):
     def _loop(self):
         loop = object.__new__(AMGTaskNeutralAgentLoop)
-        loop.enable_continuous_token = True
         loop.continuous_token_builder = _RecordingContinuousBuilder()
         loop.tokenizer = object()
         loop.apply_chat_template_kwargs = {}
@@ -359,7 +358,7 @@ class TestAMGAgentLoop(IsolatedAsyncioTestCase):
         loop.tokenizer = _Tokenizer(
             {(100 + index,): action for index, action in enumerate(actions)}
         )
-        loop.enable_continuous_token = False
+        loop.continuous_token_builder = _RecordingContinuousBuilder()
         loop._render_prompt_sync = lambda messages: [
             1 + index for index, _ in enumerate(json.dumps(messages, sort_keys=True))
         ]

@@ -44,10 +44,11 @@ EXPECTED_CHECKPOINT_BYTES=108992339992
 MEMORY_CGROUP_USAGE_PATH=/sys/fs/cgroup/memory/memory.usage_in_bytes
 MEMORY_CGROUP_LIMIT_PATH=/sys/fs/cgroup/memory/memory.limit_in_bytes
 MEMORY_CGROUP_RUNTIME_MARGIN_BYTES=274877906944
-TRAINER_GPUS=4
-STANDALONE_ROLLOUT_GPUS=4
+TRAINER_GPUS=6
+STANDALONE_ROLLOUT_GPUS=2
 ACTOR_USE_FUSED_KERNELS=0
 CRITIC_USE_FUSED_KERNELS=0
+CUDA_TOOLKIT_ROOT=/dev/shm/cuda-13-b300-toolkit
 
 while (($#)); do
   case "$1" in
@@ -115,6 +116,10 @@ esac
 case "$EXPECTED_CHECKPOINT_BYTES" in
   *[!0-9]*|'') echo "invalid checkpoint byte estimate" >&2; exit 64 ;;
 esac
+if [ "$MODE" = formal ] && [ "$TRAINER_GPUS:$STANDALONE_ROLLOUT_GPUS" != 6:2 ]; then
+  echo "formal Hybrid + Standalone topology must be 6+2, got $TRAINER_GPUS+$STANDALONE_ROLLOUT_GPUS" >&2
+  exit 64
+fi
 case "$TRAINER_GPUS:$STANDALONE_ROLLOUT_GPUS" in
   4:4|6:2) ;;
   *) echo "unsupported Hybrid + Standalone topology: $TRAINER_GPUS+$STANDALONE_ROLLOUT_GPUS" >&2; exit 64 ;;
@@ -131,7 +136,7 @@ ENDPOINT_INNER=$ENDPOINT_OUTER/AgentGym
 START_ENDPOINT=$LAUNCHER_ROOT/start_openmle_fast_endpoints.sh
 PROCESS_GUARD=$LAUNCHER_ROOT/process_guard.py
 ENV_ADDR=http://127.0.0.1:$PORT
-PROCESS_OWNER=amg-verl-v090-fully-async
+PROCESS_OWNER=amg-verl-latest-fully-async
 CPU_MARKER=/tmp/agentmemory-formal-cpu-active
 GPU_MARKER=/tmp/crg-holder-yield
 MARKER_LOCK=/tmp/amg-holder-marker-transaction.lock
@@ -401,6 +406,21 @@ path.unlink()
 PY
 }
 
+[ -x "$CUDA_TOOLKIT_ROOT/bin/nvcc" ] || {
+  echo "missing CUDA 13 toolkit: $CUDA_TOOLKIT_ROOT" >&2
+  exit 66
+}
+RUNTIME_SITE_PACKAGES=$("$PY" - "$LOCK" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1]))["training_runtime"]["site_packages"])
+PY
+)
+export CUDA_HOME="$CUDA_TOOLKIT_ROOT"
+export CUDA_PATH="$CUDA_TOOLKIT_ROOT"
+export PATH="$CUDA_TOOLKIT_ROOT/bin:$(dirname -- "$PY"):$PATH"
+export LD_LIBRARY_PATH="$CUDA_TOOLKIT_ROOT/lib64:/usr/local/cuda/lib64/stubs:$RUNTIME_SITE_PACKAGES/nvidia/cu13/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
 printf '[async-%s] start=%s run_id=%s\n' "$MODE" "$(date -u +%FT%TZ)" "$RUN_ID"
 for path in "$PY" "$LOCK" "$TOOL" "$FIX/publication-receipt.json" \
   "$FIX/formal100-schedule-certificate.json" "$SCHEDULE" "$START_ENDPOINT" \
@@ -438,10 +458,11 @@ if ss -ltn | awk '{print $4}' | grep -Eq "(^|:)$PORT$"; then
   echo "foreign endpoint on $PORT" >&2
   exit 70
 fi
-if pgrep -af 'ray::|raylet|gcs_server|VLLM::EngineCore|vllm.entrypoints' \
+INFERENCE_RESIDUE_PATTERN='ray::|raylet|gcs_server|VLLM::EngineCore|vllm.entrypoints|SGLang::|sglang::|python.*-m sglang\.(launch_server|serve)|sglang\.srt\.entrypoints'
+if pgrep -af "$INFERENCE_RESIDUE_PATTERN" \
     | grep -vE '(^| )grep ' >/dev/null; then
-  echo "foreign Ray/vLLM residue detected before $MODE" >&2
-  pgrep -af 'ray::|raylet|gcs_server|VLLM::EngineCore|vllm.entrypoints' >&2 || true
+  echo "foreign Ray/inference-engine residue detected before $MODE" >&2
+  pgrep -af "$INFERENCE_RESIDUE_PATTERN" >&2 || true
   exit 71
 fi
 "$PY" "$PROCESS_GUARD" --mode assert-clean --owner "$PROCESS_OWNER" \
@@ -665,15 +686,7 @@ grep -q '"status": "ready"' "$RUN_DIR/gpu-monitor/ready.json"
   --memory-cgroup-margin-bytes "$MEMORY_CGROUP_RUNTIME_MARGIN_BYTES" \
   --require-distinct-filesystems --expected-persistent-fs-type nfs \
   --output "$RUN_DIR/capacity-pretrainer.json"
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export WANDB_MODE=disabled
-export VLLM_ALLOW_INSECURE_SERIALIZATION=1
-export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export VLLM_ENABLE_V1_MULTIPROCESSING=0
-export VLLM_DBO_COMM_SMS=0
-export VLLM_USE_DEEP_GEMM=0
-export VLLM_MOE_USE_DEEP_GEMM=0
-export VLLM_USE_DEEP_GEMM_E8M0=0
 printf '%s\n' "$(date -u +%FT%TZ)" > "$RUN_DIR/trainer-started-at"
 LAUNCH_TUNING_ARGS=(
   --trainer-gpus "$TRAINER_GPUS"

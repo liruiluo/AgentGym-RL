@@ -14,11 +14,11 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-# Updated only after the generic veRL runtime-evidence, fused-forward
-# instance-scope, upstream masked fused-head, variable-response alignment, and
-# FSDP phase-stable update-probe patches are reviewed and committed. It is
-# intentionally not caller-selectable.
-EXPECTED_VERL_COMMIT = "440b5a30d0eb68b3abcc6b80680846945c5b15b6"
+# Updated only after the thin generic latest-veRL adapters for multi-output
+# AgentLoop rows, custom advantage forwarding, loss-neutral batch alignment,
+# and current-cycle metrics are reviewed and committed. It is intentionally
+# not caller-selectable.
+EXPECTED_VERL_COMMIT = "46612729045225436c9b471166e6e41744cd7272"
 
 # Files needed to load the exact Qwen3.5-4B text model and tokenizer.  The model
 # root itself comes from the publication's training_runtime section, so a newer
@@ -177,9 +177,10 @@ def validate_training_runtime_lock(observed: Mapping[str, Any]) -> dict[str, Any
     if isinstance(gpu_count, bool) or not isinstance(gpu_count, int) or gpu_count != 8:
         raise RuntimeError(f"training runtime gpu_count must be 8, got {gpu_count!r}")
     gpu_type = observed.get("gpu_type")
-    if gpu_type != "B200":
+    if gpu_type not in {"B200", "B300"}:
         raise RuntimeError(
-            f"training runtime gpu_type must be 'B200', got {gpu_type!r}"
+            "training runtime gpu_type must be one of {'B200', 'B300'}, "
+            f"got {gpu_type!r}"
         )
     normalized.update(gpu_count=gpu_count, gpu_type=gpu_type)
     return normalized

@@ -96,6 +96,9 @@ def endpoint_identity(mode: str) -> dict:
 
 def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
     formal = mode == "formal"
+    trainer_gpus = 6 if formal else 4
+    rollout_gpus = 2 if formal else 4
+    ppo_mini_batch_size = 510 if formal else 512
     identity = endpoint_identity(mode)
     agentgym = {
         "task_name": "openmle_fast",
@@ -117,11 +120,13 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
                 "fused_kernel_options": {"impl_backend": "torch"},
             },
             "actor": {
-                "ppo_mini_batch_size": 512,
+                "ppo_mini_batch_size": ppo_mini_batch_size,
                 "ppo_micro_batch_size_per_gpu": 8,
                 "ppo_epochs": 1,
                 "shuffle": False,
                 "use_dynamic_bsz": True,
+                "loss_agg_mode": "token-mean",
+                "use_prefix_grouper": False,
                 "use_rollout_log_probs": True,
                 "strategy": "fsdp2",
                 "fsdp_config": {
@@ -135,12 +140,24 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
             },
             "rollout": {
                 "n": 1,
-                "name": "vllm",
+                "name": "sglang",
                 "mode": "async",
                 "calculate_log_probs": True,
                 "gpu_memory_utilization": 0.35,
                 "standalone_gpu_memory_utilization": 0.8,
-                "engine_kwargs": {"vllm": {"gdn_prefill_backend": "triton"}},
+                "max_num_seqs": 32,
+                "enforce_eager": False,
+                "free_cache_engine": True,
+                "engine_kwargs": {
+                    "sglang": {
+                        "mamba_scheduler_strategy": "no_buffer",
+                        "disable_radix_cache": True,
+                        "cuda_graph_max_bs": 32,
+                        "max_running_requests": 32,
+                        "chunked_prefill_size": 16384,
+                        "max_prefill_tokens": 16384,
+                    }
+                },
                 "multi_turn": {"enable": True},
                 "agent": {
                     "default_agent_loop": "amg_task_neutral_async",
@@ -151,16 +168,17 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
         "critic": {
             "enable": True,
             "strategy": "fsdp2",
-            "ppo_mini_batch_size": 512,
+            "ppo_mini_batch_size": ppo_mini_batch_size,
             "ppo_micro_batch_size_per_gpu": 8,
             "ppo_epochs": 1,
             "shuffle": False,
             "use_dynamic_bsz": True,
+            "loss_agg_mode": "token-mean",
             "fsdp": {
                 "strategy": "fsdp2",
                 "param_offload": False,
                 "optimizer_offload": False,
-                "reshard_after_forward": False,
+                "reshard_after_forward": True,
             },
             "optim": {"lr": 1e-5},
             "model": {
@@ -192,14 +210,13 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
                 "path": "pkg://agentmemorygym_verl.dataset",
                 "name": "AMGTrajectoryDataset",
             },
-            "continuous_token": {"enable": True, "model_family": "qwen35"},
             "apply_chat_template_kwargs": {"enable_thinking": False},
             "agentgym": dict(agentgym),
         },
         "async_training": {
             "staleness_threshold": 0.1,
             "trigger_parameter_sync_step": 1,
-            "require_batches": 0.125,
+            "require_batches": 64 / ppo_mini_batch_size,
             "partial_rollout": True,
             "use_trainer_do_validate": False,
             "use_dynamic_resource_scheduling": True,
@@ -207,20 +224,10 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
             "dynamic_schedule_deactivate_ratio": 0.6,
             "dynamic_schedule_enable_rebalance": True,
             "concurrent_samples_per_replica": 16,
-            "runtime_receipt_path": str(run_dir / "native-runtime-receipt.json"),
-            "rollout_data_non_tensor_keys": ["step_record_json"],
-            "rollout_data_non_tensor_max_keys": 1,
-            "parameter_update_probe": {
-                "enabled": True,
-                "max_parameters": 8,
-                "max_elements_per_parameter": 16,
-                "atol": 0.0,
-                "require_change": True,
-            },
         },
         "trainer": {
             "nnodes": 1,
-            "n_gpus_per_node": 4,
+            "n_gpus_per_node": trainer_gpus,
             "total_training_steps": 100 if formal else 1,
             "total_epochs": 1,
             "val_before_train": False,
@@ -237,7 +244,7 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
         },
         "rollout": {
             "nnodes": 1,
-            "n_gpus_per_node": 4,
+            "n_gpus_per_node": rollout_gpus,
             "n": 1,
             "total_rollout_steps": 6400 if formal else 64,
         },
@@ -274,7 +281,7 @@ def _execution_info(
 
 
 def _action_rows(
-    item_id: str, trajectory_uid: str, version: int, chain: bool
+    item_id: str, data_idx: int, trajectory_uid: str, version: int, chain: bool
 ) -> list[dict]:
     if chain:
         actions = [
@@ -340,7 +347,7 @@ def _action_rows(
             {
                 "schema": "amg_task_neutral_action_row_v1",
                 "item_id": item_id,
-                "data_idx": 0,
+                "data_idx": data_idx,
                 "trajectory_uid": trajectory_uid,
                 "trajectory_row_uid": f"{trajectory_uid}-row-{order}",
                 "trajectory_row_order": order,
@@ -367,15 +374,18 @@ def _action_rows(
     return rows
 
 
-def _checkpoint(run_dir: Path, step: int) -> None:
+def _checkpoint(run_dir: Path, step: int, *, world_size: int) -> None:
     root = run_dir / "checkpoints"
     target = root / f"global_step_{step}"
     for role in ("actor", "critic"):
         role_dir = target / role
         role_dir.mkdir(parents=True)
-        for rank in range(4):
+        for rank in range(world_size):
             for kind in ("model", "optim", "extra_state"):
-                (role_dir / f"{kind}_world_size_4_rank_{rank}.pt").write_bytes(
+                (
+                    role_dir
+                    / f"{kind}_world_size_{world_size}_rank_{rank}.pt"
+                ).write_bytes(
                     f"{role}:{kind}:{rank}".encode()
                 )
         hf = role_dir / "huggingface"
@@ -386,6 +396,7 @@ def _checkpoint(run_dir: Path, step: int) -> None:
 
 
 def build_valid_run(run_dir: Path, mode: str = "gate") -> dict:
+    formal = mode == "formal"
     run_dir.mkdir(parents=True, exist_ok=True)
     schedule_path, schedule_rows = read_schedule(mode)
     role = "gate_only" if mode == "gate" else "train_pool"
@@ -395,6 +406,9 @@ def build_valid_run(run_dir: Path, mode: str = "gate") -> dict:
     collections_per_publication = 1
 
     config = resolved_config(mode, run_dir, schedule_path)
+    ppo_mini_batch_size = config["actor_rollout_ref"]["actor"][
+        "ppo_mini_batch_size"
+    ]
     resolved_path = run_dir / "resolved-config.yaml"
     resolved_path.write_text(yaml.safe_dump(config, sort_keys=True), encoding="utf-8")
     hydra_dir = run_dir / "hydra" / ".hydra"
@@ -424,7 +438,11 @@ def build_valid_run(run_dir: Path, mode: str = "gate") -> dict:
             item_id = schedule_row["item_id"]
             trajectory_uid = f"trajectory-{item_id}"
             rows = _action_rows(
-                item_id, trajectory_uid, version, chain=position % 64 == 0
+                item_id,
+                schedule_row["data_idx"],
+                trajectory_uid,
+                version,
+                chain=position % 64 == 0,
             )
             for row in rows:
                 real_rows.append(row)
@@ -451,7 +469,7 @@ def build_valid_run(run_dir: Path, mode: str = "gate") -> dict:
         collection_real_tokens.append(
             sum(row["response_token_count"] for row in collection_records)
         )
-        padding_rows += (-len(collection_records)) % 512
+        padding_rows += (-len(collection_records)) % ppo_mini_batch_size
 
     metrics_path = run_dir / "metrics.jsonl"
     metric_lines = []
@@ -468,11 +486,15 @@ def build_valid_run(run_dir: Path, mode: str = "gate") -> dict:
                         "critic/grad_norm": 1.0,
                         "fully_async/count/current_param_version": publication,
                         "fully_async/count/stale_trajectory_processed": 0,
-                        "fully_async/count/terminal_underfill_samples": 0,
-                        "rollout_corr/bypass_real_token_count": real_token_count,
-                        "rollout_corr/bypass_max_abs_diff": 0.0,
-                        "parameter_update_probe/actor/changed": True,
-                        "parameter_update_probe/critic/changed": True,
+                        "fully_async/count/total_generated_samples": min(
+                            episodes, (publication + 1) * 64
+                        ),
+                        "fully_async/count/dropped_stale_samples": 0,
+                        "fully_async/monitor/queue/mq_queue_size": 0,
+                        "fully_async/static/required_samples": 64,
+                        "rollout_corr/kl": 0.01,
+                        "rollout_corr/k3_kl": 0.001,
+                        "rollout_corr/log_ppl_abs_diff": 0.01,
                     },
                 },
                 sort_keys=True,
@@ -481,115 +503,7 @@ def build_valid_run(run_dir: Path, mode: str = "gate") -> dict:
     metrics_path.write_text("\n".join(metric_lines) + "\n", encoding="utf-8")
 
     checkpoint_step = publication_cycles
-    _checkpoint(run_dir, checkpoint_step)
-    probe = {
-        "changed": True,
-        "changed_elements": 1,
-        "sampled_elements": 16,
-        "sampled_parameters": 8,
-        "worker_count": 4,
-        "max_abs_diff": 0.0001,
-        "atol": 0.0,
-    }
-    trainer_statistics = {
-        "global_steps": collections + 1,
-        "current_param_version": publication_cycles,
-        "total_train_steps": publication_cycles,
-        "local_trigger_step": 1,
-        "processed_samples": episodes,
-        "stale_trajectory_processed": 0,
-        "terminal_underfill_events": 0,
-        "terminal_underfill_samples": 0,
-        "pending_rollout_dump_writes": 0,
-        "latest_bypass_log_prob_evidence": {
-            "rollout_corr/bypass_real_token_count": collection_real_tokens[-1],
-            "rollout_corr/bypass_max_abs_diff": 0.0,
-        },
-        "latest_parameter_update_probe": {
-            "actor": dict(probe),
-            "critic": dict(probe),
-        },
-    }
-    max_required_samples = int(64 * 1.1 * collections_per_publication)
-    rollouter_statistics = {
-        "monitor/active_tasks_size": 0,
-        "monitor/queue/pending_queue_size": 0,
-        "monitor/queue/mq_queue_size": 0,
-        "count/total_generated_samples": episodes,
-        "count/staleness_samples": 0,
-        "count/dropped_stale_samples": 0,
-        "static/max_required_samples": max_required_samples,
-        "static/required_samples": 64,
-        "static/staleness_threshold": 0.1,
-        "static/max_queue_size": max_required_samples,
-        "static/max_concurrent_samples": 64,
-    }
-    queue_statistics = {
-        "queue_size": 0,
-        "total_produced": episodes,
-        "total_consumed": episodes,
-        "dropped_samples": 0,
-        "max_queue_size": max_required_samples,
-        "closed": True,
-        "real_enqueued": episodes,
-        "real_consumed": episodes,
-        "real_evicted": 0,
-        "real_cleared": 0,
-        "real_resident": 0,
-        "control_signals_enqueued": 0,
-        "last_dequeue_residence_s": 0.01,
-    }
-
-    def snapshot() -> dict:
-        return {
-            "timestamp": "2026-08-18T00:00:01+00:00",
-            "trainer": {
-                "timestamp": "2026-08-18T00:00:01+00:00",
-                "available": True,
-                "statistics": json.loads(json.dumps(trainer_statistics)),
-            },
-            "rollouter": {
-                "timestamp": "2026-08-18T00:00:01+00:00",
-                "available": True,
-                "statistics": dict(rollouter_statistics),
-            },
-            "queue": {
-                "timestamp": "2026-08-18T00:00:01+00:00",
-                "available": True,
-                "statistics": dict(queue_statistics),
-            },
-        }
-
-    runtime_receipt = {
-        "schema_version": 1,
-        "outcome": "success",
-        "status": "completed",
-        "exception": None,
-        "timestamps": {
-            "run_started_at": "2026-08-18T00:00:00+00:00",
-            "finalization_started_at": "2026-08-18T00:00:01+00:00",
-            "finalized_at": "2026-08-18T00:00:02+00:00",
-        },
-        "snapshots": {"before_clear": snapshot(), "after_clear": snapshot()},
-        "queue_conservation": {
-            "before_clear": True,
-            "after_clear": True,
-            "clear_delta_matches_resident": True,
-        },
-        "finalization_errors": [],
-        "trainer_step": publication_cycles,
-    }
-    runtime_path = run_dir / "native-runtime-receipt.json"
-    runtime_path.write_text(
-        json.dumps(
-            {"step": publication_cycles, "data": runtime_receipt},
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
+    _checkpoint(run_dir, checkpoint_step, world_size=6 if formal else 4)
     manifest = SOURCE_LOCK["integration"]["manifests"][role]
     routing = SOURCE_LOCK["integration"]["routing"][role]
     budget_contract = {
@@ -645,7 +559,7 @@ def build_valid_run(run_dir: Path, mode: str = "gate") -> dict:
         "training_runtime": dict(PUBLICATION_TRAINING_RUNTIME),
     }
     launch_receipt = {
-        "schema": "amg_verl_fully_async_launch_receipt_v4",
+        "schema": "amg_verl_fully_async_launch_receipt_v5",
         "entrypoint": "verl.experimental.fully_async_policy.fully_async_main",
         "inputs": {
             "mode": mode,
@@ -680,7 +594,6 @@ def build_valid_run(run_dir: Path, mode: str = "gate") -> dict:
             "sha256": sha256(resolved_path),
         },
         "runtime_artifacts": {
-            "native_receipt": str(runtime_path),
             "file_logger": str(metrics_path),
             "rollout_data": str(rollout_dir),
             "hydra_config": str(hydra_dir / "config.yaml"),
@@ -700,7 +613,6 @@ def build_valid_run(run_dir: Path, mode: str = "gate") -> dict:
         "schedule_rows": schedule_rows,
         "real_rows": real_rows,
         "padding_rows": padding_rows,
-        "runtime_path": runtime_path,
         "metrics_path": metrics_path,
         "resolved_path": resolved_path,
         "hydra_path": hydra_dir / "config.yaml",

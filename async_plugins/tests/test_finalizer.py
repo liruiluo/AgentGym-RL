@@ -14,26 +14,6 @@ from finalizer_fixture import build_valid_run, mutate_json, sha256
 JsonMutation = Callable[[dict], None]
 
 
-def mutate_runtime(fixture: dict, mutation: JsonMutation) -> None:
-    def mutate_wrapper(wrapper: dict) -> None:
-        mutation(wrapper["data"])
-
-    mutate_json(fixture["runtime_path"], mutate_wrapper)
-
-
-def mutate_runtime_statistics(
-    fixture: dict,
-    component: str,
-    mutation: JsonMutation,
-) -> None:
-    def mutate_receipt(receipt: dict) -> None:
-        for boundary in ("before_clear", "after_clear"):
-            statistics = receipt["snapshots"][boundary][component]["statistics"]
-            mutation(statistics)
-
-    mutate_runtime(fixture, mutate_receipt)
-
-
 def rewrite_first_rollout(fixture: dict, mutation: JsonMutation) -> None:
     path = sorted(fixture["rollout_dir"].glob("*.jsonl"))[0]
     lines = path.read_text(encoding="utf-8").splitlines()
@@ -140,13 +120,6 @@ def make_post_initial_action_rows_stale(fixture: dict) -> int:
         "\n".join(json.dumps(row, sort_keys=True) for row in metric_rows) + "\n",
         encoding="utf-8",
     )
-    mutate_runtime_statistics(
-        fixture,
-        "trainer",
-        lambda statistics: statistics.update(
-            stale_trajectory_processed=stale_action_rows
-        ),
-    )
     return stale_action_rows
 
 
@@ -231,41 +204,25 @@ class TestFinalizerTerminalPaths(FinalizerTestCase):
             )
             self.assertEqual(verdict["terminal_path"], "crash")
 
-    def test_native_crash_receipt_is_classified_and_fails_closed(self):
+    def test_incomplete_native_rollout_budget_is_partial(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.build(Path(directory))
-
-            def make_crash(receipt: dict) -> None:
-                receipt.update(
-                    outcome="crash",
-                    status="failed",
-                    exception={
-                        "type": "RuntimeError",
-                        "module": "builtins",
-                        "message": "trainer exploded",
-                    },
-                )
-
-            mutate_runtime(fixture, make_crash)
-            verdict = self.assert_failed(
-                fixture["run_dir"], exit_code=1, contains="native runtime outcome"
+            path = sorted(fixture["rollout_dir"].glob("*.jsonl"))[0]
+            rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+            first_record = json.loads(rows[0]["step_record_json"])
+            uid = first_record["trajectory_uid"]
+            rows = [
+                row
+                for row in rows
+                if json.loads(row["step_record_json"])["trajectory_uid"] != uid
+            ]
+            path.write_text(
+                "\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n",
+                encoding="utf-8",
             )
-            self.assertEqual(verdict["terminal_path"], "crash")
 
-    def test_terminal_underfill_partial_lineage_fails_closed(self):
-        with tempfile.TemporaryDirectory() as directory:
-            fixture = self.build(Path(directory))
-
-            def make_partial(receipt: dict) -> None:
-                receipt.update(outcome="terminal_underfill", status="partial")
-                for boundary in ("before_clear", "after_clear"):
-                    statistics = receipt["snapshots"][boundary]["trainer"]["statistics"]
-                    statistics["terminal_underfill_events"] = 1
-                    statistics["terminal_underfill_samples"] = 1
-
-            mutate_runtime(fixture, make_partial)
             verdict = self.assert_failed(
-                fixture["run_dir"], contains="terminal_underfill"
+                fixture["run_dir"], contains="terminal trajectories per learner update"
             )
             self.assertEqual(verdict["terminal_path"], "partial")
 
@@ -276,15 +233,14 @@ class TestFinalizerTerminalPaths(FinalizerTestCase):
                 finalize_run(fixture["run_dir"], trainer_exit_code=0)["status"],
                 "pass",
             )
-            fixture["runtime_path"].unlink()
-            self.assert_failed(fixture["run_dir"], contains="native runtime receipt")
+            fixture["metrics_path"].unlink()
+            self.assert_failed(fixture["run_dir"], contains="FileLogger JSONL")
 
 
 class TestFinalizerMissingArtifacts(FinalizerTestCase):
     def test_every_required_native_artifact_is_mandatory(self):
         cases = {
             "launch receipt": lambda fixture: fixture["launch_path"].unlink(),
-            "native runtime receipt": lambda fixture: fixture["runtime_path"].unlink(),
             "FileLogger": lambda fixture: fixture["metrics_path"].unlink(),
             "resolved config": lambda fixture: fixture["resolved_path"].unlink(),
             "Hydra config": lambda fixture: fixture["hydra_path"].unlink(),
@@ -307,273 +263,6 @@ class TestFinalizerMissingArtifacts(FinalizerTestCase):
                 remove(fixture)
                 self.assert_failed(fixture["run_dir"], contains=expected)
 
-    def test_missing_or_unavailable_runtime_components_fail_closed(self):
-        cases: tuple[tuple[str, JsonMutation], ...] = (
-            ("snapshots mapping", lambda receipt: receipt.pop("snapshots")),
-            (
-                "before_clear.trainer",
-                lambda receipt: receipt["snapshots"]["before_clear"].pop("trainer"),
-            ),
-            (
-                "after_clear.rollouter statistics are unavailable",
-                lambda receipt: receipt["snapshots"]["after_clear"].__setitem__(
-                    "rollouter",
-                    {
-                        "timestamp": "2026-08-18T00:00:02+00:00",
-                        "available": False,
-                        "error": {
-                            "type": "RuntimeError",
-                            "module": "builtins",
-                            "message": "statistics unavailable",
-                        },
-                    },
-                ),
-            ),
-            (
-                "before_clear.queue statistics are unavailable",
-                lambda receipt: receipt["snapshots"]["before_clear"].__setitem__(
-                    "queue", {"available": False, "error": {"type": "RuntimeError"}}
-                ),
-            ),
-        )
-        for expected, mutation in cases:
-            with (
-                self.subTest(expected=expected),
-                tempfile.TemporaryDirectory() as directory,
-            ):
-                fixture = self.build(Path(directory))
-                mutate_runtime(fixture, mutation)
-                self.assert_failed(fixture["run_dir"], contains=expected)
-
-
-class TestFinalizerRuntimeReceipt(FinalizerTestCase):
-    def test_native_stale_counter_tracks_action_rows_not_episodes(self):
-        with tempfile.TemporaryDirectory() as directory:
-            fixture = self.build(Path(directory), mode="formal")
-            stale_action_rows = make_post_initial_action_rows_stale(fixture)
-
-            self.assertGreater(stale_action_rows, len(fixture["schedule_rows"]))
-            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
-
-            self.assertEqual(verdict["status"], "pass", verdict)
-            self.assertEqual(
-                verdict["counts"]["stale_action_rows"], stale_action_rows
-            )
-
-    def test_wrapper_and_terminal_metadata_mismatches_fail(self):
-        wrapper_cases: tuple[tuple[str, JsonMutation], ...] = (
-            ("wrapper step", lambda wrapper: wrapper.update(step=0)),
-            ("data mapping", lambda wrapper: wrapper.update(data=[])),
-        )
-        for expected, mutation in wrapper_cases:
-            with (
-                self.subTest(expected=expected),
-                tempfile.TemporaryDirectory() as directory,
-            ):
-                fixture = self.build(Path(directory))
-                mutate_json(fixture["runtime_path"], mutation)
-                self.assert_failed(fixture["run_dir"], contains=expected)
-
-        receipt_cases: tuple[tuple[str, JsonMutation], ...] = (
-            ("schema_version", lambda receipt: receipt.update(schema_version=2)),
-            ("native runtime outcome", lambda receipt: receipt.update(outcome="crash")),
-            ("native runtime status", lambda receipt: receipt.update(status="partial")),
-            (
-                "native runtime exception",
-                lambda receipt: receipt.update(exception={"type": "RuntimeError"}),
-            ),
-            (
-                "finalization_errors",
-                lambda receipt: receipt.update(
-                    finalization_errors=[
-                        {"stage": "queue.clear", "exception": {"type": "OSError"}}
-                    ]
-                ),
-            ),
-            ("timestamps", lambda receipt: receipt["timestamps"].pop("finalized_at")),
-            ("trainer_step", lambda receipt: receipt.update(trainer_step=0)),
-        )
-        for expected, mutation in receipt_cases:
-            with (
-                self.subTest(expected=expected),
-                tempfile.TemporaryDirectory() as directory,
-            ):
-                fixture = self.build(Path(directory))
-                mutate_runtime(fixture, mutation)
-                self.assert_failed(fixture["run_dir"], contains=expected)
-
-    def test_trainer_counter_and_bounded_evidence_mismatches_fail(self):
-        cases: tuple[tuple[str, JsonMutation], ...] = (
-            ("global_steps", lambda stats: stats.update(global_steps=1)),
-            (
-                "current_param_version",
-                lambda stats: stats.update(current_param_version=0),
-            ),
-            ("total_train_steps", lambda stats: stats.update(total_train_steps=2)),
-            ("local_trigger_step", lambda stats: stats.update(local_trigger_step=2)),
-            ("processed_samples", lambda stats: stats.update(processed_samples=63)),
-            (
-                "stale_trajectory_processed",
-                lambda stats: stats.update(stale_trajectory_processed=65),
-            ),
-            (
-                "terminal_underfill_events",
-                lambda stats: stats.update(terminal_underfill_events=1),
-            ),
-            (
-                "terminal_underfill_samples",
-                lambda stats: stats.update(terminal_underfill_samples=1),
-            ),
-            (
-                "pending_rollout_dump_writes",
-                lambda stats: stats.update(pending_rollout_dump_writes=1),
-            ),
-            (
-                "bypass real-token count",
-                lambda stats: stats["latest_bypass_log_prob_evidence"].update(
-                    **{"rollout_corr/bypass_real_token_count": 0}
-                ),
-            ),
-            (
-                "old/rollout logprob",
-                lambda stats: stats["latest_bypass_log_prob_evidence"].update(
-                    **{"rollout_corr/bypass_max_abs_diff": 0.01}
-                ),
-            ),
-            (
-                "actor parameter-update probe",
-                lambda stats: stats["latest_parameter_update_probe"]["actor"].update(
-                    changed=False, changed_elements=0, max_abs_diff=0.0
-                ),
-            ),
-            (
-                "critic parameter-update probe",
-                lambda stats: stats["latest_parameter_update_probe"]["critic"].update(
-                    changed=False, changed_elements=0, max_abs_diff=0.0
-                ),
-            ),
-        )
-        for expected, mutation in cases:
-            with (
-                self.subTest(expected=expected),
-                tempfile.TemporaryDirectory() as directory,
-            ):
-                fixture = self.build(Path(directory))
-                mutate_runtime_statistics(fixture, "trainer", mutation)
-                self.assert_failed(fixture["run_dir"], contains=expected)
-
-    def test_rollouter_counter_and_pending_work_mismatches_fail(self):
-        cases: tuple[tuple[str, JsonMutation], ...] = (
-            (
-                "active_tasks_size",
-                lambda stats: stats.update(**{"monitor/active_tasks_size": 1}),
-            ),
-            (
-                "pending_queue_size",
-                lambda stats: stats.update(**{"monitor/queue/pending_queue_size": 1}),
-            ),
-            (
-                "mq_queue_size",
-                lambda stats: stats.update(**{"monitor/queue/mq_queue_size": 1}),
-            ),
-            (
-                "total_generated_samples",
-                lambda stats: stats.update(**{"count/total_generated_samples": 63}),
-            ),
-            (
-                "staleness_samples",
-                lambda stats: stats.update(**{"count/staleness_samples": 65}),
-            ),
-            (
-                "dropped_stale_samples",
-                lambda stats: stats.update(**{"count/dropped_stale_samples": 1}),
-            ),
-            (
-                "required_samples",
-                lambda stats: stats.update(**{"static/required_samples": 63}),
-            ),
-            (
-                "max_required_samples",
-                lambda stats: stats.update(**{"static/max_required_samples": 69}),
-            ),
-            (
-                "max_queue_size",
-                lambda stats: stats.update(**{"static/max_queue_size": 69}),
-            ),
-            (
-                "max_concurrent_samples",
-                lambda stats: stats.update(**{"static/max_concurrent_samples": 0}),
-            ),
-        )
-        for expected, mutation in cases:
-            with (
-                self.subTest(expected=expected),
-                tempfile.TemporaryDirectory() as directory,
-            ):
-                fixture = self.build(Path(directory))
-                mutate_runtime_statistics(fixture, "rollouter", mutation)
-                self.assert_failed(fixture["run_dir"], contains=expected)
-
-    def test_queue_conservation_count_and_terminal_state_mismatches_fail(self):
-        cases: tuple[tuple[str, JsonMutation], ...] = (
-            ("total_produced", lambda stats: stats.update(total_produced=63)),
-            ("total_consumed", lambda stats: stats.update(total_consumed=63)),
-            ("real_enqueued", lambda stats: stats.update(real_enqueued=63)),
-            ("real_consumed", lambda stats: stats.update(real_consumed=63)),
-            ("real_evicted", lambda stats: stats.update(real_evicted=1)),
-            ("real_cleared", lambda stats: stats.update(real_cleared=1)),
-            ("real_resident", lambda stats: stats.update(real_resident=1)),
-            ("queue_size", lambda stats: stats.update(queue_size=1)),
-            ("dropped_samples", lambda stats: stats.update(dropped_samples=1)),
-            ("closed", lambda stats: stats.update(closed=False)),
-            (
-                "control_signals_enqueued",
-                lambda stats: stats.update(control_signals_enqueued=1),
-            ),
-        )
-        for expected, mutation in cases:
-            with (
-                self.subTest(expected=expected),
-                tempfile.TemporaryDirectory() as directory,
-            ):
-                fixture = self.build(Path(directory))
-                mutate_runtime_statistics(fixture, "queue", mutation)
-                self.assert_failed(fixture["run_dir"], contains=expected)
-
-    def test_queue_receipt_flags_and_before_after_stability_are_verified(self):
-        cases: tuple[tuple[str, JsonMutation], ...] = (
-            (
-                "queue_conservation.before_clear",
-                lambda receipt: receipt["queue_conservation"].update(
-                    before_clear=False
-                ),
-            ),
-            (
-                "queue_conservation.after_clear",
-                lambda receipt: receipt["queue_conservation"].update(after_clear=False),
-            ),
-            (
-                "clear_delta_matches_resident",
-                lambda receipt: receipt["queue_conservation"].update(
-                    clear_delta_matches_resident=False
-                ),
-            ),
-            (
-                "before/after trainer statistics",
-                lambda receipt: receipt["snapshots"]["after_clear"]["trainer"][
-                    "statistics"
-                ].update(global_steps=3),
-            ),
-        )
-        for expected, mutation in cases:
-            with (
-                self.subTest(expected=expected),
-                tempfile.TemporaryDirectory() as directory,
-            ):
-                fixture = self.build(Path(directory))
-                mutate_runtime(fixture, mutation)
-                self.assert_failed(fixture["run_dir"], contains=expected)
-
 
 class TestFinalizerFileLogger(FinalizerTestCase):
     def test_step_zero_rollouter_bootstrap_and_split_publication_rows_pass(self):
@@ -583,11 +272,12 @@ class TestFinalizerFileLogger(FinalizerTestCase):
                 fixture["metrics_path"].read_text(encoding="utf-8").splitlines()[0]
             )
             learner = dict(original["data"])
-            bypass = {
+            correction = {
                 key: learner.pop(key)
                 for key in (
-                    "rollout_corr/bypass_real_token_count",
-                    "rollout_corr/bypass_max_abs_diff",
+                    "rollout_corr/kl",
+                    "rollout_corr/k3_kl",
+                    "rollout_corr/log_ppl_abs_diff",
                 )
             }
             rows = [
@@ -598,7 +288,7 @@ class TestFinalizerFileLogger(FinalizerTestCase):
                         "dynamic_resource/rollout_resource_utilization": 0.5,
                     },
                 },
-                {"step": 1, "data": bypass},
+                {"step": 1, "data": correction},
                 {"step": 1, "data": learner},
             ]
             fixture["metrics_path"].write_text(
@@ -607,22 +297,16 @@ class TestFinalizerFileLogger(FinalizerTestCase):
             )
 
             verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
-
             self.assertEqual(verdict["status"], "pass", verdict)
 
     def test_step_zero_must_be_rollouter_only(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.build(Path(directory))
             with fixture["metrics_path"].open("a", encoding="utf-8") as handle:
-                handle.write(
-                    json.dumps({"step": 0, "data": {"actor/grad_norm": 1.0}})
-                    + "\n"
-                )
-            self.assert_failed(
-                fixture["run_dir"], contains="step 0 is not rollouter-only"
-            )
+                handle.write(json.dumps({"step": 0, "data": {"actor/grad_norm": 1.0}}) + "\n")
+            self.assert_failed(fixture["run_dir"], contains="step 0 is not rollouter-only")
 
-    def test_each_publication_has_learner_evidence(self):
+    def test_each_publication_has_native_learner_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.build(Path(directory), mode="formal")
             rows = [
@@ -635,41 +319,25 @@ class TestFinalizerFileLogger(FinalizerTestCase):
                 encoding="utf-8",
             )
             self.assert_failed(
-                fixture["run_dir"], contains="publication step 2 has no unique nonzero actor update metric"
+                fixture["run_dir"], contains="publication step 2 has no unique nonzero actor/grad_norm"
             )
 
-    def test_publication_cycle_evidence_is_complete_and_exact(self):
+    def test_publication_cycle_native_evidence_is_complete_and_exact(self):
         cases: tuple[tuple[str, JsonMutation], ...] = (
             (
-                "compared real-token count",
-                lambda row: row["data"].update(
-                    **{"rollout_corr/bypass_real_token_count": 0}
-                ),
+                "rollout_corr/kl",
+                lambda row: row["data"].pop("rollout_corr/kl"),
             ),
             (
-                "old/rollout logprob mismatch",
-                lambda row: row["data"].update(
-                    **{"rollout_corr/bypass_max_abs_diff": 0.001}
-                ),
+                "rollout_corr/k3_kl",
+                lambda row: row["data"].update(**{"rollout_corr/k3_kl": float("nan")}),
             ),
             (
-                "actor parameter-update probe",
-                lambda row: row["data"].update(
-                    **{"parameter_update_probe/actor/changed": False}
-                ),
-            ),
-            (
-                "critic parameter-update probe",
-                lambda row: row["data"].update(
-                    **{"parameter_update_probe/critic/changed": False}
-                ),
-            ),
-            (
-                "actor update metric",
+                "actor/grad_norm",
                 lambda row: row["data"].update(**{"actor/grad_norm": 0.0}),
             ),
             (
-                "critic update metric",
+                "critic/grad_norm",
                 lambda row: row["data"].update(**{"critic/grad_norm": 0.0}),
             ),
             (
@@ -684,6 +352,12 @@ class TestFinalizerFileLogger(FinalizerTestCase):
                     **{"fully_async/count/stale_trajectory_processed": 1}
                 ),
             ),
+            (
+                "required_samples mismatch",
+                lambda row: row["data"].update(
+                    **{"fully_async/static/required_samples": 63}
+                ),
+            ),
         )
         for expected, mutation in cases:
             with (
@@ -695,64 +369,53 @@ class TestFinalizerFileLogger(FinalizerTestCase):
                 self.assert_failed(fixture["run_dir"], contains=expected)
 
     def test_update_metrics_require_unique_canonical_grad_norms(self):
-        cases = (
-            ("actor", "distractor/value"),
-            ("critic", "critic/values/max"),
-        )
+        cases = (("actor", "distractor/value"), ("critic", "critic/values/max"))
         for role, decoy in cases:
             with self.subTest(role=role), tempfile.TemporaryDirectory() as directory:
                 fixture = self.build(Path(directory))
                 rows = [
                     json.loads(line)
-                    for line in fixture["metrics_path"]
-                    .read_text(encoding="utf-8")
-                    .splitlines()
+                    for line in fixture["metrics_path"].read_text(encoding="utf-8").splitlines()
                 ]
                 rows[0]["data"].pop(f"{role}/grad_norm")
                 rows[0]["data"][decoy] = 1.0
                 fixture["metrics_path"].write_text(
-                    "\n".join(json.dumps(row, sort_keys=True) for row in rows)
-                    + "\n",
+                    "\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n",
                     encoding="utf-8",
                 )
                 self.assert_failed(
-                    fixture["run_dir"],
-                    contains=f"no unique nonzero {role} update metric",
+                    fixture["run_dir"], contains=f"no unique nonzero {role}/grad_norm"
                 )
 
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.build(Path(directory))
             with fixture["metrics_path"].open("a", encoding="utf-8") as handle:
                 handle.write(
-                    json.dumps(
-                        {"step": 1, "data": {"actor/grad_norm": 2.0}},
-                        sort_keys=True,
-                    )
+                    json.dumps({"step": 1, "data": {"actor/grad_norm": 2.0}}, sort_keys=True)
                     + "\n"
                 )
             self.assert_failed(
-                fixture["run_dir"],
-                contains="no unique nonzero actor update metric",
+                fixture["run_dir"], contains="no unique nonzero actor/grad_norm"
             )
 
-    def test_file_logger_token_sum_and_validation_count_are_cross_checked(self):
+    def test_native_counters_are_monotone_and_validation_is_absent(self):
         with tempfile.TemporaryDirectory() as directory:
-            fixture = self.build(Path(directory))
-            rewrite_metrics(
-                fixture,
-                lambda row: row["data"].update(
-                    **{"rollout_corr/bypass_real_token_count": 1}
-                ),
+            fixture = self.build(Path(directory), mode="formal")
+            rows = [
+                json.loads(line)
+                for line in fixture["metrics_path"].read_text(encoding="utf-8").splitlines()
+            ]
+            rows[10]["data"]["fully_async/count/total_generated_samples"] = 1
+            fixture["metrics_path"].write_text(
+                "\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n",
+                encoding="utf-8",
             )
-            self.assert_failed(fixture["run_dir"], contains="real-token total")
+            self.assert_failed(fixture["run_dir"], contains="total-generated-samples count is not cumulative")
 
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.build(Path(directory))
             with fixture["metrics_path"].open("a", encoding="utf-8") as handle:
-                handle.write(
-                    json.dumps({"step": 1, "data": {"val-core/score/mean@1": 1.0}})
-                    + "\n"
-                )
+                handle.write(json.dumps({"step": 1, "data": {"val-core/score/mean@1": 1.0}}) + "\n")
             self.assert_failed(fixture["run_dir"], contains="validation metric")
 
 
@@ -811,6 +474,19 @@ class TestFinalizerRollouts(FinalizerTestCase):
             verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
 
             self.assertEqual(verdict["status"], "pass", verdict)
+
+    def test_finalizer_rejects_schedule_data_idx_substitution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+            for order in range(4):
+                rewrite_chain_record(
+                    fixture,
+                    order,
+                    lambda record: record.update(data_idx=1),
+                )
+            self.assert_failed(
+                fixture["run_dir"], contains="item_id/data_idx occurrences"
+            )
 
     def test_duplicate_or_missing_action_order_still_fails(self):
         for bad_order in (1, 99):
@@ -1042,6 +718,33 @@ class TestFinalizerRollouts(FinalizerTestCase):
                     contains="policy-authored external-document chain",
                 )
 
+    def test_dummy_code_path_cannot_satisfy_openmle_memory_chain(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+
+            def rewrite_path(record: dict) -> None:
+                record["action"] = record["action"].replace("train.py", "dummy.py")
+                record["action_submission"]["raw_policy_output"] = record[
+                    "action_submission"
+                ]["raw_policy_output"].replace("train.py", "dummy.py")
+                execution = record["env_info_after"]["execution"]
+                if isinstance(execution.get("stdout"), str):
+                    execution["stdout"] = execution["stdout"].replace(
+                        "train.py", "dummy.py"
+                    )
+                if isinstance(execution.get("changed_paths"), list):
+                    execution["changed_paths"] = [
+                        path.replace("train.py", "dummy.py")
+                        for path in execution["changed_paths"]
+                    ]
+
+            for order in range(4):
+                rewrite_chain_record(fixture, order, rewrite_path)
+            self.assert_failed(
+                fixture["run_dir"],
+                contains="policy-authored external-document chain",
+            )
+
     def test_continuation_fields_and_completed_execution_are_required(self):
         cases = ("missing_objective", "not_completed")
         for case in cases:
@@ -1070,7 +773,7 @@ class TestFinalizerRollouts(FinalizerTestCase):
 
 
 class TestFinalizerConfigAndCheckpoint(FinalizerTestCase):
-    def test_six_trainer_checkpoint_and_probe_world_size_pass(self):
+    def test_six_trainer_checkpoint_world_size_pass(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.build(Path(directory))
             config = yaml.safe_load(
@@ -1111,12 +814,6 @@ class TestFinalizerConfigAndCheckpoint(FinalizerTestCase):
                         (role_dir / f"{kind}_world_size_6_rank_{rank}.pt").write_bytes(
                             f"{role}:{kind}:{rank}".encode()
                         )
-
-            def set_worker_count(stats: dict) -> None:
-                for evidence in stats["latest_parameter_update_probe"].values():
-                    evidence["worker_count"] = 6
-
-            mutate_runtime_statistics(fixture, "trainer", set_worker_count)
 
             verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
 
@@ -1183,7 +880,7 @@ class TestFinalizerConfigAndCheckpoint(FinalizerTestCase):
                         fixture["run_dir"], contains=f"checkpoint {role}"
                     )
 
-    def test_checkpoint_tracker_and_runtime_artifact_binding_fail_on_drift(self):
+    def test_checkpoint_tracker_and_native_artifact_binding_fail_on_drift(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.build(Path(directory))
             tracker = fixture["checkpoint_root"] / "latest_checkpointed_iteration.txt"
@@ -1195,11 +892,11 @@ class TestFinalizerConfigAndCheckpoint(FinalizerTestCase):
             mutate_json(
                 fixture["launch_path"],
                 lambda receipt: receipt["runtime_artifacts"].update(
-                    native_receipt="/tmp/caller-selected-runtime-receipt.json"
+                    file_logger="/tmp/caller-selected-metrics.jsonl"
                 ),
             )
             self.assert_failed(
-                fixture["run_dir"], contains="runtime artifact native_receipt"
+                fixture["run_dir"], contains="runtime artifact file_logger"
             )
 
 

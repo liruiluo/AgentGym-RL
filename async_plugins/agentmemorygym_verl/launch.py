@@ -8,7 +8,7 @@ import json
 import os
 import subprocess
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -44,6 +44,8 @@ _ENDPOINT_ENV_FIELDS = {
 }
 _MAX_OBSERVATION_TOKENS = 8192
 _UPSTREAM_ENTRYPOINT = "verl.experimental.fully_async_policy.fully_async_main"
+_CUDA13_TOOLKIT_ROOT = Path("/dev/shm/cuda-13-b300-toolkit")
+_EXPECTED_CUDA_VERSION = "13.0"
 _ASYNC_TUNING = {
     "gate": {
         "trigger_parameter_sync_step": 1,
@@ -73,8 +75,8 @@ class LaunchInputs:
     endpoint_contract_tool: Path
     publication_receipt: Path
     formal_schedule_certificate: Path
-    trainer_gpus: int = 4
-    standalone_rollout_gpus: int = 4
+    trainer_gpus: int = 6
+    standalone_rollout_gpus: int = 2
     actor_use_fused_kernels: bool = False
     critic_use_fused_kernels: bool = False
 
@@ -190,8 +192,9 @@ def build_overrides(
         "data.seed=233",
         "data.custom_cls.path=pkg://agentmemorygym_verl.dataset",
         "data.custom_cls.name=AMGTrajectoryDataset",
-        "data.continuous_token.enable=True",
-        "data.continuous_token.model_family=qwen35",
+        # Latest veRL owns Continuous Token unconditionally for AgentLoop and
+        # selects Qwen3.5 from the root Hugging Face model_type. Do not restore
+        # the removed legacy data.continuous_token config surface.
         # Reuse veRL/Transformers native Qwen3.5 template control. The frozen
         # synchronous baseline used a closed thinking block so each generation
         # is the bare three-tool action expected by the environment parser.
@@ -204,7 +207,7 @@ def build_overrides(
         "actor_rollout_ref.model.fused_kernel_options.impl_backend=torch",
         # Keep veRL's native HF/FSDP gradient checkpointing enabled. The
         # synchronous comparator used the upstream default successfully;
-        # disabling it made the four-way async critic retain full activations.
+        # disabling it made the six-way async learner retain full activations.
         "actor_rollout_ref.model.enable_gradient_checkpointing=True",
         f"critic.model.path={model_path}",
         f"critic.model.tokenizer_path={model_path}",
@@ -217,15 +220,14 @@ def build_overrides(
         "actor_rollout_ref.actor.fsdp_config.strategy=fsdp2",
         "actor_rollout_ref.actor.fsdp_config.param_offload=False",
         "actor_rollout_ref.actor.fsdp_config.optimizer_offload=False",
-        # Keep the accepted actor baseline unchanged. The candidate changes only
-        # critic FSDP2 resharding below.
+        # Start the latest-veRL migration from the upstream FSDP2 default.
         "actor_rollout_ref.actor.fsdp_config.reshard_after_forward=True",
         f"actor_rollout_ref.actor.ppo_mini_batch_size={ppo_mini_batch_size}",
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8",
         "actor_rollout_ref.actor.ppo_epochs=1",
         "actor_rollout_ref.actor.shuffle=False",
         "actor_rollout_ref.actor.use_dynamic_bsz=True",
-        # Four-way FSDP leaves less activation headroom than the historical
+        # Six-way FSDP leaves less activation headroom than the historical
         # eight-way synchronous trainer. Keep microbatch=8 but bound packed
         # training tokens; formal tuning may raise these after measured headroom.
         "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=65536",
@@ -241,21 +243,26 @@ def build_overrides(
         "actor_rollout_ref.actor.use_kl_loss=False",
         "actor_rollout_ref.actor.kl_loss_coef=0.0",
         "actor_rollout_ref.actor.loss_agg_mode=token-mean",
+        # Synthetic rows used only for native DP/mini-batch alignment are neutral
+        # under token-mean aggregation. PrefixGrouper requires a separate grouped
+        # padding proof and is deliberately not enabled in this baseline.
+        "actor_rollout_ref.actor.use_prefix_grouper=False",
         "actor_rollout_ref.actor.policy_loss.loss_mode=bypass_mode",
         "critic.enable=True",
         "critic.strategy=fsdp2",
         "critic.fsdp.strategy=fsdp2",
         "critic.fsdp.param_offload=False",
         "critic.fsdp.optimizer_offload=False",
-        # Upstream FSDP2 can retain unsharded critic parameters between forward
-        # and backward. B200 memory headroom is traded for fewer parameter
-        # all-gathers; PPO data, losses, and optimizer semantics stay unchanged.
-        "critic.fsdp.reshard_after_forward=False",
+        # Start the latest-veRL migration from the upstream FSDP2 default. Any
+        # no-reshard treatment must earn its place in a later isolated speed and
+        # action-adoption comparison rather than leaking into this baseline.
+        "critic.fsdp.reshard_after_forward=True",
         f"critic.ppo_mini_batch_size={ppo_mini_batch_size}",
         "critic.ppo_micro_batch_size_per_gpu=8",
         "critic.ppo_epochs=1",
         "critic.shuffle=False",
         "critic.use_dynamic_bsz=True",
+        "critic.loss_agg_mode=token-mean",
         # G64 r6/r8/r9/r11 showed that mechanically lowering this target while
         # gradient checkpointing was disabled did not control the activation
         # peak. Retain the conservative 32,768 target for the first gate with
@@ -267,22 +274,24 @@ def build_overrides(
         "critic.optim.lr_warmup_steps=0",
         "critic.optim.lr_scheduler_type=constant",
         "actor_rollout_ref.rollout.n=1",
-        "actor_rollout_ref.rollout.name=vllm",
+        "actor_rollout_ref.rollout.name=sglang",
         "actor_rollout_ref.rollout.mode=async",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
         "actor_rollout_ref.rollout.dtype=bfloat16",
         "actor_rollout_ref.rollout.gpu_memory_utilization=0.35",
         "actor_rollout_ref.rollout.standalone_gpu_memory_utilization=0.8",
         "actor_rollout_ref.rollout.max_model_len=32768",
-        "actor_rollout_ref.rollout.max_num_batched_tokens=131072",
         "actor_rollout_ref.rollout.max_num_seqs=32",
-        "actor_rollout_ref.rollout.enable_chunked_prefill=True",
-        # Use veRL's native vLLM engine-kwargs pass-through. vLLM's automatic
-        # FlashInfer GDN prefill selection deadlocks on B300 under a real
-        # concurrent batch, while its upstream Triton/FLA backend passes the
-        # same formal-shaped batch without changing PPO or AMG semantics.
-        "+actor_rollout_ref.rollout.engine_kwargs.vllm.gdn_prefill_backend=triton",
-        "+actor_rollout_ref.rollout.enable_sleep_mode=True",
+        "actor_rollout_ref.rollout.enforce_eager=False",
+        # Qwen3.5's GDN state is handled by SGLang's native no-buffer scheduler.
+        # These are the upstream Qwen3.5 fully-async knobs; AMG does not add an
+        # inference scheduler or a model-specific rollout implementation.
+        "+actor_rollout_ref.rollout.engine_kwargs.sglang.mamba_scheduler_strategy=no_buffer",
+        "+actor_rollout_ref.rollout.engine_kwargs.sglang.disable_radix_cache=True",
+        "+actor_rollout_ref.rollout.engine_kwargs.sglang.cuda_graph_max_bs=32",
+        "+actor_rollout_ref.rollout.engine_kwargs.sglang.max_running_requests=32",
+        "+actor_rollout_ref.rollout.engine_kwargs.sglang.chunked_prefill_size=16384",
+        "+actor_rollout_ref.rollout.engine_kwargs.sglang.max_prefill_tokens=16384",
         "actor_rollout_ref.rollout.free_cache_engine=True",
         "actor_rollout_ref.rollout.disable_log_stats=False",
         # Upstream fully-async prepare_single_generation_data() selects the
@@ -294,6 +303,8 @@ def build_overrides(
         "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True",
         "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=131072",
         "actor_rollout_ref.rollout.checkpoint_engine.backend=nccl",
+        "actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=1024",
+        "actor_rollout_ref.nccl_timeout=9600",
         "actor_rollout_ref.rollout.agent.num_workers=64",
         "actor_rollout_ref.rollout.agent.default_agent_loop=amg_task_neutral_async",
         f"actor_rollout_ref.rollout.agent.agent_loop_config_path={loop_config}",
@@ -342,14 +353,7 @@ def build_overrides(
         "async_training.dynamic_schedule_deactivate_ratio=0.6",
         "async_training.dynamic_schedule_enable_rebalance=True",
         "async_training.concurrent_samples_per_replica=16",
-        f"async_training.runtime_receipt_path={run_dir}/native-runtime-receipt.json",
-        "async_training.rollout_data_non_tensor_keys=[step_record_json]",
-        "async_training.rollout_data_non_tensor_max_keys=1",
-        "async_training.parameter_update_probe.enabled=True",
-        "async_training.parameter_update_probe.max_parameters=8",
-        "async_training.parameter_update_probe.max_elements_per_parameter=16",
-        "async_training.parameter_update_probe.atol=0.0",
-        "async_training.parameter_update_probe.require_change=True",
+        "+trainer.worker_env.PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
         f"hydra.run.dir={run_dir}/hydra",
         "hydra.output_subdir=.hydra",
         "hydra.job.chdir=False",
@@ -389,22 +393,36 @@ def build_runtime_env(
     reject_ambient_identity(environment_to_check)
     env["PYTHONPATH"] = closed_pythonpath
     runtime_bin = str(Path(_string(training_runtime["python"])).parent)
+    cuda_home = str(_CUDA13_TOOLKIT_ROOT)
+    cuda_bin = str(_CUDA13_TOOLKIT_ROOT / "bin")
     inherited_path = env.get("PATH", "")
     path_entries = [
         entry
         for entry in inherited_path.split(os.pathsep)
-        if entry and entry != runtime_bin
+        if entry and entry not in {cuda_bin, runtime_bin}
     ]
-    env["PATH"] = os.pathsep.join([runtime_bin, *path_entries])
+    env["PATH"] = os.pathsep.join([cuda_bin, runtime_bin, *path_entries])
+    runtime_cuda_lib = str(
+        Path(_string(training_runtime["site_packages"])) / "nvidia" / "cu13" / "lib"
+    )
+    cuda_library_entries = [
+        str(_CUDA13_TOOLKIT_ROOT / "lib64"),
+        "/usr/local/cuda/lib64/stubs",
+        runtime_cuda_lib,
+    ]
+    inherited_ld_library_path = env.get("LD_LIBRARY_PATH", "")
+    cuda_library_entries.extend(
+        entry
+        for entry in inherited_ld_library_path.split(os.pathsep)
+        if entry and entry not in cuda_library_entries
+    )
+    env["CUDA_HOME"] = cuda_home
+    env["CUDA_PATH"] = cuda_home
+    env["LD_LIBRARY_PATH"] = os.pathsep.join(cuda_library_entries)
     env["VERL_USE_EXTERNAL_MODULES"] = "agentmemorygym_verl.action_gae"
     env["VERL_USE_EXTERNAL_PLUGINS"] = "none"
     env["VERL_FILE_LOGGER_PATH"] = str(inputs.run_dir / "metrics.jsonl")
-    env["VERL_FULLY_ASYNC_RUNTIME_RECEIPT_PATH"] = str(
-        inputs.run_dir / "native-runtime-receipt.json"
-    )
-    env["VLLM_USE_V1"] = "1"
-    # vLLM otherwise emits platform-detection INFO to stdout before Hydra YAML.
-    env["VLLM_LOGGING_LEVEL"] = "ERROR"
+    env.pop("VERL_FULLY_ASYNC_RUNTIME_RECEIPT_PATH", None)
     env["PYTHONUNBUFFERED"] = "1"
     env["TOKENIZERS_PARALLELISM"] = "false"
     env["HYDRA_FULL_ERROR"] = "1"
@@ -1073,22 +1091,96 @@ def _training_command(overrides: list[str], *, python: str) -> list[str]:
     ]
 
 
+def _validate_accelerator_runtime(
+    observed: Mapping[str, Any], *, training_runtime: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Bind the launch to the publication GPU identity and CUDA 13 toolchain."""
+
+    expected_gpu_count = _require_positive_int(
+        training_runtime.get("gpu_count"), field="training runtime gpu_count"
+    )
+    expected_gpu_type = _string(training_runtime.get("gpu_type", ""))
+    gpu_count = observed.get("gpu_count")
+    gpu_names = observed.get("gpu_names")
+    if gpu_count != expected_gpu_count:
+        raise RuntimeError(
+            f"runtime GPU count {gpu_count!r} does not match publication {expected_gpu_count}"
+        )
+    if (
+        not isinstance(gpu_names, Sequence)
+        or isinstance(gpu_names, (str, bytes))
+        or len(gpu_names) != expected_gpu_count
+        or any(not isinstance(name, str) or expected_gpu_type not in name for name in gpu_names)
+    ):
+        raise RuntimeError(
+            f"runtime GPUs do not match publication type {expected_gpu_type}: {gpu_names!r}"
+        )
+    if observed.get("torch_cuda_available") is not True:
+        raise RuntimeError("publication runtime reports CUDA unavailable")
+    if observed.get("torch_cuda") != _EXPECTED_CUDA_VERSION:
+        raise RuntimeError(
+            "PyTorch CUDA build does not match the locked CUDA 13 runtime: "
+            f"{observed.get('torch_cuda')!r}"
+        )
+    if observed.get("nvcc_release") != _EXPECTED_CUDA_VERSION:
+        raise RuntimeError(
+            "nvcc does not match the locked CUDA 13 runtime: "
+            f"{observed.get('nvcc_release')!r}"
+        )
+    if observed.get("cuda_home") != str(_CUDA13_TOOLKIT_ROOT):
+        raise RuntimeError(
+            f"CUDA_HOME must be {_CUDA13_TOOLKIT_ROOT}, got {observed.get('cuda_home')!r}"
+        )
+    normalized = dict(observed)
+    normalized["gpu_names"] = list(gpu_names)
+    return normalized
+
+
 def _runtime_preflight(
-    inputs: LaunchInputs, env: dict[str, str], *, model_path: Path
+    inputs: LaunchInputs,
+    env: dict[str, str],
+    *,
+    model_path: Path,
+    training_runtime: Mapping[str, Any],
 ) -> dict[str, Any]:
     if not model_path.is_dir():
         raise FileNotFoundError(f"publication model directory missing: {model_path}")
     code = r"""
 import json
+import os
+import re
 import shutil
+import subprocess
+import sys
+import torch
 import trl
+from transformers import AutoConfig, AutoTokenizer
 from trl import AutoModelForCausalLMWithValueHead
 from agentmemorygym_verl.agent_loop import AMGTaskNeutralAgentLoop
 from agentmemorygym_verl.dataset import AMGTrajectoryDataset
 from agentmemorygym_verl.env_client import create_env_client
 from verl.trainer.ppo.core_algos import get_adv_estimator_fn
+from verl.utils.tokenizer.continuous_token_wiring import (
+    create_continuous_token_builder,
+    infer_continuous_token_model_family,
+)
 
 fn = get_adv_estimator_fn("amg_action_axis_gae")
+model_path = sys.argv[1]
+hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+continuous_token_family = infer_continuous_token_model_family(
+    hf_model_type=getattr(hf_config, "model_type", None),
+)
+continuous_token_builder = create_continuous_token_builder(
+    tokenizer,
+    hf_model_type=getattr(hf_config, "model_type", None),
+)
+if str(continuous_token_family) != "qwen35":
+    raise RuntimeError(
+        "publication model must resolve to veRL native Qwen3.5 Continuous Token, "
+        f"got {continuous_token_family!s}"
+    )
 client_config = json.loads(__import__("os").environ["AMG_ENDPOINT_CLIENT_CONFIG_JSON"])
 client = create_env_client({
     "task_name": "openmle_fast",
@@ -1106,14 +1198,40 @@ if not isinstance(framing, list) or not framing:
 ninja_path = shutil.which("ninja")
 if ninja_path is None:
     raise RuntimeError("publication runtime PATH does not provide ninja")
+nvcc_path = shutil.which("nvcc")
+if nvcc_path is None:
+    raise RuntimeError("publication runtime PATH does not provide nvcc")
+nvcc_output = subprocess.check_output([nvcc_path, "--version"], text=True)
+nvcc_match = re.search(r"release\s+(\d+\.\d+)", nvcc_output)
+if nvcc_match is None:
+    raise RuntimeError("cannot parse nvcc release")
+nvidia_smi = shutil.which("nvidia-smi")
+if nvidia_smi is None:
+    raise RuntimeError("publication runtime PATH does not provide nvidia-smi")
+gpu_names = [
+    line.strip()
+    for line in subprocess.check_output(
+        [nvidia_smi, "--query-gpu=name", "--format=csv,noheader"], text=True
+    ).splitlines()
+    if line.strip()
+]
 print(json.dumps({
     "adv_estimator": fn.__name__,
     "agent_loop": AMGTaskNeutralAgentLoop.__name__,
     "dataset": AMGTrajectoryDataset.__name__,
     "policy_framing_messages": len(framing),
     "ninja_path": ninja_path,
+    "cuda_home": os.environ.get("CUDA_HOME"),
+    "nvcc_path": nvcc_path,
+    "nvcc_release": nvcc_match.group(1),
+    "torch_cuda": torch.version.cuda,
+    "torch_cuda_available": torch.cuda.is_available(),
+    "gpu_count": len(gpu_names),
+    "gpu_names": gpu_names,
     "trl_version": trl.__version__,
     "value_head_class": AutoModelForCausalLMWithValueHead.__name__,
+    "continuous_token_family": str(continuous_token_family),
+    "continuous_token_builder": type(continuous_token_builder).__name__,
 }, sort_keys=True))
 """
     probe_env = dict(env)
@@ -1121,7 +1239,7 @@ print(json.dumps({
     if "AMG_ENDPOINT_CLIENT_CONFIG_JSON" not in probe_env:
         raise RuntimeError("endpoint client identity was not exported for preflight")
     completed = subprocess.run(
-        [sys.executable, "-c", code],
+        [sys.executable, "-c", code, str(model_path)],
         check=True,
         text=True,
         capture_output=True,
@@ -1132,9 +1250,14 @@ print(json.dumps({
     if not lines:
         raise RuntimeError("AMG runtime preflight produced no receipt")
     try:
-        return json.loads(lines[-1])
+        receipt = json.loads(lines[-1])
     except json.JSONDecodeError as exc:
         raise RuntimeError("AMG runtime preflight receipt is not JSON") from exc
+    if not isinstance(receipt, Mapping):
+        raise RuntimeError("AMG runtime preflight receipt is not an object")
+    return _validate_accelerator_runtime(
+        receipt, training_runtime=training_runtime
+    )
 
 
 def _atomic_json(path: Path, value: Any) -> None:
@@ -1229,10 +1352,15 @@ def prepare_launch(
 
     runtime = None
     if not skip_endpoint_preflight:
-        runtime = _runtime_preflight(inputs, env, model_path=model_path)
+        runtime = _runtime_preflight(
+            inputs,
+            env,
+            model_path=model_path,
+            training_runtime=training_runtime,
+        )
     training_command = _training_command(overrides, python=runtime_python)
     receipt = {
-        "schema": "amg_verl_fully_async_launch_receipt_v4",
+        "schema": "amg_verl_fully_async_launch_receipt_v5",
         "entrypoint": _UPSTREAM_ENTRYPOINT,
         "inputs": {
             "mode": inputs.mode,
@@ -1257,7 +1385,6 @@ def prepare_launch(
         },
         "runtime_preflight": runtime,
         "runtime_artifacts": {
-            "native_receipt": str(inputs.run_dir / "native-runtime-receipt.json"),
             "file_logger": str(inputs.run_dir / "metrics.jsonl"),
             "rollout_data": str(inputs.run_dir / "rollout_data"),
             "hydra_config": str(inputs.run_dir / "hydra" / ".hydra" / "config.yaml"),
@@ -1287,8 +1414,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--endpoint-contract-tool", type=Path, required=True)
     parser.add_argument("--publication-receipt", type=Path, required=True)
     parser.add_argument("--formal-schedule-certificate", type=Path, required=True)
-    parser.add_argument("--trainer-gpus", type=int, default=4)
-    parser.add_argument("--standalone-rollout-gpus", type=int, default=4)
+    parser.add_argument("--trainer-gpus", type=int, default=6)
+    parser.add_argument("--standalone-rollout-gpus", type=int, default=2)
     parser.add_argument("--actor-use-fused-kernels", action="store_true")
     parser.add_argument("--critic-use-fused-kernels", action="store_true")
     parser.add_argument("--resolve-only", action="store_true")

@@ -2,8 +2,9 @@
 
 The finalizer joins artifacts owned by their native layers instead of making the
 generic veRL receipt carry OpenMLE fields: launch/publication identity, resolved
-Hydra config, FileLogger metrics, real-row rollout dumps, generic runtime queue
-snapshots, and native actor/critic checkpoints.
+Hydra config, native FileLogger metrics, real-row rollout dumps, and native
+actor/critic checkpoints.  It deliberately does not depend on the retired local
+runtime-receipt / parameter-probe patch that current upstream veRL does not consume.
 """
 
 from __future__ import annotations
@@ -138,6 +139,15 @@ def _finite_positive(value: Any) -> bool:
     return math.isfinite(number) and number > 0.0
 
 
+def _finite_number(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def _positive_int(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         return None
@@ -167,7 +177,6 @@ class _Audit:
         self.role: str | None = None
         self.expected: Mapping[str, Any] | None = None
         self.launch: Mapping[str, Any] | None = None
-        self.runtime: Mapping[str, Any] | None = None
         self.batch_multiple: int | None = None
         self.staleness_threshold: float | None = None
         self.trainer_world_size: int | None = None
@@ -184,6 +193,7 @@ class _Audit:
             "validation_events": 0,
             "memory_chains": 0,
             "late_memory_chains": 0,
+            "completed_episodes": 0,
         }
 
     def check(self, condition: bool, message: str) -> bool:
@@ -203,8 +213,8 @@ class _Audit:
             return
         self.launch = launch
         self.check(
-            launch.get("schema") == "amg_verl_fully_async_launch_receipt_v4",
-            "launch receipt schema must be amg_verl_fully_async_launch_receipt_v4",
+            launch.get("schema") == "amg_verl_fully_async_launch_receipt_v5",
+            "launch receipt schema must be amg_verl_fully_async_launch_receipt_v5",
         )
         self.check(
             launch.get("entrypoint")
@@ -248,7 +258,6 @@ class _Audit:
             "launch run_dir does not match the finalized directory",
         )
         runtime_artifacts = {
-            "native_receipt": self.run_dir / "native-runtime-receipt.json",
             "file_logger": self.run_dir / "metrics.jsonl",
             "rollout_data": self.run_dir / "rollout_data",
             "hydra_config": self.run_dir / "hydra" / ".hydra" / "config.yaml",
@@ -425,14 +434,6 @@ class _Audit:
             _at(resolved, "trainer.validation_data_dir") is None,
             "resolved config validation_data_dir must be null",
         )
-        self.check(
-            _same_path(
-                _at(resolved, "async_training.runtime_receipt_path"),
-                self.run_dir / "native-runtime-receipt.json",
-            ),
-            "resolved config native runtime receipt path mismatch",
-        )
-
         resolved_endpoint = _at(resolved, "actor_rollout_ref.agentgym")
         launch_endpoint = _at(self.launch, "endpoint_publication.client_config")
         endpoint_fields = (
@@ -477,9 +478,14 @@ class _Audit:
                     expected_sha256=str(self.expected["schedule_sha256"]),
                     expected_role=str(self.expected["role"]),
                 )
-                self._schedule_ids = [
-                    str(json.loads(line)["item_id"])
+                schedule_rows = [
+                    json.loads(line)
                     for line in schedule_path.read_text(encoding="utf-8").splitlines()
+                ]
+                self._schedule_ids = [str(row["item_id"]) for row in schedule_rows]
+                self._schedule_instances = [
+                    (str(row["item_id"]), int(row["data_idx"]))
+                    for row in schedule_rows
                 ]
             except Exception as exc:
                 self.error("publication schedule", exc)
@@ -494,21 +500,35 @@ class _Audit:
             self.batch_multiple = _lcm(actor_batch, critic_batch)
 
     def audit_file_logger(self) -> None:
+        """Audit metrics emitted by current upstream veRL itself.
+
+        The previous integration added a private runtime receipt and sampled
+        parameter probes.  Current upstream has no consumers for those config
+        keys, so this audit instead joins the native FileLogger signals that are
+        produced by the actual learner/rollouter path: actor and critic gradient
+        norms, rollout-correction diagnostics, policy/staleness versions, queue
+        counters, rollout JSONL, and the complete optimizer checkpoint.
+        """
+
         path = self.run_dir / "metrics.jsonl"
         try:
             rows = _jsonl(path, "FileLogger JSONL")
         except Exception as exc:
             self.error("FileLogger JSONL", exc)
             return
+
         validation_metrics = 0
-        bypass_evidence_rows = 0
-        actor_probe_rows = 0
-        critic_probe_rows = 0
-        bypass_real_tokens = 0
+        actor_grad_rows = 0
+        critic_grad_rows = 0
+        rollout_correction_rows = 0
         current_param_versions: dict[int, int] = {}
         native_stale_action_rows: dict[int, int] = {}
+        generated_samples: dict[int, int] = {}
+        dropped_samples: dict[int, int] = {}
+        queue_sizes: dict[int, int] = {}
         observed_steps: list[int] = []
         rows_by_step: dict[int, list[Mapping[str, Any]]] = {}
+
         for index, row in enumerate(rows):
             raw_step = row.get("step")
             valid_step = isinstance(raw_step, int) and not isinstance(raw_step, bool)
@@ -521,18 +541,18 @@ class _Audit:
                 step = int(raw_step)
                 observed_steps.append(step)
                 rows_by_step.setdefault(step, []).append(data)
-            for key, value in data.items():
+            for key in data:
                 folded = str(key).casefold()
-                if "validation" in folded or folded.startswith(
-                    ("val/", "val_", "val-")
-                ):
+                if "validation" in folded or folded.startswith(("val/", "val_", "val-")):
                     validation_metrics += 1
+
         self.check(
             validation_metrics == 0,
             f"FileLogger emitted {validation_metrics} validation metric(s)",
         )
         if self.expected is not None:
             publications = int(self.expected["publication_cycles"])
+            samples_per_update = int(self.expected["samples_per_update"])
 
             step_zero_bad_keys = sorted(
                 str(key)
@@ -545,8 +565,7 @@ class _Audit:
             )
             self.check(
                 not step_zero_bad_keys,
-                "FileLogger step 0 is not rollouter-only: "
-                + ", ".join(step_zero_bad_keys),
+                "FileLogger step 0 is not rollouter-only: " + ", ".join(step_zero_bad_keys),
             )
             out_of_range_steps = sorted(
                 step for step in rows_by_step if step < 0 or step > publications
@@ -565,121 +584,87 @@ class _Audit:
                 "FileLogger publication steps are incomplete",
             )
 
+            required_rollout_corr = (
+                "rollout_corr/kl",
+                "rollout_corr/k3_kl",
+                "rollout_corr/log_ppl_abs_diff",
+            )
             for step in range(1, publications + 1):
                 data_rows = rows_by_step.get(step, [])
-                items = [
-                    (str(key), value)
-                    for data in data_rows
-                    for key, value in data.items()
-                ]
+                items = [(str(key), value) for data in data_rows for key, value in data.items()]
+
                 for role in ("actor", "critic"):
-                    grad_norms = [
-                        value for key, value in items if key == f"{role}/grad_norm"
-                    ]
+                    grad_norms = [value for key, value in items if key == f"{role}/grad_norm"]
+                    valid_grad = len(grad_norms) == 1 and _finite_positive(grad_norms[0])
                     self.check(
-                        len(grad_norms) == 1 and _finite_positive(grad_norms[0]),
-                        f"FileLogger publication step {step} has no unique nonzero "
-                        f"{role} update metric",
+                        valid_grad,
+                        f"FileLogger publication step {step} has no unique nonzero {role}/grad_norm",
                     )
+                    if valid_grad:
+                        if role == "actor":
+                            actor_grad_rows += 1
+                        else:
+                            critic_grad_rows += 1
 
-                bypass_counts = [
-                    value
-                    for key, value in items
-                    if key == "rollout_corr/bypass_real_token_count"
-                ]
-                bypass_diffs = [
-                    value
-                    for key, value in items
-                    if key == "rollout_corr/bypass_max_abs_diff"
-                ]
-                self.check(
-                    len(bypass_counts) == 1 and _finite_positive(bypass_counts[0]),
-                    f"FileLogger publication step {step} has no unique compared real-token count",
-                )
-                self.check(
-                    len(bypass_diffs) == 1 and bypass_diffs[0] in (0, 0.0),
-                    f"FileLogger publication step {step} reports an old/rollout logprob mismatch",
-                )
-                if len(bypass_counts) == 1 and _finite_positive(bypass_counts[0]):
-                    bypass_evidence_rows += 1
-                    bypass_real_tokens += int(bypass_counts[0])
+                correction_values: dict[str, float] = {}
+                for key in required_rollout_corr:
+                    values = [value for item_key, value in items if item_key == key]
+                    valid = len(values) == 1 and _finite_number(values[0])
+                    self.check(
+                        valid,
+                        f"FileLogger publication step {step} has no unique finite {key}",
+                    )
+                    if valid:
+                        correction_values[key] = float(values[0])
+                if len(correction_values) == len(required_rollout_corr):
+                    rollout_correction_rows += 1
 
-                actor_probes = [
-                    value
-                    for key, value in items
-                    if key == "parameter_update_probe/actor/changed"
-                ]
-                critic_probes = [
-                    value
-                    for key, value in items
-                    if key == "parameter_update_probe/critic/changed"
-                ]
-                self.check(
-                    len(actor_probes) == 1
-                    and actor_probes[0] in (True, 1, 1.0),
-                    f"FileLogger publication step {step} has no unique actor parameter-update probe",
-                )
-                self.check(
-                    len(critic_probes) == 1
-                    and critic_probes[0] in (True, 1, 1.0),
-                    f"FileLogger publication step {step} has no unique critic parameter-update probe",
-                )
-                actor_probe_rows += int(
-                    len(actor_probes) == 1
-                    and actor_probes[0] in (True, 1, 1.0)
-                )
-                critic_probe_rows += int(
-                    len(critic_probes) == 1
-                    and critic_probes[0] in (True, 1, 1.0)
-                )
+                integral_metrics = {
+                    "current_param_version": "fully_async/count/current_param_version",
+                    "stale_trajectory_processed": "fully_async/count/stale_trajectory_processed",
+                    "total_generated_samples": "fully_async/count/total_generated_samples",
+                    "dropped_stale_samples": "fully_async/count/dropped_stale_samples",
+                    "mq_queue_size": "fully_async/monitor/queue/mq_queue_size",
+                    "required_samples": "fully_async/static/required_samples",
+                }
+                observed_integrals: dict[str, int] = {}
+                for label, key in integral_metrics.items():
+                    values = [value for item_key, value in items if item_key == key]
+                    parsed = _nonnegative_integral(values[0]) if len(values) == 1 else None
+                    self.check(
+                        parsed is not None,
+                        f"FileLogger publication step {step} has no unique integral {key}",
+                    )
+                    if parsed is not None:
+                        observed_integrals[label] = parsed
 
-                current_versions = [
-                    value
-                    for key, value in items
-                    if key == "fully_async/count/current_param_version"
-                ]
-                current_version = (
-                    _nonnegative_integral(current_versions[0])
-                    if len(current_versions) == 1
-                    else None
-                )
-                self.check(
-                    current_version is not None,
-                    f"FileLogger publication step {step} has no unique integral "
-                    "current parameter version",
-                )
-                if current_version is not None:
-                    current_param_versions[step] = current_version
-
-                stale_counts = [
-                    value
-                    for key, value in items
-                    if key == "fully_async/count/stale_trajectory_processed"
-                ]
-                stale_count = (
-                    _nonnegative_integral(stale_counts[0])
-                    if len(stale_counts) == 1
-                    else None
-                )
-                self.check(
-                    stale_count is not None,
-                    f"FileLogger publication step {step} has no unique integral "
-                    "native stale action-row count",
-                )
-                if stale_count is not None:
-                    native_stale_action_rows[step] = stale_count
+                if observed_integrals.get("required_samples") is not None:
+                    self.check(
+                        observed_integrals["required_samples"] == samples_per_update,
+                        f"FileLogger publication step {step} native required_samples mismatch",
+                    )
+                if "current_param_version" in observed_integrals:
+                    current_param_versions[step] = observed_integrals["current_param_version"]
+                if "stale_trajectory_processed" in observed_integrals:
+                    native_stale_action_rows[step] = observed_integrals["stale_trajectory_processed"]
+                if "total_generated_samples" in observed_integrals:
+                    generated_samples[step] = observed_integrals["total_generated_samples"]
+                if "dropped_stale_samples" in observed_integrals:
+                    dropped_samples[step] = observed_integrals["dropped_stale_samples"]
+                if "mq_queue_size" in observed_integrals:
+                    queue_sizes[step] = observed_integrals["mq_queue_size"]
 
             self.check(
-                bypass_evidence_rows == publications,
-                "FileLogger old/rollout logprob evidence does not cover every publication cycle",
+                actor_grad_rows == publications,
+                "FileLogger actor/grad_norm does not cover every publication cycle",
             )
             self.check(
-                actor_probe_rows == publications,
-                "FileLogger actor parameter-update probe does not cover every publication cycle",
+                critic_grad_rows == publications,
+                "FileLogger critic/grad_norm does not cover every publication cycle",
             )
             self.check(
-                critic_probe_rows == publications,
-                "FileLogger critic parameter-update probe does not cover every publication cycle",
+                rollout_correction_rows == publications,
+                "FileLogger native rollout-correction diagnostics do not cover every publication cycle",
             )
             if len(current_param_versions) == publications:
                 self.check(
@@ -687,15 +672,18 @@ class _Audit:
                     == list(range(publications)),
                     "FileLogger current parameter versions do not match publication order",
                 )
-            if len(native_stale_action_rows) == publications:
-                stale_sequence = [
-                    native_stale_action_rows[step]
-                    for step in range(1, publications + 1)
-                ]
-                self.check(
-                    stale_sequence == sorted(stale_sequence),
-                    "FileLogger native stale action-row count is not cumulative",
-                )
+            for label, values in (
+                ("native stale action-row count", native_stale_action_rows),
+                ("native total-generated-samples count", generated_samples),
+                ("native dropped-stale-samples count", dropped_samples),
+            ):
+                if len(values) == publications:
+                    sequence = [values[step] for step in range(1, publications + 1)]
+                    self.check(
+                        sequence == sorted(sequence),
+                        f"FileLogger {label} is not cumulative",
+                    )
+
         self.counts["validation_events"] += validation_metrics
         current_param_versions_by_update: dict[int, int] = {}
         if self.expected is not None:
@@ -706,12 +694,14 @@ class _Audit:
                     current_param_versions_by_update[update] = version
         self._file_logger_summary = {
             "rows": len(rows),
-            "bypass_evidence_rows": bypass_evidence_rows,
-            "actor_probe_rows": actor_probe_rows,
-            "critic_probe_rows": critic_probe_rows,
-            "bypass_real_tokens": bypass_real_tokens,
+            "actor_grad_rows": actor_grad_rows,
+            "critic_grad_rows": critic_grad_rows,
+            "rollout_correction_rows": rollout_correction_rows,
             "current_param_versions_by_update": current_param_versions_by_update,
             "native_stale_action_rows_by_publication": native_stale_action_rows,
+            "native_total_generated_samples_by_publication": generated_samples,
+            "native_dropped_stale_samples_by_publication": dropped_samples,
+            "native_mq_queue_size_by_publication": queue_sizes,
         }
 
     @staticmethod
@@ -853,7 +843,8 @@ class _Audit:
         }
         if not measurement_fields.intersection(fields):
             return None
-        return cls._safe_relative_path(fields["code_path"])
+        code_path = cls._safe_relative_path(fields["code_path"])
+        return code_path if code_path == "train.py" else None
 
     @staticmethod
     def _changed_paths(execution: Mapping[str, Any]) -> set[str] | None:
@@ -987,6 +978,7 @@ class _Audit:
         version_pairs: Counter[str] = Counter()
         versions: set[int] = set()
         terminal_ids: list[str] = []
+        terminal_instances: list[tuple[str, int]] = []
         memory_chain_updates: list[int] = []
         seen_uids: set[str] = set()
         samples_per_update = (
@@ -1113,6 +1105,20 @@ class _Audit:
                     self.errors.append(
                         f"trajectory identity changed item_id within {uid!r}"
                     )
+                data_indices = {
+                    record.get("data_idx") for record, _document in episode
+                }
+                valid_data_idx = (
+                    len(data_indices) == 1
+                    and all(
+                        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                        for value in data_indices
+                    )
+                )
+                if not valid_data_idx:
+                    self.errors.append(
+                        f"trajectory identity changed or has invalid data_idx within {uid!r}"
+                    )
                 orders = [record.get("trajectory_row_order") for record, _ in episode]
                 valid_orders = all(
                     isinstance(order, int) and not isinstance(order, bool)
@@ -1161,8 +1167,11 @@ class _Audit:
                 else:
                     completed_episodes.append(sorted_episode)
                     terminal_id = sorted_episode[0][0].get("item_id")
+                    terminal_data_idx = sorted_episode[0][0].get("data_idx")
                     if isinstance(terminal_id, str) and terminal_id:
                         terminal_ids.append(terminal_id)
+                        if valid_data_idx:
+                            terminal_instances.append((terminal_id, terminal_data_idx))
                 seen_uids.add(uid)
             self.check(
                 len(completed_episodes) == samples_per_update,
@@ -1183,10 +1192,6 @@ class _Audit:
                 "rollout policy-version span exceeds the published learner horizon",
             )
         if isinstance(file_logger_summary, Mapping):
-            self.check(
-                file_logger_summary.get("bypass_real_tokens") == real_tokens,
-                "FileLogger old/rollout logprob real-token total differs from rollout data",
-            )
             native_stale = file_logger_summary.get(
                 "native_stale_action_rows_by_publication"
             )
@@ -1222,6 +1227,7 @@ class _Audit:
             stale_action_rows=stale_action_rows,
             memory_chains=memory_chains,
             late_memory_chains=late_memory_chains,
+            completed_episodes=len(terminal_ids),
         )
         if versions:
             self.counts["policy_version_min"] = min(versions)
@@ -1245,275 +1251,12 @@ class _Audit:
                 Counter(terminal_ids) == Counter(schedule_ids),
                 "rollout terminal trajectory identity/occurrences differ from the publication schedule",
             )
-
-    @staticmethod
-    def _component_statistics(
-        runtime: Mapping[str, Any], boundary: str, component: str
-    ) -> Mapping[str, Any] | None:
-        record = _at(runtime, f"snapshots.{boundary}.{component}")
-        if not isinstance(record, Mapping) or record.get("available") is not True:
-            return None
-        statistics = record.get("statistics")
-        return statistics if isinstance(statistics, Mapping) else None
-
-    @staticmethod
-    def _queue_conserved(statistics: Mapping[str, Any]) -> bool:
-        fields = (
-            "real_enqueued",
-            "real_consumed",
-            "real_evicted",
-            "real_cleared",
-            "real_resident",
-        )
-        if any(not isinstance(statistics.get(field), int) for field in fields):
-            return False
-        return statistics["real_enqueued"] == sum(
-            statistics[field]
-            for field in (
-                "real_consumed",
-                "real_evicted",
-                "real_cleared",
-                "real_resident",
-            )
-        )
-
-    def audit_runtime(self) -> None:
-        path = self.run_dir / "native-runtime-receipt.json"
-        try:
-            wrapper = _load_json(path, "native runtime receipt")
-        except Exception as exc:
-            self.error("native runtime receipt", exc)
-            return
-        runtime = wrapper.get("data")
-        self.check(
-            isinstance(wrapper.get("step"), int)
-            and not isinstance(wrapper.get("step"), bool),
-            "native runtime FileLogger wrapper has no integer step",
-        )
-        if not isinstance(runtime, Mapping):
-            self.errors.append("native runtime receipt has no FileLogger data mapping")
-            return
-        self.runtime = runtime
-        self.check(
-            runtime.get("schema_version") == 1,
-            "native runtime receipt schema_version mismatch",
-        )
-        self.check(
-            runtime.get("outcome") == "success", "native runtime outcome is not success"
-        )
-        self.check(
-            runtime.get("status") == "completed",
-            "native runtime status is not completed",
-        )
-        self.check(
-            runtime.get("exception") is None,
-            "native runtime exception must be null on success",
-        )
-        self.check(
-            runtime.get("finalization_errors") == [],
-            "native runtime finalization_errors must be empty on success",
-        )
-        timestamps = runtime.get("timestamps")
-        self.check(
-            isinstance(timestamps, Mapping)
-            and all(
-                timestamps.get(key)
-                for key in ("run_started_at", "finalization_started_at", "finalized_at")
-            ),
-            "native runtime timestamps are incomplete",
-        )
-
-        self.check(
-            isinstance(runtime.get("snapshots"), Mapping),
-            "native runtime snapshots mapping is missing",
-        )
-        boundaries: dict[str, dict[str, Mapping[str, Any]]] = {}
-        for boundary in ("before_clear", "after_clear"):
-            boundaries[boundary] = {}
-            for component in ("trainer", "rollouter", "queue"):
-                statistics = self._component_statistics(runtime, boundary, component)
-                if statistics is None:
-                    self.errors.append(
-                        f"native runtime {boundary}.{component} statistics are unavailable"
-                    )
-                    statistics = {}
-                boundaries[boundary][component] = statistics
-        before = boundaries["before_clear"]
-        after = boundaries["after_clear"]
-
-        flags = runtime.get("queue_conservation")
-        self.check(
-            isinstance(flags, Mapping),
-            "native runtime queue_conservation mapping is missing",
-        )
-        for flag in ("before_clear", "after_clear", "clear_delta_matches_resident"):
+        schedule_instances = getattr(self, "_schedule_instances", None)
+        if schedule_instances is not None:
             self.check(
-                isinstance(flags, Mapping) and flags.get(flag) is True,
-                f"native runtime queue_conservation.{flag} did not pass",
+                Counter(terminal_instances) == Counter(schedule_instances),
+                "rollout terminal item_id/data_idx occurrences differ from the publication schedule",
             )
-        for boundary, stats in (
-            ("before_clear", before["queue"]),
-            ("after_clear", after["queue"]),
-        ):
-            self.check(
-                self._queue_conserved(stats),
-                f"native queue accounting is not conserved at {boundary}",
-            )
-        self.check(
-            after["queue"].get("real_resident") == 0,
-            "native queue retained samples after clear",
-        )
-        self.check(
-            after["queue"].get("real_cleared", 0)
-            - before["queue"].get("real_cleared", 0)
-            == before["queue"].get("real_resident", 0),
-            "native queue clear delta does not match its resident samples",
-        )
-
-        if self.expected is None:
-            return
-        episodes = int(self.expected["episodes"])
-        publications = int(self.expected["publication_cycles"])
-        samples_per_update = int(self.expected["samples_per_update"])
-        trainer = before["trainer"]
-        rollouter = before["rollouter"]
-        queue = before["queue"]
-        self.check(
-            runtime.get("trainer_step") == publications
-            and wrapper.get("step") == publications,
-            "native runtime FileLogger wrapper step/trainer_step mismatch",
-        )
-        for field, wanted in (
-            ("global_steps", int(self.expected["optimizer_updates"]) + 1),
-            ("current_param_version", publications),
-            ("total_train_steps", publications),
-            ("local_trigger_step", 1),
-            ("processed_samples", episodes),
-            ("terminal_underfill_events", 0),
-            ("terminal_underfill_samples", 0),
-            ("pending_rollout_dump_writes", 0),
-        ):
-            self.check(
-                trainer.get(field) == wanted,
-                f"native trainer {field} mismatch",
-            )
-        stale_processed = trainer.get("stale_trajectory_processed")
-        valid_stale_processed = (
-            isinstance(stale_processed, int)
-            and not isinstance(stale_processed, bool)
-            and 0 <= stale_processed <= self.counts["real_action_rows"]
-        )
-        self.check(
-            valid_stale_processed,
-            "native trainer stale_trajectory_processed is not a valid action-row count",
-        )
-        # veRL retains the historical field name, but AMG expands every trajectory
-        # into action rows before PPO.  Upstream therefore evaluates one
-        # trajectory_param_versions entry per action row here.
-        self.check(
-            valid_stale_processed
-            and stale_processed == self.counts["stale_action_rows"],
-            "native trainer stale_trajectory_processed differs from the "
-            "independently reconstructed stale action-row count",
-        )
-        bypass = trainer.get("latest_bypass_log_prob_evidence")
-        self.check(
-            isinstance(bypass, Mapping)
-            and _finite_positive(bypass.get("rollout_corr/bypass_real_token_count"))
-            and bypass.get("rollout_corr/bypass_max_abs_diff") in (0, 0.0),
-            "native trainer latest bypass real-token count/old/rollout logprob evidence failed",
-        )
-        probes = trainer.get("latest_parameter_update_probe")
-        for role in ("actor", "critic"):
-            evidence = probes.get(role) if isinstance(probes, Mapping) else None
-            self.check(
-                isinstance(evidence, Mapping)
-                and evidence.get("changed") is True
-                and _finite_positive(evidence.get("changed_elements"))
-                and _finite_positive(evidence.get("sampled_elements"))
-                and evidence.get("worker_count") == self.trainer_world_size,
-                f"native trainer latest {role} parameter-update probe failed",
-            )
-
-        for field, wanted in (
-            ("monitor/active_tasks_size", 0),
-            ("monitor/queue/pending_queue_size", 0),
-            ("monitor/queue/mq_queue_size", 0),
-            ("count/total_generated_samples", episodes),
-            ("count/dropped_stale_samples", 0),
-            ("static/required_samples", samples_per_update),
-        ):
-            self.check(
-                rollouter.get(field) == wanted,
-                f"native rollouter {field} mismatch",
-            )
-        staleness_samples = rollouter.get("count/staleness_samples")
-        self.check(
-            isinstance(staleness_samples, int)
-            and not isinstance(staleness_samples, bool)
-            and 0 <= staleness_samples <= episodes,
-            "native rollouter count/staleness_samples is invalid",
-        )
-        if self.staleness_threshold is not None:
-            expected_max_required = int(
-                samples_per_update
-                * (self.staleness_threshold + 1.0)
-                * int(self.expected["trigger_parameter_sync_step"])
-            )
-            self.check(
-                rollouter.get("static/staleness_threshold") == self.staleness_threshold,
-                "native rollouter static/staleness_threshold mismatch",
-            )
-            self.check(
-                rollouter.get("static/max_required_samples") == expected_max_required,
-                "native rollouter static/max_required_samples mismatch",
-            )
-            self.check(
-                rollouter.get("static/max_queue_size") == expected_max_required,
-                "native rollouter static/max_queue_size mismatch",
-            )
-            max_concurrent = rollouter.get("static/max_concurrent_samples")
-            self.check(
-                isinstance(max_concurrent, int)
-                and not isinstance(max_concurrent, bool)
-                and 0 < max_concurrent <= expected_max_required,
-                "native rollouter static/max_concurrent_samples is invalid",
-            )
-
-        queue_expectations = (
-            ("total_produced", episodes),
-            ("total_consumed", episodes),
-            ("real_enqueued", episodes),
-            ("real_consumed", episodes),
-            ("real_evicted", 0),
-            ("real_cleared", 0),
-            ("real_resident", 0),
-            ("queue_size", 0),
-            ("dropped_samples", 0),
-            ("closed", True),
-            ("control_signals_enqueued", 0),
-        )
-        for field, wanted in queue_expectations:
-            self.check(
-                queue.get(field) == wanted,
-                f"native queue {field} mismatch",
-            )
-        # Native popleft eviction is a valid freshness mechanism in general.  This
-        # publication has no replacement horizon, so every eviction/drop would
-        # remove one exact scheduled occurrence and must fail treatment accounting.
-        self.check(
-            rollouter.get("count/dropped_stale_samples") == 0,
-            "native rollouter count/dropped_stale_samples violates the no-replacement budget",
-        )
-
-        self.check(
-            before["trainer"] == after["trainer"],
-            "native before/after trainer statistics changed during finalization",
-        )
-        self.check(
-            before["rollouter"] == after["rollouter"],
-            "native before/after rollouter statistics changed during finalization",
-        )
 
     def audit_checkpoint(self) -> None:
         if self.expected is None:
@@ -1564,13 +1307,10 @@ class _Audit:
     def terminal_path(self) -> str:
         if self.trainer_exit_code != 0:
             return "crash"
-        if self.runtime is not None:
-            outcome = self.runtime.get("outcome")
-            status = self.runtime.get("status")
-            if outcome == "terminal_underfill" or status == "partial":
-                return "partial"
-            if outcome != "success" or status != "completed":
-                return "crash"
+        scheduled = self.counts.get("scheduled_episodes", 0)
+        completed = self.counts.get("completed_episodes", 0)
+        if scheduled > 0 and completed < scheduled:
+            return "partial"
         return "success"
 
     def run(self) -> dict[str, Any]:
@@ -1580,7 +1320,6 @@ class _Audit:
         self.audit_config()
         self.audit_file_logger()
         self.audit_rollouts()
-        self.audit_runtime()
         self.audit_checkpoint()
         terminal_path = self.terminal_path()
         if terminal_path == "partial" and not any(
@@ -1588,7 +1327,7 @@ class _Audit:
         ):
             self.errors.append("native runtime ended on a partial terminal path")
         return {
-            "schema": "amg_verl_fully_async_finalization_v2",
+            "schema": "amg_verl_fully_async_finalization_v3",
             "status": "pass" if not self.errors else "fail",
             "terminal_path": terminal_path,
             "trainer_exit_code": self.trainer_exit_code,
@@ -1611,7 +1350,7 @@ def finalize_run(
     except Exception as exc:  # finalization itself must fail closed on every path
         audit.error("unexpected finalizer failure", exc)
         verdict = {
-            "schema": "amg_verl_fully_async_finalization_v2",
+            "schema": "amg_verl_fully_async_finalization_v3",
             "status": "fail",
             "terminal_path": audit.terminal_path(),
             "trainer_exit_code": audit.trainer_exit_code,

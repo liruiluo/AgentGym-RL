@@ -146,13 +146,33 @@ def verify_resolved_config(
         )
     _require_equal(config, "async_training.dynamic_schedule_policy", "default")
     _require_equal(config, "async_training.dynamic_schedule_enable_rebalance", True)
-    _require_equal(config, "actor_rollout_ref.rollout.name", "vllm")
+    _require_equal(config, "actor_rollout_ref.rollout.name", "sglang")
     _require_equal(config, "actor_rollout_ref.rollout.mode", "async")
-    _require_equal(
-        config,
-        "actor_rollout_ref.rollout.engine_kwargs.vllm.gdn_prefill_backend",
-        "triton",
-    )
+    engine_kwargs = _plain(_at(config, "actor_rollout_ref.rollout.engine_kwargs"))
+    if not isinstance(engine_kwargs, Mapping):
+        raise ValueError("rollout engine_kwargs must be a mapping")
+    if engine_kwargs.get("vllm") not in (None, {}):
+        raise ValueError("SGLang rollout must not retain vLLM engine kwargs")
+    sglang_kwargs = engine_kwargs.get("sglang")
+    if not isinstance(sglang_kwargs, Mapping):
+        raise ValueError("SGLang rollout requires engine_kwargs.sglang")
+    for key, expected_value in {
+        "mamba_scheduler_strategy": "no_buffer",
+        "disable_radix_cache": True,
+        "cuda_graph_max_bs": 32,
+        "max_running_requests": 32,
+        "chunked_prefill_size": 16384,
+        "max_prefill_tokens": 16384,
+    }.items():
+        observed = sglang_kwargs.get(key)
+        if observed != expected_value:
+            raise ValueError(
+                f"SGLang rollout engine_kwargs.{key} must be "
+                f"{expected_value!r}, got {observed!r}"
+            )
+    _require_equal(config, "actor_rollout_ref.rollout.max_num_seqs", 32)
+    _require_equal(config, "actor_rollout_ref.rollout.enforce_eager", False)
+    _require_equal(config, "actor_rollout_ref.rollout.free_cache_engine", True)
 
     trainer_nodes = _positive_int(_at(config, "trainer.nnodes"), field="trainer.nnodes")
     trainer_gpus_per_node = _positive_int(
@@ -164,9 +184,15 @@ def verify_resolved_config(
     )
     trainer_gpus = trainer_nodes * trainer_gpus_per_node
     standalone_rollout_gpus = rollout_nodes * rollout_gpus_per_node
-    if (trainer_gpus, standalone_rollout_gpus) not in {(4, 4), (6, 2)}:
+    topology = (trainer_gpus, standalone_rollout_gpus)
+    if mode == "formal" and topology != (6, 2):
         raise ValueError(
-            "AMG reviewed Hybrid + Standalone topology must be 4+4 or 6+2, "
+            "AMG formal Hybrid + Standalone topology must be 6+2, "
+            f"got {trainer_gpus}+{standalone_rollout_gpus}"
+        )
+    if mode == "gate" and topology not in {(4, 4), (6, 2)}:
+        raise ValueError(
+            "AMG gate Hybrid + Standalone topology must be 4+4 or 6+2, "
             f"got {trainer_gpus}+{standalone_rollout_gpus}"
         )
 
@@ -183,11 +209,17 @@ def verify_resolved_config(
             "standalone rollout memory utilization must exceed the hybrid value and remain <=0.95"
         )
 
-    if (
-        _at(config, "data.continuous_token.enable") is not True
-        or _at(config, "data.continuous_token.model_family") != "qwen35"
-    ):
-        raise ValueError("AMG Qwen3.5 multi-action rollout requires Continuous Token")
+    # Latest veRL enables Continuous Token for every AgentLoop and infers the
+    # Qwen3.5 builder from the root Hugging Face model_type. The removed legacy
+    # data.continuous_token config must not be reintroduced as an AMG shim.
+    data_config = _plain(_at(config, "data"))
+    if not isinstance(data_config, Mapping):
+        raise ValueError("resolved data config must be a mapping")
+    if "continuous_token" in data_config:
+        raise ValueError(
+            "legacy data.continuous_token must be absent; latest veRL owns "
+            "AgentLoop Continuous Token selection from model_type"
+        )
     _require_equal(config, "data.apply_chat_template_kwargs.enable_thinking", False)
     # veRL fully async stamps ``single_turn_agent`` when multi_turn is false.
     # AMG therefore needs the native multi-turn switch even though lifecycle
@@ -307,17 +339,20 @@ def verify_resolved_config(
         "actor_rollout_ref.actor.ppo_epochs": 1,
         "actor_rollout_ref.actor.shuffle": False,
         "actor_rollout_ref.actor.use_dynamic_bsz": True,
+        "actor_rollout_ref.actor.loss_agg_mode": "token-mean",
+        "actor_rollout_ref.actor.use_prefix_grouper": False,
         "actor_rollout_ref.actor.strategy": "fsdp2",
         "actor_rollout_ref.actor.fsdp_config.strategy": "fsdp2",
         "actor_rollout_ref.actor.fsdp_config.param_offload": False,
         "actor_rollout_ref.actor.fsdp_config.optimizer_offload": False,
         "actor_rollout_ref.actor.fsdp_config.reshard_after_forward": True,
-        "critic.fsdp.reshard_after_forward": False,
+        "critic.fsdp.reshard_after_forward": True,
         "critic.ppo_mini_batch_size": ppo_mini_batch_size,
         "critic.ppo_micro_batch_size_per_gpu": 8,
         "critic.ppo_epochs": 1,
         "critic.shuffle": False,
         "critic.use_dynamic_bsz": True,
+        "critic.loss_agg_mode": "token-mean",
         "critic.strategy": "fsdp2",
         "algorithm.gamma": 1.0,
         "algorithm.lam": 1.0,
@@ -338,25 +373,28 @@ def verify_resolved_config(
             "AMG fully-async training requires trainer.rollout_data_dir for durable row evidence"
         )
 
-    runtime_receipt_path = _at(config, "async_training.runtime_receipt_path")
-    if not isinstance(runtime_receipt_path, str) or not runtime_receipt_path.strip():
-        raise ValueError(
-            "AMG fully-async training requires the native runtime_receipt_path"
-        )
-    _require_equal(
-        config,
-        "async_training.rollout_data_non_tensor_keys",
-        ["step_record_json"],
+    # These fields belonged to the previous locally patched veRL runtime.  They
+    # are silently ignored by current upstream and must stay absent so a green
+    # Hydra compose cannot be mistaken for runtime evidence.  Latest veRL owns
+    # rollout JSONL, gradient/off-policy metrics, staleness counters, and
+    # checkpoint persistence directly.
+    legacy_async_evidence_fields = (
+        "runtime_receipt_path",
+        "rollout_data_non_tensor_keys",
+        "rollout_data_non_tensor_max_keys",
+        "parameter_update_probe",
     )
-    _require_equal(config, "async_training.rollout_data_non_tensor_max_keys", 1)
-    for path, expected_value in {
-        "async_training.parameter_update_probe.enabled": True,
-        "async_training.parameter_update_probe.max_parameters": 8,
-        "async_training.parameter_update_probe.max_elements_per_parameter": 16,
-        "async_training.parameter_update_probe.atol": 0.0,
-        "async_training.parameter_update_probe.require_change": True,
-    }.items():
-        _require_equal(config, path, expected_value)
+    async_training = _plain(_at(config, "async_training"))
+    if not isinstance(async_training, Mapping):
+        raise ValueError("resolved async_training config must be a mapping")
+    present_legacy_fields = sorted(
+        field for field in legacy_async_evidence_fields if field in async_training
+    )
+    if present_legacy_fields:
+        raise ValueError(
+            "legacy no-op async evidence config must be absent on latest veRL: "
+            + ", ".join(present_legacy_fields)
+        )
 
     actor_model = str(_at(config, "actor_rollout_ref.model.path"))
     critic_model = str(_at(config, "critic.model.path"))
@@ -476,7 +514,8 @@ def verify_resolved_config(
         "standalone_rollout_gpus": standalone_rollout_gpus,
         "dynamic_hybrid_enabled": True,
         "gradient_checkpointing": {"actor": True, "critic": True},
-        "fsdp2_reshard_after_forward": {"actor": True, "critic": False},
+        "rollout_backend": "sglang",
+        "fsdp2_reshard_after_forward": {"actor": True, "critic": True},
         "fused_kernels": {
             "actor": actor_fused,
             "critic": critic_fused,
@@ -550,7 +589,16 @@ def inspect_schedule(
                     f"AMG schedule_position drift at row {position}: "
                     f"{extra.get('schedule_position')!r}"
                 )
-            if extra.get("index") != row.get("data_idx"):
+            data_idx = row.get("data_idx")
+            if (
+                not isinstance(data_idx, int)
+                or isinstance(data_idx, bool)
+                or data_idx < 0
+            ):
+                raise ValueError(
+                    f"AMG schedule row {position} has invalid data_idx {data_idx!r}"
+                )
+            if extra.get("index") != data_idx:
                 raise ValueError(f"AMG schedule index/data_idx drift at row {position}")
             row_role = extra.get("role")
             if row_role not in {"gate_only", "train_pool"}:

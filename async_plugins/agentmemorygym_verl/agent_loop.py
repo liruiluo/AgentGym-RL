@@ -22,7 +22,6 @@ from verl.experimental.agent_loop.agent_loop import (
     AgentLoopOutput,
 )
 from verl.utils.tokenizer import normalize_token_ids
-from verl.utils.tokenizer.chat_template import apply_chat_template
 from verl.workers.rollout.replica import TokenOutput
 
 from .env_client import create_env_client
@@ -187,18 +186,11 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
         self._envelope_tokens: int | None = None
 
     def _render_prompt_sync(self, messages: list[dict[str, str]]) -> list[int]:
-        if self.enable_continuous_token:
-            return normalize_token_ids(
-                self.continuous_token_builder.build_initial_tokens(messages)
-            )
+        # Latest veRL always routes AgentLoop tokenization through its native
+        # Continuous Token builder. Qwen3.5 selection is inferred from the
+        # root Hugging Face model_type by AgentLoopWorker.
         return normalize_token_ids(
-            apply_chat_template(
-                self.tokenizer,
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                **self.apply_chat_template_kwargs,
-            )
+            self.continuous_token_builder.build_initial_tokens(messages)
         )
 
     def _prompt_for_candidate(
@@ -227,9 +219,6 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
         next_messages: list[dict[str, str]],
         verify: bool,
     ) -> list[int]:
-        if not self.enable_continuous_token:
-            return self._render_prompt_sync(next_messages)
-
         assistant_messages = prepared_messages + [
             {"role": "assistant", "content": action}
         ]
