@@ -23,7 +23,7 @@ class TestAMGFullyAsyncIdentity(unittest.TestCase):
     def test_verl_pin_contains_reviewed_fully_async_critic_and_masked_fused_head(self):
         self.assertEqual(
             EXPECTED_VERL_COMMIT,
-            "949a576c5c9b1c919f685f46430dc209a87112e1",
+            "a5d9f6a1a24d20164e2ec917b17922fd7eb9cac5",
         )
 
     def test_only_reviewed_verl_and_model_bytes_are_module_constants(self):
