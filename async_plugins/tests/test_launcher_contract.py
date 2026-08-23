@@ -21,6 +21,8 @@ from agentmemorygym_verl.launch import (
     _load_multitask_identity,
     _parse_args,
     _partition_selected_file_hashes,
+    _preserve_legacy_runtime_preflight_fields,
+    _require_exact_multitask_outer_commit,
     _validate_accelerator_runtime,
     build_overrides,
     build_runtime_env,
@@ -696,6 +698,7 @@ class TestAMGMultitaskLauncherContract(unittest.TestCase):
             "sha256": schedule_sha256,
             "count": row_count,
             "role": role,
+            "panel_id": "multitask-panel",
             "route_order": list(self.ROUTES),
             "per_route_counts": {
                 route_id: rows_per_route for route_id in self.ROUTES
@@ -812,6 +815,105 @@ class TestAMGMultitaskLauncherContract(unittest.TestCase):
                 _load_launch_identity(inputs, schedule_report=schedule_report),
                 identity,
             )
+
+    def _rewrite_multitask_certificate(
+        self, inputs: LaunchInputs, source_lock: dict, certificate: dict
+    ) -> None:
+        assert inputs.multitask_schedule_certificate is not None
+        assert inputs.multitask_source_lock is not None
+        inputs.multitask_schedule_certificate.write_text(
+            json.dumps(certificate, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        source_lock["integration"]["schedule_certificate"]["sha256"] = (
+            hashlib.sha256(inputs.multitask_schedule_certificate.read_bytes()).hexdigest()
+        )
+        inputs.multitask_source_lock.write_text(
+            json.dumps(source_lock, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+    def test_multitask_identity_validates_panel_and_source_repetition_contract(self):
+        mutations = (
+            (
+                "panel",
+                lambda certificate: certificate.__setitem__(
+                    "panel_id", "wrong-panel"
+                ),
+                "panel_id drifted",
+            ),
+            (
+                "source row count",
+                lambda certificate: certificate["sources"]["webshop"].__setitem__(
+                    "source_row_count", 0
+                ),
+                "source_row_count",
+            ),
+            (
+                "repetition type",
+                lambda certificate: certificate["sources"]["webshop"].__setitem__(
+                    "allow_repetition", "true"
+                ),
+                "allow_repetition must be boolean",
+            ),
+            (
+                "repetition permission",
+                lambda certificate: certificate["sources"]["webshop"].update(
+                    source_row_count=1, allow_repetition=False
+                ),
+                "would exhaust",
+            ),
+        )
+        for label, mutate, error in mutations:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                inputs, schedule_report, source_lock = self._identity_fixture(
+                    Path(directory)
+                )
+                assert inputs.multitask_schedule_certificate is not None
+                certificate = json.loads(
+                    inputs.multitask_schedule_certificate.read_text(encoding="utf-8")
+                )
+                mutate(certificate)
+                self._rewrite_multitask_certificate(
+                    inputs, source_lock, certificate
+                )
+                with self.assertRaisesRegex((TypeError, ValueError), error):
+                    _load_multitask_identity(
+                        inputs, schedule_report=schedule_report
+                    )
+
+    def test_multitask_outer_commit_must_equal_locked_commit(self):
+        exact = "a" * 40
+        _require_exact_multitask_outer_commit(
+            launch_identity_schema="amg_multitask_source_identity_v1",
+            publication_outer_commit=exact,
+            observed_outer_commit=exact,
+        )
+        with self.assertRaisesRegex(RuntimeError, "exact outer commit"):
+            _require_exact_multitask_outer_commit(
+                launch_identity_schema="amg_multitask_source_identity_v1",
+                publication_outer_commit=exact,
+                observed_outer_commit="b" * 40,
+            )
+        _require_exact_multitask_outer_commit(
+            launch_identity_schema="amg_openmle_publication_identity_v3",
+            publication_outer_commit=exact,
+            observed_outer_commit="b" * 40,
+        )
+
+    def test_legacy_runtime_receipt_preserves_policy_framing_fields(self):
+        route = {
+            "route_id": "openmle_fast",
+            "policy_framing_messages": 2,
+            "policy_framing_sha256": "f" * 64,
+        }
+        normalized = _preserve_legacy_runtime_preflight_fields(
+            {"routes": [route]}, multitask=False
+        )
+        self.assertEqual(normalized["policy_framing_messages"], 2)
+        self.assertEqual(normalized["policy_framing_sha256"], "f" * 64)
+        multitask = _preserve_legacy_runtime_preflight_fields(
+            {"routes": [route]}, multitask=True
+        )
+        self.assertNotIn("policy_framing_messages", multitask)
 
     def test_multitask_identity_rejects_schedule_and_registry_substitution(self):
         with tempfile.TemporaryDirectory() as directory:

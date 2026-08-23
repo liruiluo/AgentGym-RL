@@ -530,6 +530,53 @@ def _require_regular_file(path: Path | None, *, label: str) -> Path:
     return path
 
 
+def _require_exact_multitask_outer_commit(
+    *,
+    launch_identity_schema: object,
+    publication_outer_commit: str,
+    observed_outer_commit: str,
+) -> None:
+    """Freeze the complete outer runtime for a multitask launch."""
+
+    if (
+        launch_identity_schema == "amg_multitask_source_identity_v1"
+        and observed_outer_commit != publication_outer_commit
+    ):
+        raise RuntimeError(
+            "multitask launch requires the exact outer commit from its source lock: "
+            f"expected {publication_outer_commit}, got {observed_outer_commit}"
+        )
+
+
+def _preserve_legacy_runtime_preflight_fields(
+    receipt: Mapping[str, Any], *, multitask: bool
+) -> dict[str, Any]:
+    """Keep the v5 single-route receipt surface while adding route receipts."""
+
+    normalized = dict(receipt)
+    if multitask:
+        return normalized
+    routes = normalized.get("routes")
+    if (
+        isinstance(routes, (str, bytes))
+        or not isinstance(routes, Sequence)
+        or len(routes) != 1
+        or not isinstance(routes[0], Mapping)
+    ):
+        raise RuntimeError(
+            "legacy runtime preflight must contain exactly one route receipt"
+        )
+    route = routes[0]
+    for field in ("policy_framing_messages", "policy_framing_sha256"):
+        value = route.get(field)
+        if field in normalized and normalized[field] != value:
+            raise RuntimeError(
+                f"legacy runtime preflight {field} disagrees with route receipt"
+            )
+        normalized[field] = value
+    return normalized
+
+
 def _load_multitask_identity(
     inputs: LaunchInputs, *, schedule_report: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -718,10 +765,14 @@ def _load_multitask_identity(
         != certificate_schedule_sha256
     ):
         raise ValueError("multitask source lock schedule digest drifted")
+    certificate_panel_id = certificate.get("panel_id")
+    if not isinstance(certificate_panel_id, str) or not certificate_panel_id.strip():
+        raise ValueError("multitask certificate panel_id must be non-empty text")
     expected_report = {
         "sha256": certificate_schedule_sha256,
         "count": scheduled_episode_count,
         "role": role,
+        "panel_id": certificate_panel_id,
         "route_order": list(_MULTITASK_ROUTE_IDS),
         "per_route_counts": expected_per_route_rows,
         "route_registry_sha256": registry.sha256,
@@ -752,6 +803,26 @@ def _load_multitask_identity(
         ):
             raise ValueError(
                 f"multitask route {route.route_id!r} omitted source provenance"
+            )
+        source_row_count = _require_positive_int(
+            source.get("source_row_count"),
+            field=(
+                "multitask certificate sources."
+                f"{route.route_id}.source_row_count"
+            ),
+        )
+        allow_repetition = source.get("allow_repetition")
+        if not isinstance(allow_repetition, bool):
+            raise TypeError(
+                "multitask certificate sources."
+                f"{route.route_id}.allow_repetition must be boolean"
+            )
+        scheduled_route_rows = expected_per_route_rows[route.route_id]
+        if scheduled_route_rows > source_row_count and not allow_repetition:
+            raise ValueError(
+                f"multitask route {route.route_id!r} source would exhaust at "
+                f"{source_row_count}/{scheduled_route_rows} rows without explicit "
+                "repetition"
             )
         source_schedule_sha256 = _require_sha256(
             source.get("schedule_sha256"),
@@ -1286,6 +1357,11 @@ def _verify_source(
         field="launch_identity.publication_inner_commit",
     )
     outer_commit = _git(inputs.outer_root, "rev-parse", "HEAD")
+    _require_exact_multitask_outer_commit(
+        launch_identity_schema=launch_identity.get("schema"),
+        publication_outer_commit=publication_outer_commit,
+        observed_outer_commit=outer_commit,
+    )
     ancestor = (
         subprocess.run(
             [
@@ -1697,6 +1773,9 @@ print(json.dumps({
         raise RuntimeError("AMG runtime preflight receipt is not JSON") from exc
     if not isinstance(receipt, Mapping):
         raise RuntimeError("AMG runtime preflight receipt is not an object")
+    receipt = _preserve_legacy_runtime_preflight_fields(
+        receipt, multitask=inputs.route_registry is not None
+    )
     return _validate_accelerator_runtime(
         receipt, training_runtime=training_runtime
     )
