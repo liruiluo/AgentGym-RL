@@ -15,6 +15,8 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from .routes import load_route_registry
+
 
 def _plain(value: Any) -> Any:
     if isinstance(value, Mapping):
@@ -244,67 +246,124 @@ def verify_resolved_config(
         raise ValueError(
             "actor_rollout_ref.agentgym and data.agentgym configs must match"
         )
-    for key, expected_value in {
-        "task_name": "openmle_fast",
-        "max_rounds": 30,
-        "max_observation_tokens": 8192,
-        "timeout": 240,
-        "max_retries": 2,
-    }.items():
-        if actor_agentgym.get(key) != expected_value:
-            raise ValueError(
-                f"AMG agentgym.{key} must be {expected_value!r}, "
-                f"got {actor_agentgym.get(key)!r}"
-            )
-    env_addr = str(actor_agentgym.get("env_addr", ""))
-    if not env_addr.startswith(("http://", "https://")):
-        raise ValueError("AMG agentgym.env_addr must be an HTTP endpoint")
-    expected_endpoint_role = str(expected["role"])
-    endpoint_sha_fields = (
-        "expected_manifest_sha256",
-        "expected_materializer_sha256",
-        "expected_actions_sha256",
+    has_registry = any(
+        key in actor_agentgym
+        for key in ("route_registry_path", "route_registry_sha256")
     )
-    for key in endpoint_sha_fields:
-        value = actor_agentgym.get(key)
+    route_ids: list[str] | None = None
+    route_registry_sha256: str | None = None
+    env_addr: str | None = None
+    if has_registry:
+        forbidden_global_fields = (
+            "task_name",
+            "env_addr",
+            "max_rounds",
+            "max_observation_tokens",
+            "timeout",
+            "max_retries",
+            "expected_manifest_sha256",
+            "expected_release_revision",
+            "expected_outer_commit",
+            "expected_inner_commit",
+            "expected_role",
+            "expected_executor_runtime_digest",
+            "expected_materializer_sha256",
+            "expected_actions_sha256",
+            "expected_max_observation_tokens",
+        )
+        for key in forbidden_global_fields:
+            if key in actor_agentgym:
+                raise ValueError(
+                    f"multi-environment config must not set global agentgym.{key}"
+                )
+        expected_route_ids = expected.get("route_ids")
         if (
-            not isinstance(value, str)
-            or len(value) != 64
-            or any(character not in "0123456789abcdef" for character in value)
+            isinstance(expected_route_ids, (str, bytes))
+            or not isinstance(expected_route_ids, Sequence)
         ):
-            raise ValueError(f"AMG agentgym.{key} must be a lowercase SHA-256")
-    for key in (
-        "expected_release_revision",
-        "expected_outer_commit",
-        "expected_inner_commit",
-    ):
-        value = actor_agentgym.get(key)
+            raise ValueError(
+                "multi-environment expected_budget.route_ids must be a sequence"
+            )
+        registry = load_route_registry(
+            actor_agentgym.get("route_registry_path"),
+            expected_sha256=str(actor_agentgym.get("route_registry_sha256", "")),
+            expected_route_ids=expected_route_ids,
+        )
+        if len(registry.route_ids) != 4:
+            raise ValueError(
+                "AMG multitask config requires exactly four registered routes"
+            )
+        route_ids = list(registry.route_ids)
+        route_registry_sha256 = registry.sha256
+        if route_registry_sha256 != expected.get("route_registry_sha256"):
+            raise ValueError(
+                "AMG route registry differs from the selected multitask budget"
+            )
+    else:
+        for key, expected_value in {
+            "task_name": "openmle_fast",
+            "max_rounds": 30,
+            "max_observation_tokens": 8192,
+            "timeout": 240,
+            "max_retries": 2,
+        }.items():
+            if actor_agentgym.get(key) != expected_value:
+                raise ValueError(
+                    f"AMG agentgym.{key} must be {expected_value!r}, "
+                    f"got {actor_agentgym.get(key)!r}"
+                )
+        env_addr = str(actor_agentgym.get("env_addr", ""))
+        if not env_addr.startswith(("http://", "https://")):
+            raise ValueError("AMG agentgym.env_addr must be an HTTP endpoint")
+        expected_endpoint_role = str(expected["role"])
+        endpoint_sha_fields = (
+            "expected_manifest_sha256",
+            "expected_materializer_sha256",
+            "expected_actions_sha256",
+        )
+        for key in endpoint_sha_fields:
+            value = actor_agentgym.get(key)
+            if (
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise ValueError(f"AMG agentgym.{key} must be a lowercase SHA-256")
+        for key in (
+            "expected_release_revision",
+            "expected_outer_commit",
+            "expected_inner_commit",
+        ):
+            value = actor_agentgym.get(key)
+            if (
+                not isinstance(value, str)
+                or len(value) != 40
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise ValueError(f"AMG agentgym.{key} must be a full Git revision")
+        runtime_digest = actor_agentgym.get("expected_executor_runtime_digest")
         if (
-            not isinstance(value, str)
-            or len(value) != 40
-            or any(character not in "0123456789abcdef" for character in value)
+            not isinstance(runtime_digest, str)
+            or not runtime_digest.startswith("sha256:")
+            or len(runtime_digest) != 71
+            or any(
+                character not in "0123456789abcdef"
+                for character in runtime_digest[7:]
+            )
         ):
-            raise ValueError(f"AMG agentgym.{key} must be a full Git revision")
-    runtime_digest = actor_agentgym.get("expected_executor_runtime_digest")
-    if (
-        not isinstance(runtime_digest, str)
-        or not runtime_digest.startswith("sha256:")
-        or len(runtime_digest) != 71
-        or any(character not in "0123456789abcdef" for character in runtime_digest[7:])
-    ):
-        raise ValueError(
-            "AMG agentgym.expected_executor_runtime_digest must use sha256:<hex>"
-        )
-    if actor_agentgym.get("expected_role") != expected_endpoint_role:
-        raise ValueError(
-            "AMG endpoint role must match the launch mode: "
-            f"expected {expected_endpoint_role!r}, got "
-            f"{actor_agentgym.get('expected_role')!r}"
-        )
-    if actor_agentgym.get("expected_max_observation_tokens") != 8192:
-        raise ValueError(
-            "AMG endpoint expected_max_observation_tokens must be exactly 8192"
-        )
+            raise ValueError(
+                "AMG agentgym.expected_executor_runtime_digest must use sha256:<hex>"
+            )
+        if actor_agentgym.get("expected_role") != expected_endpoint_role:
+            raise ValueError(
+                "AMG endpoint role must match the launch mode: "
+                f"expected {expected_endpoint_role!r}, got "
+                f"{actor_agentgym.get('expected_role')!r}"
+            )
+        if actor_agentgym.get("expected_max_observation_tokens") != 8192:
+            raise ValueError(
+                "AMG endpoint expected_max_observation_tokens must be exactly 8192"
+            )
 
     actor_fused = _at(config, "actor_rollout_ref.model.use_fused_kernels")
     critic_fused = _at(config, "critic.model.use_fused_kernels")
@@ -504,7 +563,7 @@ def verify_resolved_config(
     return {
         "schema": "amg_verl_fully_async_budget_v2",
         "mode": mode,
-        "role": expected_endpoint_role,
+        "role": str(expected["role"]),
         "publication_cycles": publication_cycles,
         "trigger_parameter_sync_step": trigger,
         "optimizer_updates": optimizer_updates,
@@ -526,6 +585,8 @@ def verify_resolved_config(
         "advantage_normalization": "upstream_masked_whiten",
         "model_path": actor_model,
         "env_addr": env_addr,
+        "route_ids": route_ids,
+        "route_registry_sha256": route_registry_sha256,
         "save_freq": _positive_int(expected["save_freq"], field="expected save_freq"),
         "max_actor_ckpt_to_keep": _positive_int(
             expected["max_actor_ckpt_to_keep"],
@@ -549,6 +610,8 @@ def inspect_schedule(
     expected_count: int | None = None,
     expected_sha256: str | None = None,
     expected_role: str | None = None,
+    expected_route_ids: Sequence[str] | None = None,
+    expected_route_registry_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Validate a frozen AMG JSONL schedule and return exact identity evidence."""
 
@@ -564,6 +627,33 @@ def inspect_schedule(
     item_ids: set[str] = set()
     global_indices: set[int] = set()
     route_mode: bool | None = None
+    normalized_expected_routes: tuple[str, ...] | None = None
+    if expected_route_ids is not None:
+        if isinstance(expected_route_ids, (str, bytes)):
+            raise TypeError("expected_route_ids must be a sequence, not a string")
+        normalized_expected_routes = tuple(str(value) for value in expected_route_ids)
+        if not normalized_expected_routes or any(
+            not route_id for route_id in normalized_expected_routes
+        ):
+            raise ValueError("expected_route_ids must contain non-empty route IDs")
+        if len(set(normalized_expected_routes)) != len(normalized_expected_routes):
+            raise ValueError("expected_route_ids contains duplicates")
+    if expected_route_registry_sha256 is not None:
+        if (
+            len(expected_route_registry_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in expected_route_registry_sha256
+            )
+        ):
+            raise ValueError(
+                "expected_route_registry_sha256 must be a lowercase SHA-256"
+            )
+    route_order: list[str] = []
+    per_route_counts: dict[str, int] = {}
+    per_route_provenance: dict[str, dict[str, str | None]] = {}
+    route_registry_sha256: str | None = None
+    agent_name: str | None = None
     manifest_digest: str | None = None
     panel_id: str | None = None
     role: str | None = None
@@ -612,6 +702,85 @@ def inspect_schedule(
                 route_mode = has_route
             elif route_mode != has_route:
                 raise ValueError("AMG schedule mixes routed and legacy rows")
+            if normalized_expected_routes is not None and not has_route:
+                raise ValueError(
+                    "AMG multi-environment schedule row is missing route_id"
+                )
+            if has_route:
+                route_id = str(row_route if row_route is not None else extra_route)
+                if route_id not in per_route_counts:
+                    route_order.append(route_id)
+                    per_route_counts[route_id] = 0
+                per_route_counts[route_id] += 1
+                if normalized_expected_routes is not None:
+                    expected_route = normalized_expected_routes[
+                        position % len(normalized_expected_routes)
+                    ]
+                    if route_id != expected_route:
+                        raise ValueError(
+                            "AMG schedule route order drift at row "
+                            f"{position}: expected {expected_route!r}, got {route_id!r}"
+                        )
+                    observed_agent_name = row.get("agent_name")
+                    if observed_agent_name != "amg_task_neutral_async":
+                        raise ValueError(
+                            "AMG multitask schedule must select the shared "
+                            "amg_task_neutral_async AgentLoop"
+                        )
+                    if row.get("data_source") != route_id:
+                        raise ValueError(
+                            f"AMG schedule data_source drift at row {position}"
+                        )
+                    if agent_name is None:
+                        agent_name = str(observed_agent_name)
+                    elif agent_name != observed_agent_name:
+                        raise ValueError(
+                            f"AMG schedule agent_name drift at row {position}"
+                        )
+
+                    registry_digest = str(extra.get("route_registry_sha256", ""))
+                    attestation_digest = str(
+                        extra.get("route_attestation_sha256", "")
+                    )
+                    source_schedule_digest = str(
+                        extra.get("source_schedule_sha256", "")
+                    )
+                    source_manifest_digest = str(
+                        extra.get("source_manifest_digest", "")
+                    )
+                    for field, value in (
+                        ("route_registry_sha256", registry_digest),
+                        ("route_attestation_sha256", attestation_digest),
+                        ("source_schedule_sha256", source_schedule_digest),
+                        ("source_manifest_digest", source_manifest_digest),
+                    ):
+                        if len(value) != 64 or any(
+                            character not in "0123456789abcdef" for character in value
+                        ):
+                            raise ValueError(
+                                f"AMG schedule row {position} has invalid {field}"
+                            )
+                    if route_registry_sha256 is None:
+                        route_registry_sha256 = registry_digest
+                    elif route_registry_sha256 != registry_digest:
+                        raise ValueError(
+                            f"AMG schedule route registry drift at row {position}"
+                        )
+                    provenance = {
+                        "route_attestation_sha256": attestation_digest,
+                        "source_schedule_sha256": source_schedule_digest,
+                        "source_manifest_digest": source_manifest_digest,
+                        "source_panel_id": (
+                            str(extra["source_panel_id"])
+                            if extra.get("source_panel_id") is not None
+                            else None
+                        ),
+                    }
+                    previous = per_route_provenance.setdefault(route_id, provenance)
+                    if previous != provenance:
+                        raise ValueError(
+                            f"AMG schedule route provenance drift for {route_id!r}"
+                        )
 
             raw_global_index = extra.get("index")
             if (
@@ -678,6 +847,22 @@ def inspect_schedule(
         raise ValueError(
             f"AMG schedule must contain {expected_count} rows, got {count}"
         )
+    if normalized_expected_routes is not None:
+        if tuple(route_order) != normalized_expected_routes:
+            raise ValueError(
+                "AMG schedule route order mismatch: "
+                f"{tuple(route_order)!r} != {normalized_expected_routes!r}"
+            )
+        if set(per_route_counts) != set(normalized_expected_routes):
+            raise ValueError("AMG schedule does not contain every expected route")
+    if (
+        expected_route_registry_sha256 is not None
+        and route_registry_sha256 != expected_route_registry_sha256
+    ):
+        raise ValueError(
+            "AMG schedule route registry digest mismatch: "
+            f"{route_registry_sha256!r} != {expected_route_registry_sha256!r}"
+        )
     return {
         "schema": "amg_schedule_identity_v1",
         "path": str(schedule_path.resolve()),
@@ -688,6 +873,11 @@ def inspect_schedule(
         "manifest_digest": manifest_digest,
         "panel_id": panel_id,
         "role": role,
+        "route_order": route_order,
+        "per_route_counts": per_route_counts,
+        "route_registry_sha256": route_registry_sha256,
+        "agent_name": agent_name,
+        "per_route_provenance": per_route_provenance,
         "first_schedule_position": 0,
         "last_schedule_position": count - 1,
     }

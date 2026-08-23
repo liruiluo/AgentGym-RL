@@ -11,6 +11,7 @@ from agentmemorygym_verl.config_contract import (
     inspect_schedule,
     verify_resolved_config,
 )
+from agentmemorygym_verl.routes import canonical_policy_framing_sha256
 
 
 def _endpoint_identity(role: str) -> dict:
@@ -425,6 +426,113 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "mamba_scheduler_strategy"):
             _verify(config, mode="formal")
 
+    def test_accepts_formal400_route_registry_without_global_route_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            route_ids = ("webshop", "swesmith", "literesearcher", "openmle_fast")
+            payload = {
+                "schema": "amg_route_registry_v1",
+                "agent_name": "amg_task_neutral_async",
+                "routes": [
+                    {
+                        "route_id": route_id,
+                        "max_rounds": 30,
+                        "max_observation_tokens": 8192,
+                        "policy_framing_sha256": canonical_policy_framing_sha256(
+                            [{"role": "system", "content": route_id}]
+                        ),
+                        "route_attestation_sha256": str(index + 1) * 64,
+                        "client": {
+                            "task_name": route_id,
+                            "env_addr": f"http://127.0.0.1:{65101 + index}",
+                            "timeout": 240,
+                            "max_retries": 2,
+                        },
+                    }
+                    for index, route_id in enumerate(route_ids)
+                ],
+            }
+            registry = root / "routes.json"
+            registry.write_text(
+                json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            registry_sha256 = hashlib.sha256(registry.read_bytes()).hexdigest()
+            agentgym = {
+                "route_registry_path": str(registry),
+                "route_registry_sha256": registry_sha256,
+                "route_registry_expected_ids": list(route_ids),
+            }
+            config = _config(mode="formal")
+            config["actor_rollout_ref"]["agentgym"] = copy.deepcopy(agentgym)
+            config["data"]["agentgym"] = copy.deepcopy(agentgym)
+            config["trainer"]["total_training_steps"] = 400
+            config["rollout"]["total_rollout_steps"] = 25_600
+            budget = _budget("formal")
+            budget.update(
+                publication_cycles=400,
+                optimizer_updates=400,
+                episodes=25_600,
+                route_registry_sha256=registry_sha256,
+                route_ids=list(route_ids),
+            )
+
+            report = verify_resolved_config(
+                config, mode="formal", expected_budget=budget
+            )
+
+            self.assertEqual(report["optimizer_updates"], 400)
+            self.assertEqual(report["episodes"], 25_600)
+            self.assertEqual(report["route_ids"], list(route_ids))
+            self.assertEqual(report["route_registry_sha256"], registry_sha256)
+            self.assertIsNone(report["env_addr"])
+
+    def test_multitask_registry_rejects_legacy_global_route_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            route_ids = ("webshop", "swesmith", "literesearcher", "openmle_fast")
+            payload = {
+                "schema": "amg_route_registry_v1",
+                "agent_name": "amg_task_neutral_async",
+                "routes": [
+                    {
+                        "route_id": route_id,
+                        "max_rounds": 30,
+                        "max_observation_tokens": 8192,
+                        "policy_framing_sha256": "a" * 64,
+                        "route_attestation_sha256": str(index + 1) * 64,
+                        "client": {
+                            "task_name": route_id,
+                            "env_addr": f"http://127.0.0.1:{65101 + index}",
+                        },
+                    }
+                    for index, route_id in enumerate(route_ids)
+                ],
+            }
+            registry = root / "routes.json"
+            registry.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            digest = hashlib.sha256(registry.read_bytes()).hexdigest()
+            agentgym = {
+                "route_registry_path": str(registry),
+                "route_registry_sha256": digest,
+                "route_registry_expected_ids": list(route_ids),
+                "env_addr": "http://127.0.0.1:65525",
+            }
+            config = _config(mode="formal")
+            config["actor_rollout_ref"]["agentgym"] = copy.deepcopy(agentgym)
+            config["data"]["agentgym"] = copy.deepcopy(agentgym)
+            config["trainer"]["total_training_steps"] = 400
+            config["rollout"]["total_rollout_steps"] = 25_600
+            budget = _budget("formal")
+            budget.update(
+                publication_cycles=400,
+                optimizer_updates=400,
+                episodes=25_600,
+                route_registry_sha256=digest,
+                route_ids=list(route_ids),
+            )
+            with self.assertRaisesRegex(ValueError, "global agentgym.env_addr"):
+                verify_resolved_config(config, mode="formal", expected_budget=budget)
+
     def test_rejects_multi_turn_disabled_before_upstream_stamps_single_turn(self):
         config = _config()
         config["actor_rollout_ref"]["rollout"]["multi_turn"]["enable"] = False
@@ -532,6 +640,84 @@ class TestAMGScheduleContract(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "global index"):
                 inspect_schedule(path, expected_count=2)
+
+    def test_multienvironment_schedule_reports_route_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "multienv.jsonl"
+            route_ids = ("webshop", "swesmith", "literesearcher", "openmle_fast")
+            registry_sha256 = "f" * 64
+            rows = []
+            for position in range(8):
+                route_id = route_ids[position % 4]
+                rows.append(
+                    {
+                        "index": position,
+                        "data_idx": position // 4,
+                        "route_id": route_id,
+                        "data_source": route_id,
+                        "agent_name": "amg_task_neutral_async",
+                        "extra_info": {
+                            "index": position,
+                            "route_id": route_id,
+                            "manifest_digest": "a" * 64,
+                            "panel_id": "multienv-train",
+                            "role": "train_pool",
+                            "schedule_position": position,
+                            "route_registry_sha256": registry_sha256,
+                            "route_attestation_sha256": str(
+                                route_ids.index(route_id) + 1
+                            )
+                            * 64,
+                            "source_schedule_sha256": str(
+                                route_ids.index(route_id) + 5
+                            )
+                            * 64,
+                            "source_manifest_digest": "9abc"[
+                                route_ids.index(route_id)
+                            ]
+                            * 64,
+                            "source_panel_id": f"source-{route_id}",
+                        },
+                        "item_id": f"{route_id}:task-{position}",
+                    }
+                )
+            path.write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+
+            report = inspect_schedule(
+                path,
+                expected_count=8,
+                expected_route_ids=route_ids,
+                expected_route_registry_sha256=registry_sha256,
+            )
+
+            self.assertEqual(report["route_order"], list(route_ids))
+            self.assertEqual(
+                report["per_route_counts"], {route_id: 2 for route_id in route_ids}
+            )
+            self.assertEqual(report["route_registry_sha256"], registry_sha256)
+            self.assertEqual(report["agent_name"], "amg_task_neutral_async")
+            self.assertEqual(
+                report["per_route_provenance"]["webshop"],
+                {
+                    "route_attestation_sha256": "1" * 64,
+                    "source_schedule_sha256": "5" * 64,
+                    "source_manifest_digest": "9" * 64,
+                    "source_panel_id": "source-webshop",
+                },
+            )
+
+            rows[5]["route_id"] = "webshop"
+            rows[5]["extra_info"]["route_id"] = "webshop"
+            rows[5]["data_source"] = "webshop"
+            path.write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "route order"):
+                inspect_schedule(path, expected_route_ids=route_ids)
 
     def test_rejects_schedule_position_drift(self):
         with tempfile.TemporaryDirectory() as directory:

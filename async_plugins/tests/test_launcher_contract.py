@@ -17,12 +17,15 @@ from agentmemorygym_verl.identity import (
 from agentmemorygym_verl.launch import (
     LaunchInputs,
     _load_endpoint_identity,
+    _load_launch_identity,
+    _load_multitask_identity,
     _parse_args,
     _partition_selected_file_hashes,
     _validate_accelerator_runtime,
     build_overrides,
     build_runtime_env,
 )
+from agentmemorygym_verl.routes import canonical_policy_framing_sha256
 
 FIXTURES = Path("/tmp/openmle-v8-launch-fixtures-20260818")
 
@@ -552,6 +555,311 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
         self.assertIn("foreign Ray/inference-engine residue", text)
         self.assertNotIn("export VLLM_", text)
         self.assertNotIn("PROCESS_OWNER=amg-verl-v090", text)
+
+
+class TestAMGMultitaskLauncherContract(unittest.TestCase):
+    ROUTES = ("webshop", "swesmith", "literesearcher", "openmle_fast")
+
+    @staticmethod
+    def _values(overrides: list[str]) -> dict[str, str]:
+        return {
+            key.lstrip("+"): value
+            for key, value in (item.split("=", 1) for item in overrides)
+        }
+
+    def _registry(self, root: Path) -> tuple[Path, str]:
+        payload = {
+            "schema": "amg_route_registry_v1",
+            "agent_name": "amg_task_neutral_async",
+            "routes": [
+                {
+                    "route_id": route_id,
+                    "max_rounds": 30,
+                    "max_observation_tokens": 8192,
+                    "policy_framing_sha256": canonical_policy_framing_sha256(
+                        [{"role": "system", "content": route_id}]
+                    ),
+                    "route_attestation_sha256": str(index + 1) * 64,
+                    "client": {
+                        "task_name": route_id,
+                        "env_addr": f"http://127.0.0.1:{65101 + index}",
+                        "timeout": 240,
+                        "max_retries": 2,
+                    },
+                }
+                for index, route_id in enumerate(self.ROUTES)
+            ],
+        }
+        path = root / "routes.json"
+        path.write_text(
+            json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        return path, hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def _identity_fixture(
+        self, root: Path, *, mode: str = "formal"
+    ) -> tuple[LaunchInputs, dict, dict]:
+        registry, registry_sha256 = self._registry(root)
+        updates = 400 if mode == "formal" else 1
+        role = "train_pool" if mode == "formal" else "gate_only"
+        row_count = updates * 64
+        rows_per_route = row_count // len(self.ROUTES)
+        schedule_sha256 = "e" * 64
+        spec_sha256 = "d" * 64
+        sources = {
+            route_id: {
+                "schedule_sha256": str(index + 5) * 64,
+                "route_attestation_sha256": str(index + 1) * 64,
+                "source_row_count": rows_per_route,
+                "allow_repetition": True,
+            }
+            for index, route_id in enumerate(self.ROUTES)
+        }
+        certificate = {
+            "schema": "amg_multitask_schedule_certificate_v1",
+            "spec_sha256": spec_sha256,
+            "schedule_sha256": schedule_sha256,
+            "route_registry_sha256": registry_sha256,
+            "role": role,
+            "panel_id": "multitask-panel",
+            "agent_name": "amg_task_neutral_async",
+            "optimizer_updates": updates,
+            "samples_per_update": 64,
+            "row_count": row_count,
+            "route_order": list(self.ROUTES),
+            "per_route_rows": {
+                route_id: rows_per_route for route_id in self.ROUTES
+            },
+            "sources": sources,
+        }
+        certificate_path = root / "multitask-schedule-certificate.json"
+        certificate_path.write_text(
+            json.dumps(certificate, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        certificate_sha256 = hashlib.sha256(
+            certificate_path.read_bytes()
+        ).hexdigest()
+        source_lock = {
+            "schema": "amg_multitask_launcher_source_lock_v1",
+            "status": "pass",
+            "runtime_source": {
+                "outer_commit": "a" * 40,
+                "inner_commit": "b" * 40,
+                "verl_commit": EXPECTED_VERL_COMMIT,
+                "selected_files": {
+                    "outer:async_plugins/agentmemorygym_verl/routes.py": "1" * 64,
+                    "inner:agentenv/agentenv/envs/swesmith.py": "2" * 64,
+                },
+            },
+            "training_runtime": {
+                "base_model": "/models/Qwen3.5-4B",
+                "python": "/runtime/bin/python3.12",
+                "site_packages": "/runtime/lib/python3.12/site-packages",
+                "bundle_sha256": "3" * 64,
+                "bundle_sha256_file": "/runtime/runtime.sha256",
+                "gpu_count": 8,
+                "gpu_type": "B300",
+            },
+            "integration": {
+                "route_registry": {
+                    "sha256": registry_sha256,
+                    "route_ids": list(self.ROUTES),
+                },
+                "schedule_certificate": {
+                    "sha256": certificate_sha256,
+                    "schedule_sha256": schedule_sha256,
+                },
+            },
+        }
+        source_lock_path = root / "multitask-source-lock.json"
+        source_lock_path.write_text(
+            json.dumps(source_lock, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        inputs = LaunchInputs(
+            mode=mode,
+            verl_root=root / "verl",
+            outer_root=root / "outer",
+            schedule=root / "multitask.jsonl",
+            env_addr=None,
+            run_dir=root / "run",
+            experiment_name=f"multitask-{mode}",
+            endpoint_source_lock=None,
+            endpoint_contract_tool=None,
+            publication_receipt=None,
+            formal_schedule_certificate=None,
+            route_registry=registry,
+            route_registry_sha256=registry_sha256,
+            multitask_source_lock=source_lock_path,
+            multitask_schedule_certificate=certificate_path,
+        )
+        schedule_report = {
+            "sha256": schedule_sha256,
+            "count": row_count,
+            "role": role,
+            "route_order": list(self.ROUTES),
+            "per_route_counts": {
+                route_id: rows_per_route for route_id in self.ROUTES
+            },
+            "route_registry_sha256": registry_sha256,
+            "agent_name": "amg_task_neutral_async",
+            "manifest_digest": spec_sha256,
+            "per_route_provenance": {
+                route_id: {
+                    "route_attestation_sha256": source[
+                        "route_attestation_sha256"
+                    ],
+                    "source_schedule_sha256": source["schedule_sha256"],
+                    "source_manifest_digest": str(index + 9) * 64,
+                    "source_panel_id": f"source-{route_id}",
+                }
+                for index, (route_id, source) in enumerate(sources.items())
+            },
+        }
+        return inputs, schedule_report, source_lock
+
+    def test_multitask_overrides_propagate_registry_without_global_route(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry, registry_sha256 = self._registry(root)
+            inputs = LaunchInputs(
+                mode="formal",
+                verl_root=root / "verl",
+                outer_root=root / "outer",
+                schedule=root / "formal400.jsonl",
+                env_addr=None,
+                run_dir=root / "run",
+                experiment_name="multitask400",
+                endpoint_source_lock=None,
+                endpoint_contract_tool=None,
+                publication_receipt=None,
+                formal_schedule_certificate=None,
+                route_registry=registry,
+                route_registry_sha256=registry_sha256,
+            )
+            budget = {
+                "publication_cycles": 400,
+                "trigger_parameter_sync_step": 1,
+                "optimizer_updates": 400,
+                "samples_per_update": 64,
+                "episodes": 25_600,
+                "save_freq": 10,
+                "max_actor_ckpt_to_keep": 1,
+                "max_critic_ckpt_to_keep": 1,
+            }
+            values = self._values(
+                build_overrides(
+                    inputs,
+                    effective_schedule=inputs.schedule,
+                    endpoint_client_config=None,
+                    budget_contract=budget,
+                    training_runtime={"base_model": "/models/Qwen3.5-4B"},
+                )
+            )
+
+            for prefix in ("actor_rollout_ref", "data"):
+                self.assertEqual(
+                    values[f"{prefix}.agentgym.route_registry_path"],
+                    json.dumps(str(registry.resolve())),
+                )
+                self.assertEqual(
+                    values[f"{prefix}.agentgym.route_registry_sha256"],
+                    json.dumps(registry_sha256),
+                )
+                self.assertEqual(
+                    json.loads(values[f"{prefix}.agentgym.route_registry_expected_ids"]),
+                    list(self.ROUTES),
+                )
+                for forbidden in (
+                    "task_name",
+                    "env_addr",
+                    "max_rounds",
+                    "max_observation_tokens",
+                ):
+                    self.assertNotIn(f"{prefix}.agentgym.{forbidden}", values)
+            self.assertEqual(values["trainer.total_training_steps"], "400")
+            self.assertEqual(values["rollout.total_rollout_steps"], "25600")
+            self.assertEqual(
+                values["actor_rollout_ref.rollout.agent.default_agent_loop"],
+                "amg_task_neutral_async",
+            )
+            self.assertEqual(values["data.shuffle"], "False")
+
+    def test_multitask_identity_binds_formal400_sources_runtime_and_routes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inputs, schedule_report, source_lock = self._identity_fixture(
+                Path(directory)
+            )
+
+            identity = _load_multitask_identity(
+                inputs, schedule_report=schedule_report
+            )
+
+            self.assertEqual(identity["schema"], "amg_multitask_source_identity_v1")
+            self.assertEqual(identity["route_ids"], list(self.ROUTES))
+            self.assertIsNone(identity["client_config"])
+            self.assertEqual(identity["environment"], {})
+            self.assertEqual(
+                identity["selected_files"],
+                source_lock["runtime_source"]["selected_files"],
+            )
+            budget = identity["budget_contract"]
+            self.assertEqual(budget["optimizer_updates"], 400)
+            self.assertEqual(budget["samples_per_update"], 64)
+            self.assertEqual(budget["episodes"], 25_600)
+            self.assertEqual(budget["publication_cycles"], 400)
+            self.assertEqual(budget["route_ids"], list(self.ROUTES))
+            self.assertEqual(
+                _load_launch_identity(inputs, schedule_report=schedule_report),
+                identity,
+            )
+
+    def test_multitask_identity_rejects_schedule_and_registry_substitution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inputs, schedule_report, _ = self._identity_fixture(Path(directory))
+            mutated_report = dict(schedule_report, sha256="0" * 64)
+            with self.assertRaisesRegex(ValueError, "schedule sha256 drifted"):
+                _load_multitask_identity(
+                    inputs, schedule_report=mutated_report
+                )
+
+            source_lock = json.loads(inputs.multitask_source_lock.read_text())
+            source_lock["integration"]["route_registry"]["sha256"] = "0" * 64
+            inputs.multitask_source_lock.write_text(
+                json.dumps(source_lock, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "registry digest drifted"):
+                _load_multitask_identity(inputs, schedule_report=schedule_report)
+
+    def test_multitask_cli_does_not_require_openmle_global_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inputs, _, _ = self._identity_fixture(Path(directory))
+            parsed = _parse_args(
+                [
+                    "--mode",
+                    "formal",
+                    "--verl-root",
+                    str(inputs.verl_root),
+                    "--schedule",
+                    str(inputs.schedule),
+                    "--run-dir",
+                    str(inputs.run_dir),
+                    "--experiment-name",
+                    inputs.experiment_name,
+                    "--route-registry",
+                    str(inputs.route_registry),
+                    "--route-registry-sha256",
+                    str(inputs.route_registry_sha256),
+                    "--multitask-source-lock",
+                    str(inputs.multitask_source_lock),
+                    "--multitask-schedule-certificate",
+                    str(inputs.multitask_schedule_certificate),
+                    "--resolve-only",
+                    "--skip-runtime-preflight",
+                ]
+            )
+            self.assertIsNone(parsed.env_addr)
+            self.assertIsNone(parsed.endpoint_source_lock)
+            self.assertTrue(parsed.skip_runtime_preflight)
 
 
 if __name__ == "__main__":

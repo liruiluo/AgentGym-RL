@@ -29,8 +29,17 @@ from .identity import (
     validate_training_runtime_lock,
     verify_hash_manifest,
 )
+from .routes import load_route_registry
 
 _ENDPOINT_SOURCE_LOCK_SCHEMA = "openmle_fast_launcher_source_lock_v1"
+_MULTITASK_SOURCE_LOCK_SCHEMA = "amg_multitask_launcher_source_lock_v1"
+_MULTITASK_SCHEDULE_CERTIFICATE_SCHEMA = "amg_multitask_schedule_certificate_v1"
+_MULTITASK_ROUTE_IDS = (
+    "webshop",
+    "swesmith",
+    "literesearcher",
+    "openmle_fast",
+)
 _ENDPOINT_ENV_FIELDS = {
     "expected_manifest_sha256": "OPENMLE_FAST_TASK_MANIFEST_SHA256",
     "expected_release_revision": "OPENMLE_FAST_RELEASE_REVISION",
@@ -68,17 +77,21 @@ class LaunchInputs:
     verl_root: Path
     outer_root: Path
     schedule: Path
-    env_addr: str
+    env_addr: str | None
     run_dir: Path
     experiment_name: str
-    endpoint_source_lock: Path
-    endpoint_contract_tool: Path
-    publication_receipt: Path
-    formal_schedule_certificate: Path
+    endpoint_source_lock: Path | None
+    endpoint_contract_tool: Path | None
+    publication_receipt: Path | None
+    formal_schedule_certificate: Path | None
     trainer_gpus: int = 6
     standalone_rollout_gpus: int = 2
     actor_use_fused_kernels: bool = False
     critic_use_fused_kernels: bool = False
+    route_registry: Path | None = None
+    route_registry_sha256: str | None = None
+    multitask_source_lock: Path | None = None
+    multitask_schedule_certificate: Path | None = None
 
 
 def _string(value: str | Path) -> str:
@@ -92,7 +105,7 @@ def build_overrides(
     inputs: LaunchInputs,
     *,
     effective_schedule: Path,
-    endpoint_client_config: Mapping[str, str | int],
+    endpoint_client_config: Mapping[str, str | int] | None,
     budget_contract: Mapping[str, Any],
     training_runtime: Mapping[str, Any],
 ) -> list[str]:
@@ -163,17 +176,49 @@ def build_overrides(
         / "config"
         / "amg_task_neutral_agent_loop.yaml"
     )
-    env_addr = _string(inputs.env_addr.rstrip("/"))
-
-    agentgym = {
-        "task_name": "openmle_fast",
-        "env_addr": env_addr,
-        "max_rounds": 30,
-        "max_observation_tokens": _MAX_OBSERVATION_TOKENS,
-        "timeout": 240,
-        "max_retries": 2,
-        **endpoint_client_config,
-    }
+    if (inputs.route_registry is None) != (inputs.route_registry_sha256 is None):
+        raise ValueError(
+            "route_registry and route_registry_sha256 must be provided together"
+        )
+    if inputs.route_registry is not None:
+        if inputs.env_addr is not None:
+            raise ValueError(
+                "multi-environment launch must not set a global env_addr"
+            )
+        if endpoint_client_config:
+            raise ValueError(
+                "multi-environment launch must not set a global endpoint client config"
+            )
+        registry = load_route_registry(
+            inputs.route_registry,
+            expected_sha256=str(inputs.route_registry_sha256),
+        )
+        if len(registry.route_ids) != 4:
+            raise ValueError(
+                "AMG multitask launch requires exactly four registered routes"
+            )
+        agentgym: dict[str, Any] = {
+            "route_registry_path": str(registry.source_path),
+            "route_registry_sha256": registry.sha256,
+            "route_registry_expected_ids": list(registry.route_ids),
+        }
+    else:
+        if inputs.env_addr is None:
+            raise ValueError("single-environment launch requires env_addr")
+        if endpoint_client_config is None:
+            raise ValueError(
+                "single-environment launch requires endpoint client config"
+            )
+        env_addr = _string(inputs.env_addr.rstrip("/"))
+        agentgym = {
+            "task_name": "openmle_fast",
+            "env_addr": env_addr,
+            "max_rounds": 30,
+            "max_observation_tokens": _MAX_OBSERVATION_TOKENS,
+            "timeout": 240,
+            "max_retries": 2,
+            **endpoint_client_config,
+        }
     overrides = [
         f"data.train_files={schedule_path}",
         f"data.val_files={schedule_path}",
@@ -361,8 +406,8 @@ def build_overrides(
     for prefix in ("actor_rollout_ref", "data"):
         for key, value in agentgym.items():
             rendered = (
-                json.dumps(value, ensure_ascii=True)
-                if isinstance(value, str)
+                json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+                if isinstance(value, (str, list, tuple, dict))
                 else str(value)
             )
             overrides.append(f"++{prefix}.agentgym.{key}={rendered}")
@@ -477,6 +522,313 @@ def _require_positive_int(value: Any, *, field: str) -> int:
     return value
 
 
+def _require_regular_file(path: Path | None, *, label: str) -> Path:
+    if path is None:
+        raise ValueError(f"{label} is required")
+    if not path.is_file() or path.is_symlink():
+        raise FileNotFoundError(f"{label} is missing or not regular: {path}")
+    return path
+
+
+def _load_multitask_identity(
+    inputs: LaunchInputs, *, schedule_report: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Resolve one immutable four-environment source/runtime identity.
+
+    The route registry and schedule certificate own environment composition.
+    The source lock owns only repository, veRL, runtime, model, and selected-file
+    identity.  This keeps the generic launcher independent of any one wrapper's
+    publication format while retaining the stricter legacy OpenMLE validator.
+    """
+
+    if inputs.mode not in _ASYNC_TUNING:
+        raise ValueError(f"unsupported launch mode {inputs.mode!r}")
+    if inputs.route_registry is None or inputs.route_registry_sha256 is None:
+        raise ValueError(
+            "multitask launch requires route_registry and route_registry_sha256"
+        )
+    if inputs.env_addr is not None:
+        raise ValueError("multitask launch must not set a global env_addr")
+    endpoint_only = {
+        "endpoint_source_lock": inputs.endpoint_source_lock,
+        "endpoint_contract_tool": inputs.endpoint_contract_tool,
+        "publication_receipt": inputs.publication_receipt,
+        "formal_schedule_certificate": inputs.formal_schedule_certificate,
+    }
+    conflicts = sorted(name for name, value in endpoint_only.items() if value is not None)
+    if conflicts:
+        raise ValueError(
+            "multitask launch must not set OpenMLE-only publication inputs: "
+            + ", ".join(conflicts)
+        )
+
+    source_lock_path = _require_regular_file(
+        inputs.multitask_source_lock, label="multitask source lock"
+    )
+    certificate_path = _require_regular_file(
+        inputs.multitask_schedule_certificate,
+        label="multitask schedule certificate",
+    )
+    registry = load_route_registry(
+        inputs.route_registry,
+        expected_sha256=inputs.route_registry_sha256,
+        expected_route_ids=_MULTITASK_ROUTE_IDS,
+    )
+    source_lock = _load_json_mapping(source_lock_path, label="multitask source lock")
+    certificate = _load_json_mapping(
+        certificate_path, label="multitask schedule certificate"
+    )
+    if (
+        source_lock.get("schema") != _MULTITASK_SOURCE_LOCK_SCHEMA
+        or source_lock.get("status") != "pass"
+    ):
+        raise ValueError("multitask source lock is not a completed v1 lock")
+    if certificate.get("schema") != _MULTITASK_SCHEDULE_CERTIFICATE_SCHEMA:
+        raise ValueError("multitask schedule certificate schema drifted")
+
+    source_lock_sha256 = _sha256(source_lock_path)
+    certificate_sha256 = _sha256(certificate_path)
+    runtime_source = source_lock.get("runtime_source")
+    integration = source_lock.get("integration")
+    raw_training_runtime = source_lock.get("training_runtime")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (runtime_source, integration, raw_training_runtime)
+    ):
+        raise ValueError("multitask source lock omitted runtime identity sections")
+    assert isinstance(runtime_source, Mapping)
+    assert isinstance(integration, Mapping)
+    assert isinstance(raw_training_runtime, Mapping)
+
+    publication_outer_commit = _require_git_revision(
+        runtime_source.get("outer_commit"), field="runtime_source.outer_commit"
+    )
+    publication_inner_commit = _require_git_revision(
+        runtime_source.get("inner_commit"), field="runtime_source.inner_commit"
+    )
+    locked_verl_commit = _require_git_revision(
+        runtime_source.get("verl_commit"), field="runtime_source.verl_commit"
+    )
+    if locked_verl_commit != EXPECTED_VERL_COMMIT:
+        raise ValueError(
+            "multitask source lock selected an unreviewed veRL commit: "
+            f"{locked_verl_commit} != {EXPECTED_VERL_COMMIT}"
+        )
+    selected_files = runtime_source.get("selected_files")
+    if not isinstance(selected_files, Mapping) or not selected_files:
+        raise ValueError("multitask source lock omitted selected runtime file hashes")
+    for identity_path, digest in selected_files.items():
+        if not isinstance(identity_path, str):
+            raise TypeError("multitask selected file identity must be text")
+        _require_sha256(digest, field=f"runtime_source.selected_files.{identity_path}")
+    selected_outer_files, selected_inner_files = _partition_selected_file_hashes(
+        selected_files
+    )
+    if not selected_outer_files or not selected_inner_files:
+        raise ValueError(
+            "multitask source lock must bind both outer and AgentGym runtime files"
+        )
+    training_runtime = validate_training_runtime_lock(raw_training_runtime)
+
+    registry_binding = integration.get("route_registry")
+    schedule_binding = integration.get("schedule_certificate")
+    if not isinstance(registry_binding, Mapping) or not isinstance(
+        schedule_binding, Mapping
+    ):
+        raise ValueError("multitask source lock omitted integration bindings")
+    bound_route_ids = registry_binding.get("route_ids")
+    if (
+        isinstance(bound_route_ids, (str, bytes))
+        or not isinstance(bound_route_ids, Sequence)
+        or tuple(str(value) for value in bound_route_ids) != _MULTITASK_ROUTE_IDS
+    ):
+        raise ValueError("multitask source lock route order drifted")
+    if (
+        _require_sha256(
+            registry_binding.get("sha256"),
+            field="integration.route_registry.sha256",
+        )
+        != registry.sha256
+    ):
+        raise ValueError("multitask source lock route registry digest drifted")
+    if (
+        _require_sha256(
+            schedule_binding.get("sha256"),
+            field="integration.schedule_certificate.sha256",
+        )
+        != certificate_sha256
+    ):
+        raise ValueError("multitask source lock schedule certificate digest drifted")
+
+    role = "gate_only" if inputs.mode == "gate" else "train_pool"
+    if certificate.get("role") != role:
+        raise ValueError(
+            "multitask schedule role mismatch: "
+            f"{certificate.get('role')!r} != {role!r}"
+        )
+    if certificate.get("agent_name") != "amg_task_neutral_async":
+        raise ValueError("multitask schedule selected a non-shared AgentLoop")
+    route_order = certificate.get("route_order")
+    if (
+        isinstance(route_order, (str, bytes))
+        or not isinstance(route_order, Sequence)
+        or tuple(str(value) for value in route_order) != _MULTITASK_ROUTE_IDS
+    ):
+        raise ValueError("multitask schedule certificate route order drifted")
+    if certificate.get("route_registry_sha256") != registry.sha256:
+        raise ValueError("multitask schedule certificate registry digest drifted")
+
+    optimizer_updates = _require_positive_int(
+        certificate.get("optimizer_updates"),
+        field="multitask certificate optimizer_updates",
+    )
+    samples_per_update = _require_positive_int(
+        certificate.get("samples_per_update"),
+        field="multitask certificate samples_per_update",
+    )
+    scheduled_episode_count = _require_positive_int(
+        certificate.get("row_count"), field="multitask certificate row_count"
+    )
+    expected_updates = 1 if inputs.mode == "gate" else 400
+    if optimizer_updates != expected_updates or samples_per_update != 64:
+        raise ValueError(
+            "multitask budget must be gate1 or formal400 with 64 episodes/update: "
+            f"updates={optimizer_updates}, samples_per_update={samples_per_update}"
+        )
+    if scheduled_episode_count != optimizer_updates * samples_per_update:
+        raise ValueError(
+            "multitask schedule rows do not conserve optimizer update budget"
+        )
+    rows_per_route = scheduled_episode_count // len(_MULTITASK_ROUTE_IDS)
+    expected_per_route_rows = {
+        route_id: rows_per_route for route_id in _MULTITASK_ROUTE_IDS
+    }
+    if certificate.get("per_route_rows") != expected_per_route_rows:
+        raise ValueError("multitask certificate per-route episode budget drifted")
+
+    certificate_schedule_sha256 = _require_sha256(
+        certificate.get("schedule_sha256"),
+        field="multitask certificate schedule_sha256",
+    )
+    if (
+        _require_sha256(
+            schedule_binding.get("schedule_sha256"),
+            field="integration.schedule_certificate.schedule_sha256",
+        )
+        != certificate_schedule_sha256
+    ):
+        raise ValueError("multitask source lock schedule digest drifted")
+    expected_report = {
+        "sha256": certificate_schedule_sha256,
+        "count": scheduled_episode_count,
+        "role": role,
+        "route_order": list(_MULTITASK_ROUTE_IDS),
+        "per_route_counts": expected_per_route_rows,
+        "route_registry_sha256": registry.sha256,
+        "agent_name": "amg_task_neutral_async",
+        "manifest_digest": _require_sha256(
+            certificate.get("spec_sha256"),
+            field="multitask certificate spec_sha256",
+        ),
+    }
+    for field, expected in expected_report.items():
+        if schedule_report.get(field) != expected:
+            raise ValueError(
+                f"multitask schedule {field} drifted: "
+                f"{schedule_report.get(field)!r} != {expected!r}"
+            )
+
+    sources = certificate.get("sources")
+    provenance = schedule_report.get("per_route_provenance")
+    if not isinstance(sources, Mapping) or not isinstance(provenance, Mapping):
+        raise ValueError("multitask schedule omitted per-route provenance")
+    if set(sources) != set(_MULTITASK_ROUTE_IDS):
+        raise ValueError("multitask certificate source routes drifted")
+    for route in registry.routes:
+        source = sources.get(route.route_id)
+        route_provenance = provenance.get(route.route_id)
+        if not isinstance(source, Mapping) or not isinstance(
+            route_provenance, Mapping
+        ):
+            raise ValueError(
+                f"multitask route {route.route_id!r} omitted source provenance"
+            )
+        source_schedule_sha256 = _require_sha256(
+            source.get("schedule_sha256"),
+            field=f"multitask certificate sources.{route.route_id}.schedule_sha256",
+        )
+        route_attestation_sha256 = _require_sha256(
+            source.get("route_attestation_sha256"),
+            field=(
+                "multitask certificate sources."
+                f"{route.route_id}.route_attestation_sha256"
+            ),
+        )
+        if route_attestation_sha256 != route.route_attestation_sha256:
+            raise ValueError(
+                f"multitask route {route.route_id!r} attestation drifted"
+            )
+        if route_provenance.get("source_schedule_sha256") != source_schedule_sha256:
+            raise ValueError(
+                f"multitask route {route.route_id!r} source schedule drifted"
+            )
+        if (
+            route_provenance.get("route_attestation_sha256")
+            != route_attestation_sha256
+        ):
+            raise ValueError(
+                f"multitask route {route.route_id!r} schedule attestation drifted"
+            )
+
+    tuning = _ASYNC_TUNING[inputs.mode]
+    trigger_parameter_sync_step = tuning["trigger_parameter_sync_step"]
+    if optimizer_updates % trigger_parameter_sync_step:
+        raise ValueError(
+            "multitask optimizer updates are not divisible by parameter-sync cadence"
+        )
+    publication_cycles = optimizer_updates // trigger_parameter_sync_step
+    budget_contract = {
+        "schema": "amg_verl_multitask_budget_contract_v1",
+        "mode": inputs.mode,
+        "role": role,
+        "publication_cycles": publication_cycles,
+        "trigger_parameter_sync_step": trigger_parameter_sync_step,
+        "optimizer_updates": optimizer_updates,
+        "samples_per_update": samples_per_update,
+        "episodes": scheduled_episode_count,
+        "save_freq": tuning["save_freq"],
+        "max_actor_ckpt_to_keep": tuning["max_actor_ckpt_to_keep"],
+        "max_critic_ckpt_to_keep": tuning["max_critic_ckpt_to_keep"],
+        "model_path": training_runtime["base_model"],
+        "route_ids": list(_MULTITASK_ROUTE_IDS),
+        "route_registry_sha256": registry.sha256,
+        "schedule_sha256": certificate_schedule_sha256,
+        "manifest_sha256": expected_report["manifest_digest"],
+        "routing_sha256": certificate_schedule_sha256,
+    }
+    return {
+        "schema": "amg_multitask_source_identity_v1",
+        "source_lock_path": str(source_lock_path),
+        "source_lock_sha256": source_lock_sha256,
+        "schedule_certificate_path": str(certificate_path),
+        "schedule_certificate_sha256": certificate_sha256,
+        "publication_outer_commit": publication_outer_commit,
+        "publication_inner_commit": publication_inner_commit,
+        "verl_commit": locked_verl_commit,
+        "route_registry_path": str(registry.source_path),
+        "route_registry_sha256": registry.sha256,
+        "route_ids": list(registry.route_ids),
+        "schedule_count": scheduled_episode_count,
+        "schedule_sha256": certificate_schedule_sha256,
+        "formal_schedule_contract": dict(certificate),
+        "budget_contract": budget_contract,
+        "client_config": None,
+        "environment": {},
+        "selected_files": dict(selected_files),
+        "training_runtime": training_runtime,
+    }
+
+
 def _load_endpoint_identity(
     inputs: LaunchInputs, *, schedule_report: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -489,8 +841,12 @@ def _load_endpoint_identity(
         (inputs.formal_schedule_certificate, "formal schedule certificate"),
     )
     for path, label in paths:
-        if not path.is_file() or path.is_symlink():
-            raise FileNotFoundError(f"{label} is missing or not regular: {path}")
+        _require_regular_file(path, label=label)
+
+    assert inputs.endpoint_source_lock is not None
+    assert inputs.endpoint_contract_tool is not None
+    assert inputs.publication_receipt is not None
+    assert inputs.formal_schedule_certificate is not None
 
     validated = subprocess.run(
         [
@@ -847,6 +1203,21 @@ def _load_endpoint_identity(
     }
 
 
+def _load_launch_identity(
+    inputs: LaunchInputs, *, schedule_report: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Select the generic multitask or strict legacy OpenMLE identity path."""
+
+    has_registry = inputs.route_registry is not None or inputs.route_registry_sha256 is not None
+    has_multitask_lock = (
+        inputs.multitask_source_lock is not None
+        or inputs.multitask_schedule_certificate is not None
+    )
+    if has_registry or has_multitask_lock:
+        return _load_multitask_identity(inputs, schedule_report=schedule_report)
+    return _load_endpoint_identity(inputs, schedule_report=schedule_report)
+
+
 def _git(root: Path, *args: str) -> str:
     completed = subprocess.run(
         ["git", "-C", str(root), *args],
@@ -860,13 +1231,13 @@ def _git(root: Path, *args: str) -> str:
 def _partition_selected_file_hashes(
     selected_files: Mapping[str, str],
 ) -> tuple[dict[str, str], dict[str, str]]:
-    """Map publication identities to their repository-relative runtime paths."""
+    """Map source-lock identities to their repository-relative runtime paths."""
 
     outer_manifest: dict[str, str] = {}
     inner_manifest: dict[str, str] = {}
     for identity_path, digest in selected_files.items():
         if not isinstance(identity_path, str) or not isinstance(digest, str):
-            raise TypeError("OpenMLE selected file manifest is malformed")
+            raise TypeError("selected runtime file manifest is malformed")
         if identity_path.startswith("inner:"):
             inner_manifest[identity_path.removeprefix("inner:")] = digest
         elif identity_path.startswith("outer:AgentGym-RL/"):
@@ -874,9 +1245,11 @@ def _partition_selected_file_hashes(
             # subdirectory in that repository, so preserve it in the relative
             # path instead of treating it as a display-only identity prefix.
             outer_manifest[identity_path.removeprefix("outer:")] = digest
+        elif identity_path.startswith("outer:"):
+            outer_manifest[identity_path.removeprefix("outer:")] = digest
         else:
             raise RuntimeError(
-                f"unsupported OpenMLE selected file identity: {identity_path!r}"
+                f"unsupported selected runtime file identity: {identity_path!r}"
             )
     return outer_manifest, inner_manifest
 
@@ -885,7 +1258,7 @@ def _verify_source(
     inputs: LaunchInputs,
     *,
     require_outer_clean: bool,
-    endpoint_identity: Mapping[str, Any],
+    launch_identity: Mapping[str, Any],
 ) -> dict[str, Any]:
     if not (inputs.verl_root / "verl" / "experimental" / "fully_async_policy").is_dir():
         raise FileNotFoundError(f"not a veRL source tree: {inputs.verl_root}")
@@ -894,17 +1267,23 @@ def _verify_source(
         raise RuntimeError(
             f"veRL commit mismatch: expected {EXPECTED_VERL_COMMIT}, got {verl_commit}"
         )
+    locked_verl_commit = launch_identity.get("verl_commit")
+    if locked_verl_commit is not None and locked_verl_commit != verl_commit:
+        raise RuntimeError(
+            "launch source lock veRL commit mismatch: "
+            f"expected {locked_verl_commit}, got {verl_commit}"
+        )
     verl_status = _git(inputs.verl_root, "status", "--porcelain")
     if verl_status:
         raise RuntimeError("veRL runtime tree must be clean after the reviewed commit")
 
     publication_outer_commit = _require_git_revision(
-        endpoint_identity.get("publication_outer_commit"),
-        field="endpoint_identity.publication_outer_commit",
+        launch_identity.get("publication_outer_commit"),
+        field="launch_identity.publication_outer_commit",
     )
     publication_inner_commit = _require_git_revision(
-        endpoint_identity.get("publication_inner_commit"),
-        field="endpoint_identity.publication_inner_commit",
+        launch_identity.get("publication_inner_commit"),
+        field="launch_identity.publication_inner_commit",
     )
     outer_commit = _git(inputs.outer_root, "rev-parse", "HEAD")
     ancestor = (
@@ -980,14 +1359,14 @@ def _verify_source(
     if agentgym_status:
         raise RuntimeError("AgentGym runtime submodule must be clean")
 
-    selected_files = endpoint_identity.get("selected_files")
+    selected_files = launch_identity.get("selected_files")
     if not isinstance(selected_files, Mapping) or not selected_files:
-        raise RuntimeError("selected OpenMLE publication omitted selected file hashes")
+        raise RuntimeError("selected launch identity omitted runtime file hashes")
     outer_manifest, inner_manifest = _partition_selected_file_hashes(selected_files)
     verified_outer_files = verify_hash_manifest(inputs.outer_root, outer_manifest)
     verified_inner_files = verify_hash_manifest(agentgym_root, inner_manifest)
 
-    raw_training_runtime = endpoint_identity.get("training_runtime")
+    raw_training_runtime = launch_identity.get("training_runtime")
     training_runtime = validate_training_runtime_lock(raw_training_runtime)
     runtime_python = Path(training_runtime["python"])
     if not runtime_python.is_file() or not os.access(runtime_python, os.X_OK):
@@ -1159,6 +1538,10 @@ from trl import AutoModelForCausalLMWithValueHead
 from agentmemorygym_verl.agent_loop import AMGTaskNeutralAgentLoop
 from agentmemorygym_verl.dataset import AMGTrajectoryDataset
 from agentmemorygym_verl.env_client import create_env_client
+from agentmemorygym_verl.routes import (
+    canonical_policy_framing_sha256,
+    load_route_registry,
+)
 from verl.trainer.ppo.core_algos import get_adv_estimator_fn
 from verl.utils.tokenizer.continuous_token_wiring import (
     create_continuous_token_builder,
@@ -1167,6 +1550,8 @@ from verl.utils.tokenizer.continuous_token_wiring import (
 
 fn = get_adv_estimator_fn("amg_action_axis_gae")
 model_path = sys.argv[1]
+registry_path = sys.argv[2]
+registry_sha256 = sys.argv[3]
 hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
 tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 continuous_token_family = infer_continuous_token_model_family(
@@ -1181,20 +1566,58 @@ if str(continuous_token_family) != "qwen35":
         "publication model must resolve to veRL native Qwen3.5 Continuous Token, "
         f"got {continuous_token_family!s}"
     )
-client_config = json.loads(__import__("os").environ["AMG_ENDPOINT_CLIENT_CONFIG_JSON"])
-client = create_env_client({
-    "task_name": "openmle_fast",
-    "env_addr": __import__("os").environ["AMG_ENV_ADDR"],
-    "timeout": 240,
-    "max_retries": 2,
-    **client_config,
-})
-try:
-    framing = client.policy_framing()
-finally:
-    client.close()
-if not isinstance(framing, list) or not framing:
-    raise RuntimeError("AMG endpoint returned empty policy framing")
+route_receipts = []
+if registry_path:
+    registry = load_route_registry(
+        registry_path,
+        expected_sha256=registry_sha256,
+    )
+    for route in registry.routes:
+        client = create_env_client(dict(route.client_config))
+        try:
+            framing = client.policy_framing()
+        finally:
+            client.close()
+        if not isinstance(framing, (list, tuple)) or not framing:
+            raise RuntimeError(
+                f"AMG route {route.route_id!r} returned empty policy framing"
+            )
+        framing_sha256 = canonical_policy_framing_sha256(framing)
+        if framing_sha256 != route.policy_framing_sha256:
+            raise RuntimeError(
+                f"AMG route {route.route_id!r} policy framing digest drifted"
+            )
+        route_receipts.append({
+            "route_id": route.route_id,
+            "task_name": str(route.client_config["task_name"]),
+            "env_addr": str(route.client_config["env_addr"]),
+            "policy_framing_messages": len(framing),
+            "policy_framing_sha256": framing_sha256,
+            "route_attestation_sha256": route.route_attestation_sha256,
+        })
+else:
+    client_config = json.loads(os.environ["AMG_ENDPOINT_CLIENT_CONFIG_JSON"])
+    client = create_env_client({
+        "task_name": "openmle_fast",
+        "env_addr": os.environ["AMG_ENV_ADDR"],
+        "timeout": 240,
+        "max_retries": 2,
+        **client_config,
+    })
+    try:
+        framing = client.policy_framing()
+    finally:
+        client.close()
+    if not isinstance(framing, (list, tuple)) or not framing:
+        raise RuntimeError("AMG endpoint returned empty policy framing")
+    route_receipts.append({
+        "route_id": "openmle_fast",
+        "task_name": "openmle_fast",
+        "env_addr": os.environ["AMG_ENV_ADDR"],
+        "policy_framing_messages": len(framing),
+        "policy_framing_sha256": canonical_policy_framing_sha256(framing),
+        "route_attestation_sha256": None,
+    })
 ninja_path = shutil.which("ninja")
 if ninja_path is None:
     raise RuntimeError("publication runtime PATH does not provide ninja")
@@ -1219,7 +1642,7 @@ print(json.dumps({
     "adv_estimator": fn.__name__,
     "agent_loop": AMGTaskNeutralAgentLoop.__name__,
     "dataset": AMGTrajectoryDataset.__name__,
-    "policy_framing_messages": len(framing),
+    "routes": route_receipts,
     "ninja_path": ninja_path,
     "cuda_home": os.environ.get("CUDA_HOME"),
     "nvcc_path": nvcc_path,
@@ -1235,11 +1658,30 @@ print(json.dumps({
 }, sort_keys=True))
 """
     probe_env = dict(env)
-    probe_env["AMG_ENV_ADDR"] = inputs.env_addr
-    if "AMG_ENDPOINT_CLIENT_CONFIG_JSON" not in probe_env:
-        raise RuntimeError("endpoint client identity was not exported for preflight")
+    registry_path = ""
+    registry_sha256 = ""
+    if inputs.route_registry is not None:
+        assert inputs.route_registry_sha256 is not None
+        registry_path = str(inputs.route_registry.resolve())
+        registry_sha256 = inputs.route_registry_sha256
+        if "AMG_ENDPOINT_CLIENT_CONFIG_JSON" in probe_env or "AMG_ENV_ADDR" in probe_env:
+            raise RuntimeError(
+                "multitask runtime preflight inherited a global endpoint identity"
+            )
+    else:
+        assert inputs.env_addr is not None
+        probe_env["AMG_ENV_ADDR"] = inputs.env_addr
+        if "AMG_ENDPOINT_CLIENT_CONFIG_JSON" not in probe_env:
+            raise RuntimeError("endpoint client identity was not exported for preflight")
     completed = subprocess.run(
-        [sys.executable, "-c", code, str(model_path)],
+        [
+            sys.executable,
+            "-c",
+            code,
+            str(model_path),
+            registry_path,
+            registry_sha256,
+        ],
         check=True,
         text=True,
         capture_output=True,
@@ -1282,12 +1724,30 @@ def prepare_launch(
     if skip_endpoint_preflight and not resolve_only:
         raise ValueError(
             "endpoint preflight may only be skipped for resolve-only checks"
-        )
+    )
     inputs.run_dir.mkdir(parents=True, exist_ok=True)
-    schedule_report = inspect_schedule(inputs.schedule)
-    endpoint_identity = _load_endpoint_identity(inputs, schedule_report=schedule_report)
-    budget_contract = endpoint_identity.get("budget_contract")
-    training_runtime = endpoint_identity.get("training_runtime")
+    if inputs.route_registry is not None:
+        if inputs.route_registry_sha256 is None:
+            raise ValueError(
+                "route_registry and route_registry_sha256 must be provided together"
+            )
+        registry = load_route_registry(
+            inputs.route_registry,
+            expected_sha256=inputs.route_registry_sha256,
+            expected_route_ids=_MULTITASK_ROUTE_IDS,
+        )
+        schedule_report = inspect_schedule(
+            inputs.schedule,
+            expected_route_ids=registry.route_ids,
+            expected_route_registry_sha256=registry.sha256,
+        )
+    else:
+        schedule_report = inspect_schedule(inputs.schedule)
+    launch_identity = _load_launch_identity(
+        inputs, schedule_report=schedule_report
+    )
+    budget_contract = launch_identity.get("budget_contract")
+    training_runtime = launch_identity.get("training_runtime")
     if not isinstance(budget_contract, Mapping):
         raise RuntimeError("publication identity omitted its async budget contract")
     if not isinstance(training_runtime, Mapping):
@@ -1298,20 +1758,27 @@ def prepare_launch(
     source_report_runtime = _verify_source(
         inputs,
         require_outer_clean=not resolve_only,
-        endpoint_identity=endpoint_identity,
+        launch_identity=launch_identity,
     )
     env = build_runtime_env(inputs, training_runtime=training_runtime)
-    env.update(endpoint_identity["environment"])
-    env["AMG_ENDPOINT_CLIENT_CONFIG_JSON"] = json.dumps(
-        endpoint_identity["client_config"],
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    identity_environment = launch_identity.get("environment")
+    if not isinstance(identity_environment, Mapping):
+        raise RuntimeError("launch identity environment must be a mapping")
+    env.update({str(key): str(value) for key, value in identity_environment.items()})
+    endpoint_client_config = launch_identity.get("client_config")
+    if endpoint_client_config is not None:
+        if not isinstance(endpoint_client_config, Mapping):
+            raise RuntimeError("launch endpoint client config must be a mapping")
+        env["AMG_ENDPOINT_CLIENT_CONFIG_JSON"] = json.dumps(
+            endpoint_client_config,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
     overrides = build_overrides(
         inputs,
         effective_schedule=inputs.schedule,
-        endpoint_client_config=endpoint_identity["client_config"],
+        endpoint_client_config=endpoint_client_config,
         budget_contract=budget_contract,
         training_runtime=training_runtime,
     )
@@ -1360,13 +1827,21 @@ def prepare_launch(
         )
     training_command = _training_command(overrides, python=runtime_python)
     receipt = {
-        "schema": "amg_verl_fully_async_launch_receipt_v5",
+        "schema": (
+            "amg_verl_fully_async_multitask_launch_receipt_v1"
+            if inputs.route_registry is not None
+            else "amg_verl_fully_async_launch_receipt_v5"
+        ),
         "entrypoint": _UPSTREAM_ENTRYPOINT,
         "inputs": {
             "mode": inputs.mode,
             "experiment_name": inputs.experiment_name,
             "model_path": str(model_path),
             "env_addr": inputs.env_addr,
+            "route_registry": (
+                str(inputs.route_registry) if inputs.route_registry is not None else None
+            ),
+            "route_registry_sha256": inputs.route_registry_sha256,
             "run_dir": str(inputs.run_dir),
             "trainer_gpus": inputs.trainer_gpus,
             "standalone_rollout_gpus": inputs.standalone_rollout_gpus,
@@ -1376,7 +1851,12 @@ def prepare_launch(
         "source": source_report_runtime,
         "plugin_manifest": _production_manifest(inputs.outer_root),
         "schedule": schedule_report,
-        "endpoint_publication": endpoint_identity,
+        "launch_identity": launch_identity,
+        "endpoint_publication": (
+            launch_identity
+            if launch_identity.get("schema") == "amg_openmle_publication_identity_v3"
+            else None
+        ),
         "budget_contract": dict(budget_contract),
         "budget": budget,
         "resolved_config": {
@@ -1407,19 +1887,28 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--verl-root", type=Path, required=True)
     parser.add_argument("--outer-root", type=Path, default=outer_default)
     parser.add_argument("--schedule", type=Path, required=True)
-    parser.add_argument("--env-addr", required=True)
+    parser.add_argument("--env-addr")
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--experiment-name", required=True)
-    parser.add_argument("--endpoint-source-lock", type=Path, required=True)
-    parser.add_argument("--endpoint-contract-tool", type=Path, required=True)
-    parser.add_argument("--publication-receipt", type=Path, required=True)
-    parser.add_argument("--formal-schedule-certificate", type=Path, required=True)
+    parser.add_argument("--endpoint-source-lock", type=Path)
+    parser.add_argument("--endpoint-contract-tool", type=Path)
+    parser.add_argument("--publication-receipt", type=Path)
+    parser.add_argument("--formal-schedule-certificate", type=Path)
+    parser.add_argument("--route-registry", type=Path)
+    parser.add_argument("--route-registry-sha256")
+    parser.add_argument("--multitask-source-lock", type=Path)
+    parser.add_argument("--multitask-schedule-certificate", type=Path)
     parser.add_argument("--trainer-gpus", type=int, default=6)
     parser.add_argument("--standalone-rollout-gpus", type=int, default=2)
     parser.add_argument("--actor-use-fused-kernels", action="store_true")
     parser.add_argument("--critic-use-fused-kernels", action="store_true")
     parser.add_argument("--resolve-only", action="store_true")
-    parser.add_argument("--skip-endpoint-preflight", action="store_true")
+    parser.add_argument(
+        "--skip-runtime-preflight",
+        "--skip-endpoint-preflight",
+        dest="skip_runtime_preflight",
+        action="store_true",
+    )
     return parser.parse_args(argv)
 
 
@@ -1433,19 +1922,49 @@ def main(argv: list[str] | None = None) -> int:
         env_addr=args.env_addr,
         run_dir=args.run_dir.resolve(),
         experiment_name=args.experiment_name,
-        endpoint_source_lock=args.endpoint_source_lock.resolve(),
-        endpoint_contract_tool=args.endpoint_contract_tool.resolve(),
-        publication_receipt=args.publication_receipt.resolve(),
-        formal_schedule_certificate=args.formal_schedule_certificate.resolve(),
+        endpoint_source_lock=(
+            args.endpoint_source_lock.resolve()
+            if args.endpoint_source_lock is not None
+            else None
+        ),
+        endpoint_contract_tool=(
+            args.endpoint_contract_tool.resolve()
+            if args.endpoint_contract_tool is not None
+            else None
+        ),
+        publication_receipt=(
+            args.publication_receipt.resolve()
+            if args.publication_receipt is not None
+            else None
+        ),
+        formal_schedule_certificate=(
+            args.formal_schedule_certificate.resolve()
+            if args.formal_schedule_certificate is not None
+            else None
+        ),
         trainer_gpus=args.trainer_gpus,
         standalone_rollout_gpus=args.standalone_rollout_gpus,
         actor_use_fused_kernels=args.actor_use_fused_kernels,
         critic_use_fused_kernels=args.critic_use_fused_kernels,
+        route_registry=(
+            args.route_registry.resolve() if args.route_registry is not None else None
+        ),
+        route_registry_sha256=args.route_registry_sha256,
+        multitask_source_lock=(
+            args.multitask_source_lock.resolve()
+            if args.multitask_source_lock is not None
+            else None
+        ),
+        multitask_schedule_certificate=(
+            args.multitask_schedule_certificate.resolve()
+            if args.multitask_schedule_certificate is not None
+            else None
+        ),
     )
     command, env, receipt = prepare_launch(
         inputs,
         resolve_only=args.resolve_only,
-        skip_endpoint_preflight=args.skip_endpoint_preflight,
+        skip_endpoint_preflight=args.skip_runtime_preflight,
     )
     if args.resolve_only:
         print(json.dumps(receipt, ensure_ascii=False, sort_keys=True))
