@@ -254,6 +254,43 @@ class TestAMGTrajectoryDataset(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "agent_name"):
             dataset[0]
 
+    def test_rejects_schedule_provenance_that_conflicts_with_registry(self):
+        dataset = self._dataset(
+            [
+                {
+                    "item_id": "task",
+                    "data_idx": 0,
+                    "extra_info": {
+                        "index": 0,
+                        "route_attestation_sha256": "b" * 64,
+                        "route_registry_sha256": "c" * 64,
+                    },
+                }
+            ]
+        )
+        route = dataset._route_registry.routes[0]
+        dataset._route_registry = RouteRegistry(
+            routes=(
+                RouteSpec(
+                    route_id=route.route_id,
+                    max_rounds=route.max_rounds,
+                    max_observation_tokens=route.max_observation_tokens,
+                    policy_framing_sha256=route.policy_framing_sha256,
+                    route_attestation_sha256="a" * 64,
+                    client_config=route.client_config,
+                ),
+            ),
+            sha256="d" * 64,
+            source_path=None,
+        )
+
+        with self.assertRaisesRegex(ValueError, "route_attestation_sha256 drift"):
+            dataset[0]
+
+        dataset.dataframe[0]["extra_info"]["route_attestation_sha256"] = "a" * 64
+        with self.assertRaisesRegex(ValueError, "route_registry_sha256 drift"):
+            dataset[0]
+
 
 if __name__ == "__main__":
     unittest.main()

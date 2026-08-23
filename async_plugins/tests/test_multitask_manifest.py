@@ -10,7 +10,7 @@ from agentmemorygym_verl.config_contract import inspect_schedule
 from agentmemorygym_verl.multitask_manifest import compose_multitask_manifest
 
 
-ROUTES = ("webshop", "swesmith", "literesearcher", "openmle-fast")
+ROUTES = ("webshop", "swesmith", "literesearcher", "openmle_fast")
 
 
 def _write_source(
@@ -29,7 +29,7 @@ def _write_source(
                 "data_source": f"legacy-{route_id}",
                 "source_family": f"family-{route_id}-{position % 2}",
                 "extra_info": {
-                    "index": position,
+                    "index": position % 2,
                     "schedule_position": position,
                     "role": role,
                     "manifest_digest": hashlib.sha256(route_id.encode()).hexdigest(),
@@ -176,6 +176,55 @@ class TestMultitaskManifest(unittest.TestCase):
                     [block % 2] * 4,
                 )
 
+    def test_source_identity_allows_shuffled_and_repeated_task_indices(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec, _ = _write_spec(
+                root,
+                source_count=3,
+                optimizer_updates=3,
+                samples_per_update=4,
+                allow_repetition=False,
+            )
+            for route_id in ROUTES:
+                source = root / f"{route_id}.jsonl"
+                rows = [json.loads(line) for line in source.read_text().splitlines()]
+                for position, row in enumerate(rows):
+                    task_index = (position * 2 + 1) % 3
+                    row["data_idx"] = task_index
+                    row["extra_info"]["index"] = task_index
+                    row["extra_info"]["schedule_repetition"] = position + 7
+                source.write_text(
+                    "\n".join(json.dumps(row) for row in rows) + "\n",
+                    encoding="utf-8",
+                )
+            payload = json.loads(spec.read_text())
+            for route in payload["routes"]:
+                route["schedule_sha256"] = hashlib.sha256(
+                    (root / f"{route['route_id']}.jsonl").read_bytes()
+                ).hexdigest()
+            spec.write_text(json.dumps(payload, sort_keys=True) + "\n")
+            spec_sha256 = hashlib.sha256(spec.read_bytes()).hexdigest()
+
+            output = root / "output.jsonl"
+            compose_multitask_manifest(
+                spec,
+                expected_spec_sha256=spec_sha256,
+                output_path=output,
+            )
+            rows = [json.loads(line) for line in output.read_text().splitlines()]
+
+            self.assertEqual(rows[0]["data_idx"], 1)
+            self.assertEqual(rows[0]["extra_info"]["source_index"], 1)
+            self.assertEqual(
+                rows[0]["extra_info"]["source_schedule_repetition_declared"], 7
+            )
+            self.assertEqual(rows[4]["data_idx"], 0)
+            self.assertEqual(rows[4]["extra_info"]["source_index"], 0)
+            self.assertEqual(
+                rows[4]["extra_info"]["source_schedule_repetition_declared"], 8
+            )
+
     def test_rejects_source_exhaustion_without_explicit_repetition(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -204,7 +253,7 @@ class TestMultitaskManifest(unittest.TestCase):
                 lambda rows: rows[1]["extra_info"].__setitem__("role", "gate_only"),
             ),
             (
-                "source global index",
+                "index/data_idx drift",
                 lambda rows: rows[1]["extra_info"].__setitem__("index", 99),
             ),
         )

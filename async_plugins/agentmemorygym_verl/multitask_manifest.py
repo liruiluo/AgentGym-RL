@@ -200,10 +200,10 @@ def _parse_source_row(
         extra.get("index"),
         field=f"route {source.route_id!r} source row {source_position} index",
     )
-    if source_index != source_position:
+    if source_index != data_idx:
         raise ValueError(
-            f"route {source.route_id!r} source global index drift at row "
-            f"{source_position}: index={source_index}"
+            f"route {source.route_id!r} source index/data_idx drift at row "
+            f"{source_position}: index={source_index}, data_idx={data_idx}"
         )
     if "index" in row and _nonnegative_int(
         row["index"],
@@ -218,6 +218,13 @@ def _parse_source_row(
             f"route {source.route_id!r} source schedule_position drift at row "
             f"{source_position}"
         )
+    source_schedule_repetition = _nonnegative_int(
+        extra.get("schedule_repetition", 0),
+        field=(
+            f"route {source.route_id!r} source row {source_position} "
+            "schedule_repetition"
+        ),
+    )
     if extra.get("role") != source.role:
         raise ValueError(
             f"route {source.route_id!r} source role drift at row {source_position}"
@@ -232,6 +239,7 @@ def _parse_source_row(
             )
     row["item_id"] = item_id
     row["data_idx"] = data_idx
+    extra["schedule_repetition"] = source_schedule_repetition
     row["extra_info"] = extra
     return row
 
@@ -415,6 +423,9 @@ def _output_row(
     source_item_id = str(row["item_id"])
     source_index = int(source_extra["index"])
     source_schedule_position = int(source_extra["schedule_position"])
+    source_schedule_repetition_declared = int(
+        source_extra.get("schedule_repetition", 0)
+    )
     source_manifest_digest = source_extra.get("manifest_digest")
     source_panel_id = source_extra.get("panel_id")
 
@@ -444,6 +455,9 @@ def _output_row(
             "source_schedule_sha256": source.sha256,
             "source_schedule_position": source_position,
             "source_schedule_repetition": source_repetition,
+            "source_schedule_repetition_declared": (
+                source_schedule_repetition_declared
+            ),
             "source_index": source_index,
             "source_item_id": source_item_id,
             "source_manifest_digest": source_manifest_digest,

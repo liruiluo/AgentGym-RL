@@ -23,6 +23,12 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 _AGENT_NAME = "amg_task_neutral_async"
 _REGISTRY_SCHEMA = "amg_route_registry_v1"
+_CANONICAL_ROUTE_IDS = (
+    "webshop",
+    "swesmith",
+    "literesearcher",
+    "openmle_fast",
+)
 _CONTROL_FIELDS = {
     "route_registry_path",
     "route_registry_sha256",
@@ -289,12 +295,25 @@ def _route_spec(raw: Any, *, require_attestation: bool) -> RouteSpec:
         raise ValueError(f"route {route_id} client.max_retries must be non-negative")
     client["max_retries"] = retries_int
     if require_attestation:
-        client_attestation = client.get("route_attestation_sha256")
-        if attestation is None and client_attestation is not None:
-            attestation = _sha256(
-                client_attestation,
+        client_attestation_raw = client.pop("route_attestation_sha256", None)
+        client_attestation = (
+            _sha256(
+                client_attestation_raw,
                 field=f"route {route_id} client.route_attestation_sha256",
             )
+            if client_attestation_raw is not None
+            else None
+        )
+        if (
+            attestation is not None
+            and client_attestation is not None
+            and attestation != client_attestation
+        ):
+            raise ValueError(
+                f"route {route_id} route attestation drift between route and client"
+            )
+        if attestation is None:
+            attestation = client_attestation
         if attestation is None:
             raise ValueError(f"route {route_id} is missing route_attestation_sha256")
     return RouteSpec(
@@ -342,6 +361,11 @@ def load_route_registry(
         source_path=registry_path.resolve(),
         agent_name=str(payload.get("agent_name", "")),
     )
+    if registry.route_ids != _CANONICAL_ROUTE_IDS:
+        raise ValueError(
+            "AMG route registry canonical route order mismatch: "
+            f"{registry.route_ids!r} != {_CANONICAL_ROUTE_IDS!r}"
+        )
     if expected_route_ids is not None:
         if isinstance(expected_route_ids, (str, bytes)):
             raise TypeError("expected_route_ids must be a sequence, not a string")
@@ -349,10 +373,10 @@ def load_route_registry(
             _route_id(value, field="expected route_id")
             for value in expected_route_ids
         )
-        if registry.route_ids != expected:
+        if expected != _CANONICAL_ROUTE_IDS:
             raise ValueError(
-                "AMG route registry route order mismatch: "
-                f"{registry.route_ids!r} != {expected!r}"
+                "expected route IDs differ from the canonical route order: "
+                f"{expected!r} != {_CANONICAL_ROUTE_IDS!r}"
             )
     return registry
 

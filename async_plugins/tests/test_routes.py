@@ -108,6 +108,22 @@ class RouteRegistryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "loopback"):
                 load_route_registry(path, expected_sha256=digest)
 
+    def test_rejects_conflicting_route_attestation_locations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            payload = _registry_payload()
+            payload["routes"][0]["client"]["route_attestation_sha256"] = "f" * 64
+            path, digest = self._write(directory, payload)
+            with self.assertRaisesRegex(ValueError, "route attestation drift"):
+                load_route_registry(path, expected_sha256=digest)
+
+    def test_file_registry_requires_canonical_four_route_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            payload = _registry_payload()
+            payload["routes"] = payload["routes"][:-1]
+            path, digest = self._write(directory, payload)
+            with self.assertRaisesRegex(ValueError, "canonical route order"):
+                load_route_registry(path, expected_sha256=digest)
+
     def test_rejects_symlink_and_missing_required_fields(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
