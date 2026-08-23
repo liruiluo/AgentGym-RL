@@ -299,7 +299,7 @@ class _FixtureTransport:
                 "done": False,
                 "info": info,
             }
-        if path == "close":
+        if path in {"close", "abort"}:
             return self.close_response
         raise AssertionError((method, path))
 

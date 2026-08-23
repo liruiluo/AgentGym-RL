@@ -6,6 +6,7 @@ import time
 from typing import Any, Callable, Mapping, Optional
 
 from .contracts import (
+    ACTION_ACCOUNTING_COUNTERS,
     AdapterClose,
     AdapterReset,
     ArtifactResult,
@@ -80,6 +81,55 @@ def exception_chain_contains(error: BaseException, kind: type) -> bool:
     return False
 
 
+def exception_chain_mapping(
+    error: BaseException,
+    attribute: str,
+) -> Optional[Mapping[str, Any]]:
+    """Return one structured attribute carried through wrapper exceptions."""
+
+    seen = set()
+    current: Optional[BaseException] = error
+    while current is not None and id(current) not in seen:
+        value = getattr(current, attribute, None)
+        if isinstance(value, Mapping):
+            return value
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def apply_action_accounting(
+    totals: dict[str, int],
+    value: Mapping[str, Any],
+) -> None:
+    """Validate and add one wrapper-authored policy-output classification."""
+
+    if set(value) != set(ACTION_ACCOUNTING_COUNTERS):
+        raise ValueError("action accounting fields are not canonical")
+    delta = dict(value)
+    if any(type(count) is not int or count < 0 for count in delta.values()):
+        raise ValueError("action accounting values must be non-negative integers")
+    if delta["successful_backend_calls"] > delta["domain_tool_attempts"]:
+        raise ValueError("backend successes exceed domain-tool attempts")
+    if delta["parser_corrections"] > delta["invalid_actions"]:
+        raise ValueError("parser corrections exceed invalid actions")
+    if delta["parsed_actions"] != (
+        delta["domain_tool_attempts"]
+        + delta["workspace_actions"]
+        + delta["answers"]
+    ):
+        raise ValueError("parsed-action accounting does not match dispatches")
+    if (
+        delta["parsed_actions"]
+        + delta["compactions"]
+        + delta["invalid_actions"]
+        != 1
+    ):
+        raise ValueError("one policy output must have exactly one classification")
+    for name in ACTION_ACCOUNTING_COUNTERS:
+        totals[name] += delta[name]
+
+
 def validate_declared_roots(
     config: RunConfig,
     namespace: Namespace,
@@ -139,6 +189,9 @@ class PairedRunner:
             "error_code": getattr(error, "code", None),
             "message": str(error),
         }
+        structured_receipt = exception_chain_mapping(error, "receipt")
+        if structured_receipt is not None:
+            payload["structured_receipt"] = dict(structured_receipt)
         reference = self.evidence_store.put_json("errors", payload)
         self.append_receipt(
             receipts,
@@ -175,7 +228,7 @@ class PairedRunner:
         receipts: list[dict[str, Any]] = []
         turns: list[dict[str, Any]] = []
         policy_turns = 0
-        tool_calls = 0
+        action_totals = {name: 0 for name in ACTION_ACCOUNTING_COUNTERS}
         prompt_tokens = 0
         response_tokens = 0
         retry_count = 0
@@ -284,6 +337,10 @@ class PairedRunner:
                     termination_reason = "horizon"
                     horizon_cause = "policy_turn_limit"
                     break
+                tool_calls = (
+                    action_totals["domain_tool_attempts"]
+                    + action_totals["workspace_actions"]
+                )
                 if tool_calls >= config.budgets.max_tool_calls:
                     termination_reason = "horizon"
                     horizon_cause = "tool_call_limit"
@@ -347,6 +404,11 @@ class PairedRunner:
                     remaining_tokens - prepared.prompt_token_count,
                     model_response_capacity,
                 )
+                if prepared.control_request is not None:
+                    response_capacity = min(
+                        response_capacity,
+                        config.compaction.summary_max_tokens,
+                    )
                 decoding = config.decoding.with_max_output_tokens(response_capacity)
 
                 try:
@@ -451,7 +513,6 @@ class PairedRunner:
                     termination_reason = "timeout"
                     break
 
-                tool_calls += 1
                 try:
                     completed = self.controller.complete(
                         adapter.client,
@@ -460,6 +521,15 @@ class PairedRunner:
                     )
                     step_output = completed.step_output
                     step_receipt = step_output.task_neutral_receipt
+                    wrapper_evidence = step_output.info.get("wrapper_evidence")
+                    if not isinstance(wrapper_evidence, Mapping):
+                        raise TypeError("environment omitted wrapper evidence")
+                    action_delta = wrapper_evidence.get(
+                        "action_accounting_delta"
+                    )
+                    if not isinstance(action_delta, Mapping):
+                        raise TypeError("environment omitted action accounting")
+                    apply_action_accounting(action_totals, action_delta)
                     if step_receipt.policy_output_sha256 != sha256_text(
                         model_output.text
                     ):
@@ -527,6 +597,15 @@ class PairedRunner:
                         },
                     )
                 except Exception as error:
+                    failure_delta = exception_chain_mapping(
+                        error,
+                        "action_accounting_delta",
+                    )
+                    if failure_delta is not None:
+                        try:
+                            apply_action_accounting(action_totals, failure_delta)
+                        except Exception as accounting_error:
+                            error = accounting_error
                     failure = self.record_error(
                         receipts,
                         stage="environment_step",
@@ -588,43 +667,47 @@ class PairedRunner:
                     failure_class=None if failure is None else failure["class"],
                     timed_out=False if failure is None else failure["timed_out"],
                     policy_turns=policy_turns,
-                    tool_calls=tool_calls,
+                    tool_calls=(
+                        action_totals["domain_tool_attempts"]
+                        + action_totals["workspace_actions"]
+                    ),
                 )
-                try:
-                    artifact_result = adapter.finalize_artifact(context)
-                    if not isinstance(artifact_result, ArtifactResult):
-                        raise TypeError(
-                            "adapter artifact finalizer must return ArtifactResult"
-                        )
-                    if artifact_result.artifact_type != config.task.artifact_type:
-                        raise ValueError("adapter returned the wrong artifact type")
-                    artifact_receipt = self.append_receipt(
-                        receipts,
-                        "artifact",
-                        {
-                            "artifact_type": artifact_result.artifact_type,
-                            "artifact": {
-                                "protected_ref": artifact_result.protected_ref,
-                                "sha256": artifact_result.sha256,
+                if failure is None and termination_reason in {"terminal", "horizon"}:
+                    try:
+                        artifact_result = adapter.finalize_artifact(context)
+                        if not isinstance(artifact_result, ArtifactResult):
+                            raise TypeError(
+                                "adapter artifact finalizer must return ArtifactResult"
+                            )
+                        if artifact_result.artifact_type != config.task.artifact_type:
+                            raise ValueError("adapter returned the wrong artifact type")
+                        artifact_receipt = self.append_receipt(
+                            receipts,
+                            "artifact",
+                            {
+                                "artifact_type": artifact_result.artifact_type,
+                                "artifact": {
+                                    "protected_ref": artifact_result.protected_ref,
+                                    "sha256": artifact_result.sha256,
+                                },
+                                "adapter_receipt": artifact_result.receipt,
                             },
-                            "adapter_receipt": artifact_result.receipt,
-                        },
-                    )
-                    final_artifact = {
-                        "type": artifact_result.artifact_type,
-                        "protected_ref": artifact_result.protected_ref,
-                        "sha256": artifact_result.sha256,
-                        "receipt_ref": artifact_receipt["protected_ref"],
-                    }
-                except Exception as error:
-                    artifact_error = self.record_error(
-                        receipts,
-                        stage="artifact",
-                        failure_class="artifact_failure",
-                        error=error,
-                    )
-                    if failure is None:
-                        failure = artifact_error
+                        )
+                        final_artifact = {
+                            "type": artifact_result.artifact_type,
+                            "protected_ref": artifact_result.protected_ref,
+                            "sha256": artifact_result.sha256,
+                            "receipt_ref": artifact_receipt["protected_ref"],
+                        }
+                    except Exception as error:
+                        artifact_error = self.record_error(
+                            receipts,
+                            stage="artifact",
+                            failure_class="artifact_failure",
+                            error=error,
+                        )
+                        if failure is None:
+                            failure = artifact_error
 
                 if final_artifact is not None:
                     try:
@@ -642,6 +725,10 @@ class PairedRunner:
                             raise ValueError(
                                 "scorer identity does not match grader config"
                             )
+                        if scorer_result.input_sha256 != artifact_result.sha256:
+                            raise ValueError(
+                                "scorer input is not bound to the final artifact"
+                            )
                         scorer_receipt = self.append_receipt(
                             receipts,
                             "scorer",
@@ -649,6 +736,10 @@ class PairedRunner:
                                 "name": scorer_result.name,
                                 "revision": scorer_result.revision,
                                 "config_sha256": scorer_result.config_sha256,
+                                "status": scorer_result.status,
+                                "input_sha256": scorer_result.input_sha256,
+                                "output_sha256": scorer_result.output_sha256,
+                                "per_task_correct": scorer_result.per_task_correct,
                                 "public_metrics": dict(
                                     scorer_result.public_metrics
                                 ),
@@ -659,6 +750,10 @@ class PairedRunner:
                             "name": scorer_result.name,
                             "revision": scorer_result.revision,
                             "config_sha256": scorer_result.config_sha256,
+                            "status": scorer_result.status,
+                            "input_sha256": scorer_result.input_sha256,
+                            "output_sha256": scorer_result.output_sha256,
+                            "per_task_correct": scorer_result.per_task_correct,
                             "public_metrics": dict(
                                 scorer_result.public_metrics
                             ),
@@ -726,11 +821,16 @@ class PairedRunner:
             termination_reason = "timeout"
             horizon_cause = None
             elapsed = max(0.0, self.clock() - started)
-        comparable = (
+        scorable = (
             failure is None
             and termination_reason in {"terminal", "horizon"}
             and final_artifact is not None
             and scorer is not None
+        )
+        comparable = scorable and scorer["status"] == "scored"
+        tool_calls = (
+            action_totals["domain_tool_attempts"]
+            + action_totals["workspace_actions"]
         )
         config_payload = config.to_payload()
         namespace_payload = expected_namespace.to_payload()
@@ -786,7 +886,9 @@ class PairedRunner:
             "turns": turns,
             "usage": {
                 "policy_turns": policy_turns,
+                "policy_outputs": policy_turns,
                 "tool_calls": tool_calls,
+                **action_totals,
                 "prompt_tokens": prompt_tokens,
                 "response_tokens": response_tokens,
                 "total_tokens": prompt_tokens + response_tokens,
@@ -811,6 +913,7 @@ class PairedRunner:
             },
             "final_artifact": final_artifact,
             "scorer": scorer,
+            "scorable": scorable,
             "comparable": comparable,
         }
         return row

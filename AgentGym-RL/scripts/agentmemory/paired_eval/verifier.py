@@ -8,6 +8,7 @@ import re
 from typing import Any, Mapping, Sequence
 
 from .contracts import (
+    ACTION_ACCOUNTING_COUNTERS,
     Arm,
     CAPABILITY_LATTICE,
     CapabilityRoot,
@@ -20,6 +21,7 @@ from .contracts import (
     ROUTE_EXECUTION_KINDS,
     RESULT_SCHEMA,
     RESULT_SCHEMA_VERSION,
+    SCORER_STATUSES,
     RunConfig,
     SHA256_PATTERN,
     TERMINATION_REASONS,
@@ -68,6 +70,7 @@ RESULT_KEYS = frozenset(
         "failure",
         "final_artifact",
         "scorer",
+        "scorable",
         "comparable",
     }
 )
@@ -688,7 +691,9 @@ def validate_result_row(row: Mapping[str, Any]) -> None:
         usage,
         {
             "policy_turns",
+            "policy_outputs",
             "tool_calls",
+            *ACTION_ACCOUNTING_COUNTERS,
             "prompt_tokens",
             "response_tokens",
             "total_tokens",
@@ -697,11 +702,43 @@ def validate_result_row(row: Mapping[str, Any]) -> None:
         },
     )
     policy_turns = require_nonnegative_int("usage.policy_turns", usage["policy_turns"])
+    policy_outputs = require_nonnegative_int(
+        "usage.policy_outputs", usage["policy_outputs"]
+    )
     tool_calls = require_nonnegative_int("usage.tool_calls", usage["tool_calls"])
     if policy_turns != len(turns):
         raise ResultValidationError("policy turn accounting mismatch")
-    if tool_calls < completed_steps or tool_calls > policy_turns:
+    if policy_outputs != policy_turns:
+        raise ResultValidationError("policy output accounting mismatch")
+    action_counts = {
+        name: require_nonnegative_int(f"usage.{name}", usage[name])
+        for name in ACTION_ACCOUNTING_COUNTERS
+    }
+    if tool_calls != (
+        action_counts["domain_tool_attempts"]
+        + action_counts["workspace_actions"]
+    ):
         raise ResultValidationError("tool call accounting mismatch")
+    if (
+        action_counts["successful_backend_calls"]
+        > action_counts["domain_tool_attempts"]
+    ):
+        raise ResultValidationError("backend success accounting mismatch")
+    if action_counts["parser_corrections"] > action_counts["invalid_actions"]:
+        raise ResultValidationError("parser correction accounting mismatch")
+    if action_counts["parsed_actions"] != (
+        action_counts["domain_tool_attempts"]
+        + action_counts["workspace_actions"]
+        + action_counts["answers"]
+    ):
+        raise ResultValidationError("parsed action accounting mismatch")
+    classified_outputs = (
+        action_counts["parsed_actions"]
+        + action_counts["compactions"]
+        + action_counts["invalid_actions"]
+    )
+    if classified_outputs > policy_outputs:
+        raise ResultValidationError("action accounting exceeds policy outputs")
     if usage["prompt_tokens"] != prompt_total:
         raise ResultValidationError("prompt token accounting mismatch")
     if usage["response_tokens"] != response_total:
@@ -730,6 +767,8 @@ def validate_result_row(row: Mapping[str, Any]) -> None:
     }
     if compaction != expected_compaction:
         raise ResultValidationError("compaction accounting/config mismatch")
+    if action_counts["compactions"] != replacement_count:
+        raise ResultValidationError("usage compaction accounting mismatch")
     if replacement_count and not config.capability.policy_authored_compaction:
         raise ResultValidationError(
             "disabled policy compaction emitted a replacement receipt"
@@ -820,6 +859,10 @@ def validate_result_row(row: Mapping[str, Any]) -> None:
                 "name",
                 "revision",
                 "config_sha256",
+                "status",
+                "input_sha256",
+                "output_sha256",
+                "per_task_correct",
                 "public_metrics",
                 "receipt_ref",
             },
@@ -831,6 +874,24 @@ def validate_result_row(row: Mapping[str, Any]) -> None:
         ):
             raise ResultValidationError("scorer identity mismatch")
         validate_public_metrics(scorer["public_metrics"])
+        if scorer["status"] not in SCORER_STATUSES:
+            raise ResultValidationError("scorer status is unsupported")
+        require_sha256("scorer.input_sha256", scorer["input_sha256"])
+        if artifact is not None and scorer["input_sha256"] != artifact["sha256"]:
+            raise ResultValidationError("scorer input is not the final artifact")
+        if scorer["status"] == "deferred":
+            if (
+                scorer["output_sha256"] is not None
+                or scorer["per_task_correct"] is not None
+                or scorer["public_metrics"] != {}
+            ):
+                raise ResultValidationError("deferred scorer contains scored output")
+        else:
+            require_sha256("scorer.output_sha256", scorer["output_sha256"])
+            if type(scorer["per_task_correct"]) is not bool:
+                raise ResultValidationError(
+                    "scored result lacks a per-task boolean"
+                )
         require_evidence_ref("scorer.receipt_ref", scorer["receipt_ref"])
         if scorer["receipt_ref"] not in receipt_refs:
             raise ResultValidationError("scorer receipt is missing")
@@ -839,34 +900,39 @@ def validate_result_row(row: Mapping[str, Any]) -> None:
     if scorer is not None and artifact is None:
         raise ResultValidationError("scorer cannot exist without an artifact")
 
-    comparable = (
+    scorable = (
         failure_class is None
         and reason in {"terminal", "horizon"}
         and artifact is not None
         and scorer is not None
     )
+    if type(result["scorable"]) is not bool or result["scorable"] != scorable:
+        raise ResultValidationError("scorable flag is inconsistent")
+    comparable = scorable and scorer["status"] == "scored"
     if type(result["comparable"]) is not bool or result["comparable"] != comparable:
         raise ResultValidationError("comparability flag is inconsistent")
-    if comparable and not declared_routes_match:
+    if scorable and classified_outputs != policy_outputs:
+        raise ResultValidationError("scorable row has unclassified policy outputs")
+    if scorable and not declared_routes_match:
         raise ResultValidationError(
-            "comparable row lifecycle routes do not match its capability"
+            "scorable row lifecycle routes do not match its capability"
         )
-    if comparable and set(closed_roots or ()) != set(declared_roots):
+    if scorable and set(closed_roots or ()) != set(declared_roots):
         raise ResultValidationError(
-            "comparable row lacks complete lifecycle cleanup"
+            "scorable row lacks complete lifecycle cleanup"
         )
-    if comparable and (
+    if scorable and (
         reset_receipt_ref is None or close_receipt_ref is None
     ):
         raise ResultValidationError(
-            "comparable row lacks lifecycle receipt references"
+            "scorable row lacks lifecycle receipt references"
         )
-    if comparable and len(close_receipts) != 1:
-        raise ResultValidationError("comparable row lacks a close receipt")
-    if comparable and float(wall_seconds) >= config.budgets.max_wall_seconds:
-        raise ResultValidationError("comparable row exceeded its wall budget")
-    if comparable and usage["total_tokens"] > config.budgets.max_total_tokens:
-        raise ResultValidationError("comparable row exceeded its token budget")
+    if scorable and len(close_receipts) != 1:
+        raise ResultValidationError("scorable row lacks a close receipt")
+    if scorable and float(wall_seconds) >= config.budgets.max_wall_seconds:
+        raise ResultValidationError("scorable row exceeded its wall budget")
+    if scorable and usage["total_tokens"] > config.budgets.max_total_tokens:
+        raise ResultValidationError("scorable row exceeded its token budget")
 
 
 def verify_pair_completeness(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -904,6 +970,8 @@ def verify_pair_completeness(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any
     )
     expected_arms = set(arm_order)
     comparable_triads = 0
+    scorable_triads = 0
+    compaction_receipts_by_arm = Counter()
     for pair_key, pair_rows in grouped.items():
         if len(pair_rows) != 3:
             raise PairVerificationError(
@@ -990,6 +1058,13 @@ def verify_pair_completeness(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any
         comparable_triads += int(
             all(by_arm[arm]["comparable"] for arm in arm_order)
         )
+        scorable_triads += int(
+            all(by_arm[arm]["scorable"] for arm in arm_order)
+        )
+        for arm in arm_order:
+            compaction_receipts_by_arm[arm] += by_arm[arm]["compaction"][
+                "receipt_count"
+            ]
 
     failure_counts = Counter(
         row["failure"]["class"] or "none" for row in rows
@@ -1004,6 +1079,26 @@ def verify_pair_completeness(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any
         "capability_lattice": dict(CAPABILITY_LATTICE),
         "comparable_pair_count": comparable_triads,
         "comparable_triad_count": comparable_triads,
+        "scorable_pair_count": scorable_triads,
+        "scorable_triad_count": scorable_triads,
+        "scored_pair_count": comparable_triads,
+        "scored_triad_count": comparable_triads,
+        "treatment_realization": {
+            "required_arms": [
+                Arm.AMG_COMPACTION_ONLY.value,
+                Arm.AMG_MEMORY.value,
+            ],
+            "compaction_receipts_by_arm": {
+                arm: compaction_receipts_by_arm[arm] for arm in arm_order
+            },
+            "realized": all(
+                compaction_receipts_by_arm[arm] > 0
+                for arm in (
+                    Arm.AMG_COMPACTION_ONLY.value,
+                    Arm.AMG_MEMORY.value,
+                )
+            ),
+        },
         "failure_counts": dict(sorted(failure_counts.items())),
     }
 
@@ -1011,7 +1106,15 @@ def verify_pair_completeness(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any
 def build_public_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Project only explicit public scalars; never copy protected references."""
 
-    verify_pair_completeness(rows)
+    verification = verify_pair_completeness(rows)
+    if verification["comparable_triad_count"] != verification["triad_count"]:
+        raise PairVerificationError(
+            "public benchmark summary requires scored comparable triads"
+        )
+    if verification["treatment_realization"]["realized"] is not True:
+        raise PairVerificationError(
+            "public benchmark summary requires realized compaction treatment"
+        )
     arm_order = (
         Arm.NATIVE.value,
         Arm.AMG_COMPACTION_ONLY.value,

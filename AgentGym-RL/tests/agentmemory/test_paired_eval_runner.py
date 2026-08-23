@@ -59,6 +59,11 @@ class PairedRunnerTest(unittest.TestCase):
             self.assertEqual(row["termination"]["reason"], "terminal")
             self.assertEqual(row["usage"]["policy_turns"], 1)
             self.assertEqual(row["usage"]["tool_calls"], 1)
+            self.assertEqual(row["usage"]["policy_outputs"], 1)
+            self.assertEqual(row["usage"]["parsed_actions"], 1)
+            self.assertEqual(row["usage"]["domain_tool_attempts"], 1)
+            self.assertEqual(row["usage"]["successful_backend_calls"], 1)
+            self.assertEqual(row["usage"]["answers"], 0)
             self.assertEqual(row["final_artifact"]["type"], artifact_type)
             shape = [receipt["kind"] for receipt in row["receipts"]]
             receipt_shapes.append(shape)
@@ -112,7 +117,9 @@ class PairedRunnerTest(unittest.TestCase):
 
         self.assertEqual(bindings.adapter.client.step_calls, list(outputs))
         self.assertEqual(row["usage"]["policy_turns"], 3)
-        self.assertEqual(row["usage"]["tool_calls"], 3)
+        self.assertEqual(row["usage"]["tool_calls"], 2)
+        self.assertEqual(row["usage"]["workspace_actions"], 1)
+        self.assertEqual(row["usage"]["compactions"], 1)
         self.assertEqual(len(row["turns"]), 3)
         self.assertEqual(
             [turn["root_kind"] for turn in row["turns"]],
@@ -145,7 +152,7 @@ class PairedRunnerTest(unittest.TestCase):
 
         self.assertIsNone(bindings.adapter.memory_service)
         self.assertEqual(row["usage"]["policy_turns"], 2)
-        self.assertEqual(row["usage"]["tool_calls"], 2)
+        self.assertEqual(row["usage"]["tool_calls"], 1)
         self.assertEqual(row["compaction"]["receipt_count"], 1)
         self.assertEqual(
             [turn["root_kind"] for turn in row["turns"]],
@@ -196,6 +203,10 @@ class PairedRunnerTest(unittest.TestCase):
                 name: rows[1]["usage"][name]
                 for name in ("policy_turns", "tool_calls")
             },
+        )
+        self.assertLessEqual(
+            rows[0]["turns"][0]["response_token_count"],
+            rows[0]["compaction"]["summary_max_tokens"],
         )
         self.assertEqual(
             [turn["execution_kind"] for turn in rows[0]["turns"]],
@@ -496,7 +507,7 @@ class PairedRunnerTest(unittest.TestCase):
             "environment_failure",
         )
         self.assertEqual(environment_failure["usage"]["policy_turns"], 1)
-        self.assertEqual(environment_failure["usage"]["tool_calls"], 1)
+        self.assertEqual(environment_failure["usage"]["tool_calls"], 0)
         self.assertFalse(environment_failure["comparable"])
 
         timeout_config = make_config(
@@ -561,6 +572,86 @@ class PairedRunnerTest(unittest.TestCase):
         self.assertIsNone(close_failure["lifecycle"]["close_receipt_ref"])
         self.assertEqual(close_bindings.adapter.close_calls, 1)
         self.assertFalse(close_failure["comparable"])
+
+    def test_deferred_scorer_is_scorable_but_never_comparable(self) -> None:
+        row, _ = self.run_case(
+            make_config(task_id="deferred-scorer"),
+            scorer_status="deferred",
+        )
+
+        self.assertEqual(row["scorer"]["status"], "deferred")
+        self.assertEqual(row["scorer"]["public_metrics"], {})
+        self.assertTrue(row["scorable"])
+        self.assertFalse(row["comparable"])
+        forged = {**row, "comparable": True}
+        with self.assertRaisesRegex(ValueError, "comparability"):
+            validate_result_row(forged)
+
+    def test_action_accounting_uses_explicit_dispatch_boundaries(self) -> None:
+        config = make_config(max_policy_turns=7, max_tool_calls=4)
+        zero = {
+            "parsed_actions": 0,
+            "domain_tool_attempts": 0,
+            "successful_backend_calls": 0,
+            "workspace_actions": 0,
+            "compactions": 0,
+            "answers": 0,
+            "invalid_actions": 0,
+            "parser_corrections": 0,
+        }
+        deltas = [
+            {**zero, "invalid_actions": 1, "parser_corrections": 1},
+            {**zero, "parsed_actions": 1, "domain_tool_attempts": 1},
+            {
+                **zero,
+                "parsed_actions": 1,
+                "domain_tool_attempts": 1,
+                "successful_backend_calls": 1,
+            },
+            {**zero, "parsed_actions": 1, "answers": 1},
+        ]
+        plan = tuple(
+            {
+                "state": f"state-{index}",
+                "done": index == len(deltas) - 1,
+                "wrapper_evidence": {"action_accounting_delta": delta},
+            }
+            for index, delta in enumerate(deltas)
+        )
+        row, _ = self.run_case(
+            config,
+            plan=plan,
+            outputs=("invalid", "failed search", "search", "answer"),
+        )
+        self.assertEqual(
+            {
+                name: row["usage"][name]
+                for name in (
+                    "policy_outputs",
+                    "parsed_actions",
+                    "domain_tool_attempts",
+                    "successful_backend_calls",
+                    "workspace_actions",
+                    "compactions",
+                    "answers",
+                    "invalid_actions",
+                    "parser_corrections",
+                    "tool_calls",
+                )
+            },
+            {
+                "policy_outputs": 4,
+                "parsed_actions": 3,
+                "domain_tool_attempts": 2,
+                "successful_backend_calls": 1,
+                "workspace_actions": 0,
+                "compactions": 0,
+                "answers": 1,
+                "invalid_actions": 1,
+                "parser_corrections": 1,
+                "tool_calls": 2,
+            },
+        )
 
     def test_private_policy_and_environment_content_is_digest_addressed(self) -> None:
         secret = "GATED-GAIA-QUESTION-AND-GOLD"

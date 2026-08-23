@@ -14,6 +14,7 @@ from types import MappingProxyType
 from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
 from .contracts import (
+    ACTION_ACCOUNTING_COUNTERS,
     AdapterClose,
     AdapterReset,
     ArtifactResult,
@@ -51,6 +52,37 @@ def _require_label(name: str, value: Any) -> str:
     if not isinstance(value, str) or not value or value.strip() != value:
         raise ValueError(f"{name} must be nonempty normalized text")
     return value
+
+
+def _normalized_action_accounting_delta(
+    value: Any,
+    *,
+    execution_kind: str,
+) -> dict[str, int]:
+    if value is None:
+        delta = {name: 0 for name in ACTION_ACCOUNTING_COUNTERS}
+        if execution_kind == "policy_compaction":
+            delta["compactions"] = 1
+        elif execution_kind == "external_memory_action":
+            delta["parsed_actions"] = 1
+            delta["workspace_actions"] = 1
+        else:
+            # Legacy task-neutral adapters do not expose domain-level parsing.
+            # Their benchmark dispatch is conservatively one successful tool call.
+            delta["parsed_actions"] = 1
+            delta["domain_tool_attempts"] = 1
+            delta["successful_backend_calls"] = 1
+        return delta
+    if not isinstance(value, Mapping) or set(value) != set(
+        ACTION_ACCOUNTING_COUNTERS
+    ):
+        raise ValueError("registered client action accounting is not canonical")
+    delta = dict(value)
+    if any(type(count) is not int or count < 0 for count in delta.values()):
+        raise ValueError("registered client action accounting must be non-negative")
+    if sum(delta.values()) == 0:
+        raise ValueError("ordinary policy output has no accounting classification")
+    return delta
 
 
 def _load_symbol(module_name: str, attribute_name: str) -> Any:
@@ -513,6 +545,13 @@ class ClientStepProxy:
             "status": "ok",
             "receipt": execution_receipt,
         }
+        adapter_wrapper_evidence = adapter_info.get("wrapper_evidence")
+        if not isinstance(adapter_wrapper_evidence, Mapping):
+            raise TypeError("registered client wrapper evidence must be a mapping")
+        action_accounting_delta = _normalized_action_accounting_delta(
+            adapter_wrapper_evidence.get("action_accounting_delta"),
+            execution_kind=execution_kind,
+        )
         info = {
             "schema": adapter_info.get("schema"),
             "env_info": dict(adapter_info),
@@ -541,6 +580,7 @@ class ClientStepProxy:
                 "adapter_schema": adapter_info.get("schema"),
                 "adapter_receipt_sha256": sha256_json(adapter_info),
                 "counter_reconciliation": raw_counter_receipt,
+                "action_accounting_delta": action_accounting_delta,
             },
         }
         # The public runner schema intentionally matches the AgentGym transition

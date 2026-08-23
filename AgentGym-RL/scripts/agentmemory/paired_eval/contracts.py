@@ -23,7 +23,7 @@ from .serialization import canonical_json_bytes, sha256_json
 
 
 RESULT_SCHEMA = "amg.paired_eval.result"
-RESULT_SCHEMA_VERSION = "2.0.0"
+RESULT_SCHEMA_VERSION = "2.1.0"
 MANIFEST_SCHEMA = "amg.paired_eval.manifest"
 MANIFEST_SCHEMA_VERSION = "2.0.0"
 CONTEXT_TRANSITION_SCHEMA = "agentmemory_task_neutral_context_transition_v1"
@@ -80,6 +80,17 @@ HORIZON_CAUSES = frozenset(
         "token_limit",
         "prompt_token_limit",
     }
+)
+SCORER_STATUSES = frozenset({"deferred", "scored"})
+ACTION_ACCOUNTING_COUNTERS = (
+    "parsed_actions",
+    "domain_tool_attempts",
+    "successful_backend_calls",
+    "workspace_actions",
+    "compactions",
+    "answers",
+    "invalid_actions",
+    "parser_corrections",
 )
 
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -1279,6 +1290,10 @@ class ScorerResult:
     name: str
     revision: str
     config_sha256: str
+    status: str
+    input_sha256: str
+    output_sha256: Optional[str]
+    per_task_correct: Optional[bool]
     public_metrics: Mapping[str, Any]
     receipt: Mapping[str, Any]
 
@@ -1286,8 +1301,20 @@ class ScorerResult:
         require_text("scorer.name", self.name)
         require_text("scorer.revision", self.revision)
         require_sha256("scorer.config_sha256", self.config_sha256)
+        if self.status not in SCORER_STATUSES:
+            raise ValueError("scorer status must be deferred or scored")
+        require_sha256("scorer.input_sha256", self.input_sha256)
         if not isinstance(self.public_metrics, Mapping):
             raise TypeError("public scorer metrics must be a mapping")
+        if self.status == "deferred":
+            if self.output_sha256 is not None or self.per_task_correct is not None:
+                raise ValueError("deferred scorer cannot contain scored output")
+            if self.public_metrics:
+                raise ValueError("deferred scorer cannot contain public metrics")
+        else:
+            require_sha256("scorer.output_sha256", self.output_sha256)
+            if type(self.per_task_correct) is not bool:
+                raise TypeError("scored result requires a per-task boolean")
         for key, value in self.public_metrics.items():
             require_text("public metric name", key)
             if value is not None and type(value) not in {bool, int, float}:
@@ -1296,6 +1323,8 @@ class ScorerResult:
                 raise ValueError("public metric floats must be finite")
         if not isinstance(self.receipt, Mapping):
             raise TypeError("scorer receipt must be a mapping")
+        if self.receipt.get("status") != self.status:
+            raise ValueError("scorer receipt status disagrees with scorer result")
 
 
 @runtime_checkable

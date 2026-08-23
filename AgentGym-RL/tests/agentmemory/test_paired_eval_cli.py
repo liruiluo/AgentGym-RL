@@ -9,7 +9,7 @@ import tempfile
 import unittest
 
 from test_paired_eval_manifest import manifest_payload
-from test_paired_eval_support import ManualClock, ROOT, make_fake_runtime
+from test_paired_eval_support import Arm, ManualClock, ROOT, make_fake_runtime
 
 from paired_eval.controller import DependencyLightPolicyTurnController
 from paired_eval.evidence import AppendSafeJsonlWriter, PrivateEvidenceStore
@@ -75,10 +75,29 @@ class PairedEvalCliTest(unittest.TestCase):
             evidence_store=store,
             clock=ManualClock(),
         )
+
+        def runtime_factory(config):
+            if config.capability.arm is Arm.NATIVE:
+                return make_fake_runtime(config, store)
+            return make_fake_runtime(
+                config,
+                store,
+                plan=(
+                    {
+                        "state": "compacted",
+                        "done": False,
+                        "control_request": "Author compact continuation state.",
+                        "operation": "replace_messages",
+                    },
+                    {"state": "terminal", "reward": 1.0, "done": True},
+                ),
+                outputs=("compact state", "ordinary-policy-output"),
+            )
+
         execute_manifest(
             manifest_payload(),
             runner=runner,
-            runtime_factory=lambda config: make_fake_runtime(config, store),
+            runtime_factory=runtime_factory,
             writer=AppendSafeJsonlWriter(
                 results,
                 validator=validate_result_row,

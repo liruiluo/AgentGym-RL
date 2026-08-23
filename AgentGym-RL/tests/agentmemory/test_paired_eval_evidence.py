@@ -39,9 +39,23 @@ class EvidenceSafetyTest(unittest.TestCase):
             clock=ManualClock(),
         )
 
-    def result_row(self, config=None):
+    def result_row(self, config=None, *, realize_compaction=False):
         config = make_config() if config is None else config
-        bindings = make_fake_runtime(config, self.store)
+        runtime_kwargs = {}
+        if realize_compaction:
+            runtime_kwargs = {
+                "plan": (
+                    {
+                        "state": "compacted",
+                        "done": False,
+                        "control_request": "Author compact continuation state.",
+                        "operation": "replace_messages",
+                    },
+                    {"state": "terminal", "reward": 1.0, "done": True},
+                ),
+                "outputs": ("compact state", "ordinary-policy-output"),
+            }
+        bindings = make_fake_runtime(config, self.store, **runtime_kwargs)
         return self.runner.run_task(config, bindings.adapter, bindings.model)
 
     def test_append_safe_jsonl_uses_private_mode_and_complete_lines(self) -> None:
@@ -82,9 +96,13 @@ class EvidenceSafetyTest(unittest.TestCase):
             validate_result_row(forbidden_compaction)
 
         compaction_row = self.result_row(
-            with_arm(make_config(), Arm.AMG_COMPACTION_ONLY)
+            with_arm(make_config(), Arm.AMG_COMPACTION_ONLY),
+            realize_compaction=True,
         )
-        memory_row = self.result_row(with_arm(make_config(), Arm.AMG_MEMORY))
+        memory_row = self.result_row(
+            with_arm(make_config(), Arm.AMG_MEMORY),
+            realize_compaction=True,
+        )
         for result, score in zip(
             (row, compaction_row, memory_row),
             (0.25, 0.5, 0.9),

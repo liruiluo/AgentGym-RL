@@ -20,6 +20,7 @@ def install_package_path() -> None:
 install_package_path()
 
 from paired_eval.contracts import (  # noqa: E402
+    ACTION_ACCOUNTING_COUNTERS,
     AdapterClose,
     AdapterReset,
     Arm,
@@ -438,6 +439,22 @@ class FakeClient:
             "status": "ok",
             "receipt": execution_receipt,
         }
+        action_accounting_delta = {
+            name: 0 for name in ACTION_ACCOUNTING_COUNTERS
+        }
+        if execution_kind == "policy_compaction":
+            action_accounting_delta["compactions"] = 1
+        elif execution_kind == "external_memory_action":
+            action_accounting_delta["parsed_actions"] = 1
+            action_accounting_delta["workspace_actions"] = 1
+        else:
+            action_accounting_delta["parsed_actions"] = 1
+            action_accounting_delta["domain_tool_attempts"] = 1
+            action_accounting_delta["successful_backend_calls"] = 1
+        wrapper_evidence = dict(item.get("wrapper_evidence", {}))
+        wrapper_evidence.setdefault(
+            "action_accounting_delta", action_accounting_delta
+        )
         info = {
             "schema": "agentmemory_task_neutral_transition_v1",
             "env_info": {},
@@ -462,7 +479,7 @@ class FakeClient:
             "session_epoch_after": 0,
             "policy_step_before": index,
             "policy_step_after": index + 1,
-            "wrapper_evidence": dict(item.get("wrapper_evidence", {})),
+            "wrapper_evidence": wrapper_evidence,
         }
         self.step_infos.append(info)
         return StepOutput(
@@ -488,6 +505,7 @@ class FakeAdapter:
         close_advance_seconds: float = 0.0,
         prompt_declaration_override: Optional[str] = None,
         invalid_close_result: bool = False,
+        scorer_status: str = "scored",
     ) -> None:
         self.config = config
         self.store = store
@@ -517,6 +535,7 @@ class FakeAdapter:
         self.close_advance_seconds = float(close_advance_seconds)
         self.prompt_declaration_override = prompt_declaration_override
         self.invalid_close_result = invalid_close_result
+        self.scorer_status = scorer_status
         self.finalization_contexts: list[FinalizationContext] = []
         self.close_calls = 0
 
@@ -589,15 +608,27 @@ class FakeAdapter:
         if self.clock is not None:
             self.clock.advance(self.scorer_advance_seconds)
         receipt = {
-            "status": "ok",
+            "status": self.scorer_status,
             "artifact_sha256": artifact.sha256,
             "private_grader_detail": "not public",
         }
+        scored = self.scorer_status == "scored"
+        output_sha256 = (
+            sha256_json({"artifact_sha256": artifact.sha256, "correct": True})
+            if scored
+            else None
+        )
         return ScorerResult(
             name=self.config.grader.name,
             revision=self.config.grader.revision,
             config_sha256=self.config.grader.config_sha256,
-            public_metrics={"score": 1.0, "passed": True},
+            status=self.scorer_status,
+            input_sha256=artifact.sha256,
+            output_sha256=output_sha256,
+            per_task_correct=True if scored else None,
+            public_metrics=(
+                {"score": 1.0, "passed": True} if scored else {}
+            ),
             receipt=receipt,
         )
 
@@ -651,6 +682,7 @@ def make_fake_runtime(
     close_advance_seconds: float = 0.0,
     prompt_declaration_override: Optional[str] = None,
     invalid_close_result: bool = False,
+    scorer_status: str = "scored",
 ):
     from paired_eval.manifest import RuntimeBindings
 
@@ -668,6 +700,7 @@ def make_fake_runtime(
         close_advance_seconds=close_advance_seconds,
         prompt_declaration_override=prompt_declaration_override,
         invalid_close_result=invalid_close_result,
+        scorer_status=scorer_status,
     )
     model = FakeModel(
         config.model,
