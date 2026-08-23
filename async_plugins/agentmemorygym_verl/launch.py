@@ -1856,6 +1856,9 @@ import trl
 from transformers import AutoConfig, AutoTokenizer
 from trl import AutoModelForCausalLMWithValueHead
 from agentmemorygym_verl.active_source_audit import audit_resolved_active_sources
+# Match veRL's real entrypoint: external estimator registration must occur
+# before the runtime probe asks the upstream registry for the AMG estimator.
+from agentmemorygym_verl import action_gae as _amg_action_gae
 from agentmemorygym_verl.agent_loop import AMGTaskNeutralAgentLoop
 from agentmemorygym_verl.dataset import AMGTrajectoryDataset
 from agentmemorygym_verl.env_client import create_env_client
@@ -2017,12 +2020,21 @@ print(json.dumps({
             str(inputs.verl_root),
             str(inputs.outer_root),
         ],
-        check=True,
+        check=False,
         text=True,
         capture_output=True,
         env=probe_env,
         cwd=inputs.verl_root,
     )
+    if completed.returncode != 0:
+        stdout = completed.stdout.strip() or "<empty>"
+        stderr = completed.stderr.strip() or "<empty>"
+        raise RuntimeError(
+            "AMG runtime preflight failed with "
+            f"exit code {completed.returncode}\n"
+            f"stdout:\n{stdout}\n"
+            f"stderr:\n{stderr}"
+        )
     lines = [line for line in completed.stdout.splitlines() if line.strip()]
     if not lines:
         raise RuntimeError("AMG runtime preflight produced no receipt")
