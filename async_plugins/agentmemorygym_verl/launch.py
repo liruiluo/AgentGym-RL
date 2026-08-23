@@ -308,11 +308,10 @@ def build_overrides(
         "critic.shuffle=False",
         "critic.use_dynamic_bsz=True",
         "critic.loss_agg_mode=token-mean",
-        # G64 r6/r8/r9/r11 showed that mechanically lowering this target while
-        # gradient checkpointing was disabled did not control the activation
-        # peak. Retain the conservative 32,768 target for the first gate with
-        # upstream checkpointing restored; tune only from measured headroom.
-        "critic.ppo_max_token_len_per_gpu=32768",
+        # Preserve r38's verified 65,536-token critic training budget. Latest
+        # veRL splits critic inference packing into its own knob, which remains
+        # at the upstream 32,768-token default; do not conflate the two.
+        "critic.ppo_max_token_len_per_gpu=65536",
         "+critic.ppo_infer_max_token_len_per_gpu=32768",
         "critic.forward_max_token_len_per_gpu=262144",
         "critic.optim.lr=1e-5",

@@ -410,7 +410,7 @@ def verify_resolved_config(
         "critic.shuffle": False,
         "critic.use_dynamic_bsz": True,
         "critic.loss_agg_mode": "token-mean",
-        "critic.ppo_max_token_len_per_gpu": 32768,
+        "critic.ppo_max_token_len_per_gpu": 65536,
         "critic.ppo_infer_max_token_len_per_gpu": 32768,
         "critic.strategy": "fsdp2",
         "algorithm.gamma": 1.0,
@@ -573,7 +573,8 @@ def verify_resolved_config(
         "standalone_rollout_gpus": standalone_rollout_gpus,
         "dynamic_hybrid_enabled": True,
         "gradient_checkpointing": {"actor": True, "critic": True},
-        "critic_active_token_budget": 32768,
+        "critic_train_token_budget": 65536,
+        "critic_infer_token_budget": 32768,
         "rollout_backend": "sglang",
         "fsdp2_reshard_after_forward": {"actor": True, "critic": True},
         "fused_kernels": {

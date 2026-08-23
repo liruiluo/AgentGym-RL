@@ -128,7 +128,7 @@ def _config(*, mode: str = "formal") -> dict:
         "critic": {
             "enable": True,
             "strategy": "fsdp2",
-            "ppo_max_token_len_per_gpu": 32768,
+            "ppo_max_token_len_per_gpu": 65536,
             "ppo_infer_max_token_len_per_gpu": 32768,
             "ppo_mini_batch_size": ppo_mini_batch_size,
             "ppo_micro_batch_size_per_gpu": 8,
@@ -255,7 +255,8 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         self.assertEqual(report["samples_per_update"], 64)
         self.assertEqual(report["trainer_gpus"], 6)
         self.assertEqual(report["standalone_rollout_gpus"], 2)
-        self.assertEqual(report["critic_active_token_budget"], 32768)
+        self.assertEqual(report["critic_train_token_budget"], 65536)
+        self.assertEqual(report["critic_infer_token_budget"], 32768)
         self.assertEqual(
             report["gradient_checkpointing"], {"actor": True, "critic": True}
         )
@@ -274,7 +275,13 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"formal.*6\+2"):
             _verify(config, mode="formal")
 
-    def test_rejects_critic_active_inference_budget_drift(self):
+    def test_rejects_critic_training_budget_drift(self):
+        config = _config(mode="formal")
+        config["critic"]["ppo_max_token_len_per_gpu"] = 32768
+        with self.assertRaisesRegex(ValueError, "critic.ppo_max_token_len_per_gpu"):
+            _verify(config, mode="formal")
+
+    def test_rejects_critic_inference_budget_drift(self):
         config = _config(mode="formal")
         config["critic"]["ppo_infer_max_token_len_per_gpu"] = 65536
         with self.assertRaisesRegex(

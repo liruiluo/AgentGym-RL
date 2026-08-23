@@ -183,7 +183,7 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
             "strategy": "fsdp2",
             "ppo_mini_batch_size": ppo_mini_batch_size,
             "ppo_micro_batch_size_per_gpu": 8,
-            "ppo_max_token_len_per_gpu": 32768,
+            "ppo_max_token_len_per_gpu": 65536,
             "ppo_infer_max_token_len_per_gpu": 32768,
             "ppo_epochs": 1,
             "shuffle": False,
