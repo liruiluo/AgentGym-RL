@@ -6,14 +6,27 @@ from collections import Counter
 from pathlib import Path
 
 import yaml
-from agentmemorygym_verl.config_contract import verify_resolved_config
+from agentmemorygym_verl.config_contract import inspect_schedule, verify_resolved_config
 from agentmemorygym_verl.identity import (
     EXPECTED_VERL_COMMIT,
     LOCKED_MODEL_FILE_SHA256,
     validate_training_runtime_lock,
 )
 
-RICH_V8_FIXTURES = Path("/tmp/openmle-v8-launch-fixtures-20260818")
+RICH_V8_FIXTURES = next(
+    (
+        candidate
+        for candidate in (
+            Path("/tmp/openmle-v8-launch-fixtures-20260818"),
+            Path("/private/tmp/openmle-v8-launch-fixtures"),
+        )
+        if (candidate / "source-lock.json").is_file()
+    ),
+    Path("/tmp/openmle-v8-launch-fixtures-20260818"),
+)
+
+FINAL_STATISTICS_VERL_COMMIT = "92428c4cffb114f8463fdc64f013ee344c6c2686"
+MULTITASK_ROUTES = ("webshop", "swesmith", "literesearcher", "openmle_fast")
 
 
 def sha256(path: Path) -> str:
@@ -286,21 +299,21 @@ def _action_rows(
     if chain:
         actions = [
             (
-                "shell_command {\"command\":\"mkdir -p .agent_memory && printf "
+                'shell_command {"command":"mkdir -p .agent_memory && printf '
                 "'%s\\\\n' 'objective: improve validation' "
                 "'measured_validation_or_failure: validation_mae=1.0' "
                 "'conclusion: update the model' 'code_path: train.py' "
                 "'next_action: edit train.py before rerunning' > "
-                ".agent_memory/OPENMLE_CONTINUATION.md\",\"workdir\":\".\","
-                "\"timeout_ms\":20000}",
+                '.agent_memory/OPENMLE_CONTINUATION.md","workdir":".",'
+                '"timeout_ms":20000}',
                 _execution_info(
                     changed_paths=(".agent_memory/OPENMLE_CONTINUATION.md",)
                 ),
             ),
             (
-                "shell_command {\"command\":\"cat "
-                ".agent_memory/OPENMLE_CONTINUATION.md\",\"workdir\":\".\","
-                "\"timeout_ms\":20000}",
+                'shell_command {"command":"cat '
+                '.agent_memory/OPENMLE_CONTINUATION.md","workdir":".",'
+                '"timeout_ms":20000}',
                 _execution_info(
                     stdout=(
                         "objective: improve validation\n"
@@ -317,11 +330,9 @@ def _action_rows(
                 _execution_info(kind="apply_patch", changed_paths=("train.py",)),
             ),
             (
-                "shell_command {\"command\":\"python train.py\",\"workdir\":\".\","
-                "\"timeout_ms\":20000}",
-                _execution_info(
-                    stdout="validation_mae=0.8", attempts=1, completed=1
-                ),
+                'shell_command {"command":"python train.py","workdir":".",'
+                '"timeout_ms":20000}',
+                _execution_info(stdout="validation_mae=0.8", attempts=1, completed=1),
             ),
         ]
     else:
@@ -343,6 +354,15 @@ def _action_rows(
             }
             context_transition = {"operation": "replace_messages", "messages": []}
             control_request = "Persist continuation state before compaction."
+        elif chain and order == 1:
+            wrapper_evidence = {
+                "memory_event": "read",
+                "document_read_observed": True,
+            }
+        elif chain and order == 2:
+            wrapper_evidence = {"memory_event": "modify"}
+        elif chain and order == 3:
+            wrapper_evidence = {"memory_event": "execute", "outcome": "success"}
         rows.append(
             {
                 "schema": "amg_task_neutral_action_row_v1",
@@ -383,11 +403,8 @@ def _checkpoint(run_dir: Path, step: int, *, world_size: int) -> None:
         for rank in range(world_size):
             for kind in ("model", "optim", "extra_state"):
                 (
-                    role_dir
-                    / f"{kind}_world_size_{world_size}_rank_{rank}.pt"
-                ).write_bytes(
-                    f"{role}:{kind}:{rank}".encode()
-                )
+                    role_dir / f"{kind}_world_size_{world_size}_rank_{rank}.pt"
+                ).write_bytes(f"{role}:{kind}:{rank}".encode())
         hf = role_dir / "huggingface"
         hf.mkdir()
         (hf / "config.json").write_text("{}\n", encoding="utf-8")
@@ -406,9 +423,7 @@ def build_valid_run(run_dir: Path, mode: str = "gate") -> dict:
     collections_per_publication = 1
 
     config = resolved_config(mode, run_dir, schedule_path)
-    ppo_mini_batch_size = config["actor_rollout_ref"]["actor"][
-        "ppo_mini_batch_size"
-    ]
+    ppo_mini_batch_size = config["actor_rollout_ref"]["actor"]["ppo_mini_batch_size"]
     resolved_path = run_dir / "resolved-config.yaml"
     resolved_path.write_text(yaml.safe_dump(config, sort_keys=True), encoding="utf-8")
     hydra_dir = run_dir / "hydra" / ".hydra"
@@ -422,7 +437,6 @@ def build_valid_run(run_dir: Path, mode: str = "gate") -> dict:
     real_rows: list[dict] = []
     version_pairs: Counter[str] = Counter()
     collection_real_rows: list[int] = []
-    collection_real_tokens: list[int] = []
     padding_rows = 0
     for collection in range(collections):
         jsonl_lines: list[str] = []
@@ -466,17 +480,11 @@ def build_valid_run(run_dir: Path, mode: str = "gate") -> dict:
             "\n".join(jsonl_lines) + "\n", encoding="utf-8"
         )
         collection_real_rows.append(len(collection_records))
-        collection_real_tokens.append(
-            sum(row["response_token_count"] for row in collection_records)
-        )
         padding_rows += (-len(collection_records)) % ppo_mini_batch_size
 
     metrics_path = run_dir / "metrics.jsonl"
     metric_lines = []
     for publication in range(publication_cycles):
-        collection_start = publication * collections_per_publication
-        collection_stop = collection_start + collections_per_publication
-        real_token_count = sum(collection_real_tokens[collection_start:collection_stop])
         metric_lines.append(
             json.dumps(
                 {
@@ -620,6 +628,487 @@ def build_valid_run(run_dir: Path, mode: str = "gate") -> dict:
         "checkpoint_root": run_dir / "checkpoints",
         "launch_path": launch_path,
     }
+
+
+def build_valid_multitask_run(
+    run_dir: Path,
+    *,
+    updates: int = 8,
+    route_counts_by_update: list[dict[str, int]] | None = None,
+) -> dict:
+    """Build a compact four-route receipt and exact owner telemetry fixture."""
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    identity_dir = run_dir / "identity"
+    identity_dir.mkdir()
+    route_ids = MULTITASK_ROUTES
+    samples_per_update = 64
+    episodes = updates * samples_per_update
+    role = "train_pool"
+    if route_counts_by_update is None:
+        route_counts_by_update = [
+            {route_id: samples_per_update // len(route_ids) for route_id in route_ids}
+            for _ in range(updates)
+        ]
+    if len(route_counts_by_update) != updates:
+        raise ValueError("route count fixture must cover every update")
+    if any(
+        sum(counts.values()) != samples_per_update for counts in route_counts_by_update
+    ):
+        raise ValueError("each fixture update must contain exactly 64 episodes")
+    if any(set(counts) != set(route_ids) for counts in route_counts_by_update):
+        raise ValueError("fixture update route set drifted")
+    expected_per_route = episodes // len(route_ids)
+    if any(
+        sum(counts[route_id] for counts in route_counts_by_update) != expected_per_route
+        for route_id in route_ids
+    ):
+        raise ValueError("fixture route counts must conserve the frozen schedule")
+
+    registry_payload = {
+        "schema": "amg_route_registry_v1",
+        "agent_name": "amg_task_neutral_async",
+        "routes": [
+            {
+                "route_id": route_id,
+                "max_rounds": 30,
+                "max_observation_tokens": 8192,
+                "policy_framing_sha256": str(index + 5) * 64,
+                "route_attestation_sha256": str(index + 1) * 64,
+                "client": {
+                    "task_name": route_id,
+                    "env_addr": f"http://127.0.0.1:{65101 + index}",
+                    "timeout": 240,
+                    "max_retries": 2,
+                },
+            }
+            for index, route_id in enumerate(route_ids)
+        ],
+    }
+    registry_path = identity_dir / "route-registry.json"
+    registry_path.write_text(
+        json.dumps(registry_payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    registry_sha256 = sha256(registry_path)
+    manifest_digest = "a" * 64
+    schedule_path = identity_dir / "multitask-schedule.jsonl"
+    schedule_rows: list[dict] = []
+    route_schedule_rows: dict[str, list[dict]] = {
+        route_id: [] for route_id in route_ids
+    }
+    route_local_indices = Counter()
+    for position in range(episodes):
+        route_id = route_ids[position % len(route_ids)]
+        route_index = route_local_indices[route_id]
+        route_local_indices[route_id] += 1
+        route_offset = route_ids.index(route_id)
+        row = {
+            "index": position,
+            "data_idx": route_index,
+            "route_id": route_id,
+            "data_source": route_id,
+            "agent_name": "amg_task_neutral_async",
+            "item_id": f"{route_id}:item-{route_index}",
+            "extra_info": {
+                "index": position,
+                "route_id": route_id,
+                "manifest_digest": manifest_digest,
+                "panel_id": "multitask-fixture",
+                "role": role,
+                "schedule_position": position,
+                "route_registry_sha256": registry_sha256,
+                "route_attestation_sha256": str(route_offset + 1) * 64,
+                "source_schedule_sha256": str(route_offset + 5) * 64,
+                "source_manifest_digest": "9abc"[route_offset] * 64,
+                "source_panel_id": f"source-{route_offset}",
+            },
+        }
+        schedule_rows.append(row)
+        route_schedule_rows[route_id].append(row)
+    schedule_path.write_text(
+        "\n".join(json.dumps(row, sort_keys=True) for row in schedule_rows) + "\n",
+        encoding="utf-8",
+    )
+    schedule_sha256 = sha256(schedule_path)
+    schedule_report = inspect_schedule(
+        schedule_path,
+        expected_count=episodes,
+        expected_sha256=schedule_sha256,
+        expected_role=role,
+        expected_route_ids=route_ids,
+        expected_route_registry_sha256=registry_sha256,
+    )
+
+    certificate = {
+        "schema": "amg_multitask_schedule_certificate_v1",
+        "spec_sha256": manifest_digest,
+        "schedule_sha256": schedule_sha256,
+        "route_registry_sha256": registry_sha256,
+        "role": role,
+        "panel_id": "multitask-fixture",
+        "agent_name": "amg_task_neutral_async",
+        "optimizer_updates": updates,
+        "samples_per_update": samples_per_update,
+        "row_count": episodes,
+        "route_order": list(route_ids),
+        "per_route_rows": {route_id: expected_per_route for route_id in route_ids},
+        "sources": {
+            route_id: {
+                "schedule_sha256": str(index + 5) * 64,
+                "route_attestation_sha256": str(index + 1) * 64,
+                "source_row_count": expected_per_route,
+                "allow_repetition": False,
+            }
+            for index, route_id in enumerate(route_ids)
+        },
+    }
+    certificate_path = identity_dir / "schedule-certificate.json"
+    certificate_path.write_text(
+        json.dumps(certificate, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    source_lock = {
+        "schema": "amg_multitask_launcher_source_lock_v1",
+        "status": "pass",
+        "runtime_source": {
+            "outer_commit": "c" * 40,
+            "inner_commit": "d" * 40,
+            "verl_commit": FINAL_STATISTICS_VERL_COMMIT,
+            "selected_files": {
+                "outer:async_plugins/agentmemorygym_verl/finalizer.py": "1" * 64,
+                "inner:agentenv/agentenv/envs/task.py": "2" * 64,
+            },
+        },
+        "training_runtime": dict(PUBLICATION_TRAINING_RUNTIME),
+        "integration": {
+            "route_registry": {
+                "sha256": registry_sha256,
+                "route_ids": list(route_ids),
+            },
+            "schedule_certificate": {
+                "sha256": sha256(certificate_path),
+                "schedule_sha256": schedule_sha256,
+            },
+        },
+    }
+    source_lock_path = identity_dir / "source-lock.json"
+    source_lock_path.write_text(
+        json.dumps(source_lock, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    config = resolved_config("formal", run_dir, schedule_path)
+    route_config = {
+        "route_registry_path": str(registry_path),
+        "route_registry_sha256": registry_sha256,
+        "route_registry_expected_ids": list(route_ids),
+    }
+    config["actor_rollout_ref"]["agentgym"] = dict(route_config)
+    config["data"]["agentgym"] = dict(route_config)
+    config["trainer"]["total_training_steps"] = updates
+    config["rollout"]["total_rollout_steps"] = episodes
+    resolved_path = run_dir / "resolved-config.yaml"
+    resolved_path.write_text(yaml.safe_dump(config, sort_keys=True), encoding="utf-8")
+    hydra_dir = run_dir / "hydra" / ".hydra"
+    hydra_dir.mkdir(parents=True)
+    hydra_path = hydra_dir / "config.yaml"
+    hydra_path.write_text(yaml.safe_dump(config, sort_keys=True), encoding="utf-8")
+
+    budget_contract = {
+        "schema": "amg_verl_multitask_budget_contract_v1",
+        "mode": "formal",
+        "role": role,
+        "publication_cycles": updates,
+        "trigger_parameter_sync_step": 1,
+        "optimizer_updates": updates,
+        "samples_per_update": samples_per_update,
+        "episodes": episodes,
+        "save_freq": 10,
+        "max_actor_ckpt_to_keep": 1,
+        "max_critic_ckpt_to_keep": 1,
+        "model_path": PUBLICATION_TRAINING_RUNTIME["base_model"],
+        "route_ids": list(route_ids),
+        "route_registry_sha256": registry_sha256,
+        "schedule_sha256": schedule_sha256,
+        "manifest_sha256": manifest_digest,
+        "routing_sha256": schedule_sha256,
+    }
+    budget = verify_resolved_config(
+        config, mode="formal", expected_budget=budget_contract
+    )
+
+    rollout_dir = run_dir / "rollout_data"
+    rollout_dir.mkdir()
+    route_cursors = Counter()
+    cumulative_episodes = Counter()
+    cumulative_actions = Counter()
+    cumulative_tokens = Counter()
+    all_real_rows: list[dict] = []
+    metric_lines: list[str] = []
+    padding_rows = 0
+    for update, route_counts in enumerate(route_counts_by_update, start=1):
+        documents: list[dict] = []
+        update_episodes = Counter()
+        update_actions = Counter()
+        update_tokens = Counter()
+        for route_id in route_ids:
+            for local_position in range(route_counts[route_id]):
+                schedule_row = route_schedule_rows[route_id][route_cursors[route_id]]
+                route_cursors[route_id] += 1
+                uid = f"trajectory-{schedule_row['item_id']}"
+                rows = _action_rows(
+                    schedule_row["item_id"],
+                    schedule_row["data_idx"],
+                    uid,
+                    update - 1,
+                    chain=local_position == 0,
+                )
+                for record in rows:
+                    record["route_id"] = route_id
+                    record["data_source"] = route_id
+                    all_real_rows.append(record)
+                    update_actions[route_id] += 1
+                    update_tokens[route_id] += record["response_token_count"]
+                    documents.append(
+                        {
+                            "input": "policy prompt",
+                            "output": record["action"],
+                            "gts": None,
+                            "score": record["immediate_reward"],
+                            "step": update,
+                            "step_record_json": json.dumps(record, sort_keys=True),
+                            "is_padding": False,
+                        }
+                    )
+                update_episodes[route_id] += 1
+        (rollout_dir / f"{update}.jsonl").write_text(
+            "\n".join(json.dumps(row, sort_keys=True) for row in documents) + "\n",
+            encoding="utf-8",
+        )
+        padding_rows += (-len(documents)) % config["actor_rollout_ref"]["actor"][
+            "ppo_mini_batch_size"
+        ]
+        cumulative_episodes.update(update_episodes)
+        cumulative_actions.update(update_actions)
+        cumulative_tokens.update(update_tokens)
+        data = {
+            "actor/grad_norm": 1.0,
+            "critic/grad_norm": 1.0,
+            "fully_async/count/current_param_version": update - 1,
+            "fully_async/count/stale_trajectory_processed": 0,
+            "fully_async/count/total_generated_samples": update * samples_per_update,
+            "fully_async/count/dropped_stale_samples": 0,
+            "fully_async/monitor/queue/mq_queue_size": 0,
+            "fully_async/static/required_samples": samples_per_update,
+            "rollout_corr/kl": 0.01,
+            "rollout_corr/k3_kl": 0.001,
+            "rollout_corr/log_ppl_abs_diff": 0.01,
+        }
+        for measure, current, cumulative in (
+            ("episodes", update_episodes, cumulative_episodes),
+            ("action_rows", update_actions, cumulative_actions),
+            ("policy_response_tokens", update_tokens, cumulative_tokens),
+        ):
+            data[f"fully_async/sum/optimizer_consumed_{measure}"] = sum(
+                current.values()
+            )
+            data[f"fully_async/count/optimizer_consumed_{measure}"] = sum(
+                cumulative.values()
+            )
+            for route_id in route_ids:
+                data[
+                    f"fully_async/sum/optimizer_consumed_{measure}/data_source/{route_id}"
+                ] = current[route_id]
+                data[
+                    f"fully_async/count/optimizer_consumed_{measure}/data_source/{route_id}"
+                ] = cumulative[route_id]
+        metric_lines.append(json.dumps({"step": update, "data": data}, sort_keys=True))
+    metrics_path = run_dir / "metrics.jsonl"
+    metrics_path.write_text("\n".join(metric_lines) + "\n", encoding="utf-8")
+
+    trainer_log = run_dir / "train.log"
+    max_required_samples = int(samples_per_update * (0.1 + 1.0))
+    final_statistics = {
+        "schema": "verl_fully_async_final_statistics_v1",
+        "queue": {
+            "queue_size": 0,
+            "total_produced": episodes,
+            "total_consumed": episodes,
+            "dropped_samples": 0,
+            "total_cleared": 0,
+            "max_queue_size": max_required_samples,
+            "enqueued_by_data_source": dict(cumulative_episodes),
+            "consumed_by_data_source": dict(cumulative_episodes),
+            "evicted_by_data_source": {},
+            "cleared_by_data_source": {},
+            "resident_by_data_source": {},
+        },
+        "rollouter": {
+            "monitor/active_tasks_size": 0,
+            "monitor/queue/pending_queue_size": 0,
+            "monitor/queue/mq_queue_size": 0,
+            "count/total_generated_samples": episodes,
+            "count/rollout_dispatched_samples": episodes,
+            "count/rollout_inflight_samples": 0,
+            "count/rollout_completed_samples": episodes,
+            "count/rollout_failed_samples": 0,
+            "count/rollout_cancelled_samples": 0,
+            "count/queue_enqueued_samples": episodes,
+            "count/queue_dequeued_samples": episodes,
+            "count/queue_overflow_evictions": 0,
+            "count/queue_cleared_samples": 0,
+            "count/queue_resident_samples": 0,
+            "count/staleness_samples": 0,
+            "count/dropped_stale_samples": 0,
+            "static/max_required_samples": max_required_samples,
+            "static/required_samples": samples_per_update,
+            "static/staleness_threshold": 0.1,
+            "static/max_queue_size": max_required_samples,
+            "static/max_concurrent_samples": 32,
+        },
+        "trainer": {
+            "optimizer_consumed_episodes": episodes,
+            "optimizer_consumed_action_rows": sum(cumulative_actions.values()),
+            "optimizer_consumed_policy_response_tokens": sum(
+                cumulative_tokens.values()
+            ),
+            "optimizer_consumed_episodes_by_data_source": dict(cumulative_episodes),
+            "optimizer_consumed_action_rows_by_data_source": dict(cumulative_actions),
+            "optimizer_consumed_policy_response_tokens_by_data_source": dict(
+                cumulative_tokens
+            ),
+            "stale_action_rows": 0,
+            "stale_action_rows_by_data_source": {},
+            "current_param_version": updates,
+        },
+        "queue_cleanup": {"status": "completed"},
+    }
+    for event in (
+        "rollout_dispatched",
+        "rollout_completed",
+        "queue_enqueued",
+        "queue_dequeued",
+    ):
+        for route_id in route_ids:
+            final_statistics["rollouter"][f"count/{event}/data_source/{route_id}"] = (
+                cumulative_episodes[route_id]
+            )
+    for event in (
+        "rollout_inflight",
+        "rollout_failed",
+        "rollout_cancelled",
+    ):
+        for route_id in route_ids:
+            final_statistics["rollouter"][f"count/{event}/data_source/{route_id}"] = 0
+    trainer_log.write_text(
+        "runtime output\n[FullyAsyncTaskRunner][FinalStatistics] "
+        + json.dumps(final_statistics, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _checkpoint(run_dir, updates, world_size=6)
+    launch_identity = {
+        "schema": "amg_multitask_source_identity_v1",
+        "source_lock_path": str(source_lock_path),
+        "source_lock_sha256": sha256(source_lock_path),
+        "schedule_certificate_path": str(certificate_path),
+        "schedule_certificate_sha256": sha256(certificate_path),
+        "publication_outer_commit": "c" * 40,
+        "publication_inner_commit": "d" * 40,
+        "verl_commit": FINAL_STATISTICS_VERL_COMMIT,
+        "route_registry_path": str(registry_path),
+        "route_registry_sha256": registry_sha256,
+        "route_ids": list(route_ids),
+        "schedule_count": episodes,
+        "schedule_sha256": schedule_sha256,
+        "formal_schedule_contract": certificate,
+        "budget_contract": budget_contract,
+        "client_config": None,
+        "environment": {},
+        "selected_files": dict(source_lock["runtime_source"]["selected_files"]),
+        "training_runtime": dict(PUBLICATION_TRAINING_RUNTIME),
+    }
+    launch_receipt = {
+        "schema": "amg_verl_fully_async_multitask_launch_receipt_v1",
+        "entrypoint": "verl.experimental.fully_async_policy.fully_async_main",
+        "inputs": {
+            "mode": "formal",
+            "experiment_name": "multitask-fixture",
+            "model_path": PUBLICATION_TRAINING_RUNTIME["base_model"],
+            "env_addr": None,
+            "route_registry": str(registry_path),
+            "route_registry_sha256": registry_sha256,
+            "run_dir": str(run_dir),
+            "trainer_gpus": 6,
+            "standalone_rollout_gpus": 2,
+        },
+        "source": {
+            "verl_commit": FINAL_STATISTICS_VERL_COMMIT,
+            "verl_clean": True,
+            "publication_outer_commit": "c" * 40,
+            "outer_commit": "c" * 40,
+            "outer_diff_paths": [],
+            "outer_clean": True,
+            "agentgym_commit": "d" * 40,
+            "agentgym_expected_commit": "d" * 40,
+            "agentgym_clean": True,
+            "training_runtime": dict(PUBLICATION_TRAINING_RUNTIME),
+            "model_files_sha256": LOCKED_MODEL_FILE_SHA256,
+        },
+        "schedule": schedule_report,
+        "launch_identity": launch_identity,
+        "endpoint_publication": None,
+        "budget_contract": budget_contract,
+        "budget": budget,
+        "resolved_config": {
+            "path": str(resolved_path),
+            "sha256": sha256(resolved_path),
+        },
+        "runtime_artifacts": {
+            "file_logger": str(metrics_path),
+            "rollout_data": str(rollout_dir),
+            "hydra_config": str(hydra_path),
+            "checkpoints": str(run_dir / "checkpoints"),
+            "finalization": str(run_dir / "finalization.json"),
+            "trainer_log": str(trainer_log),
+        },
+        "validation_enabled": False,
+    }
+    launch_path = run_dir / "launch-receipt.json"
+    launch_path.write_text(
+        json.dumps(launch_receipt, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return {
+        "run_dir": run_dir,
+        "route_ids": route_ids,
+        "schedule_rows": schedule_rows,
+        "real_rows": all_real_rows,
+        "padding_rows": padding_rows,
+        "metrics_path": metrics_path,
+        "resolved_path": resolved_path,
+        "hydra_path": hydra_path,
+        "rollout_dir": rollout_dir,
+        "checkpoint_root": run_dir / "checkpoints",
+        "launch_path": launch_path,
+        "trainer_log": trainer_log,
+    }
+
+
+def mutate_final_statistics(path: Path, mutate) -> None:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    marker = "[FullyAsyncTaskRunner][FinalStatistics] "
+    matches = [index for index, line in enumerate(lines) if marker in line]
+    if len(matches) != 1:
+        raise ValueError("fixture trainer log does not contain one statistics row")
+    index = matches[0]
+    prefix, payload = lines[index].split(marker, 1)
+    value = json.loads(payload)
+    mutate(value)
+    lines[index] = prefix + marker + json.dumps(value, sort_keys=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def mutate_json(path: Path, mutate) -> None:

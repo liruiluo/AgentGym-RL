@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import tempfile
 import unittest
 from collections.abc import Callable
@@ -9,7 +10,14 @@ from pathlib import Path
 import yaml
 from agentmemorygym_verl.config_contract import verify_resolved_config
 from agentmemorygym_verl.finalizer import finalize_run
-from finalizer_fixture import build_valid_run, mutate_json, sha256
+from finalizer_fixture import (
+    MULTITASK_ROUTES,
+    build_valid_multitask_run,
+    build_valid_run,
+    mutate_final_statistics,
+    mutate_json,
+    sha256,
+)
 
 JsonMutation = Callable[[dict], None]
 
@@ -32,9 +40,7 @@ def rewrite_first_step_record(fixture: dict, mutation: JsonMutation) -> None:
     rewrite_first_rollout(fixture, mutate_document)
 
 
-def rewrite_chain_record(
-    fixture: dict, order: int, mutation: JsonMutation
-) -> None:
+def rewrite_chain_record(fixture: dict, order: int, mutation: JsonMutation) -> None:
     path = sorted(fixture["rollout_dir"].glob("*.jsonl"))[0]
     documents = [
         json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
@@ -75,6 +81,43 @@ def rewrite_metrics(fixture: dict, mutation: JsonMutation) -> None:
     mutation(rows[0])
     path.write_text(
         "\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+
+def rewrite_multitask_source_lock(fixture: dict, mutation: JsonMutation) -> None:
+    receipt = json.loads(fixture["launch_path"].read_text(encoding="utf-8"))
+    source_lock_path = Path(receipt["launch_identity"]["source_lock_path"])
+    mutate_json(source_lock_path, mutation)
+    receipt["launch_identity"]["source_lock_sha256"] = sha256(source_lock_path)
+    fixture["launch_path"].write_text(
+        json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def rewrite_multitask_certificate(
+    fixture: dict, mutation: JsonMutation, *, mirror_contract: bool = True
+) -> None:
+    receipt = json.loads(fixture["launch_path"].read_text(encoding="utf-8"))
+    identity = receipt["launch_identity"]
+    certificate_path = Path(identity["schedule_certificate_path"])
+    source_lock_path = Path(identity["source_lock_path"])
+    mutate_json(certificate_path, mutation)
+    certificate = json.loads(certificate_path.read_text(encoding="utf-8"))
+    certificate_digest = sha256(certificate_path)
+    mutate_json(
+        source_lock_path,
+        lambda source_lock: source_lock["integration"]["schedule_certificate"].update(
+            sha256=certificate_digest
+        ),
+    )
+    identity["schedule_certificate_sha256"] = certificate_digest
+    identity["source_lock_sha256"] = sha256(source_lock_path)
+    if mirror_contract:
+        identity["formal_schedule_contract"] = certificate
+    fixture["launch_path"].write_text(
+        json.dumps(receipt, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
 
@@ -194,6 +237,18 @@ class TestFinalizerSuccess(FinalizerTestCase):
             self.assertEqual(verdict["counts"]["policy_version_max"], 99)
             self.assertEqual(verdict["counts"]["validation_events"], 0)
 
+    def test_legacy_receipt_cannot_be_reinterpreted_as_multitask(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+            mutate_json(
+                fixture["launch_path"],
+                lambda receipt: receipt.update(
+                    schema="amg_verl_fully_async_multitask_launch_receipt_v1"
+                ),
+            )
+
+            self.assert_failed(fixture["run_dir"], contains="multitask")
+
 
 class TestFinalizerTerminalPaths(FinalizerTestCase):
     def test_trainer_crash_always_fails_even_when_all_artifacts_would_pass(self):
@@ -208,7 +263,10 @@ class TestFinalizerTerminalPaths(FinalizerTestCase):
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.build(Path(directory))
             path = sorted(fixture["rollout_dir"].glob("*.jsonl"))[0]
-            rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+            rows = [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+            ]
             first_record = json.loads(rows[0]["step_record_json"])
             uid = first_record["trajectory_uid"]
             rows = [
@@ -235,6 +293,29 @@ class TestFinalizerTerminalPaths(FinalizerTestCase):
             )
             fixture["metrics_path"].unlink()
             self.assert_failed(fixture["run_dir"], contains="FileLogger JSONL")
+
+    def test_legacy_shadow_finalization_cannot_leave_stale_canonical_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+            canonical = fixture["run_dir"] / "finalization.json"
+            self.assertEqual(
+                finalize_run(fixture["run_dir"], trainer_exit_code=0)["status"],
+                "pass",
+            )
+            mutate_json(
+                fixture["launch_path"],
+                lambda receipt: receipt["runtime_artifacts"].update(
+                    finalization=str(fixture["run_dir"] / "shadow" / "verdict.json")
+                ),
+            )
+
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+
+            self.assertEqual(verdict["status"], "fail")
+            self.assertEqual(
+                json.loads(canonical.read_text(encoding="utf-8")), verdict
+            )
+            self.assertFalse((fixture["run_dir"] / "shadow" / "verdict.json").exists())
 
 
 class TestFinalizerMissingArtifacts(FinalizerTestCase):
@@ -303,15 +384,21 @@ class TestFinalizerFileLogger(FinalizerTestCase):
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.build(Path(directory))
             with fixture["metrics_path"].open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps({"step": 0, "data": {"actor/grad_norm": 1.0}}) + "\n")
-            self.assert_failed(fixture["run_dir"], contains="step 0 is not rollouter-only")
+                handle.write(
+                    json.dumps({"step": 0, "data": {"actor/grad_norm": 1.0}}) + "\n"
+                )
+            self.assert_failed(
+                fixture["run_dir"], contains="step 0 is not rollouter-only"
+            )
 
     def test_each_publication_has_native_learner_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.build(Path(directory), mode="formal")
             rows = [
                 json.loads(line)
-                for line in fixture["metrics_path"].read_text(encoding="utf-8").splitlines()
+                for line in fixture["metrics_path"]
+                .read_text(encoding="utf-8")
+                .splitlines()
             ]
             rows[1]["data"].pop("actor/grad_norm")
             fixture["metrics_path"].write_text(
@@ -319,7 +406,8 @@ class TestFinalizerFileLogger(FinalizerTestCase):
                 encoding="utf-8",
             )
             self.assert_failed(
-                fixture["run_dir"], contains="publication step 2 has no unique nonzero actor/grad_norm"
+                fixture["run_dir"],
+                contains="publication step 2 has no unique nonzero actor/grad_norm",
             )
 
     def test_publication_cycle_native_evidence_is_complete_and_exact(self):
@@ -375,7 +463,9 @@ class TestFinalizerFileLogger(FinalizerTestCase):
                 fixture = self.build(Path(directory))
                 rows = [
                     json.loads(line)
-                    for line in fixture["metrics_path"].read_text(encoding="utf-8").splitlines()
+                    for line in fixture["metrics_path"]
+                    .read_text(encoding="utf-8")
+                    .splitlines()
                 ]
                 rows[0]["data"].pop(f"{role}/grad_norm")
                 rows[0]["data"][decoy] = 1.0
@@ -391,7 +481,9 @@ class TestFinalizerFileLogger(FinalizerTestCase):
             fixture = self.build(Path(directory))
             with fixture["metrics_path"].open("a", encoding="utf-8") as handle:
                 handle.write(
-                    json.dumps({"step": 1, "data": {"actor/grad_norm": 2.0}}, sort_keys=True)
+                    json.dumps(
+                        {"step": 1, "data": {"actor/grad_norm": 2.0}}, sort_keys=True
+                    )
                     + "\n"
                 )
             self.assert_failed(
@@ -403,19 +495,27 @@ class TestFinalizerFileLogger(FinalizerTestCase):
             fixture = self.build(Path(directory), mode="formal")
             rows = [
                 json.loads(line)
-                for line in fixture["metrics_path"].read_text(encoding="utf-8").splitlines()
+                for line in fixture["metrics_path"]
+                .read_text(encoding="utf-8")
+                .splitlines()
             ]
             rows[10]["data"]["fully_async/count/total_generated_samples"] = 1
             fixture["metrics_path"].write_text(
                 "\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n",
                 encoding="utf-8",
             )
-            self.assert_failed(fixture["run_dir"], contains="total-generated-samples count is not cumulative")
+            self.assert_failed(
+                fixture["run_dir"],
+                contains="total-generated-samples count is not cumulative",
+            )
 
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.build(Path(directory))
             with fixture["metrics_path"].open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps({"step": 1, "data": {"val-core/score/mean@1": 1.0}}) + "\n")
+                handle.write(
+                    json.dumps({"step": 1, "data": {"val-core/score/mean@1": 1.0}})
+                    + "\n"
+                )
             self.assert_failed(fixture["run_dir"], contains="validation metric")
 
 
@@ -521,7 +621,9 @@ class TestFinalizerRollouts(FinalizerTestCase):
             record["trajectory_uid"] = first_record["trajectory_uid"]
             documents[0]["step_record_json"] = json.dumps(record, sort_keys=True)
             second_path.write_text(
-                "\n".join(json.dumps(document, sort_keys=True) for document in documents)
+                "\n".join(
+                    json.dumps(document, sort_keys=True) for document in documents
+                )
                 + "\n",
                 encoding="utf-8",
             )
@@ -546,7 +648,8 @@ class TestFinalizerRollouts(FinalizerTestCase):
                 ),
             )
             self.assert_failed(
-                fixture["run_dir"], contains="terminal row is not the maximum action order"
+                fixture["run_dir"],
+                contains="terminal row is not the maximum action order",
             )
 
     def test_rollout_files_must_have_numeric_optimizer_step_names(self):
@@ -619,6 +722,7 @@ class TestFinalizerRollouts(FinalizerTestCase):
                             record["wrapper_evidence"]["continuation_persisted"] = False
                     elif record["trajectory_row_order"] == 1 and case == "empty_read":
                         record["env_info_after"]["execution"]["stdout"] = ""
+                        record["wrapper_evidence"].pop("document_read_observed", None)
                     elif (
                         record["trajectory_row_order"] == 3 and case == "failed_execute"
                     ):
@@ -630,7 +734,6 @@ class TestFinalizerRollouts(FinalizerTestCase):
                     fixture["run_dir"],
                     contains="policy-authored external-document chain",
                 )
-
 
     def test_apply_patch_can_persist_the_compaction_document(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -662,7 +765,7 @@ class TestFinalizerRollouts(FinalizerTestCase):
 
             self.assertEqual(verdict["status"], "pass", verdict)
 
-    def test_action_decoys_do_not_form_a_memory_chain(self):
+    def test_action_text_does_not_override_emitted_memory_events(self):
         orders = {
             "echo_read": 1,
             "commented_execute": 3,
@@ -677,23 +780,23 @@ class TestFinalizerRollouts(FinalizerTestCase):
                 def mutate(record: dict) -> None:
                     if case == "echo_read":
                         action = (
-                            "shell_command {\"command\":\"printf 'objective: improve "
+                            'shell_command {"command":"printf \'objective: improve '
                             "validation\\nmeasured_validation_or_failure: validation_mae=1.0"
                             "\\nconclusion: update the model\\ncode_path: train.py"
                             "\\nnext_action: edit train.py before rerunning\\n' # "
-                            ".agent_memory/OPENMLE_CONTINUATION.md\",\"workdir\":\".\","
-                            "\"timeout_ms\":20000}"
+                            '.agent_memory/OPENMLE_CONTINUATION.md","workdir":".",'
+                            '"timeout_ms":20000}'
                         )
                     elif case == "commented_execute":
                         action = (
-                            "shell_command {\"command\":\"python other.py # train.py\","
-                            "\"workdir\":\".\",\"timeout_ms\":20000}"
+                            'shell_command {"command":"python other.py # train.py",'
+                            '"workdir":".","timeout_ms":20000}'
                         )
                     elif case == "subpath_read":
                         action = (
-                            "shell_command {\"command\":\"cat nested/.agent_memory/"
-                            "OPENMLE_CONTINUATION.md\",\"workdir\":\".\","
-                            "\"timeout_ms\":20000}"
+                            'shell_command {"command":"cat nested/.agent_memory/'
+                            'OPENMLE_CONTINUATION.md","workdir":".",'
+                            '"timeout_ms":20000}'
                         )
                     elif case == "subpath_edit":
                         action = (
@@ -706,19 +809,17 @@ class TestFinalizerRollouts(FinalizerTestCase):
                         ]
                     else:
                         action = (
-                            "shell_command {\"command\":\"python nested/train.py\","
-                            "\"workdir\":\".\",\"timeout_ms\":20000}"
+                            'shell_command {"command":"python nested/train.py",'
+                            '"workdir":".","timeout_ms":20000}'
                         )
                     record["action"] = action
                     record["action_submission"]["raw_policy_output"] = action
 
                 rewrite_chain_record(fixture, order, mutate)
-                self.assert_failed(
-                    fixture["run_dir"],
-                    contains="policy-authored external-document chain",
-                )
+                verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+                self.assertEqual(verdict["status"], "pass", verdict)
 
-    def test_dummy_code_path_cannot_satisfy_openmle_memory_chain(self):
+    def test_document_path_text_is_not_a_shared_evidence_parser(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.build(Path(directory))
 
@@ -740,36 +841,824 @@ class TestFinalizerRollouts(FinalizerTestCase):
 
             for order in range(4):
                 rewrite_chain_record(fixture, order, rewrite_path)
-            self.assert_failed(
-                fixture["run_dir"],
-                contains="policy-authored external-document chain",
-            )
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+            self.assertEqual(verdict["status"], "pass", verdict)
 
-    def test_continuation_fields_and_completed_execution_are_required(self):
-        cases = ("missing_objective", "not_completed")
+    def test_missing_read_or_unsuccessful_execute_event_breaks_the_chain(self):
+        cases = (
+            "missing_read_event",
+            "missing_execute_outcome",
+            "failed_execute_outcome",
+            "contradictory_action_status",
+            "contradictory_completion_counter",
+            "contradictory_execution_status",
+            "contradictory_exit_code",
+            "contradictory_execution_delta",
+        )
         for case in cases:
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
                 fixture = self.build(Path(directory))
-                order = 1 if case == "missing_objective" else 3
+                order = 1 if case == "missing_read_event" else 3
 
                 def mutate(record: dict) -> None:
-                    if case == "missing_objective":
-                        execution = record["env_info_after"]["execution"]
-                        execution["stdout"] = "\n".join(
-                            line
-                            for line in execution["stdout"].splitlines()
-                            if not line.startswith("objective:")
-                        )
+                    if case == "missing_read_event":
+                        record["wrapper_evidence"].pop("memory_event", None)
+                    elif case == "missing_execute_outcome":
+                        record["wrapper_evidence"].pop("outcome", None)
+                    elif case == "failed_execute_outcome":
+                        record["wrapper_evidence"]["outcome"] = "failed"
+                    elif case == "contradictory_action_status":
+                        record["env_info_after"]["action_status"] = "failed"
+                    elif case == "contradictory_completion_counter":
+                        record["env_info_after"]["counter_delta"][
+                            "execution_completed_count"
+                        ] = 0
+                    elif case == "contradictory_execution_status":
+                        record["env_info_after"]["execution"]["status"] = "failed"
+                    elif case == "contradictory_exit_code":
+                        record["env_info_after"]["execution"]["exit_code"] = 1
                     else:
-                        info = record["env_info_after"]
-                        info["counter_delta"]["execution_completed_count"] = 0
-                        info["execution"]["execution_completed_delta"] = 0
+                        record["env_info_after"]["execution"][
+                            "execution_completed_delta"
+                        ] = 0
 
                 rewrite_chain_record(fixture, order, mutate)
                 self.assert_failed(
                     fixture["run_dir"],
                     contains="policy-authored external-document chain",
                 )
+
+    def test_minimal_task_neutral_execute_evidence_completes_the_chain(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+            rewrite_chain_record(
+                fixture,
+                3,
+                lambda record: record.update(env_info_after={"resolved": True}),
+            )
+
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+
+            self.assertEqual(verdict["status"], "pass", verdict)
+
+    def test_plural_memory_events_cannot_forge_a_complete_chain(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+            path = next(fixture["rollout_dir"].glob("*.jsonl"))
+            documents = [
+                json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+            ]
+            chain_uids = {
+                json.loads(document["step_record_json"])["trajectory_uid"]
+                for document in documents
+                if json.loads(document["step_record_json"])
+                .get("wrapper_evidence", {})
+                .get("event")
+                == "context_compaction"
+            }
+            self.assertEqual(len(chain_uids), 1)
+            chain_uid = chain_uids.pop()
+            for document in documents:
+                record = json.loads(document["step_record_json"])
+                if record.get("trajectory_uid") == chain_uid:
+                    record["wrapper_evidence"] = {}
+                    if record.get("trajectory_row_order") == 0:
+                        record["wrapper_evidence"]["memory_events"] = [
+                            "write",
+                            "compaction",
+                            "read",
+                            "modify",
+                            "execute",
+                        ]
+                    document["step_record_json"] = json.dumps(record, sort_keys=True)
+            path.write_text(
+                "\n".join(json.dumps(document, sort_keys=True) for document in documents)
+                + "\n",
+                encoding="utf-8",
+            )
+
+            self.assert_failed(
+                fixture["run_dir"],
+                contains="policy-authored external-document chain",
+            )
+
+
+class TestMultitaskFinalizer(FinalizerTestCase):
+    def build_multitask(
+        self,
+        root: Path,
+        *,
+        updates: int = 8,
+        route_counts_by_update: list[dict[str, int]] | None = None,
+    ) -> dict:
+        return build_valid_multitask_run(
+            root / "run",
+            updates=updates,
+            route_counts_by_update=route_counts_by_update,
+        )
+
+    def test_four_opaque_routes_pass_with_exact_owner_accounting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build_multitask(Path(directory))
+
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+
+            self.assertEqual(verdict["status"], "pass", verdict)
+            self.assertEqual(
+                verdict["launch_receipt_schema"],
+                "amg_verl_fully_async_multitask_launch_receipt_v1",
+            )
+            self.assertEqual(set(verdict["routes"]), set(MULTITASK_ROUTES))
+            self.assertEqual(verdict["rolling_8_episode_share"]["status"], "pass")
+            self.assertEqual(
+                verdict["final_accounting"]["optimizer_consumed"]["episodes"],
+                8 * 64,
+            )
+            for route_id in MULTITASK_ROUTES:
+                route = verdict["routes"][route_id]
+                self.assertEqual(route["optimizer_consumed_episodes"], 128)
+                self.assertEqual(route["native_successes"], 128)
+                self.assertEqual(route["document_writes"], 8)
+                self.assertEqual(route["compactions"], 8)
+                self.assertEqual(route["document_reads"], 8)
+                self.assertEqual(route["memory_reuses_or_modifications"], 8)
+                self.assertEqual(route["executions"], 8)
+                self.assertEqual(route["complete_memory_chains"], 8)
+
+    def test_multitask_runtime_artifacts_follow_receipt_declared_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build_multitask(Path(directory))
+            launch = json.loads(fixture["launch_path"].read_text(encoding="utf-8"))
+            replacements = {
+                "file_logger": fixture["run_dir"] / "telemetry" / "metrics.jsonl",
+                "rollout_data": fixture["run_dir"] / "telemetry" / "episodes",
+            }
+            for field, replacement in replacements.items():
+                replacement.parent.mkdir(parents=True, exist_ok=True)
+                Path(launch["runtime_artifacts"][field]).rename(replacement)
+                launch["runtime_artifacts"][field] = str(replacement)
+            fixture["launch_path"].write_text(
+                json.dumps(launch, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+
+            self.assertEqual(verdict["status"], "pass", verdict)
+
+    def test_duplicate_file_logger_route_metric_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build_multitask(Path(directory))
+            rows = [
+                json.loads(line)
+                for line in fixture["metrics_path"]
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            key = (
+                "fully_async/sum/optimizer_consumed_episodes/data_source/"
+                + MULTITASK_ROUTES[0]
+            )
+            rows.insert(1, {"step": 1, "data": {key: rows[0]["data"][key]}})
+            fixture["metrics_path"].write_text(
+                "\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+
+            self.assert_failed(
+                fixture["run_dir"],
+                contains="optimizer-consumed episodes route totals mismatch",
+            )
+
+    def test_receipt_schema_identity_digest_and_budget_drift_fail_closed(self):
+        cases: tuple[tuple[str, JsonMutation], ...] = (
+            (
+                "unknown receipt schema",
+                lambda receipt: receipt.update(schema="unknown-receipt"),
+            ),
+            (
+                "legacy schema cannot reinterpret multitask fields",
+                lambda receipt: receipt.update(
+                    schema="amg_verl_fully_async_launch_receipt_v5"
+                ),
+            ),
+            (
+                "veRL identity",
+                lambda receipt: receipt["source"].update(verl_commit="0" * 40),
+            ),
+            (
+                "outer identity",
+                lambda receipt: receipt["source"].update(outer_commit="e" * 40),
+            ),
+            (
+                "inner identity",
+                lambda receipt: receipt["source"].update(agentgym_commit="e" * 40),
+            ),
+            (
+                "dirty outer source",
+                lambda receipt: receipt["source"].update(
+                    outer_diff_paths=["uncommitted.py"]
+                ),
+            ),
+            (
+                "route identity",
+                lambda receipt: receipt["launch_identity"].update(
+                    route_ids=list(MULTITASK_ROUTES[:3])
+                ),
+            ),
+            (
+                "registry digest",
+                lambda receipt: receipt["inputs"].update(
+                    route_registry_sha256="0" * 64
+                ),
+            ),
+            (
+                "schedule digest",
+                lambda receipt: receipt["schedule"].update(sha256="0" * 64),
+            ),
+            (
+                "optimizer budget",
+                lambda receipt: receipt["budget_contract"].update(episodes=511),
+            ),
+        )
+        for label, mutation in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                fixture = self.build_multitask(Path(directory))
+                mutate_json(fixture["launch_path"], mutation)
+                self.assert_failed(fixture["run_dir"])
+
+    def test_receipt_bound_artifact_digests_and_runtime_paths_fail_on_drift(self):
+        for artifact in ("source_lock", "schedule_certificate", "route_registry"):
+            with (
+                self.subTest(artifact=artifact),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                fixture = self.build_multitask(Path(directory))
+                identity = json.loads(
+                    fixture["launch_path"].read_text(encoding="utf-8")
+                )["launch_identity"]
+                path = Path(identity[f"{artifact}_path"])
+                path.write_text(
+                    path.read_text(encoding="utf-8") + " ", encoding="utf-8"
+                )
+                self.assert_failed(fixture["run_dir"])
+
+    def test_invalid_finalization_path_cannot_overwrite_runtime_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build_multitask(Path(directory))
+            metrics_before = fixture["metrics_path"].read_bytes()
+            mutate_json(
+                fixture["launch_path"],
+                lambda receipt: receipt["runtime_artifacts"].update(
+                    finalization=str(fixture["metrics_path"])
+                ),
+            )
+
+            verdict = self.assert_failed(
+                fixture["run_dir"], contains="paths must be distinct"
+            )
+
+            self.assertEqual(fixture["metrics_path"].read_bytes(), metrics_before)
+            written = json.loads(
+                (fixture["run_dir"] / "finalization.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(written, verdict)
+
+        runtime_fields = (
+            "file_logger",
+            "rollout_data",
+            "hydra_config",
+            "checkpoints",
+            "finalization",
+            "trainer_log",
+        )
+        for field in runtime_fields:
+            with (
+                self.subTest(runtime_path=field),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                fixture = self.build_multitask(Path(directory))
+                mutate_json(
+                    fixture["launch_path"],
+                    lambda receipt, field=field: receipt["runtime_artifacts"].update(
+                        {field: f"/tmp/unbound-{field}"}
+                    ),
+                )
+                self.assert_failed(fixture["run_dir"])
+
+    def test_receipt_cannot_rewrite_the_bound_source_lock_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build_multitask(Path(directory))
+
+            def mutate(receipt: dict) -> None:
+                receipt["launch_identity"]["publication_outer_commit"] = "e" * 40
+                receipt["source"]["publication_outer_commit"] = "e" * 40
+                receipt["source"]["outer_commit"] = "e" * 40
+
+            mutate_json(fixture["launch_path"], mutate)
+            self.assert_failed(fixture["run_dir"], contains="source lock")
+
+    def test_receipt_cannot_ignore_bound_schedule_certificate_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build_multitask(Path(directory))
+            receipt = json.loads(fixture["launch_path"].read_text(encoding="utf-8"))
+            identity = receipt["launch_identity"]
+            certificate_path = Path(identity["schedule_certificate_path"])
+            source_lock_path = Path(identity["source_lock_path"])
+            mutate_json(
+                certificate_path,
+                lambda certificate: certificate.update(optimizer_updates=9),
+            )
+            certificate_digest = sha256(certificate_path)
+            mutate_json(
+                source_lock_path,
+                lambda source_lock: source_lock["integration"][
+                    "schedule_certificate"
+                ].update(sha256=certificate_digest),
+            )
+            identity["schedule_certificate_sha256"] = certificate_digest
+            identity["source_lock_sha256"] = sha256(source_lock_path)
+            fixture["launch_path"].write_text(
+                json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            self.assert_failed(fixture["run_dir"], contains="certificate")
+
+    def test_source_lock_content_is_bound_even_when_its_digest_is_rewritten(self):
+        cases = (
+            ("schema", lambda lock: lock.update(schema="unknown")),
+            ("status", lambda lock: lock.update(status="fail")),
+            (
+                "outer commit",
+                lambda lock: lock["runtime_source"].update(outer_commit="e" * 40),
+            ),
+            (
+                "inner commit",
+                lambda lock: lock["runtime_source"].update(inner_commit="e" * 40),
+            ),
+            (
+                "veRL commit",
+                lambda lock: lock["runtime_source"].update(verl_commit="e" * 40),
+            ),
+            (
+                "selected files",
+                lambda lock: lock["runtime_source"].update(
+                    selected_files={"outer:changed.py": "e" * 64}
+                ),
+            ),
+            (
+                "training runtime",
+                lambda lock: lock["training_runtime"].update(
+                    base_model="/models/unbound"
+                ),
+            ),
+            (
+                "registry digest",
+                lambda lock: lock["integration"]["route_registry"].update(
+                    sha256="e" * 64
+                ),
+            ),
+            (
+                "registry routes",
+                lambda lock: lock["integration"]["route_registry"].update(
+                    route_ids=list(reversed(MULTITASK_ROUTES))
+                ),
+            ),
+            (
+                "schedule digest",
+                lambda lock: lock["integration"]["schedule_certificate"].update(
+                    schedule_sha256="e" * 64
+                ),
+            ),
+        )
+        for label, mutation in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                fixture = self.build_multitask(Path(directory))
+                rewrite_multitask_source_lock(fixture, mutation)
+                self.assert_failed(fixture["run_dir"], contains="source lock")
+
+    def test_schedule_certificate_fields_are_bound_to_launch_contract(self):
+        cases = (
+            ("schema", lambda value: value.update(schema="unknown")),
+            (
+                "registry digest",
+                lambda value: value.update(route_registry_sha256="e" * 64),
+            ),
+            (
+                "schedule digest",
+                lambda value: value.update(schedule_sha256="e" * 64),
+            ),
+            ("manifest digest", lambda value: value.update(spec_sha256="e" * 64)),
+            ("role", lambda value: value.update(role="gate_only")),
+            ("updates", lambda value: value.update(optimizer_updates=9)),
+            ("samples/update", lambda value: value.update(samples_per_update=32)),
+            ("row count", lambda value: value.update(row_count=511)),
+            (
+                "route order",
+                lambda value: value.update(
+                    route_order=list(reversed(MULTITASK_ROUTES))
+                ),
+            ),
+            (
+                "per-route rows",
+                lambda value: value["per_route_rows"].update(
+                    {MULTITASK_ROUTES[0]: 129}
+                ),
+            ),
+        )
+        for label, mutation in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                fixture = self.build_multitask(Path(directory))
+                rewrite_multitask_certificate(fixture, mutation)
+                self.assert_failed(fixture["run_dir"], contains="certificate")
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build_multitask(Path(directory))
+            mutate_json(
+                fixture["launch_path"],
+                lambda receipt: receipt["launch_identity"][
+                    "formal_schedule_contract"
+                ].update(panel_id="unbound"),
+            )
+            self.assert_failed(fixture["run_dir"], contains="certificate")
+
+    def test_final_statistics_requires_one_exact_owner_snapshot(self):
+        for case in ("missing", "duplicate", "malformed", "wrong_schema"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                fixture = self.build_multitask(Path(directory))
+                path = fixture["trainer_log"]
+                if case == "missing":
+                    path.write_text("runtime output\n", encoding="utf-8")
+                elif case == "duplicate":
+                    line = path.read_text(encoding="utf-8").splitlines()[-1]
+                    path.write_text(
+                        path.read_text(encoding="utf-8") + line + "\n",
+                        encoding="utf-8",
+                    )
+                elif case == "malformed":
+                    path.write_text(
+                        "[FullyAsyncTaskRunner][FinalStatistics] {\n",
+                        encoding="utf-8",
+                    )
+                else:
+                    mutate_final_statistics(
+                        path, lambda value: value.update(schema="unknown")
+                    )
+                self.assert_failed(fixture["run_dir"], contains="FinalStatistics")
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build_multitask(Path(directory))
+            mutate_final_statistics(
+                fixture["trainer_log"],
+                lambda value: value.update(queue_cleanup={"status": "failed"}),
+            )
+            self.assert_failed(fixture["run_dir"], contains="cleanup")
+
+    def test_final_statistics_accepts_only_direct_or_ansi_ray_log_prefixes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build_multitask(Path(directory))
+            path = fixture["trainer_log"]
+            marker_line = path.read_text(encoding="utf-8").splitlines()[-1]
+            path.write_text(
+                "runtime output\n"
+                "\x1b[36m(FullyAsyncTaskRunner pid=17, ip=127.0.0.1)\x1b[0m "
+                + marker_line
+                + "\n",
+                encoding="utf-8",
+            )
+
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+
+            self.assertEqual(verdict["status"], "pass", verdict)
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build_multitask(Path(directory))
+            path = fixture["trainer_log"]
+            marker_line = path.read_text(encoding="utf-8").splitlines()[-1]
+            path.write_text(
+                "runtime output\nINFO embedded " + marker_line + "\n",
+                encoding="utf-8",
+            )
+
+            self.assert_failed(fixture["run_dir"], contains="FinalStatistics")
+
+    def test_final_statistics_owner_shapes_are_exact(self):
+        cases: tuple[tuple[str, JsonMutation], ...] = (
+            ("top extra", lambda value: value.update(unexpected={})),
+            ("top missing", lambda value: value.pop("queue_cleanup")),
+            (
+                "queue extra",
+                lambda value: value["queue"].update(unexpected=0),
+            ),
+            (
+                "queue missing",
+                lambda value: value["queue"].pop("max_queue_size"),
+            ),
+            (
+                "rollouter extra",
+                lambda value: value["rollouter"].update(unexpected=0),
+            ),
+            (
+                "rollouter missing",
+                lambda value: value["rollouter"].pop("count/staleness_samples"),
+            ),
+            (
+                "trainer extra",
+                lambda value: value["trainer"].update(unexpected=0),
+            ),
+            (
+                "trainer missing",
+                lambda value: value["trainer"].pop("current_param_version"),
+            ),
+        )
+        for label, mutation in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                fixture = self.build_multitask(Path(directory))
+                mutate_final_statistics(fixture["trainer_log"], mutation)
+                self.assert_failed(fixture["run_dir"], contains="FinalStatistics")
+
+    def test_final_statistics_counters_reject_integral_floats(self):
+        route_id = MULTITASK_ROUTES[0]
+        cases: tuple[tuple[str, JsonMutation], ...] = (
+            (
+                "queue total",
+                lambda value: value["queue"].update(total_produced=512.0),
+            ),
+            (
+                "queue route",
+                lambda value: value["queue"]["enqueued_by_data_source"].update(
+                    {route_id: 128.0}
+                ),
+            ),
+            (
+                "rollouter total",
+                lambda value: value["rollouter"].update(
+                    {"count/total_generated_samples": 512.0}
+                ),
+            ),
+            (
+                "rollouter route",
+                lambda value: value["rollouter"].update(
+                    {f"count/rollout_completed/data_source/{route_id}": 128.0}
+                ),
+            ),
+            (
+                "trainer total",
+                lambda value: value["trainer"].update(
+                    optimizer_consumed_episodes=512.0
+                ),
+            ),
+            (
+                "trainer route",
+                lambda value: value["trainer"][
+                    "optimizer_consumed_episodes_by_data_source"
+                ].update({route_id: 128.0}),
+            ),
+        )
+        for label, mutation in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                fixture = self.build_multitask(Path(directory))
+                mutate_final_statistics(fixture["trainer_log"], mutation)
+                self.assert_failed(fixture["run_dir"], contains="FinalStatistics")
+
+    def test_final_statistics_staleness_threshold_requires_a_json_number(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build_multitask(Path(directory))
+            mutate_final_statistics(
+                fixture["trainer_log"],
+                lambda value: value["rollouter"].update(
+                    {"static/staleness_threshold": "0.1"}
+                ),
+            )
+
+            self.assert_failed(
+                fixture["run_dir"],
+                contains="staleness_threshold is invalid",
+            )
+
+    def test_conserved_nonzero_cleanup_cleared_is_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build_multitask(Path(directory))
+            route_id = MULTITASK_ROUTES[0]
+
+            def add_cleanup_surplus(value: dict) -> None:
+                queue = value["queue"]
+                queue["total_produced"] += 1
+                queue["total_cleared"] = 1
+                queue["enqueued_by_data_source"][route_id] += 1
+                queue["cleared_by_data_source"][route_id] = 1
+
+                rollouter = value["rollouter"]
+                for field in (
+                    "count/total_generated_samples",
+                    "count/rollout_dispatched_samples",
+                    "count/rollout_completed_samples",
+                    "count/queue_enqueued_samples",
+                ):
+                    rollouter[field] += 1
+                rollouter["count/queue_cleared_samples"] = 1
+                for event in (
+                    "rollout_dispatched",
+                    "rollout_completed",
+                    "queue_enqueued",
+                ):
+                    rollouter[f"count/{event}/data_source/{route_id}"] += 1
+                rollouter[f"count/queue_cleared/data_source/{route_id}"] = 1
+
+            mutate_final_statistics(fixture["trainer_log"], add_cleanup_surplus)
+
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+
+            self.assertEqual(verdict["status"], "pass", verdict)
+            self.assertEqual(
+                verdict["final_accounting"]["queue"]["cleanup_cleared"], 1
+            )
+            self.assertEqual(
+                verdict["final_accounting"]["queue_by_route"]["cleanup_cleared"][
+                    route_id
+                ],
+                1,
+            )
+
+    def test_every_global_final_statistics_counter_is_checked(self):
+        fields = (
+            ("queue", "total_produced"),
+            ("queue", "total_consumed"),
+            ("queue", "dropped_samples"),
+            ("queue", "total_cleared"),
+            ("queue", "queue_size"),
+            ("rollouter", "count/rollout_dispatched_samples"),
+            ("rollouter", "count/rollout_inflight_samples"),
+            ("rollouter", "count/rollout_completed_samples"),
+            ("rollouter", "count/rollout_failed_samples"),
+            ("rollouter", "count/rollout_cancelled_samples"),
+            ("rollouter", "count/queue_enqueued_samples"),
+            ("rollouter", "count/queue_dequeued_samples"),
+            ("rollouter", "count/queue_overflow_evictions"),
+            ("rollouter", "count/queue_cleared_samples"),
+            ("rollouter", "count/queue_resident_samples"),
+            ("rollouter", "monitor/active_tasks_size"),
+            ("rollouter", "monitor/queue/pending_queue_size"),
+            ("rollouter", "monitor/queue/mq_queue_size"),
+            ("rollouter", "count/dropped_stale_samples"),
+            ("trainer", "optimizer_consumed_episodes"),
+            ("trainer", "optimizer_consumed_action_rows"),
+            ("trainer", "optimizer_consumed_policy_response_tokens"),
+            ("trainer", "stale_action_rows"),
+            ("trainer", "current_param_version"),
+        )
+        for owner, field in fields:
+            with (
+                self.subTest(owner=owner, field=field),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                fixture = self.build_multitask(Path(directory))
+
+                def mutate(value: dict, owner: str = owner, field: str = field) -> None:
+                    value[owner][field] += 1
+
+                mutate_final_statistics(fixture["trainer_log"], mutate)
+                self.assert_failed(fixture["run_dir"])
+
+    def test_every_per_route_final_statistics_counter_is_checked(self):
+        queue_fields = (
+            "enqueued_by_data_source",
+            "consumed_by_data_source",
+            "evicted_by_data_source",
+            "cleared_by_data_source",
+            "resident_by_data_source",
+        )
+        rollouter_events = (
+            "rollout_dispatched",
+            "rollout_inflight",
+            "rollout_completed",
+            "rollout_failed",
+            "rollout_cancelled",
+            "queue_enqueued",
+            "queue_dequeued",
+            "queue_overflow_evicted",
+            "queue_cleared",
+            "queue_resident",
+        )
+        trainer_fields = (
+            "optimizer_consumed_episodes_by_data_source",
+            "optimizer_consumed_action_rows_by_data_source",
+            "optimizer_consumed_policy_response_tokens_by_data_source",
+            "stale_action_rows_by_data_source",
+        )
+        route_id = MULTITASK_ROUTES[0]
+        cases = [
+            (
+                f"queue.{field}",
+                lambda value, field=field: value["queue"][field].__setitem__(
+                    route_id, value["queue"][field].get(route_id, 0) + 1
+                ),
+            )
+            for field in queue_fields
+        ]
+        cases.extend(
+            (
+                f"rollouter.{event}",
+                lambda value, event=event: value["rollouter"].__setitem__(
+                    f"count/{event}/data_source/{route_id}",
+                    value["rollouter"].get(f"count/{event}/data_source/{route_id}", 0)
+                    + 1,
+                ),
+            )
+            for event in rollouter_events
+        )
+        cases.extend(
+            (
+                f"trainer.{field}",
+                lambda value, field=field: value["trainer"][field].__setitem__(
+                    route_id, value["trainer"][field].get(route_id, 0) + 1
+                ),
+            )
+            for field in trainer_fields
+        )
+        for label, mutation in cases:
+            with (
+                self.subTest(counter=label),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                fixture = self.build_multitask(Path(directory))
+                mutate_final_statistics(fixture["trainer_log"], mutation)
+                self.assert_failed(fixture["run_dir"])
+
+    def test_cross_owner_route_shift_fails_even_when_each_owner_conserves(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build_multitask(Path(directory))
+            left, right = MULTITASK_ROUTES[:2]
+
+            def mutate(value: dict) -> None:
+                for field in (
+                    "enqueued_by_data_source",
+                    "consumed_by_data_source",
+                ):
+                    value["queue"][field][left] -= 1
+                    value["queue"][field][right] += 1
+                for event in ("queue_enqueued", "queue_dequeued"):
+                    left_key = f"count/{event}/data_source/{left}"
+                    right_key = f"count/{event}/data_source/{right}"
+                    value["rollouter"][left_key] -= 1
+                    value["rollouter"][right_key] += 1
+
+            mutate_final_statistics(fixture["trainer_log"], mutate)
+            self.assert_failed(fixture["run_dir"], contains="route")
+
+    def test_missing_padding_label_and_synthetic_padding_both_fail(self):
+        for case in ("missing", "synthetic"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                fixture = self.build_multitask(Path(directory))
+                if case == "missing":
+                    rewrite_first_rollout(
+                        fixture, lambda document: document.pop("is_padding")
+                    )
+                else:
+                    rewrite_first_rollout(
+                        fixture, lambda document: document.update(is_padding=True)
+                    )
+                self.assert_failed(fixture["run_dir"], contains="padding")
+
+    def test_rollout_filename_is_bound_to_optimizer_update(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build_multitask(Path(directory))
+            first = fixture["rollout_dir"] / "1.jsonl"
+            first.rename(fixture["rollout_dir"] / "01.jsonl")
+            self.assert_failed(fixture["run_dir"], contains="filename")
+
+    def test_rolling_eight_route_share_rejects_a_skewed_window(self):
+        balanced_skew = [
+            {
+                MULTITASK_ROUTES[0]: 10,
+                MULTITASK_ROUTES[1]: 18,
+                MULTITASK_ROUTES[2]: 18,
+                MULTITASK_ROUTES[3]: 18,
+            }
+            for _ in range(8)
+        ]
+        balanced_skew.append(
+            {
+                MULTITASK_ROUTES[0]: 64,
+                MULTITASK_ROUTES[1]: 0,
+                MULTITASK_ROUTES[2]: 0,
+                MULTITASK_ROUTES[3]: 0,
+            }
+        )
+        balanced_skew.extend(
+            [{route_id: 16 for route_id in MULTITASK_ROUTES} for _ in range(11)]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build_multitask(
+                Path(directory),
+                updates=20,
+                route_counts_by_update=balanced_skew,
+            )
+            verdict = self.assert_failed(fixture["run_dir"], contains="rolling-8")
+            self.assertEqual(
+                verdict["rolling_8_episode_share"]["windows"][0]["status"],
+                "fail",
+            )
 
 
 class TestFinalizerConfigAndCheckpoint(FinalizerTestCase):
@@ -788,17 +1677,13 @@ class TestFinalizerConfigAndCheckpoint(FinalizerTestCase):
             fixture["resolved_path"].write_text(text, encoding="utf-8")
             fixture["hydra_path"].write_text(text, encoding="utf-8")
 
-            launch = json.loads(
-                fixture["launch_path"].read_text(encoding="utf-8")
-            )
+            launch = json.loads(fixture["launch_path"].read_text(encoding="utf-8"))
             launch["budget"] = verify_resolved_config(
                 config,
                 mode="gate",
                 expected_budget=launch["budget_contract"],
             )
-            launch["resolved_config"]["sha256"] = sha256(
-                fixture["resolved_path"]
-            )
+            launch["resolved_config"]["sha256"] = sha256(fixture["resolved_path"])
             fixture["launch_path"].write_text(
                 json.dumps(launch, indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
@@ -898,6 +1783,34 @@ class TestFinalizerConfigAndCheckpoint(FinalizerTestCase):
             self.assert_failed(
                 fixture["run_dir"], contains="runtime artifact file_logger"
             )
+
+    def test_legacy_runtime_artifacts_reject_in_tree_shadow_paths(self):
+        cases = (
+            ("file_logger", "metrics-shadow.jsonl", shutil.copy2),
+            ("rollout_data", "rollout-data-shadow", shutil.copytree),
+        )
+        for field, relative_path, copy in cases:
+            with (
+                self.subTest(runtime_path=field),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                fixture = self.build(Path(directory))
+                launch = json.loads(
+                    fixture["launch_path"].read_text(encoding="utf-8")
+                )
+                original = Path(launch["runtime_artifacts"][field])
+                shadow = fixture["run_dir"] / relative_path
+                copy(original, shadow)
+                launch["runtime_artifacts"][field] = str(shadow)
+                fixture["launch_path"].write_text(
+                    json.dumps(launch, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+
+                self.assert_failed(
+                    fixture["run_dir"],
+                    contains=f"legacy runtime artifact {field}",
+                )
 
 
 if __name__ == "__main__":

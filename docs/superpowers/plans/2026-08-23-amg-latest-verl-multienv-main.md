@@ -17,7 +17,7 @@
 - Use upstream per-row metadata, custom dataset, stateful sequential sampling, FIFO queue, staleness accounting, parameter publication, checkpointing, and PPO trainer.
 - One row produces one complete multi-action episode bundle; `rollout.n=1`; one shared actor/critic/optimizer.
 - Exact per-update 16/16/16/16 is not required. Dispatch is frozen 1:1:1:1 round-robin; learner-consumed exposure is checked over rolling 8-update windows.
-- Do not start a disposable Multitask20 lineage. The fresh Multitask400 run uses in-run update1/5/20/40 gates and continues when they pass.
+- Do not start a disposable Multitask20 lineage. The fresh Multitask400 run uses in-run update1/5/20/40/80 gates and continues when they pass.
 - No external evaluation before update400. Training-side trajectory and reward evidence drives stop-loss.
 - Do not merge rejected infra experiment history. Later rebase/cherry-pick only accepted r51c/other infra commits.
 
@@ -33,7 +33,7 @@
 - Create `async_plugins/scripts/launch_amg_multitask_fully_async.sh`: thin one-command wrapper around the Python launcher; it must not reimplement endpoint lifecycle.
 - Create `async_plugins/config/amg_multitask400.yaml`: reviewed default topology/budget and references to the frozen manifest/route registry; environment endpoints are injected by the one-click orchestrator.
 - Modify `async_plugins/agentmemorygym_verl/finalizer.py`: per-route conservation, composition, staleness/drop, action/token, reward, compaction, document write/read, and complete-memory-chain summaries.
-- Create `async_plugins/agentmemorygym_verl/online_monitor.py`: non-blocking update1/5/20/40 snapshots that can read a live run without requiring terminal finalization.
+- Create `async_plugins/agentmemorygym_verl/online_monitor.py`: non-blocking update1/5/20/40/80 snapshots that can read a live run without requiring terminal finalization.
 - Make the smallest environment-neutral changes required in the pinned external veRL `message_queue.py`, `fully_async_rollouter.py`, and `fully_async_trainer.py` for metadata-labelled queue events and non-evicting end-of-stream semantics. Use an existing upstream hook instead if source inspection finds one; never add AMG route names or reward logic there.
 - Replace the legacy-source audit with runtime-resolved source-path and AST checks for the exact imported veRL/plugin stack.
 - Add focused tests under both `async_plugins/tests/` and the pinned veRL worktree for each boundary.
@@ -135,10 +135,10 @@
 
 - [ ] Add generic metadata-labelled events at their true owners for rollout completion, enqueue acceptance, overflow eviction, dequeue, stale rejection, and optimizer consumption. The veRL changes may transport/count opaque labels but must contain no AMG route names, parser, reward, or lifecycle logic.
 - [ ] Replace the bounded-queue `put_sample(None)` end signal with a non-evicting shutdown/end-of-stream path. Add an end-to-end queue test proving an exact multiple of 64 accepted episodes yields exactly the requested optimizer-update count and no underfilled final group; fail the formal contract on any drop or missing update.
-- [ ] Add finalizer fixtures for per-route dispatch/completion/enqueue/dequeue/failure/overflow/stale accounting and optimizer-consumed episode/action/token shares. A post-run parser must not pretend to infer events that were never emitted.
-- [ ] Add rolling 8-update exposure checks requiring every route and 20%--30% optimizer-consumed episode share; at updates 1 and 5 report prefix composition without applying an undefined eight-update verdict. Report action/token shares without forcing equality.
-- [ ] Preserve existing global queue conservation and single-route memory checks; generalize reward, compaction, document write/read, and complete-memory-chain summaries by route.
-- [ ] Create a read-only online observer that snapshots update1/5/20/40 from a live run without requiring terminal checkpoint/finalization. It must not pause/drain the async pipeline; only a separate exact-PID hard-gate action may stop a conclusively invalid run.
+- [x] Add finalizer fixtures for per-route dispatch/completion/enqueue/dequeue/failure/overflow/stale accounting and optimizer-consumed episode/action/token shares. A post-run parser must not pretend to infer events that were never emitted.
+- [x] Add rolling 8-update exposure checks requiring every route and 20%--30% optimizer-consumed episode share; at updates 1 and 5 report prefix composition without applying an undefined eight-update verdict. Report action/token shares without forcing equality.
+- [x] Preserve existing global queue conservation and single-route memory checks; generalize reward, compaction, document write/read, and complete-memory-chain summaries by route.
+- [x] Create a read-only online observer that snapshots update1/5/20/40/80 from a live run without requiring terminal checkpoint/finalization. It must not pause/drain the async pipeline; only a separate exact-PID hard-gate action may stop a conclusively invalid run.
 - [ ] Run one single-route and one four-route synthetic queue fixture, then full pinned-veRL/plugin tests.
 - [ ] Commit generic veRL instrumentation separately from AMG finalizer/monitor code.
 
@@ -169,5 +169,5 @@
 - [ ] Obtain the four real single-card one-update receipts; verify each requirement field directly.
 - [ ] Launch one fresh Multitask400 lineage from the exact clean main-candidate commit. Update1 is the first mixed-environment integration gate and must continue when valid; do not stop/restart merely to rename it formal.
 - [ ] After that exact lineage passes update1 source, update-integrity, four-route, and behavior checks, fast-forward canonical main to the identical commit and push while the trainer continues. Keep the old synchronous line as a tag/rollback point, not an active parallel main.
-- [ ] At updates 1/5/20/40, use the live observer to freeze prefix evidence while the trainer continues. Apply rolling-8 composition only from update8 onward. Stop only on a declared semantic, safety, throughput, composition, or same-update-quality failure.
+- [ ] At updates 1/5/20/40/80, use the live observer to freeze prefix evidence while the trainer continues. Apply rolling-8 composition only from update8 onward. Stop only on a declared semantic, safety, throughput, composition, or same-update-quality failure.
 - [ ] At update400, verify checkpoint completeness, per-route training curves/trajectory samples, queue conservation, memory behaviors, cleanup, and only then run matched endpoint evaluation.
