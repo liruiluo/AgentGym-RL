@@ -131,29 +131,26 @@ class AMGTrajectoryDataset(RLHFDataset):
         extra_info["index"] = schedule_index
         extra_info["route_id"] = route.route_id
         if route.route_attestation_sha256 is not None:
-            configured_attestation = extra_info.get("route_attestation_sha256")
-            if (
-                configured_attestation is not None
-                and configured_attestation != route.route_attestation_sha256
-            ):
-                raise ValueError(
-                    "AMG schedule route_attestation_sha256 drift from registry"
+            if "route_attestation_sha256" in extra_info:
+                if (
+                    extra_info["route_attestation_sha256"]
+                    != route.route_attestation_sha256
+                ):
+                    raise ValueError(
+                        "AMG schedule route_attestation_sha256 drift from registry"
+                    )
+            else:
+                extra_info["route_attestation_sha256"] = (
+                    route.route_attestation_sha256
                 )
-            extra_info.setdefault(
-                "route_attestation_sha256", route.route_attestation_sha256
-            )
         if self._route_registry.sha256 is not None:
-            configured_registry = extra_info.get("route_registry_sha256")
-            if (
-                configured_registry is not None
-                and configured_registry != self._route_registry.sha256
-            ):
-                raise ValueError(
-                    "AMG schedule route_registry_sha256 drift from registry"
-                )
-            extra_info.setdefault(
-                "route_registry_sha256", self._route_registry.sha256
-            )
+            if "route_registry_sha256" in extra_info:
+                if extra_info["route_registry_sha256"] != self._route_registry.sha256:
+                    raise ValueError(
+                        "AMG schedule route_registry_sha256 drift from registry"
+                    )
+            else:
+                extra_info["route_registry_sha256"] = self._route_registry.sha256
         row["extra_info"] = extra_info
         row["index"] = schedule_index
 
