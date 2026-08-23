@@ -390,6 +390,9 @@ class vLLMRollout(BaseRollout):
             gdn_prefill_backend = rollout_config.get('gdn_prefill_backend', None)
             if gdn_prefill_backend is not None:
                 official_vllm_kwargs['gdn_prefill_backend'] = gdn_prefill_backend
+            attention_config = rollout_config.get('attention_config', None)
+            if attention_config is not None:
+                official_vllm_kwargs['attention_config'] = dict(attention_config)
             if init_load_format is not None:
                 official_vllm_kwargs['load_format'] = init_load_format
             compilation_config = resolve_official_vllm_compilation_config(

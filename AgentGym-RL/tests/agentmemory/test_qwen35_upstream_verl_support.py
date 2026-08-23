@@ -200,6 +200,17 @@ class OfficialVllmRuntimeConfigTests(unittest.TestCase):
             "official_vllm_kwargs['compilation_config']", source
         )
 
+    def test_rollout_forwards_generic_attention_config_to_official_vllm(self):
+        source = _VLLM_ROLLOUT.read_text(encoding="utf-8")
+        self.assertIn(
+            "attention_config = rollout_config.get('attention_config', None)",
+            source,
+        )
+        self.assertIn(
+            "official_vllm_kwargs['attention_config'] = dict(attention_config)",
+            source,
+        )
+
     @staticmethod
     def _fake_dynamic_triton():
         class CacheKnob:
