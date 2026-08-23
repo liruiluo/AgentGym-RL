@@ -277,9 +277,8 @@ def verify_resolved_config(
                     f"multi-environment config must not set global agentgym.{key}"
                 )
         expected_route_ids = expected.get("route_ids")
-        if (
-            isinstance(expected_route_ids, (str, bytes))
-            or not isinstance(expected_route_ids, Sequence)
+        if isinstance(expected_route_ids, (str, bytes)) or not isinstance(
+            expected_route_ids, Sequence
         ):
             raise ValueError(
                 "multi-environment expected_budget.route_ids must be a sequence"
@@ -347,8 +346,7 @@ def verify_resolved_config(
             or not runtime_digest.startswith("sha256:")
             or len(runtime_digest) != 71
             or any(
-                character not in "0123456789abcdef"
-                for character in runtime_digest[7:]
+                character not in "0123456789abcdef" for character in runtime_digest[7:]
             )
         ):
             raise ValueError(
@@ -412,6 +410,8 @@ def verify_resolved_config(
         "critic.shuffle": False,
         "critic.use_dynamic_bsz": True,
         "critic.loss_agg_mode": "token-mean",
+        "critic.ppo_max_token_len_per_gpu": 32768,
+        "critic.ppo_infer_max_token_len_per_gpu": 32768,
         "critic.strategy": "fsdp2",
         "algorithm.gamma": 1.0,
         "algorithm.lam": 1.0,
@@ -573,6 +573,7 @@ def verify_resolved_config(
         "standalone_rollout_gpus": standalone_rollout_gpus,
         "dynamic_hybrid_enabled": True,
         "gradient_checkpointing": {"actor": True, "critic": True},
+        "critic_active_token_budget": 32768,
         "rollout_backend": "sglang",
         "fsdp2_reshard_after_forward": {"actor": True, "critic": True},
         "fused_kernels": {
@@ -639,12 +640,9 @@ def inspect_schedule(
         if len(set(normalized_expected_routes)) != len(normalized_expected_routes):
             raise ValueError("expected_route_ids contains duplicates")
     if expected_route_registry_sha256 is not None:
-        if (
-            len(expected_route_registry_sha256) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in expected_route_registry_sha256
-            )
+        if len(expected_route_registry_sha256) != 64 or any(
+            character not in "0123456789abcdef"
+            for character in expected_route_registry_sha256
         ):
             raise ValueError(
                 "expected_route_registry_sha256 must be a lowercase SHA-256"
@@ -694,9 +692,7 @@ def inspect_schedule(
             extra_route = extra.get("route_id")
             if row_route is not None and extra_route is not None:
                 if str(row_route) != str(extra_route):
-                    raise ValueError(
-                        f"AMG schedule route_id drift at row {position}"
-                    )
+                    raise ValueError(f"AMG schedule route_id drift at row {position}")
             has_route = row_route is not None or extra_route is not None
             if route_mode is None:
                 route_mode = has_route
@@ -739,9 +735,7 @@ def inspect_schedule(
                         )
 
                     registry_digest = str(extra.get("route_registry_sha256", ""))
-                    attestation_digest = str(
-                        extra.get("route_attestation_sha256", "")
-                    )
+                    attestation_digest = str(extra.get("route_attestation_sha256", ""))
                     source_schedule_digest = str(
                         extra.get("source_schedule_sha256", "")
                     )

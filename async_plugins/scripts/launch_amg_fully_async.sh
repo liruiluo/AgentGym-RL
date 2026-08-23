@@ -14,8 +14,10 @@ fi
 # model bytes, and sys.executable identity before Hydra or training can run.
 VERL_ROOT=""
 ENDPOINT_SOURCE_LOCK=""
+MULTITASK_SOURCE_LOCK=""
 EXPECT_VERL_ROOT=0
 EXPECT_SOURCE_LOCK=0
+EXPECT_MULTITASK_SOURCE_LOCK=0
 for ARG in "$@"; do
   if [[ ${EXPECT_VERL_ROOT} -eq 1 ]]; then
     VERL_ROOT=${ARG}
@@ -25,6 +27,11 @@ for ARG in "$@"; do
   if [[ ${EXPECT_SOURCE_LOCK} -eq 1 ]]; then
     ENDPOINT_SOURCE_LOCK=${ARG}
     EXPECT_SOURCE_LOCK=0
+    continue
+  fi
+  if [[ ${EXPECT_MULTITASK_SOURCE_LOCK} -eq 1 ]]; then
+    MULTITASK_SOURCE_LOCK=${ARG}
+    EXPECT_MULTITASK_SOURCE_LOCK=0
     continue
   fi
   case ${ARG} in
@@ -40,14 +47,29 @@ for ARG in "$@"; do
     --endpoint-source-lock=*)
       ENDPOINT_SOURCE_LOCK=${ARG#--endpoint-source-lock=}
       ;;
+    --multitask-source-lock)
+      EXPECT_MULTITASK_SOURCE_LOCK=1
+      ;;
+    --multitask-source-lock=*)
+      MULTITASK_SOURCE_LOCK=${ARG#--multitask-source-lock=}
+      ;;
   esac
 done
 if [[ ${EXPECT_VERL_ROOT} -ne 0 || -z ${VERL_ROOT} || ! -d ${VERL_ROOT}/verl ]]; then
   echo "launch_amg_fully_async.sh: --verl-root must name a veRL source tree" >&2
   exit 64
 fi
-if [[ ${EXPECT_SOURCE_LOCK} -ne 0 || -z ${ENDPOINT_SOURCE_LOCK} || ! -f ${ENDPOINT_SOURCE_LOCK} || -L ${ENDPOINT_SOURCE_LOCK} ]]; then
-  echo "launch_amg_fully_async.sh: --endpoint-source-lock must name a regular publication lock" >&2
+if [[ ${EXPECT_SOURCE_LOCK} -ne 0 || ${EXPECT_MULTITASK_SOURCE_LOCK} -ne 0 ]]; then
+  echo "launch_amg_fully_async.sh: source-lock option is missing its path" >&2
+  exit 64
+fi
+if [[ -n ${ENDPOINT_SOURCE_LOCK} && -n ${MULTITASK_SOURCE_LOCK} ]]; then
+  echo "launch_amg_fully_async.sh: select exactly one source-lock format" >&2
+  exit 64
+fi
+SOURCE_LOCK=${ENDPOINT_SOURCE_LOCK:-${MULTITASK_SOURCE_LOCK}}
+if [[ -z ${SOURCE_LOCK} || ! -f ${SOURCE_LOCK} || -L ${SOURCE_LOCK} ]]; then
+  echo "launch_amg_fully_async.sh: a regular endpoint or multitask source lock is required" >&2
   exit 64
 fi
 if ! command -v jq >/dev/null 2>&1; then
@@ -56,7 +78,7 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 PUBLICATION_PYTHON=$(jq -er \
   '.training_runtime.python | select(type == "string" and startswith("/"))' \
-  "${ENDPOINT_SOURCE_LOCK}") || {
+  "${SOURCE_LOCK}") || {
   echo "launch_amg_fully_async.sh: publication has no absolute training_runtime.python" >&2
   exit 65
 }

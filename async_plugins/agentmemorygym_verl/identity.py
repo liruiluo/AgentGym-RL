@@ -19,15 +19,13 @@ from typing import Any
 # current-cycle metrics, current PPO critic initialization, and instance-scoped
 # fused forward selection are reviewed and committed. It is intentionally not
 # caller-selectable.
-EXPECTED_VERL_COMMIT = "b3b91799743561d5e19347751447963a2b283e6a"
+EXPECTED_VERL_COMMIT = "92428c4cffb114f8463fdc64f013ee344c6c2686"
 
 # Files needed to load the exact Qwen3.5-4B text model and tokenizer.  The model
 # root itself comes from the publication's training_runtime section, so a newer
 # publication may relocate the same immutable model without a plugin edit.
 TRL_WHEEL_RELATIVE_PATH = "async_plugins/vendor/trl-0.9.6-py3-none-any.whl"
-TRL_WHEEL_SHA256 = (
-    "4753f190c94c11488fcc46ec74b2128e53fbc61d51f0887b7204ec4dc333af4b"
-)
+TRL_WHEEL_SHA256 = "4753f190c94c11488fcc46ec74b2128e53fbc61d51f0887b7204ec4dc333af4b"
 
 
 LOCKED_MODEL_FILE_SHA256 = {
