@@ -9,6 +9,17 @@ from urllib.parse import urlparse
 
 from requests.exceptions import RequestException
 
+_CLIENT_CLASS_NAMES = {
+    "agentmemory": "AgentMemoryEnvClient",
+    "webshop": "WebshopEnvClient",
+    "swesmith": "SwesmithEnvClient",
+    "literesearcher": "LiteResearcherEnvClient",
+    "openmle_fast": "OpenMLEFastEnvClient",
+    "searchqa": "SearchQAEnvClient",
+}
+
+_AGENTMEMORY_POLICY_PROMPT_FIELD = "policy_system_prompt"
+
 _OPENMLE_IDENTITY_FIELDS = (
     "expected_manifest_sha256",
     "expected_release_revision",
@@ -36,15 +47,8 @@ def _client_classes() -> dict[str, type]:
     # any environment package or opening an HTTP session.
     from agentenv import envs
 
-    names = {
-        "agentmemory": "AgentMemoryEnvClient",
-        "webshop": "WebshopEnvClient",
-        "swesmith": "SwesmithEnvClient",
-        "openmle_fast": "OpenMLEFastEnvClient",
-        "searchqa": "SearchQAEnvClient",
-    }
     classes: dict[str, type] = {}
-    for task_name, class_name in names.items():
+    for task_name, class_name in _CLIENT_CLASS_NAMES.items():
         client_cls = getattr(envs, class_name, None)
         if client_cls is not None:
             classes[task_name] = client_cls
@@ -70,6 +74,15 @@ def create_env_client(config: Any):
             "AMG client timeout must be positive and max_retries non-negative"
         )
 
+    policy_system_prompt: str | None = None
+    if task_name == "agentmemory":
+        raw_prompt = _get(config, _AGENTMEMORY_POLICY_PROMPT_FIELD)
+        if not isinstance(raw_prompt, str) or not raw_prompt.strip():
+            raise ValueError(
+                "AgentMemory route requires a non-empty policy_system_prompt"
+            )
+        policy_system_prompt = raw_prompt.strip()
+
     last_error: Exception | None = None
     client_kwargs: dict[str, Any] = {
         "env_server_base": env_addr,
@@ -87,7 +100,7 @@ def create_env_client(config: Any):
 
     for attempt in range(retries + 1):
         try:
-            return client_cls(**client_kwargs)
+            client = client_cls(**client_kwargs)
         except (
             RequestException
         ) as exc:  # endpoint startup races are bounded by max_retries
@@ -95,6 +108,18 @@ def create_env_client(config: Any):
             if attempt >= retries:
                 break
             time.sleep(min(5.0, 0.5 * (2**attempt)))
+        else:
+            if policy_system_prompt is not None:
+                configure_prompt = getattr(
+                    client, "configure_policy_system_prompt", None
+                )
+                if not callable(configure_prompt):
+                    raise TypeError(
+                        "AgentMemory client does not expose "
+                        "configure_policy_system_prompt()"
+                    )
+                configure_prompt(policy_system_prompt)
+            return client
     assert last_error is not None
     raise RuntimeError(
         f"failed to create AMG {task_name} client after {retries + 1} attempts"

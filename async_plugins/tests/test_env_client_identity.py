@@ -4,6 +4,7 @@ import unittest
 from unittest import mock
 
 from agentmemorygym_verl.env_client import (
+    _CLIENT_CLASS_NAMES,
     _OPENMLE_IDENTITY_FIELDS,
     create_env_client,
 )
@@ -14,6 +15,70 @@ class _RecordingClient:
 
     def __init__(self, **kwargs):
         self.calls.append(kwargs)
+
+
+class _RecordingAgentMemoryClient(_RecordingClient):
+    configured_prompts: list[str] = []
+
+    def configure_policy_system_prompt(self, prompt: str) -> None:
+        self.configured_prompts.append(prompt)
+
+
+class TestClientRegistryAndPromptBinding(unittest.TestCase):
+    def setUp(self):
+        _RecordingClient.calls.clear()
+        _RecordingAgentMemoryClient.configured_prompts.clear()
+
+    def test_literesearcher_client_is_registered(self):
+        self.assertEqual(
+            _CLIENT_CLASS_NAMES["literesearcher"],
+            "LiteResearcherEnvClient",
+        )
+
+    def test_agentmemory_prompt_is_bound_after_construction(self):
+        config = {
+            "task_name": "agentmemory",
+            "env_addr": "http://127.0.0.1:65101",
+            "timeout": 17,
+            "max_retries": 0,
+            "policy_system_prompt": "  exact formal prompt  ",
+        }
+        with mock.patch(
+            "agentmemorygym_verl.env_client._client_classes",
+            return_value={"agentmemory": _RecordingAgentMemoryClient},
+        ):
+            create_env_client(config)
+
+        self.assertEqual(
+            _RecordingAgentMemoryClient.calls,
+            [
+                {
+                    "env_server_base": "http://127.0.0.1:65101",
+                    "data_len": None,
+                    "timeout": 17.0,
+                }
+            ],
+        )
+        self.assertEqual(
+            _RecordingAgentMemoryClient.configured_prompts,
+            ["exact formal prompt"],
+        )
+
+    def test_agentmemory_prompt_is_required_before_construction(self):
+        config = {
+            "task_name": "agentmemory",
+            "env_addr": "http://127.0.0.1:65101",
+            "max_retries": 0,
+        }
+        with (
+            mock.patch(
+                "agentmemorygym_verl.env_client._client_classes",
+                return_value={"agentmemory": _RecordingAgentMemoryClient},
+            ),
+            self.assertRaisesRegex(ValueError, "policy_system_prompt"),
+        ):
+            create_env_client(config)
+        self.assertEqual(_RecordingAgentMemoryClient.calls, [])
 
 
 class TestOpenMLEClientIdentityForwarding(unittest.TestCase):

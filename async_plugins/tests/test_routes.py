@@ -33,9 +33,9 @@ def _registry_payload() -> dict:
         "openmle_fast": 65104,
     }
     task_names = {
-        "webshop": "webshop",
+        "webshop": "agentmemory",
         "swesmith": "swesmith",
-        "literesearcher": "agentmemory",
+        "literesearcher": "literesearcher",
         "openmle_fast": "openmle_fast",
     }
     return {
@@ -85,7 +85,7 @@ class RouteRegistryTests(unittest.TestCase):
             self.assertEqual(registry.route_ids, ROUTE_IDS)
             self.assertEqual(
                 registry.resolve("literesearcher").client_config["task_name"],
-                "agentmemory",
+                "literesearcher",
             )
             with self.assertRaises(TypeError):
                 registry.resolve("webshop").client_config["env_addr"] = "bad"
