@@ -67,11 +67,18 @@ class TestAMGTrajectoryDataset(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "data_idx must be an integer"):
             dataset[0]
 
-    def test_rejects_schedule_index_drift(self):
+    def test_rejects_top_level_and_nested_global_index_drift(self):
         dataset = self._dataset(
-            [{"item_id": "task", "data_idx": 7, "extra_info": {"index": 8}}]
+            [
+                {
+                    "item_id": "task",
+                    "index": 7,
+                    "data_idx": 7,
+                    "extra_info": {"index": 8},
+                }
+            ]
         )
-        with self.assertRaisesRegex(ValueError, "schedule index differs"):
+        with self.assertRaisesRegex(ValueError, "global index drift"):
             dataset[0]
 
     def test_routes_each_row_to_its_exact_framing_and_shared_agent_loop(self):
@@ -79,14 +86,24 @@ class TestAMGTrajectoryDataset(unittest.TestCase):
             {
                 "item_id": "webshop:item-0",
                 "route_id": "webshop",
+                "index": 0,
                 "data_idx": 3,
-                "extra_info": {"index": 3, "route_id": "webshop"},
+                "extra_info": {
+                    "index": 0,
+                    "schedule_position": 0,
+                    "route_id": "webshop",
+                },
             },
             {
                 "item_id": "swesmith:item-0",
                 "route_id": "swesmith",
+                "index": 1,
                 "data_idx": 11,
-                "extra_info": {"index": 11, "route_id": "swesmith"},
+                "extra_info": {
+                    "index": 1,
+                    "schedule_position": 1,
+                    "route_id": "swesmith",
+                },
             },
         ]
         dataset = object.__new__(AMGTrajectoryDataset)
@@ -136,6 +153,10 @@ class TestAMGTrajectoryDataset(unittest.TestCase):
         self.assertEqual(swesmith["raw_prompt"][0]["content"], "code")
         self.assertEqual(webshop["data_idx"], 3)
         self.assertEqual(swesmith["data_idx"], 11)
+        self.assertEqual(webshop["index"], 0)
+        self.assertEqual(swesmith["index"], 1)
+        self.assertEqual(webshop["extra_info"]["index"], 0)
+        self.assertEqual(swesmith["extra_info"]["index"], 1)
         self.assertEqual(webshop["route_id"], "webshop")
         self.assertEqual(swesmith["route_id"], "swesmith")
         self.assertEqual(webshop["extra_info"]["route_id"], "webshop")
@@ -149,6 +170,58 @@ class TestAMGTrajectoryDataset(unittest.TestCase):
         self.assertEqual(
             dataset._policy_framing_by_route["webshop"][0]["content"], "shop"
         )
+
+    def test_multienvironment_row_requires_explicit_global_index(self):
+        rows = [
+            {
+                "item_id": "webshop:item-0",
+                "route_id": "webshop",
+                "data_idx": 3,
+                "extra_info": {"route_id": "webshop"},
+            }
+        ]
+        dataset = object.__new__(AMGTrajectoryDataset)
+        dataset.dataframe = deepcopy(rows)
+        dataset._route_registry = RouteRegistry(
+            routes=(
+                RouteSpec(
+                    route_id="webshop",
+                    max_rounds=30,
+                    max_observation_tokens=8192,
+                    policy_framing_sha256=None,
+                    route_attestation_sha256=None,
+                    client_config=MappingProxyType(
+                        {
+                            "task_name": "webshop",
+                            "env_addr": "http://127.0.0.1:65101",
+                        }
+                    ),
+                ),
+                RouteSpec(
+                    route_id="swesmith",
+                    max_rounds=30,
+                    max_observation_tokens=8192,
+                    policy_framing_sha256=None,
+                    route_attestation_sha256=None,
+                    client_config=MappingProxyType(
+                        {
+                            "task_name": "swesmith",
+                            "env_addr": "http://127.0.0.1:65102",
+                        }
+                    ),
+                ),
+            ),
+            sha256="a" * 64,
+            source_path=None,
+        )
+        dataset._policy_framing_by_route = {
+            "webshop": [{"role": "system", "content": "shop"}],
+            "swesmith": [{"role": "system", "content": "code"}],
+        }
+        dataset.config = SimpleNamespace(agentgym=SimpleNamespace())
+
+        with self.assertRaisesRegex(ValueError, "global index"):
+            dataset[0]
 
     def test_rejects_unknown_or_drifting_route_identity(self):
         dataset = self._dataset(

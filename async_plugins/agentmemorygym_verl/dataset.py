@@ -16,6 +16,19 @@ from .routes import (
 )
 
 
+def _nonnegative_int(value: Any, *, field: str) -> int:
+    if isinstance(value, bool):
+        raise TypeError(f"{field} must be an integer, not bool")
+    try:
+        normalized = int(value)
+        exact = float(value) == float(normalized)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field} must be an integer, got {value!r}") from exc
+    if not exact or normalized < 0:
+        raise ValueError(f"{field} must be an integer, got {value!r}")
+    return normalized
+
+
 class AMGTrajectoryDataset(RLHFDataset):
     """Attach wrapper-owned policy framing to the frozen AMG task schedule.
 
@@ -66,20 +79,9 @@ class AMGTrajectoryDataset(RLHFDataset):
         route = self._route_registry.resolve_row(row)
         if "item_id" not in row or "data_idx" not in row:
             raise ValueError("AMG schedule row must contain item_id and data_idx")
-        raw_data_idx = row["data_idx"]
-        if isinstance(raw_data_idx, bool):
-            raise TypeError("AMG schedule data_idx must be an integer, not bool")
-        try:
-            data_idx = int(raw_data_idx)
-            exact_data_idx = float(raw_data_idx) == float(data_idx)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(
-                f"AMG schedule data_idx must be an integer, got {raw_data_idx!r}"
-            ) from exc
-        if not exact_data_idx or data_idx < 0:
-            raise ValueError(
-                f"AMG schedule data_idx must be an integer, got {raw_data_idx!r}"
-            )
+        data_idx = _nonnegative_int(
+            row["data_idx"], field="AMG schedule data_idx"
+        )
         row["data_idx"] = data_idx
         row["item_id"] = str(row["item_id"])
         row["route_id"] = route.route_id
@@ -97,29 +99,43 @@ class AMGTrajectoryDataset(RLHFDataset):
         row["agent_name"] = self._route_registry.agent_name
 
         extra_info = dict(row.get("extra_info") or {})
-        raw_index = extra_info.get("index", data_idx)
-        if isinstance(raw_index, bool):
-            raise TypeError("AMG schedule index must be an integer, not bool")
-        try:
-            schedule_index = int(raw_index)
-            exact_index = float(raw_index) == float(schedule_index)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(
-                f"AMG schedule index must be an integer, got {raw_index!r}"
-            ) from exc
-        if not exact_index or schedule_index != data_idx:
-            raise ValueError(
-                "AMG schedule index differs from data_idx: "
-                f"index={raw_index!r} data_idx={data_idx}"
+        top_index = row.get("index")
+        nested_index = extra_info.get("index")
+        if top_index is None and nested_index is None:
+            if len(self._route_registry.route_ids) > 1:
+                raise ValueError(
+                    "AMG multi-environment schedule row is missing a global index"
+                )
+            schedule_index = data_idx
+        elif top_index is None:
+            schedule_index = _nonnegative_int(
+                nested_index, field="AMG schedule global index"
             )
-        extra_info["index"] = data_idx
+        elif nested_index is None:
+            schedule_index = _nonnegative_int(
+                top_index, field="AMG schedule global index"
+            )
+        else:
+            normalized_top = _nonnegative_int(
+                top_index, field="AMG schedule global index"
+            )
+            normalized_nested = _nonnegative_int(
+                nested_index, field="AMG schedule global index"
+            )
+            if normalized_top != normalized_nested:
+                raise ValueError(
+                    "AMG schedule global index drift: "
+                    f"row={normalized_top} extra_info={normalized_nested}"
+                )
+            schedule_index = normalized_top
+        extra_info["index"] = schedule_index
         extra_info["route_id"] = route.route_id
         if route.route_attestation_sha256 is not None:
             extra_info["route_attestation_sha256"] = route.route_attestation_sha256
         if self._route_registry.sha256 is not None:
             extra_info["route_registry_sha256"] = self._route_registry.sha256
         row["extra_info"] = extra_info
-        row["index"] = data_idx
+        row["index"] = schedule_index
 
         configured_source = row.get("data_source")
         if (

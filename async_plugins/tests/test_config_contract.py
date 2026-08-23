@@ -495,6 +495,44 @@ class TestAMGScheduleContract(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "duplicate item_id"):
                 inspect_schedule(path, expected_count=3)
 
+    def test_multienvironment_schedule_uses_unique_global_indices(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "multienv.jsonl"
+            rows = []
+            for position, route_id in enumerate(("webshop", "swesmith")):
+                rows.append(
+                    {
+                        "index": position,
+                        "data_idx": 7,
+                        "route_id": route_id,
+                        "extra_info": {
+                            "index": position,
+                            "route_id": route_id,
+                            "manifest_digest": "a" * 64,
+                            "panel_id": "multienv-train",
+                            "role": "train_pool",
+                            "schedule_position": position,
+                        },
+                        "item_id": f"{route_id}:task-7:occurrence-0",
+                    }
+                )
+            path.write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+
+            report = inspect_schedule(path, expected_count=2)
+            self.assertEqual(report["unique_global_indices"], 2)
+
+            rows[1]["extra_info"]["index"] = 0
+            rows[1]["index"] = 0
+            path.write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "global index"):
+                inspect_schedule(path, expected_count=2)
+
     def test_rejects_schedule_position_drift(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "position.jsonl"

@@ -562,6 +562,8 @@ def inspect_schedule(
         )
 
     item_ids: set[str] = set()
+    global_indices: set[int] = set()
+    route_mode: bool | None = None
     manifest_digest: str | None = None
     panel_id: str | None = None
     role: str | None = None
@@ -598,8 +600,48 @@ def inspect_schedule(
                 raise ValueError(
                     f"AMG schedule row {position} has invalid data_idx {data_idx!r}"
                 )
-            if extra.get("index") != data_idx:
-                raise ValueError(f"AMG schedule index/data_idx drift at row {position}")
+            row_route = row.get("route_id")
+            extra_route = extra.get("route_id")
+            if row_route is not None and extra_route is not None:
+                if str(row_route) != str(extra_route):
+                    raise ValueError(
+                        f"AMG schedule route_id drift at row {position}"
+                    )
+            has_route = row_route is not None or extra_route is not None
+            if route_mode is None:
+                route_mode = has_route
+            elif route_mode != has_route:
+                raise ValueError("AMG schedule mixes routed and legacy rows")
+
+            raw_global_index = extra.get("index")
+            if (
+                not isinstance(raw_global_index, int)
+                or isinstance(raw_global_index, bool)
+                or raw_global_index < 0
+            ):
+                raise ValueError(
+                    f"AMG schedule row {position} has invalid global index "
+                    f"{raw_global_index!r}"
+                )
+            if has_route:
+                if row.get("index") != raw_global_index:
+                    raise ValueError(
+                        f"AMG schedule global index drift at row {position}"
+                    )
+                if raw_global_index != position:
+                    raise ValueError(
+                        f"AMG schedule global index must equal schedule_position "
+                        f"at row {position}"
+                    )
+                if raw_global_index in global_indices:
+                    raise ValueError(
+                        f"AMG schedule has duplicate global index {raw_global_index}"
+                    )
+            elif raw_global_index != data_idx:
+                raise ValueError(
+                    f"AMG legacy schedule index/data_idx drift at row {position}"
+                )
+            global_indices.add(raw_global_index)
             row_role = extra.get("role")
             if row_role not in {"gate_only", "train_pool"}:
                 raise ValueError(
@@ -642,6 +684,7 @@ def inspect_schedule(
         "sha256": digest,
         "count": count,
         "unique_item_ids": len(item_ids),
+        "unique_global_indices": len(global_indices),
         "manifest_digest": manifest_digest,
         "panel_id": panel_id,
         "role": role,
