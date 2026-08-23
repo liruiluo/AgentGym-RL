@@ -57,6 +57,34 @@ class TestOpenMLEClientIdentityForwarding(unittest.TestCase):
             self.assertEqual(forwarded[field], identity[field])
         self.assertNotIn("ignored_caller_field", forwarded)
 
+    def test_non_openmle_route_does_not_receive_openmle_identity_fields(self):
+        config = {
+            "task_name": "webshop",
+            "env_addr": "http://127.0.0.1:65101",
+            "timeout": 17,
+            "max_retries": 0,
+            **{
+                field: f"must-not-forward-{field}"
+                for field in _OPENMLE_IDENTITY_FIELDS
+            },
+        }
+        with mock.patch(
+            "agentmemorygym_verl.env_client._client_classes",
+            return_value={"webshop": _RecordingClient},
+        ):
+            create_env_client(config)
+
+        self.assertEqual(
+            _RecordingClient.calls,
+            [
+                {
+                    "env_server_base": "http://127.0.0.1:65101",
+                    "data_len": None,
+                    "timeout": 17.0,
+                }
+            ],
+        )
+
     def test_each_missing_identity_field_fails_before_client_construction(self):
         identity = {
             "expected_manifest_sha256": "a" * 64,

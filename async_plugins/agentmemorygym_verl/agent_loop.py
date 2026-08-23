@@ -25,6 +25,7 @@ from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.rollout.replica import TokenOutput
 
 from .env_client import create_env_client
+from .routes import RouteSpec, route_registry_from_agentgym_config
 
 
 def _get(config: Any, key: str, default: Any = None) -> Any:
@@ -170,14 +171,9 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
             raise ValueError(
                 "AMGTaskNeutralAgentLoop requires actor_rollout_ref.agentgym"
             )
-        self.max_policy_turns = int(_get(self.agentgym_config, "max_rounds", 30))
-        self.max_observation_tokens = int(
-            _get(self.agentgym_config, "max_observation_tokens", 0)
+        self._route_registry = route_registry_from_agentgym_config(
+            self.agentgym_config
         )
-        if self.max_policy_turns <= 0 or self.max_observation_tokens <= 0:
-            raise ValueError(
-                "AMG max_rounds and max_observation_tokens must be positive"
-            )
         self._envelope_tokens: int | None = None
 
     def _render_prompt_sync(self, messages: list[dict[str, str]]) -> list[int]:
@@ -294,6 +290,7 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
         if max_retries < 0:
             raise ValueError("AMG max_retries must be non-negative")
 
+        route = self._route_registry.resolve_row(kwargs)
         attempt_kwargs = dict(kwargs)
         attempt_kwargs["uid"] = self._resolve_trajectory_uid(kwargs)
         data_idx = self._resolve_data_idx(kwargs)
@@ -304,6 +301,7 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                 return await self._run_single_attempt(
                     sampling_params,
                     priority,
+                    route=route,
                     sample_reschedule_attempt=sample_reschedule_attempt,
                     **attempt_kwargs,
                 )
@@ -322,6 +320,7 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
         sampling_params: dict[str, Any],
         priority: int = 0,
         *,
+        route: RouteSpec,
         sample_reschedule_attempt: int,
         **kwargs: Any,
     ) -> list[AgentLoopOutput]:
@@ -373,7 +372,7 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                 "AMG fully-async PPO requires rollout.calculate_log_probs=true"
             )
 
-        client = create_env_client(self.agentgym_config)
+        client = create_env_client(route.client_config)
         outputs: list[AgentLoopOutput] = []
         rows: list[dict[str, Any]] = []
         try:
@@ -384,7 +383,7 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
             current_messages = bind_initial_policy_context(client, initial_messages)
             current_prompt_ids = self._render_prompt_sync(current_messages)
 
-            for row_order in range(self.max_policy_turns):
+            for row_order in range(route.max_rounds):
                 if len(current_prompt_ids) > max_prompt_tokens:
                     raise RuntimeError(
                         "AMG prompt exceeded PPO width before a trainable compaction action: "
@@ -401,7 +400,7 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                     max_prompt_tokens=max_prompt_tokens,
                     max_model_tokens=max_model_tokens,
                     max_response_tokens=response_budget,
-                    max_observation_tokens=self.max_observation_tokens,
+                    max_observation_tokens=route.max_observation_tokens,
                     action_observation_envelope_tokens=self._action_observation_envelope_tokens(
                         current_messages, current_prompt_ids
                     ),
@@ -487,6 +486,8 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                 row_uid = f"{trajectory_uid}-row-{row_order}"
                 row = {
                     "schema": "amg_task_neutral_action_row_v1",
+                    "route_id": route.route_id,
+                    "data_source": route.route_id,
                     "item_id": item_id,
                     "data_idx": data_idx,
                     "trajectory_uid": trajectory_uid,
@@ -521,6 +522,8 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                 rows.append(row)
                 token_extra.update(
                     {
+                        "route_id": route.route_id,
+                        "data_source": route.route_id,
                         "trajectory_uid": trajectory_uid,
                         "trajectory_row_uid": row_uid,
                         "trajectory_row_order": row_order,

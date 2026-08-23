@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import ast
+import inspect
 import json
 import unittest
 from dataclasses import dataclass
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from unittest import IsolatedAsyncioTestCase, mock
 
 from agentenv.controller import StepOutput
@@ -14,6 +16,7 @@ from agentenv.controller.types import (
 )
 from agentmemorygym_verl import agent_loop as agent_loop_module
 from agentmemorygym_verl.agent_loop import AMGTaskNeutralAgentLoop
+from agentmemorygym_verl.routes import RouteRegistry, RouteSpec
 
 
 @dataclass
@@ -294,6 +297,44 @@ class _HorizonClient(_MemoryChainClient):
         )
 
 
+class _PressureHorizonClient(_HorizonClient):
+    def __init__(self):
+        super().__init__()
+        self.pressures = []
+
+    def policy_turn_candidate(self):
+        return "Optional task-neutral control turn."
+
+    def prepare_policy_turn(self, pressure):
+        self.pressures.append(pressure)
+        return None
+
+
+class _ErrorClient(_MemoryChainClient):
+    def policy_turn_candidate(self):
+        return None
+
+    def step(self, action):
+        self.actions.append(action)
+        raise RuntimeError("deliberate wrapper failure")
+
+
+class TestTaskNeutralAgentLoopSource(unittest.TestCase):
+    def test_shared_loop_contains_no_concrete_environment_literal(self):
+        tree = ast.parse(inspect.getsource(agent_loop_module))
+        forbidden = ("webshop", "swesmith", "literesearcher", "openmle", "searchqa")
+        hits = sorted(
+            {
+                value
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Constant) and isinstance(node.value, str)
+                for value in (node.value.lower(),)
+                if any(name in value for name in forbidden)
+            }
+        )
+        self.assertEqual(hits, [])
+
+
 class TestPromptRendering(unittest.TestCase):
     def _loop(self):
         loop = object.__new__(AMGTaskNeutralAgentLoop)
@@ -381,11 +422,46 @@ class TestPromptRendering(unittest.TestCase):
 
 
 class TestAMGAgentLoop(IsolatedAsyncioTestCase):
-    def _loop(self, actions, *, max_turns):
+    @staticmethod
+    def _registry(*routes):
+        if not routes:
+            routes = (
+                RouteSpec(
+                    route_id="openmle-fast",
+                    max_rounds=1,
+                    max_observation_tokens=32,
+                    policy_framing_sha256=None,
+                    route_attestation_sha256=None,
+                    client_config=MappingProxyType(
+                        {
+                            "task_name": "openmle_fast",
+                            "env_addr": "http://127.0.0.1:65404",
+                            "max_retries": 2,
+                        }
+                    ),
+                ),
+            )
+        return RouteRegistry(routes=routes, sha256=None, source_path=None)
+
+    def _loop(self, actions, *, max_turns, registry=None):
         loop = object.__new__(AMGTaskNeutralAgentLoop)
-        loop.agentgym_config = {"task_name": "openmle_fast"}
-        loop.max_policy_turns = max_turns
-        loop.max_observation_tokens = 32
+        loop.agentgym_config = {"max_retries": 2}
+        loop._route_registry = registry or self._registry(
+            RouteSpec(
+                route_id="openmle-fast",
+                max_rounds=max_turns,
+                max_observation_tokens=32,
+                policy_framing_sha256=None,
+                route_attestation_sha256=None,
+                client_config=MappingProxyType(
+                    {
+                        "task_name": "openmle_fast",
+                        "env_addr": "http://127.0.0.1:65404",
+                        "max_retries": 2,
+                    }
+                ),
+            )
+        )
         loop._envelope_tokens = 1
         loop.rollout_config = SimpleNamespace(
             response_length=8,
@@ -402,6 +478,153 @@ class TestAMGAgentLoop(IsolatedAsyncioTestCase):
             1 + index for index, _ in enumerate(json.dumps(messages, sort_keys=True))
         ]
         return loop
+
+    async def test_one_shared_loop_selects_only_the_row_route_and_labels_every_action(
+        self,
+    ):
+        route_specs = tuple(
+            RouteSpec(
+                route_id=route_id,
+                max_rounds=max_rounds,
+                max_observation_tokens=max_observation_tokens,
+                policy_framing_sha256=None,
+                route_attestation_sha256=str(index + 1) * 64,
+                client_config=MappingProxyType(
+                    {
+                        "task_name": task_name,
+                        "env_addr": f"http://127.0.0.1:{65410 + index}",
+                        "max_retries": 0,
+                    }
+                ),
+            )
+            for index, (
+                route_id,
+                task_name,
+                max_rounds,
+                max_observation_tokens,
+            ) in enumerate(
+                (
+                    ("webshop", "webshop", 1, 11),
+                    ("swesmith", "swesmith", 2, 22),
+                    ("literesearcher", "agentmemory", 3, 33),
+                    ("openmle-fast", "openmle_fast", 4, 44),
+                )
+            )
+        )
+        registry = self._registry(*route_specs)
+
+        for route in route_specs:
+            with self.subTest(route_id=route.route_id):
+                client = _SuccessfulClient()
+                loop = self._loop(
+                    [f"ACTION {route.route_id}"],
+                    max_turns=99,
+                    registry=registry,
+                )
+                selected_configs = []
+
+                def select_client(config):
+                    selected_configs.append(config)
+                    return client
+
+                with mock.patch.object(
+                    agent_loop_module,
+                    "create_env_client",
+                    side_effect=select_client,
+                ):
+                    outputs = await loop.run(
+                        {"max_tokens": 8},
+                        item_id=f"task-{route.route_id}",
+                        data_idx=0,
+                        uid=f"trajectory-{route.route_id}",
+                        route_id=route.route_id,
+                        extra_info={"route_id": route.route_id},
+                        raw_prompt=[{"role": "system", "content": "system"}],
+                    )
+
+                self.assertEqual(selected_configs, [route.client_config])
+                self.assertTrue(client.closed)
+                self.assertEqual(len(outputs), 1)
+                self.assertEqual(outputs[0].extra_fields["route_id"], route.route_id)
+                self.assertEqual(
+                    outputs[0].extra_fields["data_source"], route.route_id
+                )
+                record = json.loads(outputs[0].extra_fields["step_record_json"])
+                self.assertEqual(record["route_id"], route.route_id)
+                self.assertEqual(record["data_source"], route.route_id)
+
+    async def test_route_local_horizon_and_observation_budget_are_used(self):
+        route = RouteSpec(
+            route_id="swesmith",
+            max_rounds=2,
+            max_observation_tokens=73,
+            policy_framing_sha256=None,
+            route_attestation_sha256=None,
+            client_config=MappingProxyType(
+                {
+                    "task_name": "swesmith",
+                    "env_addr": "http://127.0.0.1:65411",
+                    "max_retries": 0,
+                }
+            ),
+        )
+        client = _PressureHorizonClient()
+        loop = self._loop(
+            ["FIRST", "SECOND"],
+            max_turns=99,
+            registry=self._registry(route),
+        )
+
+        with mock.patch.object(
+            agent_loop_module, "create_env_client", return_value=client
+        ):
+            outputs = await loop.run(
+                {"max_tokens": 8},
+                item_id="route-local-limits",
+                data_idx=0,
+                route_id="swesmith",
+                raw_prompt=[{"role": "system", "content": "system"}],
+            )
+
+        self.assertEqual(len(outputs), 2)
+        self.assertEqual(client.actions, ["FIRST", "SECOND"])
+        self.assertEqual(
+            [pressure.max_observation_tokens for pressure in client.pressures],
+            [73, 73],
+        )
+        self.assertTrue(client.closed)
+
+    async def test_selected_client_closes_when_wrapper_raises(self):
+        route = RouteSpec(
+            route_id="literesearcher",
+            max_rounds=1,
+            max_observation_tokens=32,
+            policy_framing_sha256=None,
+            route_attestation_sha256=None,
+            client_config=MappingProxyType(
+                {
+                    "task_name": "agentmemory",
+                    "env_addr": "http://127.0.0.1:65412",
+                    "max_retries": 0,
+                }
+            ),
+        )
+        client = _ErrorClient()
+        loop = self._loop(["FAIL"], max_turns=99, registry=self._registry(route))
+
+        with mock.patch.object(
+            agent_loop_module, "create_env_client", return_value=client
+        ):
+            with self.assertRaisesRegex(RuntimeError, "deliberate wrapper failure"):
+                await loop.run(
+                    {"max_tokens": 8},
+                    item_id="route-error",
+                    data_idx=0,
+                    route_id="literesearcher",
+                    raw_prompt=[{"role": "system", "content": "system"}],
+                )
+
+        self.assertTrue(client.closed)
 
     async def test_each_policy_action_stops_at_tokenizer_eos_and_records_reason(self):
         client = _SuccessfulClient()
