@@ -6,10 +6,12 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import io
 import json
 import os
 import re
 import subprocess
+import tarfile
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -209,6 +211,128 @@ def _pull_cached_tarball(
     raise RuntimeError("cached OCI pull failed:\n" + "\n".join(failures))
 
 
+class _DigestingReader:
+    def __init__(self, source: Any) -> None:
+        self.source = source
+        self.digest = hashlib.sha256()
+
+    def read(self, size: int = -1) -> bytes:
+        block = self.source.read(size)
+        self.digest.update(block)
+        return block
+
+
+def _add_verified_cached_blob(
+    archive: tarfile.TarFile,
+    *,
+    path: Path,
+    archive_name: str,
+    descriptor: dict[str, Any],
+) -> bytes | None:
+    digest = str(descriptor.get("digest", ""))
+    expected_size = int(descriptor.get("size", -1))
+    if _DIGEST_RE.fullmatch(digest) is None:
+        raise RuntimeError(f"invalid cached blob digest: {digest!r}")
+    if not path.is_file() or path.is_symlink():
+        raise RuntimeError(f"cached blob is missing: {path}")
+    actual_size = path.stat().st_size
+    if actual_size != expected_size:
+        raise RuntimeError(
+            f"cached blob size mismatch: {path}; "
+            f"expected={expected_size} actual={actual_size}"
+        )
+
+    info = tarfile.TarInfo(archive_name)
+    info.mode = 0o644
+    info.mtime = 0
+    info.size = actual_size
+    captured = bytearray() if actual_size <= 8 * 1024 * 1024 else None
+    with path.open("rb") as raw_source:
+        source = _DigestingReader(raw_source)
+        if captured is None:
+            archive.addfile(info, source)
+        else:
+            data = raw_source.read()
+            source.digest.update(data)
+            captured.extend(data)
+            archive.addfile(info, io.BytesIO(data))
+        actual_digest = "sha256:" + source.digest.hexdigest()
+    if actual_digest != digest:
+        raise RuntimeError(
+            f"cached blob digest mismatch: {path}; "
+            f"expected={digest} actual={actual_digest}"
+        )
+    return bytes(captured) if captured is not None else None
+
+
+def _build_offline_cached_tarball(
+    binding: ImageBinding,
+    *,
+    partial: Path,
+    layer_cache_root: Path,
+) -> tuple[bytes, bytes]:
+    manifest_path = layer_cache_root / "manifests" / f"{binding.cache_name}.json"
+    if not manifest_path.is_file() or manifest_path.is_symlink():
+        raise RuntimeError(f"cached image manifest is missing: {manifest_path}")
+    manifest_raw = manifest_path.read_bytes()
+    actual_manifest_digest = "sha256:" + hashlib.sha256(manifest_raw).hexdigest()
+    if actual_manifest_digest != binding.digest:
+        raise RuntimeError(
+            f"cached image manifest digest mismatch: {manifest_path}; "
+            f"expected={binding.digest} actual={actual_manifest_digest}"
+        )
+    manifest = json.loads(manifest_raw)
+    config_descriptor = manifest.get("config")
+    layer_descriptors = manifest.get("layers")
+    if not isinstance(config_descriptor, dict) or not isinstance(
+        layer_descriptors, list
+    ):
+        raise RuntimeError(f"cached image manifest is malformed: {manifest_path}")
+
+    config_digest = str(config_descriptor.get("digest", ""))
+    config_name = f"{config_digest.removeprefix('sha256:')}.json"
+    layer_names = [
+        f"{str(descriptor.get('digest', '')).removeprefix('sha256:')}.tar.gz"
+        for descriptor in layer_descriptors
+    ]
+    docker_manifest = _json_bytes(
+        [
+            {
+                "Config": config_name,
+                "RepoTags": [binding.profile_image],
+                "Layers": layer_names,
+            }
+        ]
+    )
+    image_tarball = partial / "image.tar"
+    with tarfile.open(image_tarball, "w") as archive:
+        config_raw = _add_verified_cached_blob(
+            archive,
+            path=layer_cache_root / "blobs" / config_digest,
+            archive_name=config_name,
+            descriptor=config_descriptor,
+        )
+        assert config_raw is not None
+        archived_layers: set[str] = set()
+        for descriptor, archive_name in zip(layer_descriptors, layer_names):
+            digest = str(descriptor.get("digest", ""))
+            if digest in archived_layers:
+                continue
+            archived_layers.add(digest)
+            _add_verified_cached_blob(
+                archive,
+                path=layer_cache_root / "blobs" / digest,
+                archive_name=archive_name,
+                descriptor=descriptor,
+            )
+        info = tarfile.TarInfo("manifest.json")
+        info.mode = 0o644
+        info.mtime = 0
+        info.size = len(docker_manifest)
+        archive.addfile(info, io.BytesIO(docker_manifest))
+    return manifest_raw, config_raw
+
+
 def _measure_rootfs(rootfs: Path) -> tuple[int, int]:
     total_bytes = 0
     regular_files = 0
@@ -284,6 +408,7 @@ def _materialize_one(
     dataset_revision: str,
     source_revision: str,
     layer_cache_root: Path | None = None,
+    offline_layer_cache: bool = False,
     transport_fallbacks: tuple[str, ...] = (),
     download_attempts: int = 1,
 ) -> dict[str, Any]:
@@ -304,7 +429,19 @@ def _materialize_one(
     reference = f"{prefixes[0]}/{binding.source_image}@{binding.digest}"
     selected_transport = prefixes[0]
     pull_attempts = 1
-    if layer_cache_root is None:
+    if offline_layer_cache:
+        if layer_cache_root is None:
+            raise RuntimeError("offline layer cache requires --layer-cache-root")
+        manifest_raw, config_raw = _build_offline_cached_tarball(
+            binding,
+            partial=partial,
+            layer_cache_root=layer_cache_root,
+        )
+        reference = f"offline-cache://{binding.source_image}@{binding.digest}"
+        selected_transport = "offline-layer-cache"
+        pull_attempts = 0
+        manifest = json.loads(manifest_raw)
+    elif layer_cache_root is None:
         manifest_raw = _run_bytes(
             [str(crane), "manifest", reference], environment=environment
         )
@@ -395,6 +532,7 @@ def _materialize_one(
         "transport_mirror": selected_transport,
         "transport_attempts": pull_attempts,
         "layer_cache_enabled": layer_cache_root is not None,
+        "offline_layer_cache": offline_layer_cache,
         "resolved_digest": binding.digest,
         "manifest_sha256": binding.digest.removeprefix("sha256:"),
         "config_sha256": config_sha,
@@ -453,6 +591,7 @@ def main() -> int:
     parser.add_argument("--transport-prefix", required=True)
     parser.add_argument("--fallback-transport-prefix", action="append", default=[])
     parser.add_argument("--layer-cache-root", type=Path)
+    parser.add_argument("--offline-layer-cache", action="store_true")
     parser.add_argument("--download-attempts", type=int, default=6)
     parser.add_argument("--dataset-revision", required=True)
     parser.add_argument("--source-revision", required=True)
@@ -488,6 +627,8 @@ def main() -> int:
         if args.layer_cache_root is not None
         else None
     )
+    if args.offline_layer_cache and layer_cache_root is None:
+        parser.error("--offline-layer-cache requires --layer-cache-root")
     results: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
         futures = {
@@ -501,6 +642,7 @@ def main() -> int:
                 dataset_revision=args.dataset_revision,
                 source_revision=args.source_revision,
                 layer_cache_root=layer_cache_root,
+                offline_layer_cache=args.offline_layer_cache,
                 transport_fallbacks=transport_prefixes[1:],
                 download_attempts=args.download_attempts,
             ): binding

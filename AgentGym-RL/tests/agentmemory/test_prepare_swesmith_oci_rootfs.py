@@ -1,7 +1,9 @@
 import argparse
 import hashlib
 import importlib.util
+import json
 import sys
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -109,6 +111,108 @@ class PrepareSwesmithOciRootfsTest(unittest.TestCase):
             self.assertFalse(corrupt.exists())
             self.assertTrue(ignored.exists())
             self.assertEqual(MODULE._purge_invalid_cached_layers(cache), ())
+
+    def test_builds_digest_verified_offline_tarball_from_crane_cache(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            cache = root / "cache"
+            partial = root / "partial"
+            (cache / "blobs").mkdir(parents=True)
+            (cache / "manifests").mkdir()
+            partial.mkdir()
+
+            config_raw = json.dumps(
+                {
+                    "architecture": "amd64",
+                    "os": "linux",
+                    "config": {"WorkingDir": "/testbed"},
+                },
+                separators=(",", ":"),
+            ).encode()
+            layer_raw = b"cached compressed layer"
+            config_digest = "sha256:" + hashlib.sha256(config_raw).hexdigest()
+            layer_digest = "sha256:" + hashlib.sha256(layer_raw).hexdigest()
+            manifest = {
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                "config": {
+                    "mediaType": "application/vnd.docker.container.image.v1+json",
+                    "size": len(config_raw),
+                    "digest": config_digest,
+                },
+                "layers": [
+                    {
+                        "mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip",
+                        "size": len(layer_raw),
+                        "digest": layer_digest,
+                    }
+                ],
+            }
+            manifest_raw = json.dumps(manifest, separators=(",", ":")).encode()
+            binding = MODULE.ImageBinding(
+                "source/image",
+                "profile/image",
+                "sha256:" + hashlib.sha256(manifest_raw).hexdigest(),
+            )
+            (cache / "blobs" / config_digest).write_bytes(config_raw)
+            (cache / "blobs" / layer_digest).write_bytes(layer_raw)
+            (cache / "manifests" / f"{binding.cache_name}.json").write_bytes(
+                manifest_raw
+            )
+
+            actual_manifest, actual_config = MODULE._build_offline_cached_tarball(
+                binding,
+                partial=partial,
+                layer_cache_root=cache,
+            )
+
+            self.assertEqual(actual_manifest, manifest_raw)
+            self.assertEqual(actual_config, config_raw)
+            with tarfile.open(partial / "image.tar") as archive:
+                self.assertEqual(
+                    set(archive.getnames()),
+                    {
+                        "manifest.json",
+                        f"{config_digest.removeprefix('sha256:')}.json",
+                        f"{layer_digest.removeprefix('sha256:')}.tar.gz",
+                    },
+                )
+
+    def test_offline_tarball_rejects_corrupt_cached_blob(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            cache = root / "cache"
+            partial = root / "partial"
+            (cache / "blobs").mkdir(parents=True)
+            (cache / "manifests").mkdir()
+            partial.mkdir()
+            config_raw = b'{"architecture":"amd64","os":"linux"}'
+            config_digest = "sha256:" + hashlib.sha256(config_raw).hexdigest()
+            manifest = {
+                "schemaVersion": 2,
+                "config": {
+                    "size": len(config_raw),
+                    "digest": config_digest,
+                },
+                "layers": [],
+            }
+            manifest_raw = json.dumps(manifest, separators=(",", ":")).encode()
+            binding = MODULE.ImageBinding(
+                "source/image",
+                "profile/image",
+                "sha256:" + hashlib.sha256(manifest_raw).hexdigest(),
+            )
+            (cache / "manifests" / f"{binding.cache_name}.json").write_bytes(
+                manifest_raw
+            )
+            (cache / "blobs" / config_digest).write_bytes(b"corrupt")
+
+            with self.assertRaisesRegex(RuntimeError, "cached blob size mismatch"):
+                MODULE._build_offline_cached_tarball(
+                    binding,
+                    partial=partial,
+                    layer_cache_root=cache,
+                )
 
 
 if __name__ == "__main__":
