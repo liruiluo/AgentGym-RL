@@ -110,26 +110,44 @@ def _freeze(value: Any) -> Any:
     return value
 
 
-def canonical_policy_framing_sha256(messages: Any) -> str:
-    """Hash one wrapper-owned policy framing using a stable JSON encoding."""
+def normalize_policy_framing(messages: Any) -> tuple[Mapping[str, str], ...]:
+    """Normalize legacy ``from/value`` and modern ``role/content`` messages."""
 
     if isinstance(messages, (str, bytes)) or not isinstance(messages, Sequence):
         raise TypeError("policy framing must be a non-empty message sequence")
-    normalized: list[dict[str, str]] = []
+    normalized: list[Mapping[str, str]] = []
+    role_aliases = {"human": "user", "gpt": "assistant"}
     for index, message in enumerate(messages):
         if not isinstance(message, Mapping):
-            raise TypeError(f"policy framing message {index} must be a mapping")
+            try:
+                message = dict(message)
+            except (TypeError, ValueError) as exc:
+                raise TypeError(
+                    f"policy framing message {index} must be a mapping"
+                ) from exc
         role = message.get("role")
         if role is None:
             role = message.get("from")
         content = message.get("content")
         if content is None:
             content = message.get("value")
-        if not isinstance(role, str) or not isinstance(content, str):
-            raise ValueError(f"policy framing message {index} has invalid role/content")
-        normalized.append({"role": role, "content": content})
+        role = role_aliases.get(role, role)
+        if role not in {"system", "user", "assistant"} or not isinstance(
+            content, str
+        ):
+            raise ValueError(
+                f"policy framing message {index} has invalid role/content"
+            )
+        normalized.append(MappingProxyType({"role": str(role), "content": content}))
     if not normalized:
         raise ValueError("policy framing must not be empty")
+    return tuple(normalized)
+
+
+def canonical_policy_framing_sha256(messages: Any) -> str:
+    """Hash one wrapper-owned policy framing using a stable JSON encoding."""
+
+    normalized = [dict(message) for message in normalize_policy_framing(messages)]
     payload = json.dumps(
         normalized,
         ensure_ascii=False,

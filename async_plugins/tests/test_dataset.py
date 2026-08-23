@@ -2,18 +2,40 @@ from __future__ import annotations
 
 import unittest
 from copy import deepcopy
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 from agentmemorygym_verl.dataset import AMGTrajectoryDataset
+from agentmemorygym_verl.routes import RouteRegistry, RouteSpec
 
 
 class TestAMGTrajectoryDataset(unittest.TestCase):
     def _dataset(self, rows):
         dataset = object.__new__(AMGTrajectoryDataset)
         dataset.dataframe = deepcopy(rows)
-        dataset._policy_framing = [
+        framing = [
             {"role": "system", "content": "Use ordinary shell and filesystem actions."}
         ]
+        registry = RouteRegistry(
+            routes=(
+                RouteSpec(
+                    route_id="openmle_fast",
+                    max_rounds=30,
+                    max_observation_tokens=8192,
+                    policy_framing_sha256=None,
+                    route_attestation_sha256=None,
+                    client_config=MappingProxyType(
+                        {
+                            "task_name": "openmle_fast",
+                            "env_addr": "http://127.0.0.1:65524",
+                        }
+                    ),
+                ),
+            ),
+            sha256=None,
+            source_path=None,
+        )
+        dataset._route_registry = registry
+        dataset._policy_framing_by_route = {"openmle_fast": framing}
         dataset.config = SimpleNamespace(
             agentgym=SimpleNamespace(task_name="openmle_fast")
         )
@@ -36,7 +58,9 @@ class TestAMGTrajectoryDataset(unittest.TestCase):
         )
         self.assertEqual(dataset.dataframe, rows)
         first["raw_prompt"][0]["content"] = "mutated"
-        self.assertNotEqual(first["raw_prompt"], dataset._policy_framing)
+        self.assertNotEqual(
+            first["raw_prompt"], dataset._policy_framing_by_route["openmle_fast"]
+        )
 
     def test_rejects_nonintegral_data_idx(self):
         dataset = self._dataset([{"item_id": "task", "data_idx": 1.5}])
@@ -48,6 +72,113 @@ class TestAMGTrajectoryDataset(unittest.TestCase):
             [{"item_id": "task", "data_idx": 7, "extra_info": {"index": 8}}]
         )
         with self.assertRaisesRegex(ValueError, "schedule index differs"):
+            dataset[0]
+
+    def test_routes_each_row_to_its_exact_framing_and_shared_agent_loop(self):
+        rows = [
+            {
+                "item_id": "webshop:item-0",
+                "route_id": "webshop",
+                "data_idx": 3,
+                "extra_info": {"index": 3, "route_id": "webshop"},
+            },
+            {
+                "item_id": "swesmith:item-0",
+                "route_id": "swesmith",
+                "data_idx": 11,
+                "extra_info": {"index": 11, "route_id": "swesmith"},
+            },
+        ]
+        dataset = object.__new__(AMGTrajectoryDataset)
+        dataset.dataframe = deepcopy(rows)
+        dataset._route_registry = RouteRegistry(
+            routes=(
+                RouteSpec(
+                    route_id="webshop",
+                    max_rounds=30,
+                    max_observation_tokens=8192,
+                    policy_framing_sha256=None,
+                    route_attestation_sha256=None,
+                    client_config=MappingProxyType(
+                        {
+                            "task_name": "webshop",
+                            "env_addr": "http://127.0.0.1:65101",
+                        }
+                    ),
+                ),
+                RouteSpec(
+                    route_id="swesmith",
+                    max_rounds=30,
+                    max_observation_tokens=8192,
+                    policy_framing_sha256=None,
+                    route_attestation_sha256=None,
+                    client_config=MappingProxyType(
+                        {
+                            "task_name": "swesmith",
+                            "env_addr": "http://127.0.0.1:65102",
+                        }
+                    ),
+                ),
+            ),
+            sha256="a" * 64,
+            source_path=None,
+        )
+        dataset._policy_framing_by_route = {
+            "webshop": [{"role": "system", "content": "shop"}],
+            "swesmith": [{"role": "system", "content": "code"}],
+        }
+        dataset.config = SimpleNamespace(agentgym=SimpleNamespace())
+
+        webshop = dataset[0]
+        swesmith = dataset[1]
+
+        self.assertEqual(webshop["raw_prompt"][0]["content"], "shop")
+        self.assertEqual(swesmith["raw_prompt"][0]["content"], "code")
+        self.assertEqual(webshop["data_idx"], 3)
+        self.assertEqual(swesmith["data_idx"], 11)
+        self.assertEqual(webshop["route_id"], "webshop")
+        self.assertEqual(swesmith["route_id"], "swesmith")
+        self.assertEqual(webshop["extra_info"]["route_id"], "webshop")
+        self.assertEqual(swesmith["extra_info"]["route_id"], "swesmith")
+        self.assertEqual(webshop["agent_name"], "amg_task_neutral_async")
+        self.assertEqual(swesmith["agent_name"], "amg_task_neutral_async")
+        self.assertEqual(webshop["data_source"], "webshop")
+        self.assertEqual(swesmith["data_source"], "swesmith")
+
+        webshop["raw_prompt"][0]["content"] = "mutated"
+        self.assertEqual(
+            dataset._policy_framing_by_route["webshop"][0]["content"], "shop"
+        )
+
+    def test_rejects_unknown_or_drifting_route_identity(self):
+        dataset = self._dataset(
+            [
+                {
+                    "item_id": "task",
+                    "route_id": "missing",
+                    "data_idx": 0,
+                    "extra_info": {"index": 0, "route_id": "missing"},
+                }
+            ]
+        )
+        with self.assertRaisesRegex(ValueError, "unknown AMG route_id"):
+            dataset[0]
+
+        dataset.dataframe[0]["route_id"] = "openmle_fast"
+        with self.assertRaisesRegex(ValueError, "route_id drift"):
+            dataset[0]
+
+    def test_rejects_row_that_selects_a_different_agent_loop(self):
+        dataset = self._dataset(
+            [
+                {
+                    "item_id": "task",
+                    "data_idx": 0,
+                    "agent_name": "domain_specific_loop",
+                }
+            ]
+        )
+        with self.assertRaisesRegex(ValueError, "agent_name"):
             dataset[0]
 
 
