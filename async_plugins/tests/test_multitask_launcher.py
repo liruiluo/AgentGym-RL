@@ -667,7 +667,7 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
         config = load_orchestrator_config(CONFIG)
 
         self.assertEqual(
-            EXPECTED_VERL_COMMIT, "92428c4cffb114f8463fdc64f013ee344c6c2686"
+            EXPECTED_VERL_COMMIT, "5a4ef518fa2552816d31ac28241df6f583eadd0a"
         )
         self.assertEqual(config.route_order, EXPECTED_ROUTE_IDS)
         self.assertEqual(config.optimizer_updates, 400)

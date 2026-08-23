@@ -25,7 +25,7 @@ RICH_V8_FIXTURES = next(
     Path("/tmp/openmle-v8-launch-fixtures-20260818"),
 )
 
-FINAL_STATISTICS_VERL_COMMIT = "92428c4cffb114f8463fdc64f013ee344c6c2686"
+FINAL_STATISTICS_VERL_COMMIT = "5a4ef518fa2552816d31ac28241df6f583eadd0a"
 MULTITASK_ROUTES = ("webshop", "swesmith", "literesearcher", "openmle_fast")
 
 

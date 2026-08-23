@@ -25,7 +25,7 @@ class TestAMGFullyAsyncIdentity(unittest.TestCase):
     ):
         self.assertEqual(
             EXPECTED_VERL_COMMIT,
-            "92428c4cffb114f8463fdc64f013ee344c6c2686",
+            "5a4ef518fa2552816d31ac28241df6f583eadd0a",
         )
 
     def test_only_reviewed_verl_and_model_bytes_are_module_constants(self):

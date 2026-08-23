@@ -33,7 +33,7 @@ _MULTITASK_SCHEDULE_CERTIFICATE_SCHEMA = "amg_multitask_schedule_certificate_v1"
 _ROUTE_REGISTRY_SCHEMA = "amg_route_registry_v1"
 _FINAL_STATISTICS_SCHEMA = "verl_fully_async_final_statistics_v1"
 _FINAL_STATISTICS_MARKER = "[FullyAsyncTaskRunner][FinalStatistics] "
-_FINAL_STATISTICS_VERL_COMMIT = "92428c4cffb114f8463fdc64f013ee344c6c2686"
+_FINAL_STATISTICS_VERL_COMMIT = "5a4ef518fa2552816d31ac28241df6f583eadd0a"
 _FINAL_STATISTICS_FIELDS = frozenset(
     {"schema", "queue", "rollouter", "trainer", "queue_cleanup"}
 )
