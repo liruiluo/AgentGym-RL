@@ -23,8 +23,10 @@ from agentmemorygym_verl.multitask_orchestrator import (
     EXPECTED_ROUTE_IDS,
     EndpointLaunchSpec,
     ExactProcessSupervisor,
+    HolderLease,
     LaunchPlan,
     LocalBackend,
+    MarkerLease,
     OrchestratorError,
     ProcessLease,
     _atomic_json,
@@ -687,6 +689,59 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
         self.assertFalse(config.require_exact_per_update_route_split)
         self.assertEqual(config.sampling_order, "round_robin")
 
+    def test_holder_acquisition_builds_complete_lifecycle_marker_records(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker_path = root / "yield.marker"
+            holder_lease = HolderLease(
+                source_path=root / "holder-lease.json",
+                sha256="0" * 64,
+                markers=(
+                    MarkerLease(
+                        name="gpu",
+                        path=marker_path,
+                        original_value=None,
+                        original_pid=0,
+                        original_start_ticks="",
+                    ),
+                ),
+                yield_checks=(),
+                restore_checks=(),
+            )
+            config = replace(
+                LaunchPlan.for_test(resolve_only=False).config,
+                holder_lock_path=root / "holder.lock",
+            )
+            plan = replace(
+                LaunchPlan.for_test(resolve_only=False, config=config),
+                run_dir=root / "run",
+                holder_lease=holder_lease,
+            )
+            backend = LocalBackend()
+            backend.parent_start_ticks = "parent-ticks"
+            captured: dict[str, object] = {}
+
+            def capture_markers(**kwargs: object) -> None:
+                captured.update(kwargs)
+                raise RuntimeError("stop after marker capture")
+
+            with (
+                mock.patch(
+                    "agentmemorygym_verl.multitask_orchestrator.prepare_marker_transaction",
+                    side_effect=capture_markers,
+                ),
+                self.assertRaisesRegex(RuntimeError, "stop after marker capture"),
+            ):
+                backend.acquire_holders(plan)
+
+            marker = captured["markers"][0]  # type: ignore[index]
+            self.assertFalse(marker["acquire_started"])
+            self.assertFalse(marker["acquired"])
+            self.assertFalse(marker["restore_started"])
+            self.assertFalse(marker["restore_target_set"])
+            self.assertIsNone(marker["restore_target"])
+            self.assertFalse(marker["restored"])
+
     def test_endpoint_registry_binds_receipts_assets_sources_and_route_order(
         self,
     ) -> None:
@@ -1207,6 +1262,49 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
         self.assertEqual(lease.start_ticks, "99")
         self.assertEqual(supervisor.owned_leases, (lease,))
         supervisor._release(lease)
+
+    def test_endpoint_start_exports_derived_endpoint_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = replace(
+                EndpointLaunchSpec.for_test(
+                    route_id="webshop", endpoint="http://127.0.0.1:49249"
+                ),
+                working_directory=root,
+            )
+            supervisor = ExactProcessSupervisor()
+            lease = ProcessLease(
+                name="webshop",
+                pid=101,
+                start_ticks="202",
+                process=object(),
+                log_handle=None,
+            )
+            with (
+                mock.patch(
+                    "agentmemorygym_verl.multitask_orchestrator.process_start_ticks",
+                    return_value="parent-ticks",
+                ),
+                mock.patch.object(
+                    supervisor, "start_command", return_value=lease
+                ) as start_command,
+            ):
+                result = supervisor.start(
+                    spec,
+                    run_dir=root / "run",
+                    parent_pid=os.getpid(),
+                    parent_start_ticks="parent-ticks",
+                )
+
+            self.assertIs(result, lease)
+            environment = start_command.call_args.kwargs["environment"]
+            start_command.call_args.kwargs["log_handle"].close()
+            self.assertEqual(environment["AMG_MULTITASK_ENDPOINT_HOST"], "127.0.0.1")
+            self.assertEqual(environment["AMG_MULTITASK_ENDPOINT_PORT"], "49249")
+            self.assertEqual(
+                environment["AMG_MULTITASK_ENDPOINT_URL"],
+                "http://127.0.0.1:49249",
+            )
 
     @unittest.skipUnless(Path("/proc/self/stat").is_file(), "requires Linux /proc")
     def test_failed_identity_publication_never_releases_child_bootstrap(self) -> None:

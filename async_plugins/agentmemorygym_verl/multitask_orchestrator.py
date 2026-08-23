@@ -30,6 +30,7 @@ from .config_contract import inspect_schedule
 from .identity import EXPECTED_VERL_COMMIT
 from .launch import LaunchInputs, _load_multitask_identity
 from .orchestrator_lifecycle import (
+    _marker_record,
     _signal_process_identity,
     acquire_marker_transaction,
     prepare_marker_transaction,
@@ -1346,6 +1347,8 @@ class ExactProcessSupervisor:
                 "AMG_MULTITASK_ROUTE_ID": spec.route_id,
                 "AMG_MULTITASK_ENDPOINT_RUN_DIR": str(endpoint_dir),
                 "AMG_MULTITASK_ENDPOINT_URL": spec.endpoint,
+                "AMG_MULTITASK_ENDPOINT_HOST": str(parsed.hostname),
+                "AMG_MULTITASK_ENDPOINT_PORT": str(parsed.port),
                 "AMG_MULTITASK_PARENT_PID": str(parent_pid),
                 "AMG_MULTITASK_PARENT_START_TICKS": parent_start_ticks,
             }
@@ -2036,15 +2039,13 @@ class LocalBackend:
         ready_path = state_dir / "watcher-ready.json"
         receipt_path = state_dir / "watcher-exit.json"
         markers = [
-            {
-                "name": marker.name,
-                "path": str(marker.path),
-                "original_value": marker.original_value,
-                "original_identity": {
-                    "pid": marker.original_pid,
-                    "start_ticks": marker.original_start_ticks,
-                },
-            }
+            _marker_record(
+                marker.name,
+                marker.path,
+                marker.original_value,
+                marker.original_pid,
+                marker.original_start_ticks,
+            )
             for marker in lease.markers
         ]
         watcher: ProcessLease | None = None
