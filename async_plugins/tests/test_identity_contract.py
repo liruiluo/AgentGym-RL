@@ -20,10 +20,12 @@ FIXTURES = Path("/tmp/openmle-v8-launch-fixtures-20260818")
 
 
 class TestAMGFullyAsyncIdentity(unittest.TestCase):
-    def test_verl_pin_contains_reviewed_fully_async_critic_and_fused_forward_fixes(self):
+    def test_verl_pin_contains_reviewed_fully_async_critic_and_fused_forward_fixes(
+        self,
+    ):
         self.assertEqual(
             EXPECTED_VERL_COMMIT,
-            "b3b91799743561d5e19347751447963a2b283e6a",
+            "92428c4cffb114f8463fdc64f013ee344c6c2686",
         )
 
     def test_only_reviewed_verl_and_model_bytes_are_module_constants(self):

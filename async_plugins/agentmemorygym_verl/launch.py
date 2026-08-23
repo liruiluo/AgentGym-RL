@@ -29,11 +29,13 @@ from .identity import (
     validate_training_runtime_lock,
     verify_hash_manifest,
 )
+from .orchestrator_lifecycle import process_identity_alive
 from .routes import load_route_registry
 
 _ENDPOINT_SOURCE_LOCK_SCHEMA = "openmle_fast_launcher_source_lock_v1"
 _MULTITASK_SOURCE_LOCK_SCHEMA = "amg_multitask_launcher_source_lock_v1"
 _MULTITASK_SCHEDULE_CERTIFICATE_SCHEMA = "amg_multitask_schedule_certificate_v1"
+_MULTITASK_ORCHESTRATOR_PREFLIGHT_SCHEMA = "amg_multitask_orchestrator_preflight_v1"
 _MULTITASK_ROUTE_IDS = (
     "webshop",
     "swesmith",
@@ -92,6 +94,7 @@ class LaunchInputs:
     route_registry_sha256: str | None = None
     multitask_source_lock: Path | None = None
     multitask_schedule_certificate: Path | None = None
+    multitask_orchestrator_preflight: Path | None = None
 
 
 def _string(value: str | Path) -> str:
@@ -182,9 +185,7 @@ def build_overrides(
         )
     if inputs.route_registry is not None:
         if inputs.env_addr is not None:
-            raise ValueError(
-                "multi-environment launch must not set a global env_addr"
-            )
+            raise ValueError("multi-environment launch must not set a global env_addr")
         if endpoint_client_config:
             raise ValueError(
                 "multi-environment launch must not set a global endpoint client config"
@@ -247,8 +248,7 @@ def build_overrides(
         f"actor_rollout_ref.model.path={model_path}",
         "actor_rollout_ref.model.trust_remote_code=True",
         "actor_rollout_ref.model.use_remove_padding=True",
-        "actor_rollout_ref.model.use_fused_kernels="
-        f"{inputs.actor_use_fused_kernels}",
+        f"actor_rollout_ref.model.use_fused_kernels={inputs.actor_use_fused_kernels}",
         "actor_rollout_ref.model.fused_kernel_options.impl_backend=torch",
         # Keep veRL's native HF/FSDP gradient checkpointing enabled. The
         # synchronous comparator used the upstream default successfully;
@@ -313,6 +313,7 @@ def build_overrides(
         # peak. Retain the conservative 32,768 target for the first gate with
         # upstream checkpointing restored; tune only from measured headroom.
         "critic.ppo_max_token_len_per_gpu=32768",
+        "+critic.ppo_infer_max_token_len_per_gpu=32768",
         "critic.forward_max_token_len_per_gpu=262144",
         "critic.optim.lr=1e-5",
         "critic.optim.weight_decay=0.01",
@@ -602,7 +603,9 @@ def _load_multitask_identity(
         "publication_receipt": inputs.publication_receipt,
         "formal_schedule_certificate": inputs.formal_schedule_certificate,
     }
-    conflicts = sorted(name for name, value in endpoint_only.items() if value is not None)
+    conflicts = sorted(
+        name for name, value in endpoint_only.items() if value is not None
+    )
     if conflicts:
         raise ValueError(
             "multitask launch must not set OpenMLE-only publication inputs: "
@@ -710,8 +713,7 @@ def _load_multitask_identity(
     role = "gate_only" if inputs.mode == "gate" else "train_pool"
     if certificate.get("role") != role:
         raise ValueError(
-            "multitask schedule role mismatch: "
-            f"{certificate.get('role')!r} != {role!r}"
+            f"multitask schedule role mismatch: {certificate.get('role')!r} != {role!r}"
         )
     if certificate.get("agent_name") != "amg_task_neutral_async":
         raise ValueError("multitask schedule selected a non-shared AgentLoop")
@@ -798,18 +800,13 @@ def _load_multitask_identity(
     for route in registry.routes:
         source = sources.get(route.route_id)
         route_provenance = provenance.get(route.route_id)
-        if not isinstance(source, Mapping) or not isinstance(
-            route_provenance, Mapping
-        ):
+        if not isinstance(source, Mapping) or not isinstance(route_provenance, Mapping):
             raise ValueError(
                 f"multitask route {route.route_id!r} omitted source provenance"
             )
         source_row_count = _require_positive_int(
             source.get("source_row_count"),
-            field=(
-                "multitask certificate sources."
-                f"{route.route_id}.source_row_count"
-            ),
+            field=(f"multitask certificate sources.{route.route_id}.source_row_count"),
         )
         allow_repetition = source.get("allow_repetition")
         if not isinstance(allow_repetition, bool):
@@ -836,17 +833,12 @@ def _load_multitask_identity(
             ),
         )
         if route_attestation_sha256 != route.route_attestation_sha256:
-            raise ValueError(
-                f"multitask route {route.route_id!r} attestation drifted"
-            )
+            raise ValueError(f"multitask route {route.route_id!r} attestation drifted")
         if route_provenance.get("source_schedule_sha256") != source_schedule_sha256:
             raise ValueError(
                 f"multitask route {route.route_id!r} source schedule drifted"
             )
-        if (
-            route_provenance.get("route_attestation_sha256")
-            != route_attestation_sha256
-        ):
+        if route_provenance.get("route_attestation_sha256") != route_attestation_sha256:
             raise ValueError(
                 f"multitask route {route.route_id!r} schedule attestation drifted"
             )
@@ -1279,7 +1271,9 @@ def _load_launch_identity(
 ) -> dict[str, Any]:
     """Select the generic multitask or strict legacy OpenMLE identity path."""
 
-    has_registry = inputs.route_registry is not None or inputs.route_registry_sha256 is not None
+    has_registry = (
+        inputs.route_registry is not None or inputs.route_registry_sha256 is not None
+    )
     has_multitask_lock = (
         inputs.multitask_source_lock is not None
         or inputs.multitask_schedule_certificate is not None
@@ -1287,6 +1281,253 @@ def _load_launch_identity(
     if has_registry or has_multitask_lock:
         return _load_multitask_identity(inputs, schedule_report=schedule_report)
     return _load_endpoint_identity(inputs, schedule_report=schedule_report)
+
+
+def _preflight_regular_file(value: Any, *, label: str) -> Path:
+    path = Path(str(value or ""))
+    if not path.is_absolute():
+        raise ValueError(f"{label} must be an absolute path")
+    return _require_regular_file(path, label=label).resolve()
+
+
+def _verify_preflight_file(
+    value: Any,
+    digest: Any,
+    *,
+    label: str,
+) -> Path:
+    path = _preflight_regular_file(value, label=label)
+    expected = _require_sha256(digest, field=f"{label} sha256")
+    observed = _sha256(path)
+    if observed != expected:
+        raise RuntimeError(
+            f"{label} sha256 mismatch: expected {expected}, got {observed}"
+        )
+    return path
+
+
+def _load_multitask_orchestrator_preflight(
+    inputs: LaunchInputs,
+    *,
+    launch_identity: Mapping[str, Any],
+    schedule_report: Mapping[str, Any],
+    budget_contract: Mapping[str, Any],
+    required: bool,
+) -> dict[str, Any] | None:
+    """Validate the live endpoint/holder handoff before a multitask trainer."""
+
+    path = inputs.multitask_orchestrator_preflight
+    is_multitask = inputs.route_registry is not None
+    if not is_multitask:
+        if path is not None:
+            raise ValueError(
+                "single-environment launch must not set a multitask "
+                "orchestrator preflight"
+            )
+        return None
+    if path is None:
+        if required:
+            raise ValueError(
+                "full multitask launch requires --multitask-orchestrator-preflight"
+            )
+        return None
+
+    path = _require_regular_file(path, label="multitask orchestrator preflight")
+    expected_path = (inputs.run_dir / "orchestrator-preflight.json").resolve()
+    if path.resolve() != expected_path:
+        raise ValueError(
+            "multitask orchestrator preflight must be the current run's "
+            f"receipt: {expected_path}"
+        )
+    receipt = _load_json_mapping(path, label="multitask orchestrator preflight")
+    if (
+        receipt.get("schema") != _MULTITASK_ORCHESTRATOR_PREFLIGHT_SCHEMA
+        or receipt.get("status") != "pass"
+    ):
+        raise ValueError(
+            "multitask orchestrator preflight is not a completed v1 receipt"
+        )
+
+    assert inputs.route_registry is not None
+    assert inputs.multitask_source_lock is not None
+    assert inputs.multitask_schedule_certificate is not None
+    expected_values = {
+        "route_registry_path": str(inputs.route_registry.resolve()),
+        "route_registry_sha256": inputs.route_registry_sha256,
+        "route_order": list(_MULTITASK_ROUTE_IDS),
+        "schedule_path": str(inputs.schedule.resolve()),
+        "schedule_sha256": schedule_report.get("sha256"),
+        "schedule_count": schedule_report.get("count"),
+        "multitask_source_lock_path": str(inputs.multitask_source_lock.resolve()),
+        "multitask_source_lock_sha256": launch_identity.get("source_lock_sha256"),
+        "multitask_schedule_certificate_path": str(
+            inputs.multitask_schedule_certificate.resolve()
+        ),
+        "multitask_schedule_certificate_sha256": launch_identity.get(
+            "schedule_certificate_sha256"
+        ),
+        "budget": {
+            "optimizer_updates": budget_contract.get("optimizer_updates"),
+            "samples_per_update": budget_contract.get("samples_per_update"),
+            "episodes": budget_contract.get("episodes"),
+        },
+    }
+    for field, expected in expected_values.items():
+        observed = receipt.get(field)
+        if observed != expected:
+            raise RuntimeError(
+                f"multitask orchestrator preflight {field} mismatch: "
+                f"{observed!r} != {expected!r}"
+            )
+
+    _verify_preflight_file(
+        receipt.get("config_path"),
+        receipt.get("config_sha256"),
+        label="multitask orchestrator config",
+    )
+    _verify_preflight_file(
+        receipt.get("endpoint_registry_path"),
+        receipt.get("endpoint_registry_sha256"),
+        label="multitask endpoint registry",
+    )
+
+    holder = receipt.get("holder_transaction")
+    if not isinstance(holder, Mapping) or holder.get("status") != "acquired":
+        raise RuntimeError(
+            "multitask orchestrator preflight holder transaction is not acquired"
+        )
+    _verify_preflight_file(
+        holder.get("lease_path"),
+        holder.get("lease_sha256"),
+        label="multitask holder lease",
+    )
+    holder_state_path = _preflight_regular_file(
+        holder.get("state_path"), label="multitask holder transaction state"
+    )
+    if (
+        holder_state_path
+        != (inputs.run_dir / "holder-transaction" / "state.json").resolve()
+    ):
+        raise RuntimeError(
+            "multitask holder transaction state is outside the current run"
+        )
+    holder_state = _load_json_mapping(
+        holder_state_path, label="multitask holder transaction state"
+    )
+    if (
+        holder_state.get("schema") != "amg_marker_transaction_v1"
+        or holder_state.get("status") != "acquired"
+        or holder_state.get("run_id") != inputs.experiment_name
+    ):
+        raise RuntimeError("multitask holder transaction is not actively acquired")
+    holder_parent = holder_state.get("parent")
+    if not isinstance(holder_parent, Mapping):
+        raise RuntimeError("multitask holder transaction omitted parent identity")
+    holder_parent_pid = holder_parent.get("pid")
+    holder_parent_ticks = holder_parent.get("start_ticks")
+    if (
+        isinstance(holder_parent_pid, bool)
+        or not isinstance(holder_parent_pid, int)
+        or not isinstance(holder_parent_ticks, str)
+        or not process_identity_alive(holder_parent_pid, holder_parent_ticks)
+    ):
+        raise RuntimeError(
+            "multitask holder transaction parent PID/start-ticks is not alive"
+        )
+    watcher_pid = holder.get("watcher_pid")
+    watcher_start_ticks = holder.get("watcher_start_ticks")
+    if (
+        isinstance(watcher_pid, bool)
+        or not isinstance(watcher_pid, int)
+        or not isinstance(watcher_start_ticks, str)
+        or not process_identity_alive(watcher_pid, watcher_start_ticks)
+    ):
+        raise RuntimeError("multitask holder watcher PID/start-ticks is not alive")
+    try:
+        watcher_process_group = os.getpgid(watcher_pid)
+    except ProcessLookupError as exc:
+        raise RuntimeError("multitask holder watcher disappeared") from exc
+    if watcher_process_group != watcher_pid:
+        raise RuntimeError("multitask holder watcher process group drifted")
+
+    registry = load_route_registry(
+        inputs.route_registry,
+        expected_sha256=str(inputs.route_registry_sha256),
+        expected_route_ids=_MULTITASK_ROUTE_IDS,
+    )
+    endpoint_receipts = receipt.get("endpoints")
+    if (
+        isinstance(endpoint_receipts, (str, bytes))
+        or not isinstance(endpoint_receipts, Sequence)
+        or len(endpoint_receipts) != len(_MULTITASK_ROUTE_IDS)
+    ):
+        raise RuntimeError(
+            "multitask orchestrator preflight must contain exactly four endpoints"
+        )
+    normalized_endpoints: list[dict[str, Any]] = []
+    for index, (route, endpoint_receipt) in enumerate(
+        zip(registry.routes, endpoint_receipts)
+    ):
+        if not isinstance(endpoint_receipt, Mapping):
+            raise TypeError(
+                f"multitask endpoint preflight entry {index} must be a mapping"
+            )
+        expected_endpoint = str(route.client_config["env_addr"])
+        for field, expected in {
+            "route_id": route.route_id,
+            "route_attestation_sha256": route.route_attestation_sha256,
+            "endpoint": expected_endpoint,
+        }.items():
+            observed = endpoint_receipt.get(field)
+            if observed != expected:
+                raise RuntimeError(
+                    "multitask endpoint preflight "
+                    f"{route.route_id} {field} mismatch: "
+                    f"{observed!r} != {expected!r}"
+                )
+        for prefix in ("gate_receipt", "launcher", "metadata"):
+            artifact_path = _verify_preflight_file(
+                endpoint_receipt.get(f"{prefix}_path"),
+                endpoint_receipt.get(f"{prefix}_sha256"),
+                label=f"{route.route_id} endpoint {prefix}",
+            )
+            if prefix == "metadata":
+                expected_metadata_path = (
+                    inputs.run_dir / "endpoints" / route.route_id / "metadata.json"
+                ).resolve()
+                if artifact_path != expected_metadata_path:
+                    raise RuntimeError(
+                        f"multitask endpoint {route.route_id} metadata path "
+                        "is outside the current run"
+                    )
+        pid = endpoint_receipt.get("pid")
+        start_ticks = endpoint_receipt.get("start_ticks")
+        if (
+            isinstance(pid, bool)
+            or not isinstance(pid, int)
+            or not isinstance(start_ticks, str)
+            or not process_identity_alive(pid, start_ticks)
+        ):
+            raise RuntimeError(
+                f"multitask endpoint {route.route_id} PID/start-ticks is not alive"
+            )
+        try:
+            process_group = os.getpgid(pid)
+        except ProcessLookupError as exc:
+            raise RuntimeError(
+                f"multitask endpoint {route.route_id} process disappeared"
+            ) from exc
+        if process_group != pid:
+            raise RuntimeError(
+                f"multitask endpoint {route.route_id} process group drifted"
+            )
+        normalized_endpoints.append(dict(endpoint_receipt))
+
+    normalized = dict(receipt)
+    normalized["path"] = str(path.resolve())
+    normalized["sha256"] = _sha256(path)
+    normalized["endpoints"] = normalized_endpoints
+    return normalized
 
 
 def _git(root: Path, *args: str) -> str:
@@ -1565,7 +1806,10 @@ def _validate_accelerator_runtime(
         not isinstance(gpu_names, Sequence)
         or isinstance(gpu_names, (str, bytes))
         or len(gpu_names) != expected_gpu_count
-        or any(not isinstance(name, str) or expected_gpu_type not in name for name in gpu_names)
+        or any(
+            not isinstance(name, str) or expected_gpu_type not in name
+            for name in gpu_names
+        )
     ):
         raise RuntimeError(
             f"runtime GPUs do not match publication type {expected_gpu_type}: {gpu_names!r}"
@@ -1607,10 +1851,12 @@ import re
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 import torch
 import trl
 from transformers import AutoConfig, AutoTokenizer
 from trl import AutoModelForCausalLMWithValueHead
+from agentmemorygym_verl.active_source_audit import audit_resolved_active_sources
 from agentmemorygym_verl.agent_loop import AMGTaskNeutralAgentLoop
 from agentmemorygym_verl.dataset import AMGTrajectoryDataset
 from agentmemorygym_verl.env_client import create_env_client
@@ -1628,6 +1874,8 @@ fn = get_adv_estimator_fn("amg_action_axis_gae")
 model_path = sys.argv[1]
 registry_path = sys.argv[2]
 registry_sha256 = sys.argv[3]
+verl_root = Path(sys.argv[4])
+outer_root = Path(sys.argv[5])
 hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
 tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 continuous_token_family = infer_continuous_token_model_family(
@@ -1714,6 +1962,10 @@ gpu_names = [
     ).splitlines()
     if line.strip()
 ]
+active_source_ast_audit = audit_resolved_active_sources(
+    verl_root=verl_root,
+    outer_root=outer_root,
+)
 print(json.dumps({
     "adv_estimator": fn.__name__,
     "agent_loop": AMGTaskNeutralAgentLoop.__name__,
@@ -1731,6 +1983,7 @@ print(json.dumps({
     "value_head_class": AutoModelForCausalLMWithValueHead.__name__,
     "continuous_token_family": str(continuous_token_family),
     "continuous_token_builder": type(continuous_token_builder).__name__,
+    "active_source_ast_audit": active_source_ast_audit,
 }, sort_keys=True))
 """
     probe_env = dict(env)
@@ -1740,7 +1993,10 @@ print(json.dumps({
         assert inputs.route_registry_sha256 is not None
         registry_path = str(inputs.route_registry.resolve())
         registry_sha256 = inputs.route_registry_sha256
-        if "AMG_ENDPOINT_CLIENT_CONFIG_JSON" in probe_env or "AMG_ENV_ADDR" in probe_env:
+        if (
+            "AMG_ENDPOINT_CLIENT_CONFIG_JSON" in probe_env
+            or "AMG_ENV_ADDR" in probe_env
+        ):
             raise RuntimeError(
                 "multitask runtime preflight inherited a global endpoint identity"
             )
@@ -1748,7 +2004,9 @@ print(json.dumps({
         assert inputs.env_addr is not None
         probe_env["AMG_ENV_ADDR"] = inputs.env_addr
         if "AMG_ENDPOINT_CLIENT_CONFIG_JSON" not in probe_env:
-            raise RuntimeError("endpoint client identity was not exported for preflight")
+            raise RuntimeError(
+                "endpoint client identity was not exported for preflight"
+            )
     completed = subprocess.run(
         [
             sys.executable,
@@ -1757,6 +2015,8 @@ print(json.dumps({
             str(model_path),
             registry_path,
             registry_sha256,
+            str(inputs.verl_root),
+            str(inputs.outer_root),
         ],
         check=True,
         text=True,
@@ -1773,12 +2033,29 @@ print(json.dumps({
         raise RuntimeError("AMG runtime preflight receipt is not JSON") from exc
     if not isinstance(receipt, Mapping):
         raise RuntimeError("AMG runtime preflight receipt is not an object")
+    active_source_audit = receipt.get("active_source_ast_audit")
+    if (
+        not isinstance(active_source_audit, Mapping)
+        or active_source_audit.get("schema") != "amg_runtime_active_source_ast_audit_v1"
+        or active_source_audit.get("status") != "pass"
+    ):
+        raise RuntimeError(
+            "AMG runtime preflight omitted a passing active-source AST audit"
+        )
+    active_roots = active_source_audit.get("roots")
+    expected_roots = {
+        "verl": str(inputs.verl_root.resolve()),
+        "plugin": str((inputs.outer_root / "async_plugins").resolve()),
+        "agentgym": str((inputs.outer_root / "AgentGym" / "agentenv").resolve()),
+    }
+    if not isinstance(active_roots, Mapping) or dict(active_roots) != expected_roots:
+        raise RuntimeError(
+            "AMG runtime active-source AST audit resolved unexpected roots"
+        )
     receipt = _preserve_legacy_runtime_preflight_fields(
         receipt, multitask=inputs.route_registry is not None
     )
-    return _validate_accelerator_runtime(
-        receipt, training_runtime=training_runtime
-    )
+    return _validate_accelerator_runtime(receipt, training_runtime=training_runtime)
 
 
 def _atomic_json(path: Path, value: Any) -> None:
@@ -1803,7 +2080,7 @@ def prepare_launch(
     if skip_endpoint_preflight and not resolve_only:
         raise ValueError(
             "endpoint preflight may only be skipped for resolve-only checks"
-    )
+        )
     inputs.run_dir.mkdir(parents=True, exist_ok=True)
     if inputs.route_registry is not None:
         if inputs.route_registry_sha256 is None:
@@ -1822,15 +2099,20 @@ def prepare_launch(
         )
     else:
         schedule_report = inspect_schedule(inputs.schedule)
-    launch_identity = _load_launch_identity(
-        inputs, schedule_report=schedule_report
-    )
+    launch_identity = _load_launch_identity(inputs, schedule_report=schedule_report)
     budget_contract = launch_identity.get("budget_contract")
     training_runtime = launch_identity.get("training_runtime")
     if not isinstance(budget_contract, Mapping):
         raise RuntimeError("publication identity omitted its async budget contract")
     if not isinstance(training_runtime, Mapping):
         raise RuntimeError("publication identity omitted its training runtime")
+    orchestrator_preflight = _load_multitask_orchestrator_preflight(
+        inputs,
+        launch_identity=launch_identity,
+        schedule_report=schedule_report,
+        budget_contract=budget_contract,
+        required=not resolve_only,
+    )
     model_path = Path(str(training_runtime["base_model"]))
     runtime_python = str(training_runtime["python"])
 
@@ -1918,9 +2200,16 @@ def prepare_launch(
             "model_path": str(model_path),
             "env_addr": inputs.env_addr,
             "route_registry": (
-                str(inputs.route_registry) if inputs.route_registry is not None else None
+                str(inputs.route_registry)
+                if inputs.route_registry is not None
+                else None
             ),
             "route_registry_sha256": inputs.route_registry_sha256,
+            "multitask_orchestrator_preflight": (
+                str(inputs.multitask_orchestrator_preflight)
+                if inputs.multitask_orchestrator_preflight is not None
+                else None
+            ),
             "run_dir": str(inputs.run_dir),
             "trainer_gpus": inputs.trainer_gpus,
             "standalone_rollout_gpus": inputs.standalone_rollout_gpus,
@@ -1943,12 +2232,18 @@ def prepare_launch(
             "sha256": _sha256(resolved_path),
         },
         "runtime_preflight": runtime,
+        "multitask_orchestrator_preflight": orchestrator_preflight,
         "runtime_artifacts": {
             "file_logger": str(inputs.run_dir / "metrics.jsonl"),
             "rollout_data": str(inputs.run_dir / "rollout_data"),
             "hydra_config": str(inputs.run_dir / "hydra" / ".hydra" / "config.yaml"),
             "checkpoints": str(inputs.run_dir / "checkpoints"),
             "finalization": str(inputs.run_dir / "finalization.json"),
+            **(
+                {"trainer_log": str(inputs.run_dir / "trainer.log")}
+                if inputs.route_registry is not None
+                else {}
+            ),
         },
         "training_command": training_command,
         "validation_enabled": False,
@@ -1977,6 +2272,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--route-registry-sha256")
     parser.add_argument("--multitask-source-lock", type=Path)
     parser.add_argument("--multitask-schedule-certificate", type=Path)
+    parser.add_argument("--multitask-orchestrator-preflight", type=Path)
     parser.add_argument("--trainer-gpus", type=int, default=6)
     parser.add_argument("--standalone-rollout-gpus", type=int, default=2)
     parser.add_argument("--actor-use-fused-kernels", action="store_true")
@@ -1991,53 +2287,65 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _resolve_cli_directory(path: Path, *, label: str) -> Path:
+    if path.is_symlink() or not path.is_dir():
+        raise FileNotFoundError(f"{label} is missing or symlinked: {path}")
+    return path.resolve()
+
+
+def _resolve_cli_regular_file(path: Path | None, *, label: str) -> Path | None:
+    if path is None:
+        return None
+    return _require_regular_file(path, label=label).resolve()
+
+
+def _resolve_cli_output_directory(path: Path, *, label: str) -> Path:
+    if path.is_symlink():
+        raise FileNotFoundError(f"{label} must not be a symlink: {path}")
+    return path.resolve()
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     inputs = LaunchInputs(
         mode=args.mode,
-        verl_root=args.verl_root.resolve(),
-        outer_root=args.outer_root.resolve(),
-        schedule=args.schedule.resolve(),
+        verl_root=_resolve_cli_directory(args.verl_root, label="veRL source root"),
+        outer_root=_resolve_cli_directory(args.outer_root, label="outer source root"),
+        schedule=_resolve_cli_regular_file(args.schedule, label="schedule"),
         env_addr=args.env_addr,
-        run_dir=args.run_dir.resolve(),
+        run_dir=_resolve_cli_output_directory(args.run_dir, label="run directory"),
         experiment_name=args.experiment_name,
-        endpoint_source_lock=(
-            args.endpoint_source_lock.resolve()
-            if args.endpoint_source_lock is not None
-            else None
+        endpoint_source_lock=_resolve_cli_regular_file(
+            args.endpoint_source_lock, label="endpoint source lock"
         ),
-        endpoint_contract_tool=(
-            args.endpoint_contract_tool.resolve()
-            if args.endpoint_contract_tool is not None
-            else None
+        endpoint_contract_tool=_resolve_cli_regular_file(
+            args.endpoint_contract_tool, label="endpoint contract tool"
         ),
-        publication_receipt=(
-            args.publication_receipt.resolve()
-            if args.publication_receipt is not None
-            else None
+        publication_receipt=_resolve_cli_regular_file(
+            args.publication_receipt, label="publication receipt"
         ),
-        formal_schedule_certificate=(
-            args.formal_schedule_certificate.resolve()
-            if args.formal_schedule_certificate is not None
-            else None
+        formal_schedule_certificate=_resolve_cli_regular_file(
+            args.formal_schedule_certificate,
+            label="formal schedule certificate",
         ),
         trainer_gpus=args.trainer_gpus,
         standalone_rollout_gpus=args.standalone_rollout_gpus,
         actor_use_fused_kernels=args.actor_use_fused_kernels,
         critic_use_fused_kernels=args.critic_use_fused_kernels,
-        route_registry=(
-            args.route_registry.resolve() if args.route_registry is not None else None
+        route_registry=_resolve_cli_regular_file(
+            args.route_registry, label="route registry"
         ),
         route_registry_sha256=args.route_registry_sha256,
-        multitask_source_lock=(
-            args.multitask_source_lock.resolve()
-            if args.multitask_source_lock is not None
-            else None
+        multitask_source_lock=_resolve_cli_regular_file(
+            args.multitask_source_lock, label="multitask source lock"
         ),
-        multitask_schedule_certificate=(
-            args.multitask_schedule_certificate.resolve()
-            if args.multitask_schedule_certificate is not None
-            else None
+        multitask_schedule_certificate=_resolve_cli_regular_file(
+            args.multitask_schedule_certificate,
+            label="multitask schedule certificate",
+        ),
+        multitask_orchestrator_preflight=_resolve_cli_regular_file(
+            args.multitask_orchestrator_preflight,
+            label="multitask orchestrator preflight",
         ),
     )
     command, env, receipt = prepare_launch(

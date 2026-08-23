@@ -7,6 +7,7 @@ import unittest
 from dataclasses import replace
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 from agentmemorygym_verl.config_contract import inspect_schedule
 from agentmemorygym_verl.identity import (
@@ -19,6 +20,7 @@ from agentmemorygym_verl.launch import (
     _load_endpoint_identity,
     _load_launch_identity,
     _load_multitask_identity,
+    _load_multitask_orchestrator_preflight,
     _parse_args,
     _partition_selected_file_hashes,
     _preserve_legacy_runtime_preflight_fields,
@@ -26,6 +28,7 @@ from agentmemorygym_verl.launch import (
     _validate_accelerator_runtime,
     build_overrides,
     build_runtime_env,
+    main as launch_main,
 )
 from agentmemorygym_verl.routes import canonical_policy_framing_sha256
 
@@ -128,8 +131,12 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             self.assertEqual(values["critic.enable"], "True")
             self.assertEqual(values["trainer.n_gpus_per_node"], "6")
             self.assertEqual(values["rollout.n_gpus_per_node"], "2")
-            self.assertEqual(values["actor_rollout_ref.actor.loss_agg_mode"], "token-mean")
-            self.assertEqual(values["actor_rollout_ref.actor.use_prefix_grouper"], "False")
+            self.assertEqual(
+                values["actor_rollout_ref.actor.loss_agg_mode"], "token-mean"
+            )
+            self.assertEqual(
+                values["actor_rollout_ref.actor.use_prefix_grouper"], "False"
+            )
             self.assertEqual(values["critic.loss_agg_mode"], "token-mean")
             self.assertEqual(
                 values["trainer.total_training_steps"],
@@ -181,21 +188,16 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                 values["critic.model.enable_gradient_checkpointing"], "True"
             )
             self.assertEqual(
-                values[
-                    "actor_rollout_ref.actor.fsdp_config.reshard_after_forward"
-                ],
+                values["actor_rollout_ref.actor.fsdp_config.reshard_after_forward"],
                 "True",
             )
-            self.assertEqual(
-                values["critic.fsdp.reshard_after_forward"], "True"
-            )
+            self.assertEqual(values["critic.fsdp.reshard_after_forward"], "True")
             self.assertEqual(
                 values["actor_rollout_ref.actor.ppo_max_token_len_per_gpu"],
                 "65536",
             )
-            self.assertEqual(
-                values["critic.ppo_max_token_len_per_gpu"], "32768"
-            )
+            self.assertEqual(values["critic.ppo_max_token_len_per_gpu"], "32768")
+            self.assertEqual(values["critic.ppo_infer_max_token_len_per_gpu"], "32768")
             self.assertEqual(
                 values["actor_rollout_ref.rollout.multi_turn.enable"], "True"
             )
@@ -251,9 +253,7 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             )
             self.assertEqual(values["critic.model.use_fused_kernels"], "False")
             self.assertEqual(
-                values[
-                    "actor_rollout_ref.model.fused_kernel_options.impl_backend"
-                ],
+                values["actor_rollout_ref.model.fused_kernel_options.impl_backend"],
                 "torch",
             )
             self.assertEqual(
@@ -274,14 +274,10 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             )
 
             self.assertEqual(
-                values[
-                    "actor_rollout_ref.actor.fsdp_config.reshard_after_forward"
-                ],
+                values["actor_rollout_ref.actor.fsdp_config.reshard_after_forward"],
                 "True",
             )
-            self.assertEqual(
-                values["critic.fsdp.reshard_after_forward"], "True"
-            )
+            self.assertEqual(values["critic.fsdp.reshard_after_forward"], "True")
 
     def test_gate_role_and_budget_are_derived_from_publication(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -364,7 +360,9 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
         wheel = checkout / TRL_WHEEL_RELATIVE_PATH
         self.assertTrue(wheel.is_file())
         self.assertFalse(wheel.is_symlink())
-        self.assertEqual(hashlib.sha256(wheel.read_bytes()).hexdigest(), TRL_WHEEL_SHA256)
+        self.assertEqual(
+            hashlib.sha256(wheel.read_bytes()).hexdigest(), TRL_WHEEL_SHA256
+        )
         with zipfile.ZipFile(wheel) as archive:
             metadata = archive.read("trl-0.9.6.dist-info/METADATA").decode("utf-8")
         self.assertIn("Name: trl\n", metadata)
@@ -469,9 +467,9 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             "gpu_names": ["NVIDIA B300 SXM6 AC"] * 8,
         }
         self.assertEqual(
-            _validate_accelerator_runtime(
-                observed, training_runtime=training_runtime
-            )["gpu_count"],
+            _validate_accelerator_runtime(observed, training_runtime=training_runtime)[
+                "gpu_count"
+            ],
             8,
         )
         for field, wrong in (
@@ -537,6 +535,7 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
         text = script.read_text(encoding="utf-8")
         self.assertIn(".training_runtime.python", text)
         self.assertIn("--endpoint-source-lock", text)
+        self.assertIn("--multitask-source-lock", text)
         self.assertIn("PYTHONPATH is an identity conflict", text)
         self.assertIn("trl-0.9.6-py3-none-any.whl", text)
         self.assertNotIn("/dev/shm/qwen35-runtime", text)
@@ -593,9 +592,7 @@ class TestAMGMultitaskLauncherContract(unittest.TestCase):
             ],
         }
         path = root / "routes.json"
-        path.write_text(
-            json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8"
-        )
+        path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
         return path, hashlib.sha256(path.read_bytes()).hexdigest()
 
     def _identity_fixture(
@@ -629,18 +626,14 @@ class TestAMGMultitaskLauncherContract(unittest.TestCase):
             "samples_per_update": 64,
             "row_count": row_count,
             "route_order": list(self.ROUTES),
-            "per_route_rows": {
-                route_id: rows_per_route for route_id in self.ROUTES
-            },
+            "per_route_rows": {route_id: rows_per_route for route_id in self.ROUTES},
             "sources": sources,
         }
         certificate_path = root / "multitask-schedule-certificate.json"
         certificate_path.write_text(
             json.dumps(certificate, sort_keys=True) + "\n", encoding="utf-8"
         )
-        certificate_sha256 = hashlib.sha256(
-            certificate_path.read_bytes()
-        ).hexdigest()
+        certificate_sha256 = hashlib.sha256(certificate_path.read_bytes()).hexdigest()
         source_lock = {
             "schema": "amg_multitask_launcher_source_lock_v1",
             "status": "pass",
@@ -700,17 +693,13 @@ class TestAMGMultitaskLauncherContract(unittest.TestCase):
             "role": role,
             "panel_id": "multitask-panel",
             "route_order": list(self.ROUTES),
-            "per_route_counts": {
-                route_id: rows_per_route for route_id in self.ROUTES
-            },
+            "per_route_counts": {route_id: rows_per_route for route_id in self.ROUTES},
             "route_registry_sha256": registry_sha256,
             "agent_name": "amg_task_neutral_async",
             "manifest_digest": spec_sha256,
             "per_route_provenance": {
                 route_id: {
-                    "route_attestation_sha256": source[
-                        "route_attestation_sha256"
-                    ],
+                    "route_attestation_sha256": source["route_attestation_sha256"],
                     "source_schedule_sha256": source["schedule_sha256"],
                     "source_manifest_digest": str(index + 9) * 64,
                     "source_panel_id": f"source-{route_id}",
@@ -769,7 +758,9 @@ class TestAMGMultitaskLauncherContract(unittest.TestCase):
                     json.dumps(registry_sha256),
                 )
                 self.assertEqual(
-                    json.loads(values[f"{prefix}.agentgym.route_registry_expected_ids"]),
+                    json.loads(
+                        values[f"{prefix}.agentgym.route_registry_expected_ids"]
+                    ),
                     list(self.ROUTES),
                 )
                 for forbidden in (
@@ -793,9 +784,7 @@ class TestAMGMultitaskLauncherContract(unittest.TestCase):
                 Path(directory)
             )
 
-            identity = _load_multitask_identity(
-                inputs, schedule_report=schedule_report
-            )
+            identity = _load_multitask_identity(inputs, schedule_report=schedule_report)
 
             self.assertEqual(identity["schema"], "amg_multitask_source_identity_v1")
             self.assertEqual(identity["route_ids"], list(self.ROUTES))
@@ -824,9 +813,9 @@ class TestAMGMultitaskLauncherContract(unittest.TestCase):
         inputs.multitask_schedule_certificate.write_text(
             json.dumps(certificate, sort_keys=True) + "\n", encoding="utf-8"
         )
-        source_lock["integration"]["schedule_certificate"]["sha256"] = (
-            hashlib.sha256(inputs.multitask_schedule_certificate.read_bytes()).hexdigest()
-        )
+        source_lock["integration"]["schedule_certificate"]["sha256"] = hashlib.sha256(
+            inputs.multitask_schedule_certificate.read_bytes()
+        ).hexdigest()
         inputs.multitask_source_lock.write_text(
             json.dumps(source_lock, sort_keys=True) + "\n", encoding="utf-8"
         )
@@ -835,9 +824,7 @@ class TestAMGMultitaskLauncherContract(unittest.TestCase):
         mutations = (
             (
                 "panel",
-                lambda certificate: certificate.__setitem__(
-                    "panel_id", "wrong-panel"
-                ),
+                lambda certificate: certificate.__setitem__("panel_id", "wrong-panel"),
                 "panel_id drifted",
             ),
             (
@@ -872,13 +859,9 @@ class TestAMGMultitaskLauncherContract(unittest.TestCase):
                     inputs.multitask_schedule_certificate.read_text(encoding="utf-8")
                 )
                 mutate(certificate)
-                self._rewrite_multitask_certificate(
-                    inputs, source_lock, certificate
-                )
+                self._rewrite_multitask_certificate(inputs, source_lock, certificate)
                 with self.assertRaisesRegex((TypeError, ValueError), error):
-                    _load_multitask_identity(
-                        inputs, schedule_report=schedule_report
-                    )
+                    _load_multitask_identity(inputs, schedule_report=schedule_report)
 
     def test_multitask_outer_commit_must_equal_locked_commit(self):
         exact = "a" * 40
@@ -920,9 +903,7 @@ class TestAMGMultitaskLauncherContract(unittest.TestCase):
             inputs, schedule_report, _ = self._identity_fixture(Path(directory))
             mutated_report = dict(schedule_report, sha256="0" * 64)
             with self.assertRaisesRegex(ValueError, "schedule sha256 drifted"):
-                _load_multitask_identity(
-                    inputs, schedule_report=mutated_report
-                )
+                _load_multitask_identity(inputs, schedule_report=mutated_report)
 
             source_lock = json.loads(inputs.multitask_source_lock.read_text())
             source_lock["integration"]["route_registry"]["sha256"] = "0" * 64
@@ -961,7 +942,258 @@ class TestAMGMultitaskLauncherContract(unittest.TestCase):
             )
             self.assertIsNone(parsed.env_addr)
             self.assertIsNone(parsed.endpoint_source_lock)
+            self.assertIsNone(parsed.multitask_orchestrator_preflight)
             self.assertTrue(parsed.skip_runtime_preflight)
+
+    def test_generic_cli_rejects_raw_symlink_paths_before_resolution(self):
+        file_options = (
+            "schedule",
+            "endpoint-source-lock",
+            "endpoint-contract-tool",
+            "publication-receipt",
+            "formal-schedule-certificate",
+            "route-registry",
+            "multitask-source-lock",
+            "multitask-schedule-certificate",
+            "multitask-orchestrator-preflight",
+        )
+        directory_options = ("verl-root", "outer-root")
+        for option in (*file_options, *directory_options):
+            with (
+                self.subTest(option=option),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                files = {}
+                for name in file_options:
+                    path = root / f"{name}.json"
+                    path.write_text("{}\n", encoding="utf-8")
+                    files[name] = path
+                directories = {}
+                for name in directory_options:
+                    path = root / name
+                    path.mkdir()
+                    directories[name] = path
+
+                target = (
+                    files[option] if option in file_options else directories[option]
+                )
+                symlink = root / f"{option}.link"
+                symlink.symlink_to(target, target_is_directory=target.is_dir())
+                if option in file_options:
+                    files[option] = symlink
+                else:
+                    directories[option] = symlink
+
+                argv = [
+                    "--mode",
+                    "formal",
+                    "--verl-root",
+                    str(directories["verl-root"]),
+                    "--outer-root",
+                    str(directories["outer-root"]),
+                    "--schedule",
+                    str(files["schedule"]),
+                    "--run-dir",
+                    str(root / "run"),
+                    "--experiment-name",
+                    "raw-symlink-negative",
+                    "--endpoint-source-lock",
+                    str(files["endpoint-source-lock"]),
+                    "--endpoint-contract-tool",
+                    str(files["endpoint-contract-tool"]),
+                    "--publication-receipt",
+                    str(files["publication-receipt"]),
+                    "--formal-schedule-certificate",
+                    str(files["formal-schedule-certificate"]),
+                    "--route-registry",
+                    str(files["route-registry"]),
+                    "--route-registry-sha256",
+                    "1" * 64,
+                    "--multitask-source-lock",
+                    str(files["multitask-source-lock"]),
+                    "--multitask-schedule-certificate",
+                    str(files["multitask-schedule-certificate"]),
+                    "--multitask-orchestrator-preflight",
+                    str(files["multitask-orchestrator-preflight"]),
+                    "--resolve-only",
+                    "--skip-runtime-preflight",
+                ]
+                with (
+                    mock.patch(
+                        "agentmemorygym_verl.launch.prepare_launch",
+                        side_effect=AssertionError("raw path validation was bypassed"),
+                    ) as prepare,
+                    self.assertRaisesRegex(FileNotFoundError, "symlink|regular"),
+                ):
+                    launch_main(argv)
+                prepare.assert_not_called()
+
+    def test_full_multitask_launch_requires_live_orchestrator_preflight(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inputs, schedule_report, _ = self._identity_fixture(root)
+            identity = _load_multitask_identity(inputs, schedule_report=schedule_report)
+            budget = identity["budget_contract"]
+            with self.assertRaisesRegex(ValueError, "full multitask launch requires"):
+                _load_multitask_orchestrator_preflight(
+                    inputs,
+                    launch_identity=identity,
+                    schedule_report=schedule_report,
+                    budget_contract=budget,
+                    required=True,
+                )
+
+            inputs.run_dir.mkdir()
+            files = {}
+            for name in ("config", "endpoint-registry", "holder-lease"):
+                path = root / f"{name}.json"
+                path.write_text("{}\n", encoding="utf-8")
+                files[name] = path
+            files["holder-state"] = inputs.run_dir / "holder-transaction" / "state.json"
+            files["holder-state"].parent.mkdir(parents=True)
+            files["holder-state"].write_text(
+                json.dumps(
+                    {
+                        "schema": "amg_marker_transaction_v1",
+                        "status": "acquired",
+                        "run_id": inputs.experiment_name,
+                        "parent": {"pid": 123, "start_ticks": "456"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            endpoint_entries = []
+            registry_payload = json.loads(inputs.route_registry.read_text())
+            for route in registry_payload["routes"]:
+                route_id = route["route_id"]
+                entry = {
+                    "route_id": route_id,
+                    "route_attestation_sha256": route["route_attestation_sha256"],
+                    "endpoint": route["client"]["env_addr"],
+                    "pid": 1000 + len(endpoint_entries),
+                    "start_ticks": str(2000 + len(endpoint_entries)),
+                }
+                for prefix in ("gate_receipt", "launcher", "metadata"):
+                    artifact = (
+                        inputs.run_dir / "endpoints" / route_id / "metadata.json"
+                        if prefix == "metadata"
+                        else root / f"{route_id}-{prefix}.json"
+                    )
+                    artifact.parent.mkdir(parents=True, exist_ok=True)
+                    artifact.write_text("{}\n", encoding="utf-8")
+                    entry[f"{prefix}_path"] = str(artifact)
+                    entry[f"{prefix}_sha256"] = hashlib.sha256(
+                        artifact.read_bytes()
+                    ).hexdigest()
+                endpoint_entries.append(entry)
+            receipt = {
+                "schema": "amg_multitask_orchestrator_preflight_v1",
+                "status": "pass",
+                "config_path": str(files["config"]),
+                "config_sha256": hashlib.sha256(
+                    files["config"].read_bytes()
+                ).hexdigest(),
+                "endpoint_registry_path": str(files["endpoint-registry"]),
+                "endpoint_registry_sha256": hashlib.sha256(
+                    files["endpoint-registry"].read_bytes()
+                ).hexdigest(),
+                "route_registry_path": str(inputs.route_registry.resolve()),
+                "route_registry_sha256": inputs.route_registry_sha256,
+                "route_order": list(self.ROUTES),
+                "schedule_path": str(inputs.schedule.resolve()),
+                "schedule_sha256": schedule_report["sha256"],
+                "schedule_count": schedule_report["count"],
+                "multitask_source_lock_path": str(
+                    inputs.multitask_source_lock.resolve()
+                ),
+                "multitask_source_lock_sha256": identity["source_lock_sha256"],
+                "multitask_schedule_certificate_path": str(
+                    inputs.multitask_schedule_certificate.resolve()
+                ),
+                "multitask_schedule_certificate_sha256": identity[
+                    "schedule_certificate_sha256"
+                ],
+                "budget": {
+                    "optimizer_updates": 400,
+                    "samples_per_update": 64,
+                    "episodes": 25_600,
+                },
+                "holder_transaction": {
+                    "status": "acquired",
+                    "lease_path": str(files["holder-lease"]),
+                    "lease_sha256": hashlib.sha256(
+                        files["holder-lease"].read_bytes()
+                    ).hexdigest(),
+                    "state_path": str(files["holder-state"]),
+                    "watcher_pid": 900,
+                    "watcher_start_ticks": "901",
+                },
+                "endpoints": endpoint_entries,
+            }
+            preflight = inputs.run_dir / "orchestrator-preflight.json"
+            preflight.write_text(
+                json.dumps(receipt, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            inputs = replace(inputs, multitask_orchestrator_preflight=preflight)
+            with (
+                mock.patch(
+                    "agentmemorygym_verl.launch.process_identity_alive",
+                    return_value=True,
+                ),
+                mock.patch(
+                    "agentmemorygym_verl.launch.os.getpgid", side_effect=lambda pid: pid
+                ),
+            ):
+                validated = _load_multitask_orchestrator_preflight(
+                    inputs,
+                    launch_identity=identity,
+                    schedule_report=schedule_report,
+                    budget_contract=budget,
+                    required=True,
+                )
+            self.assertEqual(
+                [entry["route_id"] for entry in validated["endpoints"]],
+                list(self.ROUTES),
+            )
+
+            with (
+                mock.patch(
+                    "agentmemorygym_verl.launch.process_identity_alive",
+                    side_effect=lambda pid, _ticks: pid != 900,
+                ),
+                self.assertRaisesRegex(RuntimeError, "holder watcher"),
+            ):
+                _load_multitask_orchestrator_preflight(
+                    inputs,
+                    launch_identity=identity,
+                    schedule_report=schedule_report,
+                    budget_contract=budget,
+                    required=True,
+                )
+
+            receipt["endpoints"][0]["endpoint"] = "http://127.0.0.1:1"
+            preflight.write_text(
+                json.dumps(receipt, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            with (
+                mock.patch(
+                    "agentmemorygym_verl.launch.process_identity_alive",
+                    return_value=True,
+                ),
+                mock.patch(
+                    "agentmemorygym_verl.launch.os.getpgid", side_effect=lambda pid: pid
+                ),
+                self.assertRaisesRegex(RuntimeError, "endpoint mismatch"),
+            ):
+                _load_multitask_orchestrator_preflight(
+                    inputs,
+                    launch_identity=identity,
+                    schedule_report=schedule_report,
+                    budget_contract=budget,
+                    required=True,
+                )
 
 
 if __name__ == "__main__":

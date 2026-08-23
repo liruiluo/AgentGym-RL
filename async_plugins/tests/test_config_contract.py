@@ -128,6 +128,8 @@ def _config(*, mode: str = "formal") -> dict:
         "critic": {
             "enable": True,
             "strategy": "fsdp2",
+            "ppo_max_token_len_per_gpu": 32768,
+            "ppo_infer_max_token_len_per_gpu": 32768,
             "ppo_mini_batch_size": ppo_mini_batch_size,
             "ppo_micro_batch_size_per_gpu": 8,
             "ppo_epochs": 1,
@@ -253,6 +255,7 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         self.assertEqual(report["samples_per_update"], 64)
         self.assertEqual(report["trainer_gpus"], 6)
         self.assertEqual(report["standalone_rollout_gpus"], 2)
+        self.assertEqual(report["critic_active_token_budget"], 32768)
         self.assertEqual(
             report["gradient_checkpointing"], {"actor": True, "critic": True}
         )
@@ -269,6 +272,14 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         config["critic"]["ppo_mini_batch_size"] = 512
         config["async_training"]["require_batches"] = 64 / 512
         with self.assertRaisesRegex(ValueError, r"formal.*6\+2"):
+            _verify(config, mode="formal")
+
+    def test_rejects_critic_active_inference_budget_drift(self):
+        config = _config(mode="formal")
+        config["critic"]["ppo_infer_max_token_len_per_gpu"] = 65536
+        with self.assertRaisesRegex(
+            ValueError, "critic.ppo_infer_max_token_len_per_gpu"
+        ):
             _verify(config, mode="formal")
 
     def test_actor_only_fused_six_plus_two_is_resolved_and_reported(self):
@@ -389,9 +400,7 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
                 for key in path:
                     target = target[key]
                 target["reshard_after_forward"] = wrong
-                with self.assertRaisesRegex(
-                    ValueError, "reshard_after_forward"
-                ):
+                with self.assertRaisesRegex(ValueError, "reshard_after_forward"):
                     _verify(config, mode="formal")
 
     def test_rejects_disabling_upstream_gradient_checkpointing(self):
@@ -668,13 +677,9 @@ class TestAMGScheduleContract(unittest.TestCase):
                                 route_ids.index(route_id) + 1
                             )
                             * 64,
-                            "source_schedule_sha256": str(
-                                route_ids.index(route_id) + 5
-                            )
+                            "source_schedule_sha256": str(route_ids.index(route_id) + 5)
                             * 64,
-                            "source_manifest_digest": "9abc"[
-                                route_ids.index(route_id)
-                            ]
+                            "source_manifest_digest": "9abc"[route_ids.index(route_id)]
                             * 64,
                             "source_panel_id": f"source-{route_id}",
                         },
