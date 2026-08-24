@@ -1919,7 +1919,6 @@ class _Audit:
                 action = record.get("action")
                 self.check(
                     isinstance(action, str)
-                    and bool(action)
                     and _at(record, "action_submission.raw_policy_output") == action
                     and document.get("output") == action,
                     "rollout action is not bound to raw policy output",

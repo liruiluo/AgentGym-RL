@@ -64,6 +64,23 @@ def rewrite_metrics(run: dict, mutation) -> None:
 
 
 class TestOnlineMonitor(unittest.TestCase):
+    def test_empty_decoded_eos_output_remains_a_bound_policy_action(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = build_valid_multitask_run(Path(directory), updates=1)
+
+            def empty_policy_output(document: dict) -> None:
+                record = json.loads(document["step_record_json"])
+                record["action"] = ""
+                record["action_submission"]["raw_policy_output"] = ""
+                document["output"] = ""
+                document["step_record_json"] = json.dumps(record, sort_keys=True)
+
+            rewrite_first_rollout(run, empty_policy_output)
+
+            snapshot = observe_run(run["run_dir"], 1)
+
+        self.assertEqual(snapshot["status"], "descriptive")
+
     def test_route_local_max_rounds_horizon_is_complete(self):
         with tempfile.TemporaryDirectory() as directory:
             run = build_valid_multitask_run(

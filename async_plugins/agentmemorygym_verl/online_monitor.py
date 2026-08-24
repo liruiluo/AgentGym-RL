@@ -139,7 +139,6 @@ def _episode_summary(
         action = record.get("action")
         if not (
             isinstance(action, str)
-            and action
             and _at(record, "action_submission.raw_policy_output") == action
             and document.get("output") == action
         ):

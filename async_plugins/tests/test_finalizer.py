@@ -190,6 +190,23 @@ class FinalizerTestCase(unittest.TestCase):
 
 
 class TestFinalizerSuccess(FinalizerTestCase):
+    def test_empty_decoded_eos_output_remains_a_bound_policy_action(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory), mode="gate")
+
+            def empty_policy_output(document: dict) -> None:
+                record = json.loads(document["step_record_json"])
+                record["action"] = ""
+                record["action_submission"]["raw_policy_output"] = ""
+                document["output"] = ""
+                document["step_record_json"] = json.dumps(record, sort_keys=True)
+
+            rewrite_first_rollout(fixture, empty_policy_output)
+
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+
+        self.assertEqual(verdict["status"], "pass", verdict)
+
     def test_real_rich_v8_gate_fixture_passes_all_mechanism_checks(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.build(Path(directory), mode="gate")
