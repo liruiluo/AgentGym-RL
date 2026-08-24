@@ -136,17 +136,22 @@ class FakeSwesmithClient(SwesmithEnvClient):
         self.native_calls.append(action)
         step = len(self.native_calls)
         workspace_changed = "printf changed >" in action
+        terminal_submission = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT" in action
         return {
             "observation": f"native tool output {step}",
-            "reward": 0.0,
-            "done": False,
+            "reward": float(terminal_submission),
+            "done": terminal_submission,
             "info": {
                 "step": step,
                 "action_kind": "shell_command",
                 "actor_credit": {
                     "schema": "task_neutral_actor_credit_v1",
                     "positive_eligible": True,
-                    "basis": "shell_executed",
+                    "basis": (
+                        "terminal_submission"
+                        if terminal_submission
+                        else "shell_executed"
+                    ),
                 },
                 "action_progress": {
                     "schema": "swesmith_action_progress_v1",
@@ -753,6 +758,30 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             with self.subTest(receipt=receipt):
                 with self.assertRaises(RuntimeError):
                     _validate_action_progress_receipt(receipt)
+
+    def test_swesmith_terminal_submission_preserves_shell_progress(self) -> None:
+        client = FakeSwesmithClient()
+
+        output = client.step(
+            'shell_command {"command":"echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT",'
+            '"workdir":"."}'
+        )
+
+        evidence = output.info["wrapper_evidence"]
+        self.assertTrue(output.done)
+        self.assertEqual(output.reward, 1.0)
+        self.assertEqual(
+            evidence["actor_credit"],
+            {
+                "schema": "task_neutral_actor_credit_v1",
+                "positive_eligible": True,
+                "basis": "terminal_submission",
+            },
+        )
+        self.assertEqual(
+            evidence["action_progress"]["schema"],
+            "swesmith_action_progress_v1",
+        )
 
     def test_swesmith_zero_progress_repeat_resets_after_workspace_change(self) -> None:
         client = FakeSwesmithClient()
