@@ -1829,6 +1829,10 @@ def _validate_accelerator_runtime(
         raise RuntimeError(
             f"CUDA_HOME must be {_CUDA13_TOOLKIT_ROOT}, got {observed.get('cuda_home')!r}"
         )
+    if observed.get("cudart_linker_ready") is not True:
+        raise RuntimeError("CUDA 13 toolkit has no usable libcudart linker name")
+    if observed.get("cccl_target_ready") is not True:
+        raise RuntimeError("CUDA 13 JIT runtime has no usable CCCL nv/target header")
     normalized = dict(observed)
     normalized["gpu_names"] = list(gpu_names)
     return normalized
@@ -1968,6 +1972,10 @@ active_source_ast_audit = audit_resolved_active_sources(
     verl_root=verl_root,
     outer_root=outer_root,
 )
+cuda_home = Path(os.environ.get("CUDA_HOME", ""))
+cudart_linker = cuda_home / "lib64" / "libcudart.so"
+cccl_include = Path(os.environ.get("CPATH", "").split(os.pathsep)[0])
+cccl_target = cccl_include / "nv" / "target"
 print(json.dumps({
     "adv_estimator": fn.__name__,
     "agent_loop": AMGTaskNeutralAgentLoop.__name__,
@@ -1975,6 +1983,10 @@ print(json.dumps({
     "routes": route_receipts,
     "ninja_path": ninja_path,
     "cuda_home": os.environ.get("CUDA_HOME"),
+    "cudart_linker_path": str(cudart_linker),
+    "cudart_linker_ready": cudart_linker.is_file(),
+    "cccl_target_path": str(cccl_target),
+    "cccl_target_ready": cccl_target.is_file(),
     "nvcc_path": nvcc_path,
     "nvcc_release": nvcc_match.group(1),
     "torch_cuda": torch.version.cuda,

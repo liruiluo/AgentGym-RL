@@ -459,6 +459,8 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
         training_runtime = dict(self.source_lock["training_runtime"], gpu_type="B300")
         observed = {
             "cuda_home": "/dev/shm/cuda-13-b300-toolkit",
+            "cudart_linker_ready": True,
+            "cccl_target_ready": True,
             "nvcc_path": "/dev/shm/cuda-13-b300-toolkit/bin/nvcc",
             "nvcc_release": "13.0",
             "torch_cuda": "13.0",
@@ -538,6 +540,9 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
         self.assertIn("--multitask-source-lock", text)
         self.assertIn("PYTHONPATH is an identity conflict", text)
         self.assertIn("trl-0.9.6-py3-none-any.whl", text)
+        self.assertIn("libcudart.so.13", text)
+        self.assertIn("flashinfer/data/cccl/libcudacxx/include", text)
+        self.assertIn('export CPATH="${CUDA13_CCCL_INCLUDE}', text)
         self.assertNotIn("/dev/shm/qwen35-runtime", text)
         self.assertNotIn("${PYTHONPATH:+", text)
         self.assertIn(EXPECTED_VERL_COMMIT, EXPECTED_VERL_COMMIT)

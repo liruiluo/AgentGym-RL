@@ -18,6 +18,7 @@ MULTITASK_SOURCE_LOCK=""
 EXPECT_VERL_ROOT=0
 EXPECT_SOURCE_LOCK=0
 EXPECT_MULTITASK_SOURCE_LOCK=0
+RESOLVE_ONLY=0
 for ARG in "$@"; do
   if [[ ${EXPECT_VERL_ROOT} -eq 1 ]]; then
     VERL_ROOT=${ARG}
@@ -53,6 +54,9 @@ for ARG in "$@"; do
     --multitask-source-lock=*)
       MULTITASK_SOURCE_LOCK=${ARG#--multitask-source-lock=}
       ;;
+    --resolve-only)
+      RESOLVE_ONLY=1
+      ;;
   esac
 done
 if [[ ${EXPECT_VERL_ROOT} -ne 0 || -z ${VERL_ROOT} || ! -d ${VERL_ROOT}/verl ]]; then
@@ -82,9 +86,43 @@ PUBLICATION_PYTHON=$(jq -er \
   echo "launch_amg_fully_async.sh: publication has no absolute training_runtime.python" >&2
   exit 65
 }
+PUBLICATION_SITE_PACKAGES=$(jq -er \
+  '.training_runtime.site_packages | select(type == "string" and startswith("/"))' \
+  "${SOURCE_LOCK}") || {
+  echo "launch_amg_fully_async.sh: publication has no absolute training_runtime.site_packages" >&2
+  exit 65
+}
 if [[ ! -x ${PUBLICATION_PYTHON} ]]; then
   echo "launch_amg_fully_async.sh: publication training Python is missing" >&2
   exit 66
+fi
+
+# CUDA 13 is staged from split runtime/compiler packages on B300.  Restore the
+# standard linker name and expose the matching CCCL headers before any SGLang or
+# FlashInfer JIT worker starts; otherwise initialization fails late after all
+# model shards have already loaded.
+CUDA13_TOOLKIT_ROOT=/dev/shm/cuda-13-b300-toolkit
+CUDA13_CUDART_VERSIONED=${CUDA13_TOOLKIT_ROOT}/lib64/libcudart.so.13
+CUDA13_CUDART_LINKER_NAME=${CUDA13_TOOLKIT_ROOT}/lib64/libcudart.so
+CUDA13_CCCL_INCLUDE=${PUBLICATION_SITE_PACKAGES}/flashinfer/data/cccl/libcudacxx/include
+if [[ ${RESOLVE_ONLY} -eq 0 ]]; then
+  if [[ ! -f ${CUDA13_CUDART_VERSIONED} ]]; then
+    echo "launch_amg_fully_async.sh: CUDA 13 libcudart runtime is missing" >&2
+    exit 66
+  fi
+  if [[ ! -e ${CUDA13_CUDART_LINKER_NAME} && ! -L ${CUDA13_CUDART_LINKER_NAME} ]]; then
+    ln -s libcudart.so.13 "${CUDA13_CUDART_LINKER_NAME}"
+  fi
+  if [[ ! -f ${CUDA13_CUDART_LINKER_NAME} ]] || \
+     [[ $(readlink -f "${CUDA13_CUDART_LINKER_NAME}") != $(readlink -f "${CUDA13_CUDART_VERSIONED}") ]]; then
+    echo "launch_amg_fully_async.sh: CUDA 13 libcudart linker name is invalid" >&2
+    exit 66
+  fi
+  if [[ ! -f ${CUDA13_CCCL_INCLUDE}/nv/target ]]; then
+    echo "launch_amg_fully_async.sh: CUDA 13 CCCL headers are missing" >&2
+    exit 66
+  fi
+  export CPATH="${CUDA13_CCCL_INCLUDE}${CPATH:+:${CPATH}}"
 fi
 
 TRL_WHEEL="${OUTER_ROOT}/async_plugins/vendor/trl-0.9.6-py3-none-any.whl"
