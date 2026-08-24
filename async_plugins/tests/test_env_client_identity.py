@@ -81,6 +81,52 @@ class TestClientRegistryAndPromptBinding(unittest.TestCase):
         self.assertEqual(_RecordingAgentMemoryClient.calls, [])
 
 
+class TestSwesmithRewardForwarding(unittest.TestCase):
+    def setUp(self):
+        _RecordingClient.calls.clear()
+
+    def test_forwards_low_invalid_action_reward(self):
+        config = {
+            "task_name": "swesmith",
+            "env_addr": "http://127.0.0.1:65125",
+            "timeout": 240,
+            "max_retries": 0,
+            "invalid_action_reward": -0.01,
+        }
+        with mock.patch(
+            "agentmemorygym_verl.env_client._client_classes",
+            return_value={"swesmith": _RecordingClient},
+        ):
+            create_env_client(config)
+        self.assertEqual(
+            _RecordingClient.calls,
+            [{
+                "env_server_base": "http://127.0.0.1:65125",
+                "data_len": None,
+                "timeout": 240.0,
+                "invalid_action_reward": -0.01,
+            }],
+        )
+
+    def test_rejects_positive_or_nonfinite_invalid_action_reward(self):
+        for value in (0.01, float("inf"), "not-a-number", True):
+            with self.subTest(value=value):
+                config = {
+                    "task_name": "swesmith",
+                    "env_addr": "http://127.0.0.1:65125",
+                    "max_retries": 0,
+                    "invalid_action_reward": value,
+                }
+                with (
+                    mock.patch(
+                        "agentmemorygym_verl.env_client._client_classes",
+                        return_value={"swesmith": _RecordingClient},
+                    ),
+                    self.assertRaises((TypeError, ValueError)),
+                ):
+                    create_env_client(config)
+
+
 class TestOpenMLEClientIdentityForwarding(unittest.TestCase):
     def setUp(self):
         _RecordingClient.calls.clear()

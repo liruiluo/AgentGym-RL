@@ -109,8 +109,9 @@ class FakeWebShopClient(AgentMemoryEnvClient):
 
 
 class FakeSwesmithClient(SwesmithEnvClient):
-    def __init__(self) -> None:
+    def __init__(self, *, invalid_action_reward: float = 0.0) -> None:
         BaseEnvClient.__init__(self, action_format=ActionFormat.REACT)
+        self.invalid_action_reward = float(invalid_action_reward)
         self.env_id = 202
         self.data_len = 1
         self.metadata = {
@@ -814,6 +815,26 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             after_mutation.info["wrapper_evidence"]["actor_credit"][
                 "positive_eligible"
             ]
+        )
+
+    def test_swesmith_low_invalid_reward_is_environment_owned(self) -> None:
+        client = FakeSwesmithClient(invalid_action_reward=-0.01)
+        inspect = 'shell_command {"command":"find . -maxdepth 2 -type f"}'
+
+        first = client.step(inspect)
+        repeated = client.step(inspect)
+
+        self.assertEqual(first.reward, 0.0)
+        self.assertEqual(repeated.reward, -0.01)
+        self.assertEqual(
+            repeated.info["wrapper_evidence"]["reward_overlay"],
+            {
+                "schema": "swesmith_invalid_action_reward_v1",
+                "basis": "zero_progress_repeat",
+                "native_reward": 0.0,
+                "penalty": -0.01,
+                "final_reward": -0.01,
+            },
         )
 
     def test_swesmith_zero_progress_repeat_resets_after_compaction(self) -> None:
