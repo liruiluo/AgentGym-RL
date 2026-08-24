@@ -542,6 +542,7 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                         "env_info_after": env_info,
                         "control_request": prepared.control_request,
                         "outcome": row["outcome"],
+                        "horizon_finalization": None,
                         "turn_scores": [reward],
                         "tool_rewards": [],
                     }

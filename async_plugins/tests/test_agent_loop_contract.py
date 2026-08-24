@@ -703,6 +703,12 @@ class TestAMGAgentLoop(IsolatedAsyncioTestCase):
             [False] * 4 + [True],
         )
         self.assertEqual(outputs[-1].extra_fields["outcome"], "success")
+        self.assertTrue(
+            all(
+                output.extra_fields["horizon_finalization"] is None
+                for output in outputs
+            )
+        )
         records = [
             json.loads(output.extra_fields["step_record_json"]) for output in outputs
         ]
@@ -744,6 +750,10 @@ class TestAMGAgentLoop(IsolatedAsyncioTestCase):
         self.assertTrue(record["rollout_done_flag"])
         self.assertEqual(record["outcome"], "success")
         self.assertEqual(output.extra_fields["outcome"], "success")
+        self.assertEqual(
+            output.extra_fields["horizon_finalization"],
+            record["horizon_finalization"],
+        )
         self.assertEqual(
             record["horizon_finalization"]["wrapper_evidence"]["source"], "horizon"
         )
