@@ -136,6 +136,21 @@ class FakeSwesmithClient(SwesmithEnvClient):
         action = str(kwargs["json"]["action"])
         self.native_calls.append(action)
         step = len(self.native_calls)
+        if action == "malformed policy output":
+            return {
+                "observation": "Invalid action: expected one bare tool action.",
+                "reward": 0.0,
+                "done": False,
+                "info": {
+                    "step": step,
+                    "action_kind": "invalid",
+                    "actor_credit": {
+                        "schema": "task_neutral_actor_credit_v1",
+                        "positive_eligible": False,
+                        "basis": "parser_rejected",
+                    },
+                },
+            }
         workspace_changed = "printf changed >" in action
         terminal_submission = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT" in action
         return {
@@ -821,21 +836,24 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         client = FakeSwesmithClient(invalid_action_reward=-0.01)
         inspect = 'shell_command {"command":"find . -maxdepth 2 -type f"}'
 
+        invalid = client.step("malformed policy output")
         first = client.step(inspect)
         repeated = client.step(inspect)
 
-        self.assertEqual(first.reward, 0.0)
-        self.assertEqual(repeated.reward, -0.01)
+        self.assertEqual(invalid.reward, -0.01)
         self.assertEqual(
-            repeated.info["wrapper_evidence"]["reward_overlay"],
+            invalid.info["wrapper_evidence"]["reward_overlay"],
             {
                 "schema": "swesmith_invalid_action_reward_v1",
-                "basis": "zero_progress_repeat",
+                "basis": "parser_rejected",
                 "native_reward": 0.0,
                 "penalty": -0.01,
                 "final_reward": -0.01,
             },
         )
+        self.assertEqual(first.reward, 0.0)
+        self.assertEqual(repeated.reward, 0.0)
+        self.assertNotIn("reward_overlay", repeated.info["wrapper_evidence"])
 
     def test_swesmith_zero_progress_repeat_resets_after_compaction(self) -> None:
         client = FakeSwesmithClient()
