@@ -291,10 +291,8 @@ def verify_resolved_config(
             expected_sha256=str(actor_agentgym.get("route_registry_sha256", "")),
             expected_route_ids=expected_route_ids,
         )
-        if len(registry.route_ids) != 4:
-            raise ValueError(
-                "AMG multitask config requires exactly four registered routes"
-            )
+        if not registry.route_ids:
+            raise ValueError("AMG route-set config requires at least one route")
         route_ids = list(registry.route_ids)
         route_registry_sha256 = registry.sha256
         if route_registry_sha256 != expected.get("route_registry_sha256"):

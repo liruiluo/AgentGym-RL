@@ -47,6 +47,21 @@ EXPECTED_ROUTE_IDS = (
     "openmle_fast",
 )
 _CONFIG_SCHEMA = "amg_multitask400_orchestrator_config_v1"
+_SWE100_CONFIG_SCHEMA = "amg_swesmith100_orchestrator_config_v1"
+_CONFIG_PROFILES = {
+    _CONFIG_SCHEMA: {
+        "route_order": EXPECTED_ROUTE_IDS,
+        "optimizer_updates": 400,
+        "samples_per_update": 64,
+        "total_episodes": 25_600,
+    },
+    _SWE100_CONFIG_SCHEMA: {
+        "route_order": ("swesmith",),
+        "optimizer_updates": 100,
+        "samples_per_update": 64,
+        "total_episodes": 6_400,
+    },
+}
 _ENDPOINT_REGISTRY_SCHEMA = "amg_multitask_endpoint_registry_v1"
 _GATE_RECEIPT_SCHEMA = "amg_single_card_optimizer_update_gate_v1"
 _GATE_ENVIRONMENT_NAMES = {
@@ -381,6 +396,14 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
     holders = _mapping(
         payload.get("holder_transaction"), field="config.holder_transaction"
     )
+    schema = str(payload.get("schema", ""))
+    profile = _CONFIG_PROFILES.get(schema)
+    if profile is None:
+        raise OrchestratorError(f"unreviewed orchestrator config schema: {schema!r}")
+    profile_route_order = tuple(profile["route_order"])
+    profile_optimizer_updates = int(profile["optimizer_updates"])
+    profile_samples_per_update = int(profile["samples_per_update"])
+    profile_total_episodes = int(profile["total_episodes"])
     required_runtime_inputs = {
         "route_registry": "cli:--route-registry",
         "route_registry_sha256": "cli:--route-registry-sha256",
@@ -394,7 +417,7 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
         "holder_lease_sha256": "cli:--holder-lease-sha256",
     }
     exact = {
-        "schema": (payload.get("schema"), _CONFIG_SCHEMA),
+        "schema": (payload.get("schema"), schema),
         "implementation base commit": (
             source.get("implementation_base_commit"),
             _IMPLEMENTATION_BASE_COMMIT,
@@ -411,13 +434,13 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
             experiment.get("checkpoint_lineage_count"),
             1,
         ),
-        "optimizer updates": (budget.get("optimizer_updates"), 400),
+        "optimizer updates": (budget.get("optimizer_updates"), profile_optimizer_updates),
         "episodes per update": (
             budget.get("consumed_episodes_per_update"),
-            64,
+            profile_samples_per_update,
         ),
-        "total episodes": (budget.get("total_episodes"), 25_600),
-        "route order": (tuple(routing.get("order", ())), EXPECTED_ROUTE_IDS),
+        "total episodes": (budget.get("total_episodes"), profile_total_episodes),
+        "route order": (tuple(routing.get("order", ())), profile_route_order),
         "sampling": (routing.get("sampling"), "round_robin"),
         "per-update route quota": (
             routing.get("require_exact_per_update_route_split"),
@@ -457,7 +480,7 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
     for field, (observed, expected) in exact.items():
         if observed != expected:
             raise OrchestratorError(
-                f"reviewed Multitask400 {field} drifted: {observed!r} != {expected!r}"
+                f"reviewed route-set {field} drifted: {observed!r} != {expected!r}"
             )
     optimizer_updates = _positive_int(
         budget["optimizer_updates"], field="optimizer updates"
@@ -468,13 +491,13 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
     total_episodes = _positive_int(budget["total_episodes"], field="total episodes")
     if optimizer_updates * samples_per_update != total_episodes:
         raise OrchestratorError(
-            "Multitask400 arithmetic drift: optimizer_updates * "
+            "route-set arithmetic drift: optimizer_updates * "
             "consumed_episodes_per_update != total_episodes"
         )
     return OrchestratorConfig(
         source_path=path.resolve(),
         sha256=_sha256(path),
-        route_order=EXPECTED_ROUTE_IDS,
+        route_order=profile_route_order,
         optimizer_updates=optimizer_updates,
         samples_per_update=samples_per_update,
         total_episodes=total_episodes,
@@ -797,20 +820,20 @@ def load_endpoint_registry(
             payload.get("route_order"), field="endpoint registry route_order"
         )
     )
-    if route_order != EXPECTED_ROUTE_IDS or route_order != route_registry.route_ids:
+    if route_order != route_registry.route_ids:
         raise OrchestratorError(
             f"endpoint registry route order mismatch: {route_order!r}"
         )
     raw_routes = _sequence(payload.get("routes"), field="endpoint registry routes")
-    if len(raw_routes) != len(EXPECTED_ROUTE_IDS):
-        raise OrchestratorError("endpoint registry must contain exactly four routes")
+    if len(raw_routes) != len(route_registry.route_ids):
+        raise OrchestratorError("endpoint registry route count mismatch")
     specs: list[EndpointLaunchSpec] = []
     receipt_report: dict[str, Any] = {}
     source_report: dict[str, Any] = {}
     asset_report: dict[str, Any] = {}
     ports: set[tuple[str, int]] = set()
     for position, (expected_route_id, raw_route) in enumerate(
-        zip(EXPECTED_ROUTE_IDS, raw_routes)
+        zip(route_registry.route_ids, raw_routes)
     ):
         route = _mapping(raw_route, field=f"endpoint registry route {position}")
         route_id = str(route.get("route_id", ""))

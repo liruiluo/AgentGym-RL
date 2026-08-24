@@ -339,11 +339,8 @@ def load_multitask_manifest_spec(
     raw_routes = payload.get("routes")
     if isinstance(raw_routes, (str, bytes)) or not isinstance(raw_routes, Sequence):
         raise TypeError("AMG multitask routes must be a sequence")
-    if len(raw_routes) != 4:
-        raise ValueError(
-            "AMG multitask spec must contain exactly four routes, "
-            f"got {len(raw_routes)}"
-        )
+    if not raw_routes:
+        raise ValueError("AMG route-set spec must contain at least one route")
     if samples_per_update % len(raw_routes) != 0:
         raise ValueError("samples_per_update must be divisible by the route count")
 

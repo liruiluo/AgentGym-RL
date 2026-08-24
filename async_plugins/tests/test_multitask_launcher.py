@@ -669,7 +669,7 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
         config = load_orchestrator_config(CONFIG)
 
         self.assertEqual(
-            EXPECTED_VERL_COMMIT, "f3ac28fe54c945e092b9630030f44d236a106a11"
+            EXPECTED_VERL_COMMIT, "5a4ef518fa2552816d31ac28241df6f583eadd0a"
         )
         self.assertEqual(config.route_order, EXPECTED_ROUTE_IDS)
         self.assertEqual(config.optimizer_updates, 400)
@@ -741,6 +741,17 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
             self.assertFalse(marker["restore_target_set"])
             self.assertIsNone(marker["restore_target"])
             self.assertFalse(marker["restored"])
+
+    def test_reviewed_config_accepts_swesmith_formal100(self) -> None:
+        config = load_orchestrator_config(
+            ROOT / "async_plugins/config/amg_swesmith100.yaml"
+        )
+
+        self.assertEqual(config.route_order, ("swesmith",))
+        self.assertEqual(config.optimizer_updates, 100)
+        self.assertEqual(config.samples_per_update, 64)
+        self.assertEqual(config.total_episodes, 6_400)
+        self.assertEqual((config.trainer_gpus, config.standalone_rollout_gpus), (6, 2))
 
     def test_endpoint_registry_binds_receipts_assets_sources_and_route_order(
         self,

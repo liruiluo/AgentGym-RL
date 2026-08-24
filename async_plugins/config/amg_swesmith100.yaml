@@ -1,4 +1,4 @@
-schema: amg_multitask400_orchestrator_config_v1
+schema: amg_swesmith100_orchestrator_config_v1
 
 # This file freezes experiment semantics. Runtime-specific absolute paths and
 # their SHA-256 digests are supplied through the CLI and endpoint registry.
@@ -17,16 +17,13 @@ experiment:
   checkpoint_lineage_count: 1
 
 budget:
-  optimizer_updates: 400
+  optimizer_updates: 100
   consumed_episodes_per_update: 64
-  total_episodes: 25600
+  total_episodes: 6400
 
 routing:
   order:
-    - webshop
     - swesmith
-    - literesearcher
-    - openmle_fast
   sampling: round_robin
   require_exact_per_update_route_split: false
 
