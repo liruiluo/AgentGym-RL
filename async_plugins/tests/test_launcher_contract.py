@@ -421,6 +421,7 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                 env["VERL_FILE_LOGGER_PATH"], str(inputs.run_dir / "metrics.jsonl")
             )
             self.assertNotIn("VERL_FULLY_ASYNC_RUNTIME_RECEIPT_PATH", env)
+            self.assertEqual(env["RAY_memory_usage_threshold"], "0.98")
             self.assertNotIn("VLLM_USE_V1", env)
             self.assertNotIn("VLLM_LOGGING_LEVEL", env)
             with self.assertRaisesRegex(RuntimeError, "PYTHONPATH"):

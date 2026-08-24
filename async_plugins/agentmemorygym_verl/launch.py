@@ -473,6 +473,10 @@ def build_runtime_env(
     env["TOKENIZERS_PARALLELISM"] = "false"
     env["HYDRA_FULL_ERROR"] = "1"
     env["RAY_DEDUP_LOGS"] = "0"
+    # Keep Ray's memory-pressure fail-safe enabled while leaving enough headroom
+    # for the colocated LiteResearcher retrieval stack. The default 0.95
+    # threshold killed the asynchronous MessageQueue at 97.37% node memory.
+    env["RAY_memory_usage_threshold"] = "0.98"
     return env
 
 
