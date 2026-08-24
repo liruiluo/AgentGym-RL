@@ -105,6 +105,10 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                 "upstream_masked_whiten",
             )
             self.assertEqual(
+                values["algorithm.amg_positive_actor_credit_rule"],
+                "zero_positive_advantage_for_ineligible_and_repeated_zero_progress_actions_only",
+            )
+            self.assertEqual(
                 values["algorithm.rollout_correction.loss_type"], "ppo_clip"
             )
             self.assertEqual(values["data.max_prompt_length"], "30720")

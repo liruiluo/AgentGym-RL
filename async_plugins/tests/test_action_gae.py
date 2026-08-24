@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 
 import numpy as np
@@ -53,6 +54,20 @@ class TestAMGActionGAE(unittest.TestCase):
             ),
         }
         batch["old_log_probs"] = batch["rollout_log_probs"]
+
+        def step_record(positive_eligible: bool, basis: str) -> str:
+            return json.dumps(
+                {
+                    "wrapper_evidence": {
+                        "actor_credit": {
+                            "schema": "task_neutral_actor_credit_v1",
+                            "positive_eligible": positive_eligible,
+                            "basis": basis,
+                        }
+                    }
+                }
+            )
+
         non_tensor_batch = {
             "trajectory_uid": np.array(["a", "a", "b", "pad"], dtype=object),
             "trajectory_row_uid": np.array(
@@ -63,12 +78,24 @@ class TestAMGActionGAE(unittest.TestCase):
             "rollout_done_flag": np.array([False, True, True, True], dtype=object),
             "immediate_reward": np.array([1.0, 2.0, 3.0, 0.0], dtype=object),
             "is_padding": np.array([False, False, False, True], dtype=object),
+            "step_record_json": np.array(
+                [
+                    step_record(True, "shell_executed"),
+                    step_record(True, "terminal_submission"),
+                    step_record(True, "workspace_changed"),
+                    "padding",
+                ],
+                dtype=object,
+            ),
         }
         config = {
             "gamma": 0.9,
             "lam": 0.8,
             "amg_reward_tolerance": 1e-6,
             "amg_advantage_normalization": "none",
+            "amg_positive_actor_credit_rule": (
+                "zero_positive_advantage_for_ineligible_and_repeated_zero_progress_actions_only"
+            ),
         }
         return batch, non_tensor_batch, config
 
@@ -145,6 +172,61 @@ class TestAMGActionGAE(unittest.TestCase):
             dtype=torch.float32,
         )
         torch.testing.assert_close(returns, expected_returns)
+
+    def test_masks_only_positive_advantage_for_ineligible_actions(self):
+        batch, non_tensor_batch, config = self._fixture()
+        records = non_tensor_batch["step_record_json"]
+        for row, (eligible, basis) in enumerate(
+            [
+                (False, "parser_rejected"),
+                (True, "terminal_submission"),
+                (False, "executor_rejected"),
+            ]
+        ):
+            records[row] = json.dumps(
+                {
+                    "wrapper_evidence": {
+                        "actor_credit": {
+                            "schema": "task_neutral_actor_credit_v1",
+                            "positive_eligible": eligible,
+                            "basis": basis,
+                        }
+                    }
+                }
+            )
+        batch["values"][2, 0] = 4.0
+
+        advantages, returns = compute_amg_action_gae(
+            batch=batch,
+            non_tensor_batch=non_tensor_batch,
+            config=config,
+        )
+
+        self.assertEqual(float(advantages[0].abs().sum().item()), 0.0)
+        self.assertEqual(float(advantages[2, 0].item()), -1.0)
+        self.assertEqual(float(advantages[1, 0].item()), 1.75)
+        self.assertAlmostEqual(float(returns[0, 0].item()), 2.485, places=6)
+        self.assertEqual(float(returns[2, 0].item()), 3.0)
+
+    def test_rejects_disabled_positive_actor_credit_rule(self):
+        batch, non_tensor_batch, config = self._fixture()
+        config["amg_positive_actor_credit_rule"] = "none"
+        with self.assertRaisesRegex(ValueError, "amg_positive_actor_credit_rule"):
+            compute_amg_action_gae(
+                batch=batch,
+                non_tensor_batch=non_tensor_batch,
+                config=config,
+            )
+
+    def test_requires_task_neutral_actor_credit_receipt(self):
+        batch, non_tensor_batch, config = self._fixture()
+        del non_tensor_batch["step_record_json"]
+        with self.assertRaisesRegex(ValueError, "step_record_json"):
+            compute_amg_action_gae(
+                batch=batch,
+                non_tensor_batch=non_tensor_batch,
+                config=config,
+            )
 
     def test_rejects_reward_packing_that_does_not_conserve_action_reward(self):
         batch, non_tensor_batch, config = self._fixture()

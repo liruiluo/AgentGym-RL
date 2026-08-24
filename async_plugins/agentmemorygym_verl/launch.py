@@ -349,6 +349,7 @@ def build_overrides(
         "actor_rollout_ref.hybrid_engine=False",
         "algorithm.adv_estimator=amg_action_axis_gae",
         "++algorithm.amg_advantage_normalization=upstream_masked_whiten",
+        "++algorithm.amg_positive_actor_credit_rule=zero_positive_advantage_for_ineligible_and_repeated_zero_progress_actions_only",
         "algorithm.gamma=1.0",
         "algorithm.lam=1.0",
         "algorithm.use_kl_in_reward=False",

@@ -153,6 +153,9 @@ def _config(*, mode: str = "formal") -> dict:
         "algorithm": {
             "adv_estimator": "amg_action_axis_gae",
             "amg_advantage_normalization": "upstream_masked_whiten",
+            "amg_positive_actor_credit_rule": (
+                "zero_positive_advantage_for_ineligible_and_repeated_zero_progress_actions_only"
+            ),
             "gamma": 1.0,
             "lam": 1.0,
             "use_kl_in_reward": False,
@@ -323,6 +326,12 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         config["algorithm"]["adv_estimator"] = "grpo"
         config["critic"]["enable"] = False
         with self.assertRaisesRegex(ValueError, "action-axis GAE"):
+            _verify(config, mode="formal")
+
+    def test_rejects_missing_positive_actor_credit_rule(self):
+        config = _config()
+        del config["algorithm"]["amg_positive_actor_credit_rule"]
+        with self.assertRaisesRegex(ValueError, "amg_positive_actor_credit_rule"):
             _verify(config, mode="formal")
 
     def test_rejects_unwhitened_action_axis_advantages(self):

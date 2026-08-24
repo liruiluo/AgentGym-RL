@@ -417,6 +417,9 @@ def verify_resolved_config(
         "algorithm.gamma": 1.0,
         "algorithm.lam": 1.0,
         "algorithm.amg_advantage_normalization": "upstream_masked_whiten",
+        "algorithm.amg_positive_actor_credit_rule": (
+            "zero_positive_advantage_for_ineligible_and_repeated_zero_progress_actions_only"
+        ),
         "algorithm.use_kl_in_reward": False,
         "trainer.total_epochs": 1,
         "trainer.val_before_train": False,
@@ -586,6 +589,7 @@ def verify_resolved_config(
         "rollout_n": 1,
         "adv_estimator": "amg_action_axis_gae",
         "advantage_normalization": "upstream_masked_whiten",
+        "positive_actor_credit_rule": "zero_positive_advantage_for_ineligible_and_repeated_zero_progress_actions_only",
         "model_path": actor_model,
         "env_addr": env_addr,
         "route_ids": route_ids,

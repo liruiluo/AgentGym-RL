@@ -8,6 +8,7 @@ broadcasts each action target over that row's sampled policy tokens.
 
 from __future__ import annotations
 
+import json
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -24,6 +25,9 @@ TRAJECTORY_TERMINAL = "trajectory_terminal"
 ROLLOUT_DONE_FLAG = "rollout_done_flag"
 IMMEDIATE_REWARD = "immediate_reward"
 IS_PADDING = "is_padding"
+STEP_RECORD_JSON = "step_record_json"
+ACTOR_CREDIT_SCHEMA = "task_neutral_actor_credit_v1"
+POSITIVE_ACTOR_CREDIT_RULE = "zero_positive_advantage_for_ineligible_and_repeated_zero_progress_actions_only"
 
 
 def _config_value(config: Any, name: str, default: Any) -> Any:
@@ -93,6 +97,65 @@ def _as_finite_float(value: Any, *, field: str, row: int) -> float:
     if not np.isfinite(number):
         raise ValueError(f"{field} must be finite at row {row}, got {value!r}")
     return number
+
+
+def _positive_actor_credit_eligibility(
+    non_tensor_batch: Mapping[str, Any],
+    *,
+    row_count: int,
+    is_padding: Sequence[Any],
+) -> list[bool]:
+    """Read the task-neutral server receipt for every real action row.
+
+    Deterministically invalid or zero-progress actions still keep negative
+    advantages, but they must never inherit positive trajectory credit.  This
+    is the latest-veRL equivalent of the accepted legacy trainer guard.
+    """
+
+    raw_records = _require_metadata(non_tensor_batch, STEP_RECORD_JSON, row_count)
+    eligibility: list[bool] = []
+    for row, raw_record in enumerate(raw_records):
+        if _as_bool(is_padding[row], field=IS_PADDING, row=row):
+            eligibility.append(False)
+            continue
+        if isinstance(raw_record, np.ndarray) and raw_record.ndim == 0:
+            raw_record = raw_record.item()
+        if not isinstance(raw_record, str):
+            raise TypeError(
+                f"AMG actor-credit {STEP_RECORD_JSON!r} must be JSON text at "
+                f"row {row}, got {type(raw_record).__name__}"
+            )
+        try:
+            record = json.loads(raw_record)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"AMG actor-credit {STEP_RECORD_JSON!r} is invalid JSON at row {row}"
+            ) from exc
+        if not isinstance(record, dict):
+            raise ValueError(
+                f"AMG actor-credit {STEP_RECORD_JSON!r} must decode to an object "
+                f"at row {row}"
+            )
+        wrapper_evidence = record.get("wrapper_evidence")
+        receipt = (
+            wrapper_evidence.get("actor_credit")
+            if isinstance(wrapper_evidence, dict)
+            else None
+        )
+        if not isinstance(receipt, dict):
+            raise ValueError(f"AMG actor-credit receipt is missing at row {row}")
+        if receipt.get("schema") != ACTOR_CREDIT_SCHEMA:
+            raise ValueError(f"AMG actor-credit receipt schema mismatch at row {row}")
+        positive_eligible = receipt.get("positive_eligible")
+        if type(positive_eligible) is not bool:
+            raise TypeError(
+                f"AMG actor-credit eligibility must be boolean at row {row}"
+            )
+        basis = receipt.get("basis")
+        if not isinstance(basis, str) or not basis:
+            raise ValueError(f"AMG actor-credit basis must be non-empty at row {row}")
+        eligibility.append(positive_eligible)
+    return eligibility
 
 
 @register_adv_est("amg_action_axis_gae")
@@ -191,10 +254,23 @@ def compute_amg_action_gae(
             f"AMG action GAE {IS_PADDING!r} must align with {row_count} rows"
         )
 
+    positive_actor_credit_eligibility = _positive_actor_credit_eligibility(
+        non_tensor_batch,
+        row_count=row_count,
+        is_padding=is_padding,
+    )
     gamma = float(_config_value(config, "gamma", 1.0))
     lam = float(_config_value(config, "lam", 1.0))
     tolerance = float(_config_value(config, "amg_reward_tolerance", 1e-6))
     normalization = str(_config_value(config, "amg_advantage_normalization", "none"))
+    positive_actor_credit_rule = str(
+        _config_value(config, "amg_positive_actor_credit_rule", "")
+    )
+    if positive_actor_credit_rule != POSITIVE_ACTOR_CREDIT_RULE:
+        raise ValueError(
+            "AMG action GAE requires amg_positive_actor_credit_rule="
+            f"{POSITIVE_ACTOR_CREDIT_RULE!r}, got {positive_actor_credit_rule!r}"
+        )
     if not np.isfinite(gamma) or not 0.0 <= gamma <= 1.0:
         raise ValueError(f"AMG action GAE gamma must be in [0, 1], got {gamma!r}")
     if not np.isfinite(lam) or not 0.0 <= lam <= 1.0:
@@ -350,5 +426,26 @@ def compute_amg_action_gae(
     if normalization == "upstream_masked_whiten":
         advantages = verl_F.masked_whiten(advantages, real_policy_mask)
         advantages = advantages * real_policy_mask.to(dtype=advantages.dtype)
+
+    eligibility = torch.tensor(
+        positive_actor_credit_eligibility,
+        dtype=torch.bool,
+        device=advantages.device,
+    )
+    ineligible_positive_tokens = (
+        (~eligibility).unsqueeze(-1) & real_policy_mask & (advantages > 0)
+    )
+    advantages = torch.where(
+        ineligible_positive_tokens, torch.zeros_like(advantages), advantages
+    )
+    masked_rows = torch.any(ineligible_positive_tokens, dim=-1)
+    print(
+        "[AMGPositiveActorCredit] "
+        f"rule={POSITIVE_ACTOR_CREDIT_RULE} "
+        f"ineligible_rows={int((~eligibility).sum().item())} "
+        f"masked_rows={int(masked_rows.sum().item())} "
+        f"masked_tokens={int(ineligible_positive_tokens.sum().item())}",
+        flush=True,
+    )
 
     return advantages, returns
