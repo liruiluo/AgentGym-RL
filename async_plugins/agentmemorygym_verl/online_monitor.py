@@ -25,6 +25,7 @@ from .finalizer import (
     _path_within,
     _receipt_protected_paths,
     _rolling_episode_shares,
+    _terminal_row_closes_trajectory,
 )
 
 SNAPSHOT_UPDATES = frozenset({1, 5, 20, 40, 80})
@@ -103,6 +104,7 @@ def _episode_summary(
     route_ids: Sequence[str],
     samples_per_update: int,
     schedule_routes: Mapping[tuple[str, int], str],
+    route_max_rounds: Mapping[str, int],
     prior_trajectory_uids: set[str],
     prior_schedule_instances: set[tuple[str, int]],
 ) -> dict[str, Any]:
@@ -218,9 +220,10 @@ def _episode_summary(
             for index, (record, _document) in enumerate(ordered)
             if record.get("trajectory_terminal") is True
         ]
-        if (
-            terminals != [len(ordered) - 1]
-            or ordered[-1][0].get("rollout_done_flag") is not True
+        if terminals != [len(ordered) - 1] or not _terminal_row_closes_trajectory(
+            ordered[-1][0],
+            episode_length=len(ordered),
+            route_max_rounds=route_max_rounds,
         ):
             raise ValueError(
                 f"rollout update {update} trajectory {uid!r} is not complete"
@@ -397,6 +400,7 @@ def _observe_run(
                 route_ids=routes,
                 samples_per_update=samples_per_update,
                 schedule_routes=launch_audit.schedule_routes,
+                route_max_rounds=launch_audit.route_max_rounds,
                 prior_trajectory_uids=seen_trajectory_uids,
                 prior_schedule_instances=seen_schedule_instances,
             )

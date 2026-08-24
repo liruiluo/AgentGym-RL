@@ -985,6 +985,60 @@ class TestMultitaskFinalizer(FinalizerTestCase):
                 self.assertEqual(route["executions"], 8)
                 self.assertEqual(route["complete_memory_chains"], 8)
 
+    def test_route_local_max_rounds_horizon_is_a_complete_trajectory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = build_valid_multitask_run(
+                Path(directory) / "run",
+                updates=8,
+                horizon_route_id=MULTITASK_ROUTES[0],
+            )
+
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+
+            self.assertEqual(verdict["status"], "pass", verdict)
+            self.assertEqual(verdict["counts"]["completed_episodes"], 512)
+            self.assertEqual(
+                verdict["routes"][MULTITASK_ROUTES[0]]["native_successes"],
+                120,
+            )
+
+    def test_false_done_without_exact_max_rounds_receipt_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = build_valid_multitask_run(
+                Path(directory) / "run",
+                updates=8,
+                horizon_route_id=MULTITASK_ROUTES[0],
+            )
+            path = fixture["rollout_dir"] / "1.jsonl"
+            documents = [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+            ]
+            for document in documents:
+                record = json.loads(document["step_record_json"])
+                if (
+                    record.get("route_id") == MULTITASK_ROUTES[0]
+                    and record.get("trajectory_terminal") is True
+                    and record.get("rollout_done_flag") is False
+                ):
+                    record["outcome"] = "continue"
+                    document["step_record_json"] = json.dumps(record, sort_keys=True)
+                    break
+            else:
+                self.fail("fixture omitted the route-local horizon terminal row")
+            path.write_text(
+                "\n".join(
+                    json.dumps(document, sort_keys=True) for document in documents
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            self.assert_failed(
+                fixture["run_dir"],
+                contains="terminal row is not done or a valid max_rounds horizon",
+            )
+
     def test_multitask_runtime_artifacts_follow_receipt_declared_paths(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.build_multitask(Path(directory))

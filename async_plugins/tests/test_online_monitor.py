@@ -64,6 +64,26 @@ def rewrite_metrics(run: dict, mutation) -> None:
 
 
 class TestOnlineMonitor(unittest.TestCase):
+    def test_route_local_max_rounds_horizon_is_complete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = build_valid_multitask_run(
+                Path(directory),
+                updates=1,
+                horizon_route_id=MULTITASK_ROUTES[0],
+            )
+
+            snapshot = observe_run(run["run_dir"], 1)
+
+        self.assertEqual(snapshot["status"], "descriptive")
+        self.assertEqual(
+            snapshot["routes"][MULTITASK_ROUTES[0]]["optimizer_consumed_episodes"],
+            16,
+        )
+        self.assertEqual(
+            snapshot["routes"][MULTITASK_ROUTES[0]]["native_successes"],
+            15,
+        )
+
     def test_supported_snapshots_cover_1_5_20_40_80(self):
         self.assertEqual(SNAPSHOT_UPDATES, frozenset({1, 5, 20, 40, 80}))
         with tempfile.TemporaryDirectory() as directory:

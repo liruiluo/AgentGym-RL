@@ -296,7 +296,13 @@ def _execution_info(
 
 
 def _action_rows(
-    item_id: str, data_idx: int, trajectory_uid: str, version: int, chain: bool
+    item_id: str,
+    data_idx: int,
+    trajectory_uid: str,
+    version: int,
+    chain: bool,
+    *,
+    horizon_rounds: int | None = None,
 ) -> list[dict]:
     if chain:
         actions = [
@@ -339,8 +345,26 @@ def _action_rows(
         ]
     else:
         actions = [("submit", {"action_kind": "submit", "action_status": "completed"})]
+    if horizon_rounds is not None:
+        if not chain or horizon_rounds < len(actions):
+            raise ValueError("horizon fixture must preserve the complete memory chain")
+        actions.extend(
+            (
+                'shell_command {"command":"true","workdir":".","timeout_ms":20000}',
+                _execution_info(),
+            )
+            for _ in range(horizon_rounds - len(actions))
+        )
     rows = []
     for order, (action, env_info) in enumerate(actions):
+        terminal = order == len(actions) - 1
+        horizon_terminal = terminal and horizon_rounds is not None
+        if not terminal:
+            outcome = "continue"
+        elif horizon_terminal:
+            outcome = "max_rounds"
+        else:
+            outcome = "success"
         wrapper_evidence = {}
         context_transition = {}
         control_request = None
@@ -373,10 +397,10 @@ def _action_rows(
                 "trajectory_uid": trajectory_uid,
                 "trajectory_row_uid": f"{trajectory_uid}-row-{order}",
                 "trajectory_row_order": order,
-                "trajectory_terminal": order == len(actions) - 1,
-                "rollout_done_flag": order == len(actions) - 1,
-                "immediate_reward": 1.0 if order == len(actions) - 1 else 0.0,
-                "trajectory_return": 1.0,
+                "trajectory_terminal": terminal,
+                "rollout_done_flag": terminal and not horizon_terminal,
+                "immediate_reward": 1.0 if terminal and not horizon_terminal else 0.0,
+                "trajectory_return": 0.0 if horizon_rounds is not None else 1.0,
                 "task_round": order + 1,
                 "action": action,
                 "action_submission": {"raw_policy_output": action},
@@ -384,7 +408,7 @@ def _action_rows(
                 "context_transition": context_transition,
                 "wrapper_evidence": wrapper_evidence,
                 "control_request": control_request,
-                "outcome": "success" if order == len(actions) - 1 else "continue",
+                "outcome": outcome,
                 "prompt_token_count": 2,
                 "prompt_token_sha256": "a" * 64,
                 "response_token_count": 1,
@@ -637,6 +661,7 @@ def build_valid_multitask_run(
     *,
     updates: int = 8,
     route_counts_by_update: list[dict[str, int]] | None = None,
+    horizon_route_id: str | None = None,
 ) -> dict:
     """Build a compact four-route receipt and exact owner telemetry fixture."""
 
@@ -644,6 +669,8 @@ def build_valid_multitask_run(
     identity_dir = run_dir / "identity"
     identity_dir.mkdir()
     route_ids = MULTITASK_ROUTES
+    if horizon_route_id is not None and horizon_route_id not in route_ids:
+        raise ValueError("horizon route must be present in the route registry")
     samples_per_update = 64
     episodes = updates * samples_per_update
     role = "train_pool"
@@ -865,6 +892,11 @@ def build_valid_multitask_run(
                     uid,
                     update - 1,
                     chain=local_position == 0,
+                    horizon_rounds=(
+                        30
+                        if local_position == 0 and route_id == horizon_route_id
+                        else None
+                    ),
                 )
                 for record in rows:
                     record["route_id"] = route_id

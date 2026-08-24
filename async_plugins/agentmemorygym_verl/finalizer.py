@@ -25,12 +25,12 @@ from .identity import (
     sha256_file,
     validate_training_runtime_lock,
 )
+from .routes import load_route_registry
 
 _LEGACY_RECEIPT_SCHEMA = "amg_verl_fully_async_launch_receipt_v5"
 _MULTITASK_RECEIPT_SCHEMA = "amg_verl_fully_async_multitask_launch_receipt_v1"
 _MULTITASK_SOURCE_LOCK_SCHEMA = "amg_multitask_launcher_source_lock_v1"
 _MULTITASK_SCHEDULE_CERTIFICATE_SCHEMA = "amg_multitask_schedule_certificate_v1"
-_ROUTE_REGISTRY_SCHEMA = "amg_route_registry_v1"
 _FINAL_STATISTICS_SCHEMA = "verl_fully_async_final_statistics_v1"
 _FINAL_STATISTICS_MARKER = "[FullyAsyncTaskRunner][FinalStatistics] "
 _FINAL_STATISTICS_VERL_COMMIT = "f3ac28fe54c945e092b9630030f44d236a106a11"
@@ -669,6 +669,33 @@ def _has_complete_memory_chain(
     return False
 
 
+def _terminal_row_closes_trajectory(
+    record: Mapping[str, Any],
+    *,
+    episode_length: int,
+    route_max_rounds: Mapping[str, int],
+) -> bool:
+    """Distinguish environment completion from a valid policy horizon.
+
+    A rollout can end because the environment returned ``done`` or because the
+    route-local AgentLoop exhausted its configured policy-action budget.  The
+    latter remains a complete PPO trajectory even though the environment did
+    not terminate.  It is accepted only when the terminal receipt explicitly
+    says ``max_rounds`` and the contiguous action-row count exactly matches the
+    immutable route registry.
+    """
+
+    done = record.get("rollout_done_flag")
+    if done is True:
+        return True
+    if done is not False or record.get("outcome") != "max_rounds":
+        return False
+    route_id = record.get("route_id")
+    if not isinstance(route_id, str):
+        return False
+    return route_max_rounds.get(route_id) == episode_length
+
+
 class _Audit:
     def __init__(
         self,
@@ -688,6 +715,7 @@ class _Audit:
         self.receipt_schema: str | None = None
         self.multitask = False
         self.route_ids: tuple[str, ...] = ()
+        self.route_max_rounds: dict[str, int] = {}
         self.runtime_paths: dict[str, Path] = {}
         self.route_summaries: dict[str, Any] = {}
         self.schedule_routes: dict[tuple[str, int], str] = {}
@@ -1009,21 +1037,18 @@ class _Audit:
         )
         try:
             registry_file = Path(str(registry_path))
-            registry = _load_json(registry_file, "route registry")
-            raw_registry_routes = registry.get("routes")
-            observed_routes = (
-                tuple(str(route.get("route_id")) for route in raw_registry_routes)
-                if isinstance(raw_registry_routes, Sequence)
-                and not isinstance(raw_registry_routes, (str, bytes))
-                and all(isinstance(route, Mapping) for route in raw_registry_routes)
-                else ()
+            registry = load_route_registry(
+                registry_file,
+                expected_sha256=str(registry_digest),
+                expected_route_ids=routes,
             )
             self.check(
-                registry.get("schema") == _ROUTE_REGISTRY_SCHEMA
-                and sha256_file(registry_file) == registry_digest
-                and observed_routes == routes,
+                registry.route_ids == routes,
                 "route registry order differs from source identity",
             )
+            self.route_max_rounds = {
+                route.route_id: route.max_rounds for route in registry.routes
+            }
         except Exception as exc:
             self.error("route registry", exc)
 
@@ -2026,10 +2051,6 @@ class _Audit:
                     done = record.get("rollout_done_flag")
                     if terminal is True:
                         terminal_indices.append(index)
-                        self.check(
-                            done is True,
-                            f"trajectory {uid!r} terminal row is not done",
-                        )
                     elif terminal is not False or done is not False:
                         self.errors.append(
                             f"trajectory {uid!r} nonterminal row has invalid terminal/done flags"
@@ -2042,6 +2063,15 @@ class _Audit:
                     self.errors.append(
                         f"trajectory {uid!r} terminal row is not the maximum action order"
                     )
+                elif not self.check(
+                    _terminal_row_closes_trajectory(
+                        sorted_episode[-1][0],
+                        episode_length=len(sorted_episode),
+                        route_max_rounds=self.route_max_rounds,
+                    ),
+                    f"trajectory {uid!r} terminal row is not done or a valid max_rounds horizon",
+                ):
+                    continue
                 else:
                     completed_episodes.append(sorted_episode)
                     terminal_id = sorted_episode[0][0].get("item_id")
