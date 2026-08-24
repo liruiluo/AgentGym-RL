@@ -57,6 +57,9 @@ def _positive_int(value: Any, *, field: str) -> int:
 
 
 _PPO_MINI_BATCH_TARGET = 512
+# Reserve the final 2,048-token response inside Qwen3.5's 32K context.
+# A valid 30-action WebShop trajectory can exceed the former 16K prompt cap.
+PPO_MAX_PROMPT_TOKENS = 30720
 
 
 def resolve_ppo_mini_batch_size(trainer_gpus: Any) -> int:
@@ -386,7 +389,7 @@ def verify_resolved_config(
         "data.gen_batch_size": 1,
         "data.shuffle": False,
         "data.seed": 233,
-        "data.max_prompt_length": 16384,
+        "data.max_prompt_length": PPO_MAX_PROMPT_TOKENS,
         "data.max_response_length": 2048,
         "data.return_raw_chat": True,
         "actor_rollout_ref.model.enable_gradient_checkpointing": True,

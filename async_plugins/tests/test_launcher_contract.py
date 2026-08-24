@@ -107,6 +107,7 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             self.assertEqual(
                 values["algorithm.rollout_correction.loss_type"], "ppo_clip"
             )
+            self.assertEqual(values["data.max_prompt_length"], "30720")
             self.assertEqual(values["actor_rollout_ref.rollout.n"], "1")
             self.assertEqual(
                 values["actor_rollout_ref.rollout.name"],

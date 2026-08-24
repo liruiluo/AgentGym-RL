@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .config_contract import (
+    PPO_MAX_PROMPT_TOKENS,
     inspect_schedule,
     resolve_ppo_mini_batch_size,
     verify_resolved_config,
@@ -229,7 +230,7 @@ def build_overrides(
         "data.val_max_samples=1",
         "data.dataloader_num_workers=0",
         "data.prompt_key=item_id",
-        "data.max_prompt_length=16384",
+        f"data.max_prompt_length={PPO_MAX_PROMPT_TOKENS}",
         "data.max_response_length=2048",
         "data.truncation=error",
         "data.return_raw_chat=True",

@@ -218,7 +218,7 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
             "gen_batch_size": 1,
             "shuffle": False,
             "seed": 233,
-            "max_prompt_length": 16384,
+            "max_prompt_length": 30720,
             "max_response_length": 2048,
             "return_raw_chat": True,
             "custom_cls": {
