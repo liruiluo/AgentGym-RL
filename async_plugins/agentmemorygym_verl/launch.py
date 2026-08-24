@@ -365,6 +365,10 @@ def build_overrides(
         "algorithm.rollout_correction.loss_type=ppo_clip",
         "algorithm.rollout_correction.rollout_is=null",
         "algorithm.rollout_correction.rollout_rs=null",
+        # Ray otherwise reserves roughly 30% of the node's currently available
+        # memory in tmpfs. AMG batches use far less object-store space, while
+        # the colocated retrieval index needs that headroom to stay resident.
+        "++ray_kwargs.ray_init.object_store_memory=8589934592",
         "trainer.nnodes=1",
         f"trainer.n_gpus_per_node={inputs.trainer_gpus}",
         "trainer.device=cuda",

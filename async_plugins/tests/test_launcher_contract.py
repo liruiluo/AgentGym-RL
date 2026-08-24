@@ -140,6 +140,9 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             )
             self.assertEqual(values["critic.loss_agg_mode"], "token-mean")
             self.assertEqual(
+                values["ray_kwargs.ray_init.object_store_memory"], "8589934592"
+            )
+            self.assertEqual(
                 values["trainer.total_training_steps"],
                 str(budget["publication_cycles"]),
             )
