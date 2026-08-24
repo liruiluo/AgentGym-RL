@@ -33,7 +33,6 @@ _MULTITASK_SOURCE_LOCK_SCHEMA = "amg_multitask_launcher_source_lock_v1"
 _MULTITASK_SCHEDULE_CERTIFICATE_SCHEMA = "amg_multitask_schedule_certificate_v1"
 _FINAL_STATISTICS_SCHEMA = "verl_fully_async_final_statistics_v1"
 _FINAL_STATISTICS_MARKER = "[FullyAsyncTaskRunner][FinalStatistics] "
-_FINAL_STATISTICS_VERL_COMMIT = "f3ac28fe54c945e092b9630030f44d236a106a11"
 _FINAL_STATISTICS_FIELDS = frozenset(
     {"schema", "queue", "rollouter", "trainer", "queue_cleanup"}
 )
@@ -1086,7 +1085,7 @@ class _Audit:
         self.check(_git_revision(outer), "multitask outer identity is invalid")
         self.check(_git_revision(inner), "multitask inner identity is invalid")
         source_checks = (
-            ("source.verl_commit", _FINAL_STATISTICS_VERL_COMMIT, "veRL identity"),
+            ("source.verl_commit", EXPECTED_VERL_COMMIT, "veRL identity"),
             ("source.publication_outer_commit", outer, "publication outer identity"),
             ("source.outer_commit", outer, "runtime outer identity"),
             ("source.agentgym_commit", inner, "runtime inner identity"),
@@ -1105,7 +1104,7 @@ class _Audit:
         for dotted, wanted, label in source_checks:
             self.check(_at(launch, dotted) == wanted, f"launch {label} mismatch")
         self.check(
-            identity.get("verl_commit") == _FINAL_STATISTICS_VERL_COMMIT,
+            identity.get("verl_commit") == EXPECTED_VERL_COMMIT,
             "multitask source identity did not select the reviewed FinalStatistics commit",
         )
         self.check(
@@ -1510,6 +1509,7 @@ class _Audit:
                 for key in data
                 if not (
                     str(key).startswith("fully_async/rollouter/")
+                    or str(key).startswith("fully_async/count/")
                     or str(key) == "dynamic_resource/rollout_resource_utilization"
                 )
             )
