@@ -361,10 +361,18 @@ def load_route_registry(
         source_path=registry_path.resolve(),
         agent_name=str(payload.get("agent_name", "")),
     )
-    if registry.route_ids != _CANONICAL_ROUTE_IDS:
+    canonical_positions = {
+        route_id: index for index, route_id in enumerate(_CANONICAL_ROUTE_IDS)
+    }
+    observed_positions = tuple(
+        canonical_positions.get(route_id) for route_id in registry.route_ids
+    )
+    if any(position is None for position in observed_positions) or tuple(
+        position for position in observed_positions if position is not None
+    ) != tuple(sorted(position for position in observed_positions if position is not None)):
         raise ValueError(
-            "AMG route registry canonical route order mismatch: "
-            f"{registry.route_ids!r} != {_CANONICAL_ROUTE_IDS!r}"
+            "AMG route registry must be a canonical ordered route subset: "
+            f"{registry.route_ids!r}"
         )
     if expected_route_ids is not None:
         if isinstance(expected_route_ids, (str, bytes)):
@@ -373,10 +381,22 @@ def load_route_registry(
             _route_id(value, field="expected route_id")
             for value in expected_route_ids
         )
-        if expected != _CANONICAL_ROUTE_IDS:
+        if not expected:
+            raise ValueError("expected_route_ids must not be empty")
+        expected_positions = tuple(
+            canonical_positions.get(route_id) for route_id in expected
+        )
+        if any(position is None for position in expected_positions) or tuple(
+            position for position in expected_positions if position is not None
+        ) != tuple(sorted(position for position in expected_positions if position is not None)):
             raise ValueError(
-                "expected route IDs differ from the canonical route order: "
-                f"{expected!r} != {_CANONICAL_ROUTE_IDS!r}"
+                "expected route IDs must be a canonical ordered route subset: "
+                f"{expected!r}"
+            )
+        if registry.route_ids != expected:
+            raise ValueError(
+                "AMG route registry expected route order mismatch: "
+                f"{registry.route_ids!r} != {expected!r}"
             )
     return registry
 
