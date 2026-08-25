@@ -282,7 +282,12 @@ _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT = (
 )
 _AGENTMEMORY_FILESYSTEM_MEMORY_GUIDANCE = (
     " The workspace starts empty and contains only files that you create; it is not a "
-    "catalog, hidden cache, or automatic session log. Before an action that advances to a "
+    "catalog, hidden cache, or automatic session log. In the first shopping session there "
+    "is no preceding purchase or note: do not run a workspace read, and start with "
+    "search[...] for the exact approved listing selected by the explicit starting request. "
+    "The read-and-retry rule below applies only after a purchase has advanced the episode "
+    "to a later session whose current prompt says its choice depends on the preceding "
+    "purchase. Before an action that advances to a "
     "new shopping session and removes facts from the current-session trace, decide whether "
     "a later decision will need a fact visible now. If it will, write a concise note on a "
     "separate workspace turn before advancing. Copy the exact policy-visible field name and "
@@ -295,7 +300,8 @@ _AGENTMEMORY_FILESYSTEM_MEMORY_GUIDANCE = (
     "lines, for example `rg --hidden -n '^Confirmed ' .`; do not guess a path. Do not search, click, "
     "or write a replacement fact until the preceding session's note contents have appeared "
     "in shell output. `rg` without `--hidden` is insufficient because a note may be in a "
-    "dotfile or dot-directory. If stdout is empty, retry the exact `rg --hidden` command; an "
+    "dotfile or dot-directory. Only in such a later dependent session, if stdout is empty, "
+    "retry the exact `rg --hidden` command; an "
     "empty result is never permission to guess, search, click, or write a replacement fact. "
     "Never infer or recreate the missing value from the choice table. Listing a directory or "
     "reading a different file is not reading the note. After the preceding Confirmed line is "

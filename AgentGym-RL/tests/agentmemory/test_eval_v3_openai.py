@@ -2635,7 +2635,7 @@ class EvalV3OpenAITest(unittest.TestCase):
         self.assertIn("latest-observation-only input", prompt)
         self.assertIn("rg --hidden -n '^Confirmed ' .", prompt)
         self.assertIn("`rg` without `--hidden` is insufficient", prompt)
-        self.assertIn("If stdout is empty, retry the exact `rg --hidden` command", prompt)
+        self.assertIn("Only in such a later dependent session, if stdout is empty", prompt)
         self.assertIn(
             "copy the chosen approved card's complete Product title into search[...] "
             "without shortening it",
