@@ -190,6 +190,23 @@ class TestOnlineMonitor(unittest.TestCase):
         self.assertEqual(snapshot["status"], "descriptive")
         self.assertEqual(snapshot["snapshot_update"], 1)
 
+    def test_exact_empty_eos_output_remains_a_bound_policy_action(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = build_valid_multitask_run(Path(directory), updates=1)
+
+            def empty_exact_output(document):
+                record = json.loads(document["step_record_json"])
+                record["action"] = ""
+                record["action_submission"]["raw_policy_output"] = ""
+                record["response_token_count"] = 1
+                document["output"] = ""
+                document["step_record_json"] = json.dumps(record, sort_keys=True)
+
+            rewrite_first_rollout(run, empty_exact_output)
+            snapshot = observe_run(run["run_dir"], 1)
+
+        self.assertEqual(snapshot["status"], "descriptive")
+
     def test_file_logger_and_rollout_mutations_fail_closed(self):
         cases = (
             (
