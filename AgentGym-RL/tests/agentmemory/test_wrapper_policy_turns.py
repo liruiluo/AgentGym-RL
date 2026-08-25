@@ -151,6 +151,33 @@ class FakeSwesmithClient(SwesmithEnvClient):
                     },
                 },
             }
+        if action == "grader infrastructure failure":
+            return {
+                "observation": "Grader backend unavailable.",
+                "reward": 0.0,
+                "done": True,
+                "info": {
+                    "step": step,
+                    "action_kind": "final",
+                    "sample_excluded": True,
+                    "sample_exclusion_reason": "grader_infrastructure_failure",
+                    "actor_credit": {
+                        "schema": "task_neutral_actor_credit_v1",
+                        "positive_eligible": True,
+                        "basis": "terminal_submission",
+                    },
+                    "action_progress": {
+                        "schema": "swesmith_action_progress_v1",
+                        "action_fingerprint": hashlib.sha256(
+                            action.encode("utf-8")
+                        ).hexdigest(),
+                        "result_fingerprint": hashlib.sha256(
+                            ("result:" + action).encode("utf-8")
+                        ).hexdigest(),
+                        "workspace_changed": True,
+                    },
+                },
+            }
         workspace_changed = "printf changed >" in action
         terminal_submission = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT" in action
         return {
@@ -774,6 +801,19 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             with self.subTest(receipt=receipt):
                 with self.assertRaises(RuntimeError):
                     _validate_action_progress_receipt(receipt)
+
+    def test_swesmith_grader_infrastructure_failure_is_excluded(self) -> None:
+        client = FakeSwesmithClient()
+
+        output = client.step("grader infrastructure failure")
+
+        self.assertTrue(output.done)
+        self.assertEqual(output.reward, 0.0)
+        self.assertTrue(client.sample_excluded)
+        self.assertEqual(
+            output.info["env_info"]["sample_exclusion_reason"],
+            "grader_infrastructure_failure",
+        )
 
     def test_swesmith_terminal_submission_preserves_shell_progress(self) -> None:
         client = FakeSwesmithClient()
