@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Mapping
 from typing import Any
@@ -89,6 +90,22 @@ def create_env_client(config: Any):
         "data_len": None,
         "timeout": timeout,
     }
+    if task_name == "swesmith":
+        raw_invalid_reward = _get(config, "invalid_action_reward", 0.0)
+        if isinstance(raw_invalid_reward, bool):
+            raise TypeError("SWE-smith invalid_action_reward must be numeric")
+        try:
+            invalid_action_reward = float(raw_invalid_reward)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "SWE-smith invalid_action_reward must be finite and non-positive"
+            ) from exc
+        if not math.isfinite(invalid_action_reward) or invalid_action_reward > 0.0:
+            raise ValueError(
+                "SWE-smith invalid_action_reward must be finite and non-positive"
+            )
+        client_kwargs["invalid_action_reward"] = invalid_action_reward
+
     if task_name == "openmle_fast":
         for field in _OPENMLE_IDENTITY_FIELDS:
             value = _get(config, field)
