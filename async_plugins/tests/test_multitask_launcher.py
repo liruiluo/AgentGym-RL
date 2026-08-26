@@ -915,6 +915,52 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
             self.assertEqual(evidence[0]["evidence_kind"], "source_lock")
             self.assertEqual(evidence[1]["evidence_kind"], "gate_receipt")
 
+    def test_all_immutable_successor_sources_require_explicit_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            route = fixture.registry_payload["routes"][2]
+            source_lock = fixture.root / "successor-source-lock.json"
+            source_lock_sha256 = _write_json(
+                source_lock,
+                {
+                    "outer_commit": fixture.source_commit,
+                    "inner_commit": fixture.source_commit,
+                },
+            )
+            for source in route["sources"]:
+                source.pop("receipt_field")
+                source["source_lock"] = {
+                    "path": str(source_lock),
+                    "sha256": source_lock_sha256,
+                    "commit_field": f"{source['name']}_commit",
+                }
+
+            registry_sha256 = fixture.rewrite()
+            with self.assertRaisesRegex(
+                OrchestratorError, "explicitly selects the all-immutable-lock"
+            ):
+                load_endpoint_registry(
+                    fixture.registry_path,
+                    expected_sha256=registry_sha256,
+                    route_registry=fixture.route_registry,
+                )
+
+            route["source_evidence_policy"] = (
+                "base_gate_plus_all_immutable_source_locks_v1"
+            )
+            registry_sha256 = fixture.rewrite()
+            specs, report = load_endpoint_registry(
+                fixture.registry_path,
+                expected_sha256=registry_sha256,
+                route_registry=fixture.route_registry,
+            )
+            self.assertEqual(len(specs), 4)
+            evidence = report["sources"]["literesearcher"]
+            self.assertEqual(
+                [item["evidence_kind"] for item in evidence],
+                ["source_lock", "source_lock"],
+            )
+
     def test_immutable_source_lock_commit_mismatch_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = RegistryFixture(Path(directory))

@@ -49,6 +49,7 @@ EXPECTED_ROUTE_IDS = (
 _CONFIG_SCHEMA = "amg_multitask400_orchestrator_config_v1"
 _ENDPOINT_REGISTRY_SCHEMA = "amg_multitask_endpoint_registry_v1"
 _GATE_RECEIPT_SCHEMA = "amg_single_card_optimizer_update_gate_v1"
+_SOURCE_EVIDENCE_POLICY = "base_gate_plus_all_immutable_source_locks_v1"
 _GATE_ENVIRONMENT_NAMES = {
     "webshop": "webshop",
     "swesmith": "swesmith",
@@ -911,11 +912,27 @@ def load_endpoint_registry(
             raise OrchestratorError(
                 f"{route_id} must bind exact outer and inner source identities"
             )
-        if not any(
+        has_gate_bound_source = any(
             source["evidence_kind"] == "gate_receipt" for source in verified_sources
-        ):
+        )
+        source_evidence_policy = route.get("source_evidence_policy")
+        if not has_gate_bound_source:
+            if (
+                source_evidence_policy != _SOURCE_EVIDENCE_POLICY
+                or not all(
+                    source["evidence_kind"] == "source_lock"
+                    for source in verified_sources
+                )
+            ):
+                raise OrchestratorError(
+                    f"{route_id} gate receipt must bind at least one launched source "
+                    "unless the route explicitly selects the all-immutable-lock "
+                    "successor policy"
+                )
+        elif source_evidence_policy is not None:
             raise OrchestratorError(
-                f"{route_id} gate receipt must bind at least one launched source"
+                f"{route_id} source_evidence_policy is only valid when every "
+                "launched source is bound by an immutable source lock"
             )
 
         raw_assets = _sequence(route.get("assets"), field=f"{route_id} assets")
