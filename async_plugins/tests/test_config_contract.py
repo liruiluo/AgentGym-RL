@@ -502,6 +502,59 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
             self.assertEqual(report["route_registry_sha256"], registry_sha256)
             self.assertIsNone(report["env_addr"])
 
+    def test_accepts_formal100_single_route_registry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            route_ids = ("literesearcher",)
+            payload = {
+                "schema": "amg_route_registry_v1",
+                "agent_name": "amg_task_neutral_async",
+                "routes": [
+                    {
+                        "route_id": "literesearcher",
+                        "max_rounds": 30,
+                        "max_observation_tokens": 8192,
+                        "policy_framing_sha256": canonical_policy_framing_sha256(
+                            [{"role": "system", "content": "literesearcher"}]
+                        ),
+                        "route_attestation_sha256": "1" * 64,
+                        "client": {
+                            "task_name": "literesearcher",
+                            "env_addr": "http://127.0.0.1:65122",
+                            "timeout": 240,
+                            "max_retries": 2,
+                        },
+                    }
+                ],
+            }
+            registry = root / "routes.json"
+            registry.write_text(
+                json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            registry_sha256 = hashlib.sha256(registry.read_bytes()).hexdigest()
+            agentgym = {
+                "route_registry_path": str(registry),
+                "route_registry_sha256": registry_sha256,
+                "route_registry_expected_ids": list(route_ids),
+            }
+            config = _config(mode="formal")
+            config["actor_rollout_ref"]["agentgym"] = copy.deepcopy(agentgym)
+            config["data"]["agentgym"] = copy.deepcopy(agentgym)
+            budget = _budget("formal")
+            budget.update(
+                route_registry_sha256=registry_sha256,
+                route_ids=list(route_ids),
+            )
+
+            report = verify_resolved_config(
+                config, mode="formal", expected_budget=budget
+            )
+
+            self.assertEqual(report["optimizer_updates"], 100)
+            self.assertEqual(report["episodes"], 6400)
+            self.assertEqual(report["route_ids"], ["literesearcher"])
+            self.assertEqual(report["route_registry_sha256"], registry_sha256)
+
     def test_multitask_registry_rejects_legacy_global_route_fields(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

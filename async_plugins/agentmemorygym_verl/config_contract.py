@@ -291,10 +291,9 @@ def verify_resolved_config(
             expected_sha256=str(actor_agentgym.get("route_registry_sha256", "")),
             expected_route_ids=expected_route_ids,
         )
-        if len(registry.route_ids) != 4:
-            raise ValueError(
-                "AMG multitask config requires exactly four registered routes"
-            )
+        # The registry loader already enforces a non-empty canonical ordered
+        # subset. A route-set formal run may intentionally select one or more
+        # routes; the frozen budget remains the authority for exact identity.
         route_ids = list(registry.route_ids)
         route_registry_sha256 = registry.sha256
         if route_registry_sha256 != expected.get("route_registry_sha256"):
