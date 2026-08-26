@@ -20,6 +20,12 @@ _AGENT_NAME = "amg_task_neutral_async"
 _ROUTE_ID = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _VALID_ROLES = {"gate_only", "train_pool"}
+_CANONICAL_ROUTE_IDS = (
+    "webshop",
+    "swesmith",
+    "literesearcher",
+    "openmle_fast",
+)
 
 
 def _sha256(value: Any, *, field: str) -> str:
@@ -339,9 +345,9 @@ def load_multitask_manifest_spec(
     raw_routes = payload.get("routes")
     if isinstance(raw_routes, (str, bytes)) or not isinstance(raw_routes, Sequence):
         raise TypeError("AMG multitask routes must be a sequence")
-    if len(raw_routes) != 4:
+    if not raw_routes or len(raw_routes) > len(_CANONICAL_ROUTE_IDS):
         raise ValueError(
-            "AMG multitask spec must contain exactly four routes, "
+            "AMG route-set spec must contain between one and four routes, "
             f"got {len(raw_routes)}"
         )
     if samples_per_update % len(raw_routes) != 0:
@@ -387,6 +393,16 @@ def load_multitask_manifest_spec(
                 role=route_role,
                 allow_repetition=allow_repetition,
             )
+        )
+
+    route_ids = tuple(source.route_id for source in sources)
+    canonical_subset = tuple(
+        route_id for route_id in _CANONICAL_ROUTE_IDS if route_id in route_ids
+    )
+    if route_ids != canonical_subset:
+        raise ValueError(
+            "AMG route-set spec must use a canonical ordered subset: "
+            f"{route_ids!r}; canonical={_CANONICAL_ROUTE_IDS!r}"
         )
 
     spec = MultitaskManifestSpec(

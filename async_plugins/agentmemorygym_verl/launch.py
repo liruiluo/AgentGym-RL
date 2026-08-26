@@ -105,6 +105,23 @@ def _string(value: str | Path) -> str:
     return rendered
 
 
+def _route_set_ids(value: Any) -> tuple[str, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise TypeError("AMG route IDs must be a sequence")
+    route_ids = tuple(str(route_id) for route_id in value)
+    if not route_ids:
+        raise ValueError("AMG route set must contain at least one route")
+    canonical_subset = tuple(
+        route_id for route_id in _MULTITASK_ROUTE_IDS if route_id in route_ids
+    )
+    if len(set(route_ids)) != len(route_ids) or route_ids != canonical_subset:
+        raise ValueError(
+            "AMG route set must be a unique canonical ordered subset: "
+            f"{route_ids!r}; canonical={_MULTITASK_ROUTE_IDS!r}"
+        )
+    return route_ids
+
+
 def build_overrides(
     inputs: LaunchInputs,
     *,
@@ -195,10 +212,7 @@ def build_overrides(
             inputs.route_registry,
             expected_sha256=str(inputs.route_registry_sha256),
         )
-        if len(registry.route_ids) != 4:
-            raise ValueError(
-                "AMG multitask launch requires exactly four registered routes"
-            )
+        _route_set_ids(registry.route_ids)
         agentgym: dict[str, Any] = {
             "route_registry_path": str(registry.source_path),
             "route_registry_sha256": registry.sha256,
@@ -630,8 +644,8 @@ def _load_multitask_identity(
     registry = load_route_registry(
         inputs.route_registry,
         expected_sha256=inputs.route_registry_sha256,
-        expected_route_ids=_MULTITASK_ROUTE_IDS,
     )
+    route_ids = _route_set_ids(registry.route_ids)
     source_lock = _load_json_mapping(source_lock_path, label="multitask source lock")
     certificate = _load_json_mapping(
         certificate_path, label="multitask schedule certificate"
@@ -698,7 +712,7 @@ def _load_multitask_identity(
     if (
         isinstance(bound_route_ids, (str, bytes))
         or not isinstance(bound_route_ids, Sequence)
-        or tuple(str(value) for value in bound_route_ids) != _MULTITASK_ROUTE_IDS
+        or tuple(str(value) for value in bound_route_ids) != route_ids
     ):
         raise ValueError("multitask source lock route order drifted")
     if (
@@ -729,7 +743,7 @@ def _load_multitask_identity(
     if (
         isinstance(route_order, (str, bytes))
         or not isinstance(route_order, Sequence)
-        or tuple(str(value) for value in route_order) != _MULTITASK_ROUTE_IDS
+        or tuple(str(value) for value in route_order) != route_ids
     ):
         raise ValueError("multitask schedule certificate route order drifted")
     if certificate.get("route_registry_sha256") != registry.sha256:
@@ -746,20 +760,21 @@ def _load_multitask_identity(
     scheduled_episode_count = _require_positive_int(
         certificate.get("row_count"), field="multitask certificate row_count"
     )
-    expected_updates = 1 if inputs.mode == "gate" else 400
-    if optimizer_updates != expected_updates or samples_per_update != 64:
+    expected_updates = {1} if inputs.mode == "gate" else {100, 400}
+    if optimizer_updates not in expected_updates or samples_per_update != 64:
         raise ValueError(
-            "multitask budget must be gate1 or formal400 with 64 episodes/update: "
+            "route-set budget must be gate1 or formal100/formal400 with "
+            "64 episodes/update: "
             f"updates={optimizer_updates}, samples_per_update={samples_per_update}"
         )
     if scheduled_episode_count != optimizer_updates * samples_per_update:
         raise ValueError(
             "multitask schedule rows do not conserve optimizer update budget"
         )
-    rows_per_route = scheduled_episode_count // len(_MULTITASK_ROUTE_IDS)
-    expected_per_route_rows = {
-        route_id: rows_per_route for route_id in _MULTITASK_ROUTE_IDS
-    }
+    if scheduled_episode_count % len(route_ids):
+        raise ValueError("route-set schedule rows are not divisible by route count")
+    rows_per_route = scheduled_episode_count // len(route_ids)
+    expected_per_route_rows = {route_id: rows_per_route for route_id in route_ids}
     if certificate.get("per_route_rows") != expected_per_route_rows:
         raise ValueError("multitask certificate per-route episode budget drifted")
 
@@ -783,7 +798,7 @@ def _load_multitask_identity(
         "count": scheduled_episode_count,
         "role": role,
         "panel_id": certificate_panel_id,
-        "route_order": list(_MULTITASK_ROUTE_IDS),
+        "route_order": list(route_ids),
         "per_route_counts": expected_per_route_rows,
         "route_registry_sha256": registry.sha256,
         "agent_name": "amg_task_neutral_async",
@@ -803,7 +818,7 @@ def _load_multitask_identity(
     provenance = schedule_report.get("per_route_provenance")
     if not isinstance(sources, Mapping) or not isinstance(provenance, Mapping):
         raise ValueError("multitask schedule omitted per-route provenance")
-    if set(sources) != set(_MULTITASK_ROUTE_IDS):
+    if set(sources) != set(route_ids):
         raise ValueError("multitask certificate source routes drifted")
     for route in registry.routes:
         source = sources.get(route.route_id)
@@ -871,7 +886,7 @@ def _load_multitask_identity(
         "max_actor_ckpt_to_keep": tuning["max_actor_ckpt_to_keep"],
         "max_critic_ckpt_to_keep": tuning["max_critic_ckpt_to_keep"],
         "model_path": training_runtime["base_model"],
-        "route_ids": list(_MULTITASK_ROUTE_IDS),
+        "route_ids": list(route_ids),
         "route_registry_sha256": registry.sha256,
         "schedule_sha256": certificate_schedule_sha256,
         "manifest_sha256": expected_report["manifest_digest"],
@@ -1359,10 +1374,11 @@ def _load_multitask_orchestrator_preflight(
     assert inputs.route_registry is not None
     assert inputs.multitask_source_lock is not None
     assert inputs.multitask_schedule_certificate is not None
+    route_ids = _route_set_ids(launch_identity.get("route_ids"))
     expected_values = {
         "route_registry_path": str(inputs.route_registry.resolve()),
         "route_registry_sha256": inputs.route_registry_sha256,
-        "route_order": list(_MULTITASK_ROUTE_IDS),
+        "route_order": list(route_ids),
         "schedule_path": str(inputs.schedule.resolve()),
         "schedule_sha256": schedule_report.get("sha256"),
         "schedule_count": schedule_report.get("count"),
@@ -1461,16 +1477,16 @@ def _load_multitask_orchestrator_preflight(
     registry = load_route_registry(
         inputs.route_registry,
         expected_sha256=str(inputs.route_registry_sha256),
-        expected_route_ids=_MULTITASK_ROUTE_IDS,
+        expected_route_ids=route_ids,
     )
     endpoint_receipts = receipt.get("endpoints")
     if (
         isinstance(endpoint_receipts, (str, bytes))
         or not isinstance(endpoint_receipts, Sequence)
-        or len(endpoint_receipts) != len(_MULTITASK_ROUTE_IDS)
+        or len(endpoint_receipts) != len(route_ids)
     ):
         raise RuntimeError(
-            "multitask orchestrator preflight must contain exactly four endpoints"
+            "route-set orchestrator preflight endpoint count does not match registry"
         )
     normalized_endpoints: list[dict[str, Any]] = []
     for index, (route, endpoint_receipt) in enumerate(
@@ -2122,8 +2138,8 @@ def prepare_launch(
         registry = load_route_registry(
             inputs.route_registry,
             expected_sha256=inputs.route_registry_sha256,
-            expected_route_ids=_MULTITASK_ROUTE_IDS,
         )
+        _route_set_ids(registry.route_ids)
         schedule_report = inspect_schedule(
             inputs.schedule,
             expected_route_ids=registry.route_ids,

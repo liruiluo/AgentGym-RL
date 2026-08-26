@@ -47,6 +47,7 @@ from agentmemorygym_verl.routes import (
 
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "async_plugins/config/amg_multitask400.yaml"
+LR100_CONFIG = ROOT / "async_plugins/config/amg_literesearcher100.yaml"
 
 
 def _sha256(path: Path) -> str:
@@ -688,6 +689,16 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
         self.assertFalse(config.critic_use_fused_kernels)
         self.assertFalse(config.require_exact_per_update_route_split)
         self.assertEqual(config.sampling_order, "round_robin")
+
+    def test_reviewed_route_set_config_supports_literesearcher_formal100(self) -> None:
+        config = load_orchestrator_config(LR100_CONFIG)
+
+        self.assertEqual(config.route_order, ("literesearcher",))
+        self.assertEqual(config.optimizer_updates, 100)
+        self.assertEqual(config.samples_per_update, 64)
+        self.assertEqual(config.total_episodes, 6_400)
+        self.assertEqual((config.trainer_gpus, config.standalone_rollout_gpus), (6, 2))
+        self.assertEqual(config.trigger_parameter_sync_step, 1)
 
     def test_holder_acquisition_builds_complete_lifecycle_marker_records(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

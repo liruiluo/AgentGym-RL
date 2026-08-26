@@ -83,6 +83,41 @@ def _write_spec(
 
 
 class TestMultitaskManifest(unittest.TestCase):
+    def test_single_route_formal100_preserves_all_source_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec, _ = _write_spec(
+                root,
+                source_count=6_400,
+                optimizer_updates=100,
+                samples_per_update=64,
+                allow_repetition=False,
+            )
+            payload = json.loads(spec.read_text(encoding="utf-8"))
+            payload["panel_id"] = "amg-lr-formal100"
+            payload["routes"] = [payload["routes"][2]]
+            spec.write_text(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            digest = hashlib.sha256(spec.read_bytes()).hexdigest()
+            output = root / "literesearcher100.jsonl"
+
+            report = compose_multitask_manifest(
+                spec, expected_spec_sha256=digest, output_path=output
+            )
+
+            self.assertEqual(report["row_count"], 6_400)
+            self.assertEqual(report["route_order"], ["literesearcher"])
+            self.assertEqual(report["per_route_rows"], {"literesearcher": 6_400})
+            inspected = inspect_schedule(
+                output,
+                expected_count=6_400,
+                expected_role="train_pool",
+                expected_route_ids=("literesearcher",),
+            )
+            self.assertEqual(inspected["per_route_counts"], {"literesearcher": 6_400})
+
     def test_formal400_is_balanced_unique_and_byte_deterministic(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

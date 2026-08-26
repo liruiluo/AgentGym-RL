@@ -116,12 +116,24 @@ class RouteRegistryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "route attestation drift"):
                 load_route_registry(path, expected_sha256=digest)
 
-    def test_file_registry_requires_canonical_four_route_order(self) -> None:
+    def test_file_registry_accepts_canonical_single_route_subset(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             payload = _registry_payload()
-            payload["routes"] = payload["routes"][:-1]
+            payload["routes"] = [payload["routes"][2]]
             path, digest = self._write(directory, payload)
-            with self.assertRaisesRegex(ValueError, "canonical route order"):
+            registry = load_route_registry(
+                path,
+                expected_sha256=digest,
+                expected_route_ids=("literesearcher",),
+            )
+            self.assertEqual(registry.route_ids, ("literesearcher",))
+
+    def test_file_registry_rejects_noncanonical_subset_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            payload = _registry_payload()
+            payload["routes"] = [payload["routes"][2], payload["routes"][0]]
+            path, digest = self._write(directory, payload)
+            with self.assertRaisesRegex(ValueError, "canonical ordered subset"):
                 load_route_registry(path, expected_sha256=digest)
 
     def test_rejects_symlink_and_missing_required_fields(self) -> None:
