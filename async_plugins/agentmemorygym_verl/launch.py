@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
@@ -90,6 +91,7 @@ class LaunchInputs:
     multitask_source_lock: Path | None = None
     multitask_schedule_certificate: Path | None = None
     multitask_orchestrator_preflight: Path | None = None
+    resume_from_path: Path | None = None
 
 
 def _string(value: str | Path) -> str:
@@ -97,6 +99,108 @@ def _string(value: str | Path) -> str:
     if not rendered or any(character in rendered for character in ("\n", "\r", "\0")):
         raise ValueError(f"unsafe empty or multiline Hydra value: {rendered!r}")
     return rendered
+
+
+def _validate_resume_checkpoint(
+    path: Path | None,
+    *,
+    optimizer_updates: int,
+    samples_per_update: int,
+    trainer_gpus: int,
+) -> dict[str, Any]:
+    """Validate an explicit fully-async continuation checkpoint.
+
+    The caller must create a fresh output run directory.  This function only
+    authenticates the immutable source checkpoint used to restore actor, critic,
+    optimizer, and dataloader state.
+    """
+
+    if path is None:
+        return {"mode": "disable", "path": None, "source_step": None}
+    raw = Path(path)
+    if not raw.is_absolute():
+        raise ValueError(f"resume checkpoint must be absolute: {raw}")
+    if raw.is_symlink() or not raw.is_dir():
+        raise FileNotFoundError(f"resume checkpoint is missing or symlinked: {raw}")
+    resolved = raw.resolve(strict=True)
+    if resolved != raw:
+        raise ValueError(f"resume checkpoint must not traverse symlinks or '..': {raw}")
+    match = re.fullmatch(r"global_step_([1-9][0-9]*)", raw.name)
+    if match is None:
+        raise ValueError(
+            "resume checkpoint basename must be global_step_<positive integer>: "
+            f"{raw.name!r}"
+        )
+    source_step = int(match.group(1))
+    if source_step >= optimizer_updates:
+        raise ValueError(
+            f"resume checkpoint step {source_step} must be below target "
+            f"{optimizer_updates}"
+        )
+    for role in ("actor", "critic"):
+        role_dir = raw / role
+        if role_dir.is_symlink() or not role_dir.is_dir():
+            raise FileNotFoundError(
+                f"resume checkpoint {role} directory is missing or symlinked: "
+                f"{role_dir}"
+            )
+        for prefix in ("model", "optim", "extra_state"):
+            shards = sorted(role_dir.glob(f"{prefix}_world_size_{trainer_gpus}_rank_*.pt"))
+            expected_names = {
+                f"{prefix}_world_size_{trainer_gpus}_rank_{rank}.pt"
+                for rank in range(trainer_gpus)
+            }
+            if {shard.name for shard in shards} != expected_names or any(
+                shard.is_symlink() or not shard.is_file() or shard.stat().st_size <= 0
+                for shard in shards
+            ):
+                raise FileNotFoundError(
+                    f"resume checkpoint has incomplete {role} {prefix} shards "
+                    f"for world size {trainer_gpus}: {role_dir}"
+                )
+    data_path = raw / "data.pt"
+    if (
+        data_path.is_symlink()
+        or not data_path.is_file()
+        or data_path.stat().st_size <= 0
+    ):
+        raise FileNotFoundError(
+            f"resume checkpoint dataloader state is missing or invalid: {data_path}"
+        )
+    try:
+        import torch
+
+        dataloader_state = torch.load(data_path, map_location="cpu", weights_only=False)
+    except Exception as exc:
+        raise ValueError(
+            f"resume checkpoint dataloader state is unreadable: {data_path}"
+        ) from exc
+    expected_cursor = source_step * samples_per_update
+    cursor_values = {
+        "_num_yielded": dataloader_state.get("_num_yielded"),
+        "_sampler_iter_yielded": dataloader_state.get("_sampler_iter_yielded"),
+        "_sampler_iter_state.samples_yielded": (
+            dataloader_state.get("_sampler_iter_state", {}).get("samples_yielded")
+            if isinstance(dataloader_state.get("_sampler_iter_state"), Mapping)
+            else None
+        ),
+    }
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value != expected_cursor
+        for value in cursor_values.values()
+    ):
+        raise ValueError(
+            "resume checkpoint dataloader cursor must equal the learner-consumed "
+            f"boundary {expected_cursor}, got {cursor_values}; pending async samples "
+            "must be replayed from a separate normalized checkpoint artifact"
+        )
+    return {
+        "mode": "resume_path",
+        "path": str(raw),
+        "source_step": source_step,
+        "dataloader_cursor": expected_cursor,
+        "data_pt_sha256": _sha256(data_path),
+    }
 
 
 def build_overrides(
@@ -117,6 +221,18 @@ def build_overrides(
             f"{inputs.trainer_gpus}+{inputs.standalone_rollout_gpus}"
         )
     tuning = _ASYNC_TUNING[inputs.mode]
+    resume = _validate_resume_checkpoint(
+        inputs.resume_from_path,
+        optimizer_updates=_require_positive_int(
+            budget_contract.get("optimizer_updates"),
+            field="budget optimizer_updates",
+        ),
+        samples_per_update=_require_positive_int(
+            budget_contract.get("samples_per_update"),
+            field="budget samples_per_update",
+        ),
+        trainer_gpus=inputs.trainer_gpus,
+    )
     publication_cycles = _require_positive_int(
         budget_contract.get("publication_cycles"), field="budget publication_cycles"
     )
@@ -370,8 +486,12 @@ def build_overrides(
         f"trainer.total_training_steps={publication_cycles}",
         "trainer.val_before_train=False",
         "trainer.test_freq=-1",
-        "trainer.resume_mode=disable",
-        "trainer.resume_from_path=null",
+        f"trainer.resume_mode={resume['mode']}",
+        (
+            f"trainer.resume_from_path={_string(resume['path'])}"
+            if resume["path"] is not None
+            else "trainer.resume_from_path=null"
+        ),
         f"trainer.save_freq={save_freq}",
         f"trainer.max_actor_ckpt_to_keep={max_actor_ckpt_to_keep}",
         f"trainer.max_critic_ckpt_to_keep={max_critic_ckpt_to_keep}",
@@ -2192,10 +2312,24 @@ def prepare_launch(
             f"stderr saved to {resolved_stderr_path}:\n{stderr_tail}"
         )
     resolved_config = _load_yaml(resolved.stdout)
+    resume = _validate_resume_checkpoint(
+        inputs.resume_from_path,
+        optimizer_updates=_require_positive_int(
+            budget_contract.get("optimizer_updates"),
+            field="budget optimizer_updates",
+        ),
+        samples_per_update=_require_positive_int(
+            budget_contract.get("samples_per_update"),
+            field="budget samples_per_update",
+        ),
+        trainer_gpus=inputs.trainer_gpus,
+    )
     budget = verify_resolved_config(
         resolved_config,
         mode=inputs.mode,
         expected_budget=budget_contract,
+        expected_resume_mode=str(resume["mode"]),
+        expected_resume_from_path=resume["path"],
     )
 
     train_files = resolved_config["data"]["train_files"]
@@ -2245,6 +2379,9 @@ def prepare_launch(
             "standalone_rollout_gpus": inputs.standalone_rollout_gpus,
             "actor_use_fused_kernels": inputs.actor_use_fused_kernels,
             "critic_use_fused_kernels": inputs.critic_use_fused_kernels,
+            "resume_mode": resume["mode"],
+            "resume_from_path": resume["path"],
+            "resume_source_step": resume["source_step"],
         },
         "source": source_report_runtime,
         "plugin_manifest": _production_manifest(inputs.outer_root),
@@ -2257,6 +2394,7 @@ def prepare_launch(
         ),
         "budget_contract": dict(budget_contract),
         "budget": budget,
+        "continuation": resume,
         "resolved_config": {
             "path": str(resolved_path),
             "sha256": _sha256(resolved_path),
@@ -2307,6 +2445,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--standalone-rollout-gpus", type=int, default=2)
     parser.add_argument("--actor-use-fused-kernels", action="store_true")
     parser.add_argument("--critic-use-fused-kernels", action="store_true")
+    parser.add_argument("--resume-from-path", type=Path)
     parser.add_argument("--resolve-only", action="store_true")
     parser.add_argument(
         "--skip-runtime-preflight",
@@ -2377,6 +2516,7 @@ def main(argv: list[str] | None = None) -> int:
             args.multitask_orchestrator_preflight,
             label="multitask orchestrator preflight",
         ),
+        resume_from_path=args.resume_from_path,
     )
     command, env, receipt = prepare_launch(
         inputs,

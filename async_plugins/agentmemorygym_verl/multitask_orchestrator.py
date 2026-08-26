@@ -28,7 +28,11 @@ from urllib.parse import urlparse
 
 from .config_contract import inspect_schedule
 from .identity import EXPECTED_VERL_COMMIT
-from .launch import LaunchInputs, _load_multitask_identity
+from .launch import (
+    LaunchInputs,
+    _load_multitask_identity,
+    _validate_resume_checkpoint,
+)
 from .orchestrator_lifecycle import (
     _marker_record,
     _signal_process_identity,
@@ -145,6 +149,7 @@ class OrchestratorConfig:
     require_exact_per_update_route_split: bool
     sampling_order: str
     holder_lock_path: Path
+    resume_mode: str = "disable"
 
 
 @dataclass(frozen=True)
@@ -239,6 +244,8 @@ class LaunchPlan:
     generic_launcher: Path
     resolve_only: bool
     holder_lease: HolderLease | None = None
+    resume_from_path: Path | None = None
+    resume_source_step: int | None = None
 
     @classmethod
     def for_test(
@@ -404,6 +411,17 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
     profile_optimizer_updates = int(profile["optimizer_updates"])
     profile_samples_per_update = int(profile["samples_per_update"])
     profile_total_episodes = int(profile["total_episodes"])
+    fresh_model = experiment.get("fresh_model")
+    resume_mode = experiment.get("resume_mode")
+    if (fresh_model, resume_mode) not in {
+        (True, "disable"),
+        (False, "resume_path"),
+    }:
+        raise OrchestratorError(
+            "reviewed continuation contract requires either "
+            "fresh_model=true/resume_mode=disable or "
+            "fresh_model=false/resume_mode=resume_path"
+        )
     required_runtime_inputs = {
         "route_registry": "cli:--route-registry",
         "route_registry_sha256": "cli:--route-registry-sha256",
@@ -416,6 +434,8 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
         "holder_lease": "cli:--holder-lease",
         "holder_lease_sha256": "cli:--holder-lease-sha256",
     }
+    if resume_mode == "resume_path":
+        required_runtime_inputs["resume_from_path"] = "cli:--resume-from-path"
     exact = {
         "schema": (payload.get("schema"), schema),
         "implementation base commit": (
@@ -425,8 +445,6 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
         "veRL commit": (source.get("verl_commit"), EXPECTED_VERL_COMMIT),
         "mode": (experiment.get("mode"), "formal"),
         "model family": (experiment.get("model_family"), "Qwen3.5-4B"),
-        "fresh model": (experiment.get("fresh_model"), True),
-        "resume mode": (experiment.get("resume_mode"), "disable"),
         "agent name": (experiment.get("agent_name"), "amg_task_neutral_async"),
         "shared actor count": (experiment.get("shared_actor_count"), 1),
         "shared critic count": (experiment.get("shared_critic_count"), 1),
@@ -514,6 +532,7 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
         holder_lock_path=_absolute_path(
             holders.get("lock_path"), field="config holder lock_path"
         ),
+        resume_mode=str(resume_mode),
     )
 
 
@@ -1781,6 +1800,8 @@ def build_generic_launch_command(
         command.append("--actor-use-fused-kernels")
     if plan.config.critic_use_fused_kernels:
         command.append("--critic-use-fused-kernels")
+    if plan.resume_from_path is not None:
+        command.extend(("--resume-from-path", str(plan.resume_from_path)))
     if resolve_only:
         command.extend(("--resolve-only", "--skip-runtime-preflight"))
     else:
@@ -1925,6 +1946,11 @@ def build_launch_plan(args: argparse.Namespace) -> LaunchPlan:
         route_registry_sha256=route_registry.sha256,
         multitask_source_lock=source_lock,
         multitask_schedule_certificate=certificate,
+        resume_from_path=(
+            Path(args.resume_from_path)
+            if getattr(args, "resume_from_path", None) is not None
+            else None
+        ),
     )
     launch_identity = _load_multitask_identity(
         identity_inputs, schedule_report=schedule_report
@@ -1944,6 +1970,24 @@ def build_launch_plan(args: argparse.Namespace) -> LaunchPlan:
                 f"multitask launch budget {field} mismatch: "
                 f"{budget.get(field)!r} != {expected!r}"
             )
+    requested_resume_path = getattr(args, "resume_from_path", None)
+    if config.resume_mode == "disable" and requested_resume_path is not None:
+        raise OrchestratorError(
+            "fresh config forbids --resume-from-path; use a reviewed resume config"
+        )
+    if config.resume_mode == "resume_path" and requested_resume_path is None:
+        raise OrchestratorError(
+            "resume config requires --resume-from-path"
+        )
+    try:
+        resume = _validate_resume_checkpoint(
+            Path(requested_resume_path) if requested_resume_path is not None else None,
+            optimizer_updates=config.optimizer_updates,
+            samples_per_update=config.samples_per_update,
+            trainer_gpus=config.trainer_gpus,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise OrchestratorError(str(exc)) from exc
     endpoint_registry_path = _regular_file(
         args.endpoint_registry, field="endpoint registry"
     )
@@ -1996,6 +2040,14 @@ def build_launch_plan(args: argparse.Namespace) -> LaunchPlan:
         generic_launcher=generic_launcher,
         resolve_only=args.resolve_only,
         holder_lease=holder_lease,
+        resume_from_path=(
+            Path(str(resume["path"])) if resume["path"] is not None else None
+        ),
+        resume_source_step=(
+            int(resume["source_step"])
+            if resume["source_step"] is not None
+            else None
+        ),
     )
 
 
@@ -2047,6 +2099,13 @@ class LocalBackend:
                 "endpoint_registry_sha256": plan.endpoint_registry_sha256,
                 "route_registry_sha256": plan.route_registry_sha256,
                 "schedule_sha256": plan.schedule_report["sha256"],
+                "resume_mode": plan.config.resume_mode,
+                "resume_from_path": (
+                    str(plan.resume_from_path)
+                    if plan.resume_from_path is not None
+                    else None
+                ),
+                "resume_source_step": plan.resume_source_step,
             },
         )
 
@@ -2461,6 +2520,13 @@ def _execute_local(plan: LaunchPlan) -> int:
                 "endpoint_registry_sha256": plan.endpoint_registry_sha256,
                 "route_registry_sha256": plan.route_registry_sha256,
                 "schedule_sha256": plan.schedule_report["sha256"],
+                "resume_mode": plan.config.resume_mode,
+                "resume_from_path": (
+                    str(plan.resume_from_path)
+                    if plan.resume_from_path is not None
+                    else None
+                ),
+                "resume_source_step": plan.resume_source_step,
                 "generic_launch_receipt": (
                     {
                         "path": str(generic_receipt),
@@ -2497,6 +2563,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--holder-lease-sha256")
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--experiment-name", required=True)
+    parser.add_argument("--resume-from-path", type=Path)
     parser.add_argument("--resolve-only", action="store_true")
     return parser.parse_args(argv)
 

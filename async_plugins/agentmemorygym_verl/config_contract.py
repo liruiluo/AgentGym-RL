@@ -95,6 +95,8 @@ def verify_resolved_config(
     *,
     mode: str,
     expected_budget: Mapping[str, Any],
+    expected_resume_mode: str = "disable",
+    expected_resume_from_path: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
     """Validate the resolved Hydra config against a publication-derived budget."""
 
@@ -128,6 +130,18 @@ def verify_resolved_config(
             "expected_budget is missing: " + ", ".join(missing_budget_fields)
         )
     expected = dict(expected_budget)
+    if expected_resume_mode not in {"disable", "resume_path"}:
+        raise ValueError(f"unsupported expected resume mode {expected_resume_mode!r}")
+    if expected_resume_mode == "disable":
+        if expected_resume_from_path is not None:
+            raise ValueError("disabled resume mode cannot carry a resume path")
+        expected_resume_path: str | None = None
+    else:
+        if expected_resume_from_path is None:
+            raise ValueError("resume_path mode requires an explicit checkpoint path")
+        expected_resume_path = str(expected_resume_from_path)
+        if not os.path.isabs(expected_resume_path):
+            raise ValueError("expected resume checkpoint path must be absolute")
 
     if (
         _at(config, "algorithm.adv_estimator") != "amg_action_axis_gae"
@@ -424,8 +438,8 @@ def verify_resolved_config(
         "trainer.total_epochs": 1,
         "trainer.val_before_train": False,
         "trainer.test_freq": -1,
-        "trainer.resume_mode": "disable",
-        "trainer.resume_from_path": None,
+        "trainer.resume_mode": expected_resume_mode,
+        "trainer.resume_from_path": expected_resume_path,
         "async_training.use_trainer_do_validate": False,
         "async_training.partial_rollout": True,
     }.items():
@@ -607,6 +621,8 @@ def verify_resolved_config(
         "schedule_sha256": expected.get("schedule_sha256"),
         "manifest_sha256": expected.get("manifest_sha256"),
         "routing_sha256": expected.get("routing_sha256"),
+        "resume_mode": expected_resume_mode,
+        "resume_from_path": expected_resume_path,
     }
 
 

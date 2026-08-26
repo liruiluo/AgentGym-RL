@@ -26,6 +26,7 @@ from agentmemorygym_verl.launch import (
     _preserve_legacy_runtime_preflight_fields,
     _require_exact_multitask_outer_commit,
     _validate_accelerator_runtime,
+    _validate_resume_checkpoint,
     build_overrides,
     build_runtime_env,
     main as launch_main,
@@ -570,6 +571,95 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
 
 class TestAMGMultitaskLauncherContract(unittest.TestCase):
     ROUTES = ("webshop", "swesmith", "literesearcher", "openmle_fast")
+
+
+    def test_resume_checkpoint_overrides_and_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "global_step_70"
+            for role in ("actor", "critic"):
+                role_dir = checkpoint / role
+                role_dir.mkdir(parents=True)
+                for prefix in ("model", "optim", "extra_state"):
+                    for rank in range(6):
+                        (role_dir / f"{prefix}_world_size_6_rank_{rank}.pt").write_bytes(b"x")
+            import torch
+
+            torch.save(
+                {
+                    "_num_yielded": 4480,
+                    "_sampler_iter_yielded": 4480,
+                    "_sampler_iter_state": {"samples_yielded": 4480},
+                },
+                checkpoint / "data.pt",
+            )
+            report = _validate_resume_checkpoint(
+                checkpoint,
+                optimizer_updates=100,
+                samples_per_update=64,
+                trainer_gpus=6,
+            )
+            self.assertEqual(report["mode"], "resume_path")
+            self.assertEqual(report["source_step"], 70)
+            inputs = LaunchInputs(
+                mode="formal",
+                verl_root=root / "verl",
+                outer_root=root / "outer",
+                schedule=root / "schedule.jsonl",
+                env_addr="http://127.0.0.1:65525",
+                run_dir=root / "run",
+                experiment_name="resume-test",
+                endpoint_source_lock=None,
+                endpoint_contract_tool=None,
+                publication_receipt=None,
+                formal_schedule_certificate=None,
+                resume_from_path=checkpoint,
+            )
+            budget = {
+                "publication_cycles": 100,
+                "trigger_parameter_sync_step": 1,
+                "optimizer_updates": 100,
+                "samples_per_update": 64,
+                "episodes": 6400,
+                "save_freq": 10,
+                "max_actor_ckpt_to_keep": 1,
+                "max_critic_ckpt_to_keep": 1,
+            }
+            values = self._values(
+                build_overrides(
+                    inputs,
+                    effective_schedule=inputs.schedule,
+                    endpoint_client_config={},
+                    budget_contract=budget,
+                    training_runtime={"base_model": "/models/Qwen3.5-4B"},
+                )
+            )
+            self.assertEqual(values["trainer.resume_mode"], "resume_path")
+            self.assertEqual(values["trainer.resume_from_path"], str(checkpoint))
+            self.assertEqual(values["trainer.total_training_steps"], "100")
+
+    def test_resume_checkpoint_rejects_incomplete_or_terminal_step(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            incomplete = root / "global_step_70"
+            incomplete.mkdir()
+            with self.assertRaisesRegex(FileNotFoundError, "actor"):
+                _validate_resume_checkpoint(
+                    incomplete,
+                    optimizer_updates=100,
+                    samples_per_update=64,
+                    trainer_gpus=6,
+                )
+            terminal = root / "global_step_100"
+            terminal.mkdir()
+            with self.assertRaisesRegex(ValueError, "below target 100"):
+                _validate_resume_checkpoint(
+                    terminal,
+                    optimizer_updates=100,
+                    samples_per_update=64,
+                    trainer_gpus=6,
+                )
+
 
     @staticmethod
     def _values(overrides: list[str]) -> dict[str, str]:

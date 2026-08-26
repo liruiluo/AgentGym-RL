@@ -247,6 +247,32 @@ def _write_schedule(
 
 
 class TestAMGFullyAsyncConfigContract(unittest.TestCase):
+    def test_resume_path_contract_is_explicit(self):
+        config = _config(mode="formal")
+        resume_path = "/checkpoints/run/global_step_70"
+        config["trainer"]["resume_mode"] = "resume_path"
+        config["trainer"]["resume_from_path"] = resume_path
+        report = verify_resolved_config(
+            config,
+            mode="formal",
+            expected_budget=_budget("formal"),
+            expected_resume_mode="resume_path",
+            expected_resume_from_path=resume_path,
+        )
+        self.assertEqual(report["resume_mode"], "resume_path")
+        self.assertEqual(report["resume_from_path"], resume_path)
+
+    def test_resume_path_contract_rejects_mismatch(self):
+        config = _config(mode="formal")
+        config["trainer"]["resume_mode"] = "resume_path"
+        config["trainer"]["resume_from_path"] = "/checkpoints/global_step_70"
+        with self.assertRaisesRegex(ValueError, "trainer.resume_mode"):
+            verify_resolved_config(
+                config,
+                mode="formal",
+                expected_budget=_budget("formal"),
+            )
+
     def test_formal100_budget_and_topology(self):
         report = _verify(_config(mode="formal"), mode="formal")
         self.assertEqual(report["optimizer_updates"], 100)

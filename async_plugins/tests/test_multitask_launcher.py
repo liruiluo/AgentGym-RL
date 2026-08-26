@@ -47,6 +47,7 @@ from agentmemorygym_verl.routes import (
 
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "async_plugins/config/amg_multitask400.yaml"
+SWE_RESUME_CONFIG = ROOT / "async_plugins/config/amg_swesmith100_resume.yaml"
 
 
 def _sha256(path: Path) -> str:
@@ -665,6 +666,13 @@ class ProductionResolveFixture:
 
 
 class TestMultitaskOrchestratorContract(unittest.TestCase):
+    def test_reviewed_swe_resume_config_only_changes_lineage_mode(self) -> None:
+        config = load_orchestrator_config(SWE_RESUME_CONFIG)
+        self.assertEqual(config.route_order, ("swesmith",))
+        self.assertEqual(config.optimizer_updates, 100)
+        self.assertEqual(config.total_episodes, 6400)
+        self.assertEqual(config.resume_mode, "resume_path")
+
     def test_reviewed_config_freezes_formal400_r38(self) -> None:
         config = load_orchestrator_config(CONFIG)
 
@@ -1895,6 +1903,22 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
         self.assertNotIn("--actor-use-fused-kernels", command)
         self.assertNotIn("--critic-use-fused-kernels", command)
         self.assertNotIn("--env-addr", command)
+
+    def test_generic_command_carries_reviewed_resume_checkpoint(self) -> None:
+        config = load_orchestrator_config(SWE_RESUME_CONFIG)
+        plan = replace(
+            LaunchPlan.for_test(resolve_only=False, config=config),
+            resume_from_path=Path("/checkpoints/run/global_step_70"),
+            resume_source_step=70,
+        )
+        command = build_generic_launch_command(
+            plan,
+            resolve_only=False,
+            orchestrator_preflight=Path("/run/orchestrator-preflight.json"),
+        )
+        self.assertIn("--resume-from-path", command)
+        index = command.index("--resume-from-path")
+        self.assertEqual(command[index + 1], "/checkpoints/run/global_step_70")
 
     def test_one_click_shell_uses_locked_runtime_and_thin_orchestrator(self) -> None:
         script = ROOT / "async_plugins/scripts/launch_amg_multitask_fully_async.sh"
