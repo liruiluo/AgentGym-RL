@@ -16,6 +16,7 @@ from finalizer_fixture import (
     build_valid_run,
     mutate_final_statistics,
     mutate_json,
+    messages_sha256,
     sha256,
 )
 
@@ -755,9 +756,15 @@ class TestFinalizerRollouts(FinalizerTestCase):
                 info = record["env_info_after"]
                 info["action_kind"] = "apply_patch"
                 record["wrapper_evidence"]["native_action_kind"] = "apply_patch"
+                record["wrapper_evidence"]["checkpoint_receipt"][
+                    "action_kind"
+                ] = "apply_patch"
                 execution = info["execution"]
                 execution["action_kind"] = "apply_patch"
                 execution["exit_code"] = None
+                execution["filesystem_checkpoint"][
+                    "action_kind"
+                ] = "apply_patch"
 
             rewrite_chain_record(fixture, 0, mutate)
 
@@ -807,6 +814,9 @@ class TestFinalizerRollouts(FinalizerTestCase):
                         record["env_info_after"]["execution"]["changed_paths"] = [
                             "nested/train.py"
                         ]
+                        record["wrapper_evidence"]["workspace_changed_paths"] = [
+                            "nested/train.py"
+                        ]
                     else:
                         action = (
                             'shell_command {"command":"python nested/train.py",'
@@ -838,9 +848,255 @@ class TestFinalizerRollouts(FinalizerTestCase):
                         path.replace("train.py", "dummy.py")
                         for path in execution["changed_paths"]
                     ]
+                evidence = record.get("wrapper_evidence", {})
+                if isinstance(evidence.get("workspace_changed_paths"), list):
+                    evidence["workspace_changed_paths"] = [
+                        path.replace("train.py", "dummy.py")
+                        for path in evidence["workspace_changed_paths"]
+                    ]
 
             for order in range(4):
                 rewrite_chain_record(fixture, order, rewrite_path)
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+            self.assertEqual(verdict["status"], "pass", verdict)
+
+    def test_trusted_assistant_framing_is_accepted_without_substring_heuristics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+
+            def mutate(record: dict) -> None:
+                successor = record["context_transition"]["messages"]
+                marker = successor[-1]["content"].split(
+                    "\n\nEarlier conversation was removed", 1
+                )[1]
+                framing = [
+                    {"role": "system", "content": "task framing"},
+                    {
+                        "role": "assistant",
+                        "content": record["control_request"],
+                    },
+                    {"role": "user", "content": "task observation"},
+                ]
+                record["wrapper_evidence"][
+                    "checkpoint_framing_sha256"
+                ] = messages_sha256(framing)
+                record["context_transition"]["messages"] = [
+                    framing[0],
+                    framing[1],
+                    {
+                        "role": "user",
+                        "content": (
+                            framing[2]["content"]
+                            + "\n\nEarlier conversation was removed"
+                            + marker
+                        ),
+                    },
+                ]
+
+            rewrite_chain_record(fixture, 0, mutate)
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+            self.assertEqual(verdict["status"], "pass", verdict)
+
+    def test_malformed_checkpoint_receipt_or_counter_drift_breaks_chain(self):
+        cases = (
+            "legacy_path",
+            "missing_receipt_key",
+            "unchanged_receipt",
+            "boolean_size",
+            "native_call_counter",
+            "context_epoch_counter",
+            "missing_successor_digest",
+            "missing_preservation_field",
+            "missing_read_requirement",
+            "missing_endpoint_receipt",
+            "endpoint_boolean_action_completed",
+            "endpoint_float_size",
+            "endpoint_null_copy",
+            "successor_action_leak",
+            "successor_marker_only_after_user",
+            "successor_partial_checkpoint_leak",
+            "missing_framing_digest",
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                fixture = self.build(Path(directory))
+
+                def mutate(record: dict) -> None:
+                    receipt = record["wrapper_evidence"]["checkpoint_receipt"]
+                    if case == "legacy_path":
+                        receipt["path"] = ".agent_memory/OPENMLE_CONTINUATION.md"
+                    elif case == "missing_receipt_key":
+                        receipt.pop("regular_file")
+                    elif case == "unchanged_receipt":
+                        receipt["changed"] = False
+                    elif case == "boolean_size":
+                        receipt["size_bytes"] = True
+                    elif case == "native_call_counter":
+                        record["native_call_count_after"] = record[
+                            "native_call_count_before"
+                        ]
+                    elif case == "context_epoch_counter":
+                        record["context_epoch_after"] = record[
+                            "context_epoch_before"
+                        ]
+                    elif case == "missing_preservation_field":
+                        record["wrapper_evidence"].pop("preserved_policy_output")
+                    elif case == "missing_read_requirement":
+                        record["wrapper_evidence"].pop(
+                            "checkpoint_read_required_after"
+                        )
+                    elif case == "missing_endpoint_receipt":
+                        record["env_info_after"]["execution"].pop(
+                            "filesystem_checkpoint"
+                        )
+                    elif case == "endpoint_boolean_action_completed":
+                        record["env_info_after"]["execution"][
+                            "filesystem_checkpoint"
+                        ]["action_completed"] = 1
+                    elif case == "endpoint_float_size":
+                        record["env_info_after"]["execution"][
+                            "filesystem_checkpoint"
+                        ]["size_bytes"] = float(receipt["size_bytes"])
+                    elif case == "endpoint_null_copy":
+                        record["env_info_after"][
+                            "filesystem_checkpoint"
+                        ] = dict(receipt)
+                        record["env_info_after"]["execution"][
+                            "filesystem_checkpoint"
+                        ] = None
+                    elif case == "successor_action_leak":
+                        record["context_transition"]["messages"][-1]["content"] += (
+                            "\n" + record["action"]
+                        )
+                    elif case == "successor_marker_only_after_user":
+                        messages = record["context_transition"]["messages"]
+                        content = messages[-1]["content"]
+                        marker = content.split(
+                            "\n\nEarlier conversation was removed", 1
+                        )[1]
+                        messages[-1]["content"] = content.split(
+                            "\n\nEarlier conversation was removed", 1
+                        )[0]
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": "Earlier conversation was removed" + marker,
+                            }
+                        )
+                    elif case == "successor_partial_checkpoint_leak":
+                        marker = "Earlier conversation was removed"
+                        content = record["context_transition"]["messages"][-1][
+                            "content"
+                        ]
+                        record["context_transition"]["messages"][-1]["content"] = (
+                            content.replace(
+                                marker,
+                                "objective: improve validation\n" + marker,
+                                1,
+                            )
+                        )
+                    elif case == "missing_framing_digest":
+                        record["wrapper_evidence"].pop(
+                            "checkpoint_framing_sha256"
+                        )
+                    else:
+                        for message in record["context_transition"]["messages"]:
+                            message["content"] = message["content"].replace(
+                                receipt["sha256"], "digest-omitted"
+                            )
+
+                rewrite_chain_record(fixture, 0, mutate)
+                self.assert_failed(
+                    fixture["run_dir"],
+                    contains="policy-authored external-document chain",
+                )
+
+    def test_malformed_read_receipt_or_counter_drift_breaks_chain(self):
+        cases = (
+            "legacy_path",
+            "not_observed",
+            "missing_key",
+            "policy_counter",
+            "epoch",
+            "missing_endpoint_receipt",
+            "endpoint_boolean_observed",
+            "endpoint_float_size",
+            "endpoint_null_copy",
+            "different_checkpoint_digest",
+            "missing_read_requirement",
+            "wrong_expected_digest",
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                fixture = self.build(Path(directory))
+
+                def mutate(record: dict) -> None:
+                    receipt = record["wrapper_evidence"][
+                        "filesystem_checkpoint_read"
+                    ]
+                    if case == "legacy_path":
+                        receipt["path"] = ".agent_memory/OPENMLE_CONTINUATION.md"
+                    elif case == "not_observed":
+                        receipt["observed"] = False
+                    elif case == "missing_key":
+                        receipt.pop("sha256")
+                    elif case == "policy_counter":
+                        record["policy_step_after"] = record["policy_step_before"]
+                    elif case == "missing_endpoint_receipt":
+                        record["env_info_after"]["execution"].pop(
+                            "filesystem_checkpoint_read"
+                        )
+                    elif case == "endpoint_boolean_observed":
+                        record["env_info_after"]["execution"][
+                            "filesystem_checkpoint_read"
+                        ]["observed"] = 1
+                    elif case == "endpoint_float_size":
+                        record["env_info_after"]["execution"][
+                            "filesystem_checkpoint_read"
+                        ]["size_bytes"] = float(receipt["size_bytes"])
+                    elif case == "endpoint_null_copy":
+                        record["env_info_after"][
+                            "filesystem_checkpoint_read"
+                        ] = dict(receipt)
+                        record["env_info_after"]["execution"][
+                            "filesystem_checkpoint_read"
+                        ] = None
+                    elif case == "different_checkpoint_digest":
+                        receipt["sha256"] = "c" * 64
+                        record["env_info_after"]["execution"][
+                            "filesystem_checkpoint_read"
+                        ]["sha256"] = "c" * 64
+                    elif case == "missing_read_requirement":
+                        record["wrapper_evidence"].pop(
+                            "checkpoint_read_required"
+                        )
+                    elif case == "wrong_expected_digest":
+                        record["wrapper_evidence"][
+                            "checkpoint_read_expected_sha256"
+                        ] = "d" * 64
+                    else:
+                        record["context_epoch_after"] = (
+                            record["context_epoch_before"] + 1
+                        )
+
+                rewrite_chain_record(fixture, 1, mutate)
+                self.assert_failed(
+                    fixture["run_dir"],
+                    contains="policy-authored external-document chain",
+                )
+
+    def test_nested_workspace_execution_receipt_completes_chain(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+            rewrite_chain_record(
+                fixture,
+                3,
+                lambda record: record.update(
+                    env_info_after={
+                        "wrapper_evidence": {"workspace_action_completed": True}
+                    }
+                ),
+            )
             verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
             self.assertEqual(verdict["status"], "pass", verdict)
 
@@ -894,7 +1150,9 @@ class TestFinalizerRollouts(FinalizerTestCase):
             rewrite_chain_record(
                 fixture,
                 3,
-                lambda record: record.update(env_info_after={"resolved": True}),
+                lambda record: record.update(
+                    env_info_after={"shell_action_succeeded": True}
+                ),
             )
 
             verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)

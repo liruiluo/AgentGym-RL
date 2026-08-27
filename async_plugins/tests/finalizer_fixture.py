@@ -33,6 +33,16 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def messages_sha256(messages: list[dict[str, str]]) -> str:
+    canonical = json.dumps(
+        messages,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def _publication_fixture_identity() -> tuple[dict, dict, dict, dict[str, str]]:
     required = {
         "source_lock": RICH_V8_FIXTURES / "source-lock.json",
@@ -304,33 +314,31 @@ def _action_rows(
     *,
     horizon_rounds: int | None = None,
 ) -> list[dict]:
+    checkpoint_path = ".agent_memory/CONTINUATION.md"
+    checkpoint_body = (
+        "objective: improve validation\n"
+        "measured_validation_or_failure: validation_mae=1.0\n"
+        "conclusion: update the model\n"
+        "code_path: train.py\n"
+        "next_action: edit train.py before rerunning\n"
+    )
+    checkpoint_sha256 = hashlib.sha256(checkpoint_body.encode("utf-8")).hexdigest()
     if chain:
         actions = [
             (
                 'shell_command {"command":"mkdir -p .agent_memory && printf '
-                "'%s\\\\n' 'objective: improve validation' "
+                "'%s\\n' 'objective: improve validation' "
                 "'measured_validation_or_failure: validation_mae=1.0' "
                 "'conclusion: update the model' 'code_path: train.py' "
                 "'next_action: edit train.py before rerunning' > "
-                '.agent_memory/OPENMLE_CONTINUATION.md","workdir":".",'
+                f'{checkpoint_path}","workdir":".",'
                 '"timeout_ms":20000}',
-                _execution_info(
-                    changed_paths=(".agent_memory/OPENMLE_CONTINUATION.md",)
-                ),
+                _execution_info(changed_paths=(checkpoint_path,)),
             ),
             (
-                'shell_command {"command":"cat '
-                '.agent_memory/OPENMLE_CONTINUATION.md","workdir":".",'
+                f'shell_command {{"command":"cat {checkpoint_path}","workdir":".",'
                 '"timeout_ms":20000}',
-                _execution_info(
-                    stdout=(
-                        "objective: improve validation\n"
-                        "measured_validation_or_failure: validation_mae=1.0\n"
-                        "conclusion: update the model\n"
-                        "code_path: train.py\n"
-                        "next_action: edit train.py before rerunning\n"
-                    )
-                ),
+                _execution_info(stdout=checkpoint_body),
             ),
             (
                 "apply_patch\n*** Begin Patch\n*** Update File: train.py\n"
@@ -356,6 +364,7 @@ def _action_rows(
             for _ in range(horizon_rounds - len(actions))
         )
     rows = []
+    context_epoch = 0
     for order, (action, env_info) in enumerate(actions):
         terminal = order == len(actions) - 1
         horizon_terminal = terminal and horizon_rounds is not None
@@ -366,29 +375,105 @@ def _action_rows(
         else:
             outcome = "success"
         wrapper_evidence = {}
-        context_transition = {}
+        context_transition = {
+            "schema": "agentmemory_task_neutral_context_transition_v1",
+            "operation": "append_observation",
+            "messages": [],
+        }
         control_request = None
+        context_before = context_epoch
         if chain and order == 0:
+            checkpoint_framing = [
+                {"role": "system", "content": "task framing"},
+                {"role": "user", "content": "task observation"},
+            ]
+            checkpoint_receipt = {
+                "schema": "agentmemory_filesystem_checkpoint_receipt_v1",
+                "path": checkpoint_path,
+                "action_kind": env_info["action_kind"],
+                "action_completed": True,
+                "changed": True,
+                "exists": True,
+                "regular_file": True,
+                "size_bytes": len(checkpoint_body.encode("utf-8")),
+                "sha256": checkpoint_sha256,
+            }
+            env_info["execution"]["filesystem_checkpoint"] = checkpoint_receipt
             wrapper_evidence = {
                 "event": "context_compaction",
-                "continuation_path": ".agent_memory/OPENMLE_CONTINUATION.md",
+                "continuation_path": checkpoint_path,
                 "continuation_persisted": True,
+                "checkpoint_receipt": checkpoint_receipt,
+                "checkpoint_failure_reason": None,
+                "context_replaced": True,
+                "retry_pending": False,
                 "preserved_policy_output": True,
                 "preserved_native_observation": True,
+                "checkpoint_action_in_successor_context": False,
+                "checkpoint_observation_in_successor_context": False,
+                "checkpoint_content_in_successor_context": False,
+                "checkpoint_read_required_after": True,
+                "checkpoint_framing_sha256": messages_sha256(checkpoint_framing),
                 "native_action_kind": env_info["action_kind"],
                 "native_action_status": env_info["action_status"],
             }
-            context_transition = {"operation": "replace_messages", "messages": []}
+            context_epoch += 1
+            context_transition = {
+                "schema": "agentmemory_task_neutral_context_transition_v1",
+                "operation": "replace_messages",
+                "messages": [
+                    checkpoint_framing[0],
+                    {
+                        "role": "user",
+                        "content": (
+                            f"{checkpoint_framing[1]['content']}\n\n"
+                            "Earlier conversation was removed "
+                            "after the continuation snapshot write succeeded. The "
+                            "workspace persists, but "
+                            f"`{checkpoint_path}` was not copied into this prompt. "
+                            "Use the next normal action to read that file, then "
+                            "continue from its evidence and next action. Other "
+                            "workspace files remain available and may still be read "
+                            "or updated normally. Verified receipt: size_bytes="
+                            f"{len(checkpoint_body.encode('utf-8'))}, "
+                            f"sha256={checkpoint_sha256}."
+                        ),
+                    },
+                ],
+            }
             control_request = "Persist continuation state before compaction."
         elif chain and order == 1:
+            read_receipt = {
+                "schema": "agentmemory_filesystem_checkpoint_read_receipt_v1",
+                "path": checkpoint_path,
+                "observed": True,
+                "size_bytes": len(checkpoint_body.encode("utf-8")),
+                "sha256": checkpoint_sha256,
+            }
+            env_info["execution"]["filesystem_checkpoint_read"] = read_receipt
             wrapper_evidence = {
                 "memory_event": "read",
                 "document_read_observed": True,
+                "filesystem_checkpoint_read": read_receipt,
+                "checkpoint_read_required": True,
+                "checkpoint_read_satisfied": True,
+                "checkpoint_read_retry_pending": False,
+                "checkpoint_read_failure_reason": None,
+                "checkpoint_read_expected_size_bytes": read_receipt["size_bytes"],
+                "checkpoint_read_expected_sha256": read_receipt["sha256"],
             }
         elif chain and order == 2:
-            wrapper_evidence = {"memory_event": "modify"}
+            wrapper_evidence = {
+                "memory_event": "modify",
+                "workspace_change_observed": True,
+                "workspace_changed_paths": ["train.py"],
+            }
         elif chain and order == 3:
-            wrapper_evidence = {"memory_event": "execute", "outcome": "success"}
+            wrapper_evidence = {
+                "memory_event": "execute",
+                "outcome": "success",
+                "execution_completed_observed": True,
+            }
         rows.append(
             {
                 "schema": "amg_task_neutral_action_row_v1",
@@ -405,6 +490,14 @@ def _action_rows(
                 "action": action,
                 "action_submission": {"raw_policy_output": action},
                 "env_info_after": env_info,
+                "native_step_before": order,
+                "native_step_after": order + 1,
+                "native_call_count_before": order,
+                "native_call_count_after": order + 1,
+                "policy_step_before": order,
+                "policy_step_after": order + 1,
+                "context_epoch_before": context_before,
+                "context_epoch_after": context_epoch,
                 "context_transition": context_transition,
                 "wrapper_evidence": wrapper_evidence,
                 "control_request": control_request,

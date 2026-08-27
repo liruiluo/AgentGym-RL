@@ -30,7 +30,26 @@ DOCUMENT_SUFFIXES = frozenset({".md", ".txt", ".rst", ".log", ".yaml", ".yml", "
 CODE_SUFFIXES = frozenset({".py", ".ipynb", ".sh", ".r", ".jl"})
 IGNORED_DOCUMENTS = frozenset({"TASK.md"})
 SUBMISSION_PATH = "submission.csv"
-CONTINUATION_PATH = ".agent_memory/OPENMLE_CONTINUATION.md"
+CONTINUATION_PATH = ".agent_memory/CONTINUATION.md"
+LEGACY_CONTINUATION_PATHS = frozenset(
+    {".agent_memory/OPENMLE_CONTINUATION.md"}
+)
+KNOWN_CONTINUATION_PATHS = frozenset(
+    {CONTINUATION_PATH, *LEGACY_CONTINUATION_PATHS}
+)
+CHECKPOINT_RECEIPT_SCHEMA = "agentmemory_filesystem_checkpoint_receipt_v1"
+CHECKPOINT_READ_RECEIPT_SCHEMA = (
+    "agentmemory_filesystem_checkpoint_read_receipt_v1"
+)
+CHECKPOINT_MAX_BYTES = 8 * 1024
+CHECKPOINT_MARKER_PREFIX = (
+    "Earlier conversation was removed after the continuation snapshot write "
+    "succeeded. The workspace persists, but "
+    "`.agent_memory/CONTINUATION.md` was not copied into this prompt. Use the "
+    "next normal action to read that file, then continue from its evidence and "
+    "next action. Other workspace files remain available and may still be read "
+    "or updated normally."
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -78,7 +97,7 @@ def _document_paths(changed_paths: Iterable[Any]) -> tuple[str, ...]:
         if not isinstance(raw, str) or not raw or raw in IGNORED_DOCUMENTS:
             continue
         path = Path(raw)
-        if raw == CONTINUATION_PATH or path.suffix.lower() in DOCUMENT_SUFFIXES:
+        if raw in KNOWN_CONTINUATION_PATHS or path.suffix.lower() in DOCUMENT_SUFFIXES:
             paths.append(raw)
     return tuple(sorted(set(paths)))
 
@@ -187,11 +206,21 @@ def _normalize_row(step: int, row: Mapping[str, Any]) -> dict[str, Any] | None:
         "row_order": record.get("trajectory_row_order"),
         "item_id": record.get("item_id"),
         "action": action,
+        "action_submission": record.get("action_submission"),
         "terminal": bool(record.get("trajectory_terminal")),
         "trajectory_return": record.get("trajectory_return"),
         "immediate_reward": record.get("immediate_reward"),
         "wrapper_evidence": dict(_mapping(record.get("wrapper_evidence"))),
         "context_transition": record.get("context_transition"),
+        "control_request": record.get("control_request"),
+        "native_step_before": record.get("native_step_before"),
+        "native_step_after": record.get("native_step_after"),
+        "native_call_count_before": record.get("native_call_count_before"),
+        "native_call_count_after": record.get("native_call_count_after"),
+        "policy_step_before": record.get("policy_step_before"),
+        "policy_step_after": record.get("policy_step_after"),
+        "context_epoch_before": record.get("context_epoch_before"),
+        "context_epoch_after": record.get("context_epoch_after"),
         "env_info_after": dict(info),
         "changed_paths": changed_paths,
         "document_paths": _document_paths(changed_paths),
@@ -205,6 +234,202 @@ def _first_after(rows: list[dict[str, Any]], order: int, predicate) -> dict[str,
         if isinstance(row_order, int) and row_order > order and predicate(row):
             return row
     return None
+
+
+def _valid_sha256(value: Any) -> bool:
+    return bool(
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _unit_counter_increment(row: Mapping[str, Any], prefix: str) -> bool:
+    before = row.get(f"{prefix}_before")
+    after = row.get(f"{prefix}_after")
+    return bool(
+        isinstance(before, int)
+        and not isinstance(before, bool)
+        and isinstance(after, int)
+        and not isinstance(after, bool)
+        and after == before + 1
+    )
+
+
+def _canonical_checkpoint_receipt(value: Any) -> Mapping[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    size = value.get("size_bytes")
+    if (
+        set(value)
+        != {
+            "schema",
+            "path",
+            "action_kind",
+            "action_completed",
+            "changed",
+            "exists",
+            "regular_file",
+            "size_bytes",
+            "sha256",
+        }
+        or value.get("schema") != CHECKPOINT_RECEIPT_SCHEMA
+        or value.get("path") != CONTINUATION_PATH
+        or value.get("action_kind") not in {"shell_command", "apply_patch"}
+        or value.get("action_completed") is not True
+        or value.get("changed") is not True
+        or value.get("exists") is not True
+        or value.get("regular_file") is not True
+        or isinstance(size, bool)
+        or not isinstance(size, int)
+        or not 0 < size <= CHECKPOINT_MAX_BYTES
+        or not _valid_sha256(value.get("sha256"))
+    ):
+        return None
+    return value
+
+
+def _canonical_read_receipt(value: Any) -> Mapping[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    size = value.get("size_bytes")
+    if (
+        set(value) != {"schema", "path", "observed", "size_bytes", "sha256"}
+        or value.get("schema") != CHECKPOINT_READ_RECEIPT_SCHEMA
+        or value.get("path") != CONTINUATION_PATH
+        or value.get("observed") is not True
+        or isinstance(size, bool)
+        or not isinstance(size, int)
+        or not 0 < size <= CHECKPOINT_MAX_BYTES
+        or not _valid_sha256(value.get("sha256"))
+    ):
+        return None
+    return value
+
+
+def _safe_checkpoint_successor(
+    row: Mapping[str, Any], receipt: Mapping[str, Any]
+) -> bool:
+    transition = row.get("context_transition")
+    messages = transition.get("messages") if isinstance(transition, Mapping) else None
+    if (
+        not isinstance(transition, Mapping)
+        or transition.get("schema")
+        != "agentmemory_task_neutral_context_transition_v1"
+        or transition.get("operation") != "replace_messages"
+        or not isinstance(messages, Sequence)
+        or isinstance(messages, (str, bytes))
+        or not messages
+    ):
+        return False
+    normalized: list[tuple[str, str]] = []
+    for message in messages:
+        if not isinstance(message, Mapping) or set(message) != {"role", "content"}:
+            return False
+        role, content = message.get("role"), message.get("content")
+        if role not in {"system", "user"} or not isinstance(content, str):
+            return False
+        normalized.append((role, content))
+    marker = (
+        f"{CHECKPOINT_MARKER_PREFIX} Verified receipt: "
+        f"size_bytes={receipt['size_bytes']}, sha256={receipt['sha256']}."
+    )
+    if normalized[-1][0] != "user" or not normalized[-1][1].endswith(marker):
+        return False
+    successor = "\n".join(content for _role, content in normalized)
+    return bool(
+        row.get("action") not in successor
+        and row.get("control_request") not in successor
+    )
+
+
+def _canonical_compaction_receipt(
+    row: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    evidence = _mapping(row.get("wrapper_evidence"))
+    receipt = _canonical_checkpoint_receipt(evidence.get("checkpoint_receipt"))
+    endpoint = _canonical_checkpoint_receipt(
+        _mapping(_mapping(row.get("env_info_after")).get("execution")).get(
+            "filesystem_checkpoint"
+        )
+    )
+    submission = _mapping(row.get("action_submission"))
+    if receipt is None or endpoint is None or dict(receipt) != dict(endpoint):
+        return None
+    if not (
+        evidence.get("event") == "context_compaction"
+        and evidence.get("continuation_path") == CONTINUATION_PATH
+        and evidence.get("continuation_persisted") is True
+        and evidence.get("checkpoint_failure_reason") is None
+        and evidence.get("context_replaced") is True
+        and evidence.get("retry_pending") is False
+        and evidence.get("preserved_policy_output") is True
+        and evidence.get("preserved_native_observation") is True
+        and evidence.get("checkpoint_action_in_successor_context") is False
+        and evidence.get("checkpoint_observation_in_successor_context") is False
+        and evidence.get("checkpoint_content_in_successor_context") is False
+        and isinstance(row.get("action"), str)
+        and CONTINUATION_PATH in row["action"]
+        and submission.get("raw_policy_output") == row["action"]
+        and isinstance(row.get("control_request"), str)
+        and bool(row["control_request"].strip())
+        and _unit_counter_increment(row, "native_step")
+        and _unit_counter_increment(row, "native_call_count")
+        and _unit_counter_increment(row, "policy_step")
+        and _unit_counter_increment(row, "context_epoch")
+        and _safe_checkpoint_successor(row, receipt)
+    ):
+        return None
+    return receipt
+
+
+def _matching_checkpoint_read(
+    row: Mapping[str, Any], receipt: Mapping[str, Any]
+) -> bool:
+    evidence = _mapping(row.get("wrapper_evidence"))
+    read = _canonical_read_receipt(evidence.get("filesystem_checkpoint_read"))
+    endpoint = _canonical_read_receipt(
+        _mapping(_mapping(row.get("env_info_after")).get("execution")).get(
+            "filesystem_checkpoint_read"
+        )
+    )
+    context_before = row.get("context_epoch_before")
+    context_after = row.get("context_epoch_after")
+    return bool(
+        read is not None
+        and endpoint is not None
+        and dict(read) == dict(endpoint)
+        and read.get("size_bytes") == receipt.get("size_bytes")
+        and read.get("sha256") == receipt.get("sha256")
+        and evidence.get("memory_event") == "read"
+        and evidence.get("document_read_observed") is True
+        and _is_completed_shell(row)
+        and _unit_counter_increment(row, "native_step")
+        and _unit_counter_increment(row, "native_call_count")
+        and _unit_counter_increment(row, "policy_step")
+        and isinstance(context_before, int)
+        and not isinstance(context_before, bool)
+        and context_after == context_before
+    )
+
+
+def _canonical_checkpoint_sequences(
+    rows: list[dict[str, Any]],
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    sequences: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for compaction in rows:
+        receipt = _canonical_compaction_receipt(compaction)
+        order = compaction.get("row_order")
+        if receipt is None or not isinstance(order, int):
+            continue
+        read = _first_after(
+            rows,
+            order,
+            lambda row, expected=receipt: _matching_checkpoint_read(row, expected),
+        )
+        if read is not None:
+            sequences.append((compaction, read))
+    return sequences
 
 
 def _post_compaction_read(
@@ -268,13 +493,31 @@ def _trajectory_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         for write in doc_writes
         if (result := _post_compaction_read(rows, compactions, write)) is not None
     ]
+    canonical_checkpoint_sequences = _canonical_checkpoint_sequences(rows)
     continuation_writes = [
-        row for row in doc_writes if CONTINUATION_PATH in row["document_paths"]
+        row
+        for row in doc_writes
+        if CONTINUATION_PATH in row["document_paths"]
+    ]
+    legacy_continuation_writes = [
+        row
+        for row in doc_writes
+        if any(
+            path in LEGACY_CONTINUATION_PATHS
+            for path in row["document_paths"]
+        )
     ]
     continuation_read_sequences = [
+        (compaction, compaction, read)
+        for compaction, read in canonical_checkpoint_sequences
+    ]
+    legacy_continuation_read_sequences = [
         sequence
         for sequence in read_sequences
-        if CONTINUATION_PATH in sequence[0]["document_paths"]
+        if any(
+            path in LEGACY_CONTINUATION_PATHS
+            for path in sequence[0]["document_paths"]
+        )
     ]
 
     chain: dict[str, Any] | None = None
@@ -324,12 +567,16 @@ def _trajectory_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "local_validation_evidence": local[:5],
         "document_write_rows": len(doc_writes),
         "continuation_write_rows": len(continuation_writes),
+        "legacy_continuation_write_rows": len(legacy_continuation_writes),
         "document_paths": sorted(
             {path for row in doc_writes for path in row["document_paths"]}
         ),
         "compaction_rows": len(compactions),
         "post_compaction_document_read": bool(read_sequences),
         "post_compaction_continuation_read": bool(continuation_read_sequences),
+        "post_compaction_legacy_continuation_read": bool(
+            legacy_continuation_read_sequences
+        ),
         "terminal_submit": terminal_submit is not None,
         "terminal_reason": terminal_info.get("terminal_reason"),
         "submission_valid": grade.get("submission_valid"),
@@ -444,6 +691,7 @@ def analyze_documents(
             "terminal_submit",
             "post_compaction_document_read",
             "post_compaction_continuation_read",
+            "post_compaction_legacy_continuation_read",
             "complete_iteration_memory_chain",
         ):
             counts[key] += int(trajectory[key])
@@ -451,6 +699,9 @@ def analyze_documents(
         counts["has_document_write"] += int(trajectory["document_write_rows"] > 0)
         counts["has_continuation_write"] += int(
             trajectory["continuation_write_rows"] > 0
+        )
+        counts["has_legacy_continuation_write"] += int(
+            trajectory["legacy_continuation_write_rows"] > 0
         )
         counts["has_compaction"] += int(trajectory["compaction_rows"] > 0)
 

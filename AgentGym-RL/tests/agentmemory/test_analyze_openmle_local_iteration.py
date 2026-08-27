@@ -18,6 +18,36 @@ MODULE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 
+CHECKPOINT_PATH = ".agent_memory/CONTINUATION.md"
+CHECKPOINT_BODY = "RMSE 0.421; next add features\n"
+CHECKPOINT_SHA256 = __import__("hashlib").sha256(
+    CHECKPOINT_BODY.encode("utf-8")
+).hexdigest()
+
+
+def _checkpoint_receipt() -> dict:
+    return {
+        "schema": "agentmemory_filesystem_checkpoint_receipt_v1",
+        "path": CHECKPOINT_PATH,
+        "action_kind": "apply_patch",
+        "action_completed": True,
+        "changed": True,
+        "exists": True,
+        "regular_file": True,
+        "size_bytes": len(CHECKPOINT_BODY.encode("utf-8")),
+        "sha256": CHECKPOINT_SHA256,
+    }
+
+
+def _read_receipt() -> dict:
+    return {
+        "schema": "agentmemory_filesystem_checkpoint_read_receipt_v1",
+        "path": CHECKPOINT_PATH,
+        "observed": True,
+        "size_bytes": len(CHECKPOINT_BODY.encode("utf-8")),
+        "sha256": CHECKPOINT_SHA256,
+    }
+
 
 def _row(
     order: int,
@@ -28,6 +58,7 @@ def _row(
     stdout: str = "",
     terminal: bool = False,
     compaction: bool = False,
+    context_epoch: int = 0,
 ):
     changed_paths = changed_paths or []
     execution = None
@@ -62,6 +93,54 @@ def _row(
             "fit_count": 2,
         },
     }
+    wrapper_evidence = {}
+    context_transition = None
+    control_request = None
+    context_after = context_epoch
+    if compaction:
+        receipt = _checkpoint_receipt()
+        execution["filesystem_checkpoint"] = dict(receipt)
+        wrapper_evidence = {
+            "event": "context_compaction",
+            "continuation_path": CHECKPOINT_PATH,
+            "continuation_persisted": True,
+            "checkpoint_receipt": dict(receipt),
+            "checkpoint_failure_reason": None,
+            "context_replaced": True,
+            "retry_pending": False,
+            "preserved_policy_output": True,
+            "preserved_native_observation": True,
+            "checkpoint_action_in_successor_context": False,
+            "checkpoint_observation_in_successor_context": False,
+            "checkpoint_content_in_successor_context": False,
+        }
+        context_after += 1
+        marker = (
+            "Earlier conversation was removed after the continuation snapshot "
+            "write succeeded. The workspace persists, but "
+            f"`{CHECKPOINT_PATH}` was not copied into this prompt. Use the next "
+            "normal action to read that file, then continue from its evidence and "
+            "next action. Other workspace files remain available and may still be "
+            "read or updated normally. Verified receipt: "
+            f"size_bytes={receipt['size_bytes']}, sha256={receipt['sha256']}."
+        )
+        context_transition = {
+            "schema": "agentmemory_task_neutral_context_transition_v1",
+            "operation": "replace_messages",
+            "messages": [
+                {"role": "system", "content": "OpenMLE task contract"},
+                {"role": "user", "content": "task observation\n\n" + marker},
+            ],
+        }
+        control_request = "Persist continuation state before compaction."
+    elif action_kind == "shell_command" and f"cat {CHECKPOINT_PATH}" in action:
+        receipt = _read_receipt()
+        execution["filesystem_checkpoint_read"] = dict(receipt)
+        wrapper_evidence = {
+            "memory_event": "read",
+            "document_read_observed": True,
+            "filesystem_checkpoint_read": dict(receipt),
+        }
     return {
         "formal_step_record": {
             "trajectory_uid": "trajectory-1",
@@ -71,19 +150,25 @@ def _row(
             "trajectory_terminal": terminal,
             "trajectory_return": 0.4 if terminal else None,
             "immediate_reward": 0.4 if terminal else 0.0,
-            "wrapper_evidence": (
-                {"event": "context_compaction"} if compaction else {}
-            ),
-            "context_transition": (
-                {"operation": "replace_messages"} if compaction else None
-            ),
+            "wrapper_evidence": wrapper_evidence,
+            "context_transition": context_transition,
+            "control_request": control_request,
+            "action_submission": {"raw_policy_output": action},
+            "native_step_before": order - 1,
+            "native_step_after": order,
+            "native_call_count_before": order - 1,
+            "native_call_count_after": order,
+            "policy_step_before": order - 1,
+            "policy_step_after": order,
+            "context_epoch_before": context_epoch,
+            "context_epoch_after": context_after,
             "env_info_after": info,
         }
     }
 
 
 def _complete_document():
-    note = ".agent_memory/OPENMLE_CONTINUATION.md"
+    note = CHECKPOINT_PATH
     return {
         "rows": [
             _row(
@@ -95,10 +180,10 @@ def _complete_document():
             _row(
                 2,
                 action="apply_patch\n*** Begin Patch\n*** Add File: "
-                + note
+                + "experiments.md"
                 + "\n+RMSE 0.421; next add features\n*** End Patch",
                 action_kind="apply_patch",
-                changed_paths=[note],
+                changed_paths=["experiments.md"],
             ),
             _row(
                 3,
@@ -115,7 +200,8 @@ def _complete_document():
                 + note
                 + '"}',
                 action_kind="shell_command",
-                stdout="RMSE 0.421; next add features\n",
+                stdout=CHECKPOINT_BODY,
+                context_epoch=1,
             ),
             _row(
                 5,
@@ -123,14 +209,22 @@ def _complete_document():
                 "@@\n-old\n+new\n*** End Patch",
                 action_kind="apply_patch",
                 changed_paths=["train.py"],
+                context_epoch=1,
             ),
             _row(
                 6,
                 action='shell_command {"command":"python train.py"}',
                 action_kind="shell_command",
                 stdout="validation RMSE=0.390\n",
+                context_epoch=1,
             ),
-            _row(7, action="submit", action_kind="submit", terminal=True),
+            _row(
+                7,
+                action="submit",
+                action_kind="submit",
+                terminal=True,
+                context_epoch=1,
+            ),
         ]
     }
 
@@ -143,16 +237,18 @@ def test_complete_local_iteration_memory_chain_is_detected():
         "has_compaction": 1,
         "has_document_write": 1,
         "has_continuation_write": 1,
+        "has_legacy_continuation_write": 0,
         "has_local_validation": 1,
         "post_compaction_continuation_read": 1,
         "post_compaction_document_read": 1,
+        "post_compaction_legacy_continuation_read": 0,
         "terminal_submit": 1,
     }
     case = result["complete_chain_cases"][0]
     assert case["chain"] == {
         "validation_order": 1,
-        "document_write_order": 2,
-        "document_paths": [".agent_memory/OPENMLE_CONTINUATION.md"],
+        "document_write_order": 3,
+        "document_paths": [".agent_memory/CONTINUATION.md"],
         "compaction_order": 3,
         "document_read_order": 4,
         "code_edit_order": 5,
@@ -308,7 +404,7 @@ def test_require_chain_failure_still_writes_diagnostic_output(tmp_path):
 
 def test_ordinary_document_chain_does_not_satisfy_canonical_continuation_gate():
     document = _complete_document()
-    canonical = ".agent_memory/OPENMLE_CONTINUATION.md"
+    canonical = ".agent_memory/CONTINUATION.md"
     for row in document["rows"]:
         record = row["formal_step_record"]
         record["action"] = record["action"].replace(canonical, "experiments.md")
@@ -321,4 +417,48 @@ def test_ordinary_document_chain_does_not_satisfy_canonical_continuation_gate():
     result = MODULE.analyze_documents([(1, document)])
     assert result["counts"].get("post_compaction_document_read", 0) == 1
     assert result["counts"].get("post_compaction_continuation_read", 0) == 0
+    assert result["counts"].get("complete_iteration_memory_chain", 0) == 0
+
+def test_legacy_openmle_continuation_path_is_reported_but_not_canonical():
+    document = _complete_document()
+    canonical = ".agent_memory/CONTINUATION.md"
+    legacy = ".agent_memory/OPENMLE_CONTINUATION.md"
+    for row in document["rows"]:
+        record = row["formal_step_record"]
+        record["action"] = record["action"].replace(canonical, legacy)
+        execution = record["env_info_after"].get("execution")
+        if execution:
+            execution["changed_paths"] = [
+                legacy if path == canonical else path
+                for path in execution["changed_paths"]
+            ]
+    result = MODULE.analyze_documents([(1, document)])
+    assert result["counts"].get("has_legacy_continuation_write", 0) == 1
+    assert result["counts"].get("post_compaction_legacy_continuation_read", 0) == 1
+    assert result["counts"].get("has_continuation_write", 0) == 0
+    assert result["counts"].get("post_compaction_continuation_read", 0) == 0
+    assert result["counts"].get("complete_iteration_memory_chain", 0) == 0
+
+
+def test_legacy_event_label_without_canonical_receipts_cannot_satisfy_gate():
+    document = _complete_document()
+    compaction = document["rows"][2]["formal_step_record"]
+    compaction["wrapper_evidence"] = {"event": "policy_context_compaction"}
+    compaction["context_transition"] = {"operation": "replace_messages"}
+    compaction["env_info_after"]["execution"].pop("filesystem_checkpoint")
+    read = document["rows"][3]["formal_step_record"]
+    read["wrapper_evidence"] = {}
+    read["env_info_after"]["execution"].pop("filesystem_checkpoint_read")
+    result = MODULE.analyze_documents([(1, document)])
+    assert result["counts"].get("complete_iteration_memory_chain", 0) == 0
+
+
+def test_read_digest_must_match_the_checkpoint_write():
+    document = _complete_document()
+    read = document["rows"][3]["formal_step_record"]
+    read["wrapper_evidence"]["filesystem_checkpoint_read"]["sha256"] = "c" * 64
+    read["env_info_after"]["execution"]["filesystem_checkpoint_read"][
+        "sha256"
+    ] = "c" * 64
+    result = MODULE.analyze_documents([(1, document)])
     assert result["counts"].get("complete_iteration_memory_chain", 0) == 0

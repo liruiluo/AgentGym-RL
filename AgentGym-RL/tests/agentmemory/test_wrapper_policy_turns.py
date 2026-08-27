@@ -30,6 +30,12 @@ from agentenv.controller.types import (  # noqa: E402
     build_task_neutral_transition_info,
 )
 from agentenv.envs.agentmemory import AgentMemoryEnvClient  # noqa: E402
+from agentenv.envs.filesystem_checkpoint import (  # noqa: E402
+    FILESYSTEM_CHECKPOINT_PATH,
+    FILESYSTEM_CHECKPOINT_READ_RECEIPT_SCHEMA,
+    FILESYSTEM_CHECKPOINT_RECEIPT_SCHEMA,
+    filesystem_workspace_action_request_sha256,
+)
 from agentenv.envs.openmle_fast import (  # noqa: E402
     OPENMLE_CONTEXT_COMPACTION_REQUEST,
     OPENMLE_POLICY_CONTINUATION_MARKER,
@@ -67,6 +73,28 @@ def prepare(client, messages, *, capacity: int = 4096):
     )
 
 
+def filesystem_checkpoint_receipt(
+    *,
+    action_kind: str = "shell_command",
+    action_completed: bool = True,
+    changed: bool = True,
+    exists: bool = True,
+    regular_file: bool = True,
+    size_bytes: int | None = 37,
+) -> dict:
+    return {
+        "schema": FILESYSTEM_CHECKPOINT_RECEIPT_SCHEMA,
+        "path": FILESYSTEM_CHECKPOINT_PATH,
+        "action_kind": action_kind,
+        "action_completed": action_completed,
+        "changed": changed,
+        "exists": exists,
+        "regular_file": regular_file,
+        "size_bytes": size_bytes,
+        "sha256": hashlib.sha256(b"checkpoint").hexdigest(),
+    }
+
+
 class FakeWebShopClient(AgentMemoryEnvClient):
     def __init__(self, responses: list[dict]) -> None:
         BaseEnvClient.__init__(self, action_format=ActionFormat.REACT)
@@ -101,7 +129,28 @@ class FakeWebShopClient(AgentMemoryEnvClient):
         self.native_calls.append(str(data["action"]))
         if not self._responses:
             raise AssertionError("fake WebShop response queue is empty")
-        return deepcopy(self._responses.pop(0))
+        response = deepcopy(self._responses.pop(0))
+        info = response.get("info", {})
+        latest_event = info.get("workspace_latest_event")
+        tool_ops = info.get("tool_ops")
+        preserve_identity = bool(info.pop("_preserve_workspace_event_identity", False))
+        if (
+            not preserve_identity
+            and isinstance(latest_event, dict)
+            and isinstance(tool_ops, list)
+            and tool_ops
+            and isinstance(tool_ops[-1], dict)
+        ):
+            current_step = len(self.native_calls)
+            request_sha256 = filesystem_workspace_action_request_sha256(
+                data["action"]
+            )
+            if request_sha256 is not None:
+                for event in (latest_event, tool_ops[-1]):
+                    event["step"] = current_step
+                    event["event_id"] = current_step - 1
+                    event["request_sha256"] = request_sha256
+        return response
 
     def reset(self, idx: int = 0) -> dict:
         del idx
@@ -110,6 +159,8 @@ class FakeWebShopClient(AgentMemoryEnvClient):
 
 class FakeSwesmithClient(SwesmithEnvClient):
     def __init__(self, *, invalid_action_reward: float = 0.0) -> None:
+        if float(invalid_action_reward) != 0.0:
+            raise ValueError("SWE-smith invalid_action_reward must be zero")
         BaseEnvClient.__init__(self, action_format=ActionFormat.REACT)
         self.invalid_action_reward = float(invalid_action_reward)
         self.env_id = 202
@@ -139,11 +190,14 @@ class FakeSwesmithClient(SwesmithEnvClient):
         if action == "malformed policy output":
             return {
                 "observation": "Invalid action: expected one bare tool action.",
-                "reward": 0.0,
-                "done": False,
+                "reward": -0.01,
+                "done": True,
                 "info": {
                     "step": step,
-                    "action_kind": "invalid",
+                    "action_kind": "parser_error",
+                    "terminal": True,
+                    "episode_success": False,
+                    "terminal_reason": "parser_rejected",
                     "actor_credit": {
                         "schema": "task_neutral_actor_credit_v1",
                         "positive_eligible": False,
@@ -151,15 +205,48 @@ class FakeSwesmithClient(SwesmithEnvClient):
                     },
                 },
             }
-        workspace_changed = "printf changed >" in action
+        checkpoint_write = (
+            FILESYSTEM_CHECKPOINT_PATH in action
+            and ("printf" in action or action.lstrip().startswith("apply_patch"))
+        )
+        checkpoint_read = (
+            f"cat {FILESYSTEM_CHECKPOINT_PATH}" in action and not checkpoint_write
+        )
+        workspace_changed = "printf changed >" in action or checkpoint_write
         terminal_submission = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT" in action
+        action_kind = (
+            "apply_patch" if action.lstrip().startswith("apply_patch") else "shell_command"
+        )
         return {
             "observation": f"native tool output {step}",
             "reward": float(terminal_submission),
             "done": terminal_submission,
             "info": {
                 "step": step,
-                "action_kind": "shell_command",
+                "action_kind": action_kind,
+                "filesystem_checkpoint": filesystem_checkpoint_receipt(
+                    action_kind=action_kind,
+                    changed=checkpoint_write,
+                    exists=checkpoint_write or checkpoint_read,
+                    size_bytes=37 if checkpoint_write or checkpoint_read else None,
+                ),
+                "filesystem_checkpoint_read": (
+                    {
+                        "schema": FILESYSTEM_CHECKPOINT_READ_RECEIPT_SCHEMA,
+                        "path": FILESYSTEM_CHECKPOINT_PATH,
+                        "observed": True,
+                        "size_bytes": 37,
+                        "sha256": hashlib.sha256(b"checkpoint").hexdigest(),
+                    }
+                    if checkpoint_read
+                    else None
+                ),
+                "workspace_changed_paths": (
+                    [FILESYSTEM_CHECKPOINT_PATH]
+                    if checkpoint_write
+                    else (["notes.md"] if "printf changed > notes.md" in action else [])
+                ),
+                "shell_action_succeeded": action_kind == "shell_command",
                 "actor_credit": {
                     "schema": "task_neutral_actor_credit_v1",
                     "positive_eligible": True,
@@ -253,6 +340,53 @@ def webshop_buy_response() -> dict:
     }
 
 
+def webshop_checkpoint_response(
+    *,
+    changed: bool = True,
+    exit_code: int = 0,
+    timed_out: bool = False,
+    stdout: str = "",
+    checkpoint_payload: bytes = b"checkpoint",
+    exists: bool | None = None,
+) -> dict:
+    if exists is None:
+        exists = changed
+    entry = {
+        "path": FILESYSTEM_CHECKPOINT_PATH,
+        "bytes": len(checkpoint_payload),
+        "sha256": hashlib.sha256(checkpoint_payload).hexdigest(),
+        "kind": "file",
+    }
+    return {
+        "observation": (
+            stdout
+            if stdout
+            else ("workspace write completed" if changed else "checkpoint unchanged")
+        ),
+        "reward": 0.0,
+        "done": False,
+        "info": {
+            "current_subtask_index": 1,
+            "tool_ops": [{"op": "SHELL_COMMAND", "step": 3}],
+            "session_trace": [],
+            "workspace_latest_event": {
+                "op": "SHELL_COMMAND",
+                "tool_name": "shell_command",
+                "status": "executed",
+                "exit_code": exit_code,
+                "timed_out": timed_out,
+                "stdout": stdout,
+                "workspace_diff": {
+                    "added": [entry] if changed else [],
+                    "modified": [],
+                    "deleted": [],
+                },
+            },
+            "workspace_snapshot": {"files": [entry] if exists else []},
+        },
+    }
+
+
 class SharedWrapperPolicyTurnTest(unittest.TestCase):
     def test_swesmith_endpoint_memory_contract_mismatch_fails_closed(self) -> None:
         for endpoint_contract in (None, "policy_compaction_only_v1"):
@@ -291,9 +425,21 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             ],
         )
 
-    def test_webshop_uses_native_action_then_local_handoff(self) -> None:
+    def test_webshop_handoff_requires_executed_checkpoint_then_real_read(self) -> None:
+        checkpoint_body = "objective: finish six purchases; next: search blue mug"
+        checkpoint_payload = checkpoint_body.encode("utf-8")
         client = FakeWebShopClient(
-            [webshop_search_response(), webshop_buy_response()]
+            [
+                webshop_search_response(),
+                webshop_buy_response(),
+                webshop_checkpoint_response(checkpoint_payload=checkpoint_payload),
+                webshop_checkpoint_response(
+                    changed=False,
+                    stdout=checkpoint_body,
+                    checkpoint_payload=checkpoint_payload,
+                    exists=True,
+                ),
+            ]
         )
         messages = self.bind_webshop(client)
         self.assertEqual(
@@ -327,8 +473,6 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
                 {"role": "user", "content": "session-0 search result"},
             ],
         )
-        self.assertNotIn("search[black mug]", str(messages))
-        self.assertNotIn("session-0 fresh observation", str(messages))
 
         buy = prepare(client, messages)
         self.assertIsNone(buy.control_request)
@@ -338,21 +482,26 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         )
         self.assertIn("click[Buy Now]", str(messages))
         self.assertNotIn("session-1 fresh observation", str(messages))
-        self.assertEqual(client.native_calls, ["search[black mug]", "click[Buy Now]"])
 
         handoff = prepare(client, messages)
         self.assertEqual(handoff.control_request, WEBSHOP_SESSION_HANDOFF_REQUEST)
-        self.assertIn("session-0 search result", str(handoff.messages))
-        self.assertNotIn("session-1 fresh observation", str(handoff.messages))
+        checkpoint_action = (
+            'shell_command {"command":"mkdir -p .agent_memory && printf %s '
+            + checkpoint_body
+            + ' > .agent_memory/CONTINUATION.md","workdir":"."}'
+        )
         handoff_output, messages = complete_policy_turn(
-            client, handoff, "notes/state.md"
+            client, handoff, checkpoint_action
         )
 
-        self.assertEqual(client.native_calls, ["search[black mug]", "click[Buy Now]"])
+        self.assertEqual(
+            client.native_calls,
+            ["search[black mug]", "click[Buy Now]", checkpoint_action],
+        )
         self.assertEqual(
             (handoff_output.info["native_call_count_before"],
              handoff_output.info["native_call_count_after"]),
-            (2, 2),
+            (2, 3),
         )
         self.assertEqual(
             (handoff_output.info["policy_step_before"],
@@ -364,36 +513,45 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
              handoff_output.info["context_epoch_after"]),
             (0, 1),
         )
-        handoff_evidence = handoff_output.info["wrapper_evidence"]
-        self.assertEqual(
-            (
-                handoff_evidence["native_call_count_before"],
-                handoff_evidence["native_call_count_after"],
-            ),
-            (2, 2),
-        )
-        self.assertEqual(
-            (
-                handoff_evidence["policy_step_before"],
-                handoff_evidence["policy_step_after"],
-            ),
-            (2, 3),
-        )
-        self.assertEqual(
-            (
-                handoff_evidence["context_epoch_before"],
-                handoff_evidence["context_epoch_after"],
-            ),
-            (0, 1),
-        )
+        evidence = handoff_output.info["wrapper_evidence"]
+        self.assertEqual(evidence["event"], "webshop_session_handoff")
+        self.assertTrue(evidence["continuation_persisted"])
+        self.assertEqual(evidence["continuation_path"], FILESYSTEM_CHECKPOINT_PATH)
+        self.assertFalse(evidence["checkpoint_action_in_successor_context"])
+        self.assertFalse(evidence["checkpoint_content_in_successor_context"])
         self.assertIn("session-1 fresh observation", str(messages))
-        self.assertIn("notes/state.md", str(messages))
+        self.assertIn(FILESYSTEM_CHECKPOINT_PATH, str(messages))
+        self.assertIn(evidence["checkpoint_receipt"]["sha256"], str(messages))
         self.assertNotIn("session-0 search result", str(messages))
         self.assertNotIn("click[Buy Now]", str(messages))
+        self.assertNotIn(checkpoint_action, str(messages))
+        self.assertNotIn(checkpoint_body, str(messages))
         self.assertNotIn(WEBSHOP_SESSION_HANDOFF_REQUEST, str(messages))
 
-    def test_invalid_webshop_handoff_remains_evidence_but_not_context(self) -> None:
-        client = FakeWebShopClient([webshop_buy_response()])
+        read = prepare(client, messages)
+        self.assertIsNone(read.control_request)
+        read_action = (
+            'shell_command {"command":"cat .agent_memory/CONTINUATION.md",'
+            '"workdir":"."}'
+        )
+        read_output, messages = complete_policy_turn(client, read, read_action)
+        self.assertEqual(client.native_calls[-1], read_action)
+        self.assertEqual(read_output.info["context_epoch_after"], 1)
+        self.assertTrue(
+            read_output.info["wrapper_evidence"]["checkpoint_read_satisfied"]
+        )
+        self.assertFalse(
+            read_output.info["wrapper_evidence"]["checkpoint_read_retry_pending"]
+        )
+        self.assertEqual(
+            read_output.info["wrapper_evidence"]["memory_event"], "read"
+        )
+        self.assertIn("objective: finish six purchases", str(messages))
+
+    def test_failed_webshop_checkpoint_keeps_context_and_retries(self) -> None:
+        client = FakeWebShopClient(
+            [webshop_buy_response(), webshop_checkpoint_response(changed=False)]
+        )
         messages = self.bind_webshop(client)
         buy_output, messages = complete_policy_turn(
             client, prepare(client, messages), "click[Buy Now]"
@@ -407,12 +565,224 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertEqual(
             handoff_output.info["action_submission"]["raw_policy_output"], invalid
         )
-        self.assertFalse(
-            handoff_output.info["wrapper_evidence"]["handoff_parse"]["valid"]
+        self.assertEqual(
+            handoff_output.info["context_transition"]["operation"],
+            "append_observation",
         )
-        self.assertNotIn(invalid, str(messages))
-        self.assertIn("session-1 fresh observation", str(messages))
-        self.assertEqual(client.native_calls, ["click[Buy Now]"])
+        self.assertEqual(handoff_output.info["context_epoch_after"], 0)
+        self.assertFalse(
+            handoff_output.info["wrapper_evidence"]["continuation_persisted"]
+        )
+        self.assertTrue(handoff_output.info["wrapper_evidence"]["retry_pending"])
+        self.assertIn(invalid, str(messages))
+        self.assertNotIn("checkpoint unchanged", str(messages))
+        self.assertEqual(
+            messages[-1]["content"],
+            "Filesystem checkpoint was not accepted (missing_receipt). "
+            "The earlier context is still present. Retry now with exactly one "
+            "shell_command or apply_patch that overwrites "
+            "`.agent_memory/CONTINUATION.md` with 1 to 8192 bytes.",
+        )
+        self.assertEqual(
+            handoff_output.info["env_info"]["workspace_latest_event"][
+                "workspace_diff"
+            ]["added"],
+            [],
+        )
+        self.assertEqual(
+            handoff_output.info["wrapper_evidence"]["native_wrapper_evidence"][
+                "event"
+            ],
+            "native_action",
+        )
+        self.assertFalse(
+            handoff_output.info["wrapper_evidence"]["native_wrapper_evidence"][
+                "raw_history_cleared"
+            ]
+        )
+        retry = prepare(client, messages, capacity=4096)
+        self.assertEqual(retry.control_request, WEBSHOP_SESSION_HANDOFF_REQUEST)
+        self.assertEqual(
+            client.native_calls,
+            ["click[Buy Now]", invalid],
+        )
+
+    def test_failed_webshop_shell_cannot_authorize_context_replacement(self) -> None:
+        client = FakeWebShopClient(
+            [
+                webshop_buy_response(),
+                webshop_checkpoint_response(changed=True, exit_code=7),
+            ]
+        )
+        messages = self.bind_webshop(client)
+        _, messages = complete_policy_turn(
+            client, prepare(client, messages), "click[Buy Now]"
+        )
+
+        output, messages = complete_policy_turn(
+            client,
+            prepare(client, messages),
+            'shell_command {"command":"false > .agent_memory/CONTINUATION.md"}',
+        )
+
+        self.assertEqual(
+            output.info["context_transition"]["operation"],
+            "append_observation",
+        )
+        self.assertFalse(output.info["wrapper_evidence"]["context_replaced"])
+        self.assertEqual(
+            output.info["wrapper_evidence"]["checkpoint_failure_reason"],
+            "action_not_completed",
+        )
+        self.assertIn("action_not_completed", messages[-1]["content"])
+
+    def test_stale_webshop_workspace_event_cannot_authorize_handoff(self) -> None:
+        stale = webshop_checkpoint_response(changed=True)
+        stale_info = stale["info"]
+        stale_info["_preserve_workspace_event_identity"] = True
+        stale_info["workspace_latest_event"].update(
+            step=1,
+            event_id=0,
+            request_sha256="a" * 64,
+        )
+        stale_info["tool_ops"][-1].update(
+            step=2,
+            event_id=1,
+            request_sha256="b" * 64,
+        )
+        client = FakeWebShopClient([webshop_buy_response(), stale])
+        messages = self.bind_webshop(client)
+        _, messages = complete_policy_turn(
+            client, prepare(client, messages), "click[Buy Now]"
+        )
+
+        output, messages = complete_policy_turn(
+            client,
+            prepare(client, messages),
+            'shell_command {"command":"printf checkpoint > '
+            '.agent_memory/CONTINUATION.md"}',
+        )
+
+        self.assertEqual(
+            output.info["context_transition"]["operation"],
+            "append_observation",
+        )
+        self.assertFalse(output.info["wrapper_evidence"]["context_replaced"])
+        self.assertEqual(
+            output.info["wrapper_evidence"]["checkpoint_failure_reason"],
+            "missing_receipt",
+        )
+        self.assertIn("missing_receipt", messages[-1]["content"])
+
+    def test_coherently_stale_webshop_event_is_bound_to_submitted_action(self) -> None:
+        stale = webshop_checkpoint_response(changed=True)
+        stale_info = stale["info"]
+        stale_info["_preserve_workspace_event_identity"] = True
+        old_digest = filesystem_workspace_action_request_sha256(
+            'shell_command {"command":"printf old > .agent_memory/CONTINUATION.md"}'
+        )
+        self.assertIsNotNone(old_digest)
+        for event in (stale_info["workspace_latest_event"], stale_info["tool_ops"][-1]):
+            event.update(step=2, event_id=1, request_sha256=old_digest)
+        client = FakeWebShopClient([webshop_buy_response(), stale])
+        messages = self.bind_webshop(client)
+        _, messages = complete_policy_turn(
+            client, prepare(client, messages), "click[Buy Now]"
+        )
+
+        output, messages = complete_policy_turn(
+            client,
+            prepare(client, messages),
+            'shell_command {"command":"printf new > '
+            '.agent_memory/CONTINUATION.md"}',
+        )
+
+        self.assertEqual(
+            output.info["context_transition"]["operation"],
+            "append_observation",
+        )
+        self.assertFalse(output.info["wrapper_evidence"]["context_replaced"])
+        self.assertEqual(
+            output.info["wrapper_evidence"]["checkpoint_failure_reason"],
+            "missing_receipt",
+        )
+        self.assertIn("missing_receipt", messages[-1]["content"])
+
+    def test_webshop_requires_matching_checkpoint_read_before_progress(self) -> None:
+        payload = b"objective: continue\nnext: search blue mug"
+        client = FakeWebShopClient(
+            [
+                webshop_buy_response(),
+                webshop_checkpoint_response(checkpoint_payload=payload),
+                {
+                    "observation": "session-1 search result",
+                    "reward": 0.0,
+                    "done": False,
+                    "info": {
+                        "current_subtask_index": 1,
+                        "tool_ops": [{"op": "SEARCH", "step": 3}],
+                        "session_trace": ["search result"],
+                    },
+                },
+                webshop_checkpoint_response(
+                    changed=False,
+                    stdout=payload.decode("utf-8"),
+                    checkpoint_payload=payload,
+                    exists=True,
+                ),
+            ]
+        )
+        messages = self.bind_webshop(client)
+        _, messages = complete_policy_turn(
+            client, prepare(client, messages), "click[Buy Now]"
+        )
+        write_action = (
+            'shell_command {"command":"printf checkpoint > '
+            '.agent_memory/CONTINUATION.md"}'
+        )
+        _, messages = complete_policy_turn(
+            client, prepare(client, messages), write_action
+        )
+
+        wrong_output, messages = complete_policy_turn(
+            client, prepare(client, messages), "search[blue mug]"
+        )
+        wrong_evidence = wrong_output.info["wrapper_evidence"]
+        self.assertTrue(wrong_evidence["checkpoint_read_required"])
+        self.assertFalse(wrong_evidence["checkpoint_read_satisfied"])
+        self.assertTrue(wrong_evidence["checkpoint_read_retry_pending"])
+        self.assertEqual(
+            wrong_output.info["context_transition"]["operation"],
+            "append_observation",
+        )
+        self.assertIn("Checkpoint read failed", messages[-1]["content"])
+        self.assertIn(FILESYSTEM_CHECKPOINT_PATH, str(messages))
+
+        read_action = (
+            'shell_command {"command":"cat .agent_memory/CONTINUATION.md"}'
+        )
+        read_output, _ = complete_policy_turn(
+            client, prepare(client, messages), read_action
+        )
+        read_evidence = read_output.info["wrapper_evidence"]
+        self.assertTrue(read_evidence["checkpoint_read_required"])
+        self.assertTrue(read_evidence["checkpoint_read_satisfied"])
+        self.assertFalse(read_evidence["checkpoint_read_retry_pending"])
+        self.assertEqual(read_evidence["memory_event"], "read")
+
+    def test_webshop_handoff_requires_one_failed_retry_of_headroom(self) -> None:
+        client = FakeWebShopClient([webshop_buy_response()])
+        messages = self.bind_webshop(client)
+        _, messages = complete_policy_turn(
+            client, prepare(client, messages), "click[Buy Now]"
+        )
+        candidate_messages = messages + [
+            {"role": "user", "content": WEBSHOP_SESSION_HANDOFF_REQUEST}
+        ]
+        barely_fits_first_request = count_prompt_tokens(candidate_messages) + 1
+
+        with self.assertRaisesRegex(RuntimeError, "failed checkpoint attempt"):
+            prepare(client, messages, capacity=barely_fits_first_request)
 
     def test_invalid_native_output_is_evidence_not_successor_context(self) -> None:
         client = FakeWebShopClient([webshop_search_response()])
@@ -436,7 +806,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertIn("session-0 search result", str(messages))
         self.assertNotIn("session-0 fresh observation", str(messages))
 
-    def test_openmle_compaction_uses_same_entrypoint_and_real_native_action(self) -> None:
+    def test_openmle_compaction_executes_checkpoint_without_free_read(self) -> None:
         client = FakeOpenMLEClient()
         initial = client.policy_framing() + [
             {"role": "user", "content": client.observe()},
@@ -465,18 +835,18 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertIsInstance(marker, str)
         self.assertIn("Earlier conversation was removed", marker)
         self.assertNotIn("but you may instead", prepared.control_request)
+        receipt = filesystem_checkpoint_receipt(action_kind="apply_patch")
         env_info = {
             "action_kind": "apply_patch",
             "action_status": "completed",
             "counters": {"action_count": 1},
-            "execution": {
-                "changed_paths": [".agent_memory/OPENMLE_CONTINUATION.md"],
-            },
+            "execution": {"filesystem_checkpoint": receipt},
         }
-        action = """apply_patch
+        secret = "next inspect train.csv then revise model"
+        action = f"""apply_patch
 *** Begin Patch
-*** Add File: .agent_memory/OPENMLE_CONTINUATION.md
-+next inspect train.csv
+*** Add File: {FILESYSTEM_CHECKPOINT_PATH}
++{secret}
 *** End Patch"""
         with mock.patch.object(
             openmle_fast_module,
@@ -498,46 +868,94 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             ),
             (0, 1, 0, 1, 0, 1),
         )
-        self.assertEqual(
-            replacement,
-            [
-                {"role": "system", "content": OPENMLE_FAST_POLICY_SYSTEM_PROMPT},
-                {"role": "user", "content": initial[-1]["content"]},
-                {"role": "assistant", "content": action},
-                {
-                    "role": "user",
-                    "content": "action_status=completed\n\n"
-                    + OPENMLE_POLICY_CONTINUATION_MARKER,
-                },
-            ],
-        )
+        self.assertEqual(replacement[0], initial[0])
+        self.assertIn(initial[-1]["content"], replacement[-1]["content"])
+        self.assertIn(FILESYSTEM_CHECKPOINT_PATH, replacement[-1]["content"])
+        self.assertIn(receipt["sha256"], replacement[-1]["content"])
         self.assertNotIn("large previous execution evidence", str(replacement))
-        self.assertEqual(replacement[-2]["content"], action)
-        self.assertEqual(
-            output.info["wrapper_evidence"]["workspace_continuity_id"],
-            client.env_id,
-        )
-        self.assertEqual(
-            output.info["wrapper_evidence"]["event"],
-            "context_compaction",
-        )
-        self.assertTrue(
-            output.info["wrapper_evidence"]["continuation_persisted"]
-        )
-        self.assertEqual(
-            output.info["wrapper_evidence"]["continuation_path"],
-            ".agent_memory/OPENMLE_CONTINUATION.md",
-        )
-        self.assertTrue(
-            output.info["wrapper_evidence"]["preserved_policy_output"]
-        )
-        self.assertTrue(
-            output.info["wrapper_evidence"]["preserved_native_observation"]
-        )
+        self.assertNotIn(action, str(replacement))
+        self.assertNotIn(secret, str(replacement))
+        evidence = output.info["wrapper_evidence"]
+        self.assertEqual(evidence["workspace_continuity_id"], client.env_id)
+        self.assertEqual(evidence["event"], "context_compaction")
+        self.assertTrue(evidence["continuation_persisted"])
+        self.assertEqual(evidence["continuation_path"], FILESYSTEM_CHECKPOINT_PATH)
+        self.assertFalse(evidence["checkpoint_action_in_successor_context"])
+        self.assertFalse(evidence["checkpoint_observation_in_successor_context"])
+        self.assertFalse(evidence["checkpoint_content_in_successor_context"])
+        self.assertTrue(evidence["checkpoint_read_required_after"])
 
-    def test_openmle_failed_continuation_write_compacts_without_state_loss(
-        self,
-    ) -> None:
+        wrong_info = {
+            "action_kind": "shell_command",
+            "action_status": "completed",
+            "counters": {"action_count": 2},
+            "counter_delta": {"execution_completed_count": 1},
+            "execution": {
+                "status": "completed",
+                "exit_code": 0,
+                "timed_out": False,
+                "changed_paths": [],
+                "execution_completed_delta": 1,
+            },
+        }
+        wrong_action = 'shell_command {"command":"python train.py"}'
+        with mock.patch.object(
+            openmle_fast_module,
+            "_validate_step_response",
+            return_value=("training complete", 0.0, False, wrong_info),
+        ):
+            wrong_output, replacement = complete_policy_turn(
+                client,
+                prepare(client, replacement),
+                wrong_action,
+            )
+        self.assertIn("Checkpoint read failed", wrong_output.state)
+        self.assertTrue(
+            wrong_output.info["wrapper_evidence"]["checkpoint_read_retry_pending"]
+        )
+        self.assertIn(FILESYSTEM_CHECKPOINT_PATH, str(replacement))
+
+        read_receipt = {
+            "schema": FILESYSTEM_CHECKPOINT_READ_RECEIPT_SCHEMA,
+            "path": FILESYSTEM_CHECKPOINT_PATH,
+            "observed": True,
+            "size_bytes": receipt["size_bytes"],
+            "sha256": receipt["sha256"],
+        }
+        read_info = {
+            "action_kind": "shell_command",
+            "action_status": "completed",
+            "counters": {"action_count": 3},
+            "counter_delta": {"execution_completed_count": 1},
+            "execution": {
+                "status": "completed",
+                "exit_code": 0,
+                "timed_out": False,
+                "changed_paths": [],
+                "execution_completed_delta": 1,
+                "filesystem_checkpoint_read": read_receipt,
+            },
+        }
+        read_action = (
+            'shell_command {"command":"cat .agent_memory/CONTINUATION.md"}'
+        )
+        with mock.patch.object(
+            openmle_fast_module,
+            "_validate_step_response",
+            return_value=("checkpoint", 0.0, False, read_info),
+        ):
+            read_output, replacement = complete_policy_turn(
+                client,
+                prepare(client, replacement),
+                read_action,
+            )
+        self.assertTrue(
+            read_output.info["wrapper_evidence"]["checkpoint_read_satisfied"]
+        )
+        self.assertIsNone(client._pending_checkpoint_read)
+        self.assertIn("checkpoint", str(replacement))
+
+    def test_openmle_failed_checkpoint_keeps_context_and_retries(self) -> None:
         client = FakeOpenMLEClient()
         initial = client.policy_framing() + [
             {"role": "user", "content": client.observe()},
@@ -555,21 +973,26 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         )
         prepared = prepare(client, messages, capacity=candidate_count + 1)
         malformed = (
-            'apply_patch {"patch":"*** Begin Patch\\n'
-            '# state\\n*** End Patch"}'
+            'apply_patch {"patch":"*** Begin Patch\n'
+            '# state\n*** End Patch"}'
+        )
+        failed_receipt = filesystem_checkpoint_receipt(
+            action_kind="parser_error",
+            action_completed=False,
+            changed=False,
+            exists=False,
+            size_bytes=None,
         )
         failed_info = {
             "action_kind": "parser_error",
             "action_status": "parser_error",
             "counters": {"action_count": 1},
-            "execution": {
-                "changed_paths": [],
-            },
+            "execution": {"filesystem_checkpoint": failed_receipt},
         }
         with mock.patch.object(
             openmle_fast_module,
             "_validate_step_response",
-            return_value=("parser error", 0.0, False, failed_info),
+            return_value=("parser error", -0.01, False, failed_info),
         ):
             output, retry_messages = complete_policy_turn(
                 client,
@@ -580,15 +1003,12 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertEqual(client.native_calls, [malformed])
         self.assertEqual(
             output.info["context_transition"]["operation"],
-            "replace_messages",
+            "append_observation",
         )
-        self.assertEqual(
-            output.info["wrapper_evidence"]["event"],
-            "context_compaction",
-        )
-        self.assertFalse(
-            output.info["wrapper_evidence"]["continuation_persisted"]
-        )
+        self.assertEqual(output.info["wrapper_evidence"]["event"], "context_compaction")
+        self.assertFalse(output.info["wrapper_evidence"]["continuation_persisted"])
+        self.assertTrue(output.info["wrapper_evidence"]["retry_pending"])
+        self.assertEqual(output.info["wrapper_evidence"]["checkpoint_failure_reason"], "wrong_action_kind")
         self.assertEqual(
             (
                 output.info["native_call_count_before"],
@@ -598,40 +1018,128 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
                 output.info["context_epoch_before"],
                 output.info["context_epoch_after"],
             ),
-            (0, 1, 0, 1, 0, 1),
+            (0, 1, 0, 1, 0, 0),
         )
-        self.assertNotIn("large previous execution evidence", str(retry_messages))
-        self.assertEqual(
-            retry_messages[-2],
-            {"role": "assistant", "content": malformed},
-        )
-        self.assertEqual(
-            retry_messages[-1],
-            {
-                "role": "user",
-                "content": "parser error\n\n"
-                + OPENMLE_POLICY_CONTINUATION_MARKER,
-            },
-        )
+        self.assertIn("large previous execution evidence", str(retry_messages))
         self.assertTrue(
-            output.info["wrapper_evidence"]["preserved_policy_output"]
+            any(message["content"] == malformed for message in retry_messages)
         )
-        self.assertTrue(
-            output.info["wrapper_evidence"]["preserved_native_observation"]
-        )
+        self.assertIn("parser error", str(retry_messages))
+        retry = prepare(client, retry_messages, capacity=4096)
+        self.assertEqual(retry.control_request, OPENMLE_CONTEXT_COMPACTION_REQUEST)
 
-    def test_swesmith_compaction_uses_same_entrypoint_without_native_call(self) -> None:
+    def test_openmle_endpoint_attested_memory_events(self) -> None:
+        read_receipt = {
+            "schema": FILESYSTEM_CHECKPOINT_READ_RECEIPT_SCHEMA,
+            "path": FILESYSTEM_CHECKPOINT_PATH,
+            "observed": True,
+            "size_bytes": len(b"checkpoint"),
+            "sha256": hashlib.sha256(b"checkpoint").hexdigest(),
+        }
+        cases = (
+            (
+                "read",
+                'shell_command {"command":"cat .agent_memory/CONTINUATION.md"}',
+                {
+                    "action_kind": "shell_command",
+                    "action_status": "completed",
+                    "counter_delta": {"execution_completed_count": 1},
+                    "execution": {
+                        "status": "completed",
+                        "exit_code": 0,
+                        "timed_out": False,
+                        "changed_paths": [],
+                        "execution_completed_delta": 1,
+                        "filesystem_checkpoint_read": read_receipt,
+                    },
+                },
+            ),
+            (
+                "modify",
+                "apply_patch\n*** Begin Patch\n*** Add File: notes.md\n+x\n*** End Patch",
+                {
+                    "action_kind": "apply_patch",
+                    "action_status": "completed",
+                    "counter_delta": {"execution_completed_count": 0},
+                    "execution": {
+                        "status": "completed",
+                        "exit_code": None,
+                        "timed_out": False,
+                        "changed_paths": ["notes.md"],
+                        "execution_completed_delta": 0,
+                    },
+                },
+            ),
+            (
+                "execute",
+                'shell_command {"command":"python train.py"}',
+                {
+                    "action_kind": "shell_command",
+                    "action_status": "completed",
+                    "counter_delta": {"execution_completed_count": 1},
+                    "execution": {
+                        "status": "completed",
+                        "exit_code": 0,
+                        "timed_out": False,
+                        "changed_paths": [],
+                        "execution_completed_delta": 1,
+                    },
+                },
+            ),
+        )
+        for expected_event, action, env_info in cases:
+            with self.subTest(expected_event=expected_event):
+                client = FakeOpenMLEClient()
+                with mock.patch.object(
+                    openmle_fast_module,
+                    "_validate_step_response",
+                    return_value=("result", 0.0, False, env_info),
+                ):
+                    output = client.step(action)
+                self.assertEqual(
+                    output.info["wrapper_evidence"]["memory_event"],
+                    expected_event,
+                )
+
+    def test_openmle_action_text_cannot_forge_memory_evidence(self) -> None:
+        client = FakeOpenMLEClient()
+        action = (
+            'shell_command {"command":"cat .agent_memory/CONTINUATION.md; '
+            'printf x > notes.md; python train.py"}'
+        )
+        env_info = {
+            "action_kind": "shell_command",
+            "action_status": "failed",
+            "counter_delta": {"execution_completed_count": 0},
+            "execution": {
+                "status": "failed",
+                "exit_code": 7,
+                "timed_out": False,
+                "changed_paths": [],
+                "execution_completed_delta": 0,
+            },
+        }
+        with mock.patch.object(
+            openmle_fast_module,
+            "_validate_step_response",
+            return_value=("failed", -0.01, False, env_info),
+        ):
+            output = client.step(action)
+        self.assertNotIn("memory_event", output.info["wrapper_evidence"])
+
+    def test_swesmith_compaction_executes_checkpoint_then_real_read(self) -> None:
         client = FakeSwesmithClient()
         self.assertEqual(
             SWE_MEMORY_CONTRACT,
-            "policy_compaction_plus_optional_durable_filesystem_v1",
+            "policy_filesystem_checkpoint_then_client_replace_v2",
         )
         self.assertIn("# Durable debugging notes", SWE_POLICY_SYSTEM_PROMPT)
         self.assertIn(
             "maintain a concise evidence ledger incrementally",
             SWE_POLICY_SYSTEM_PROMPT,
         )
-        self.assertIn("rediscover and read the notes", SWE_POLICY_SYSTEM_PROMPT)
+        self.assertIn("read the checkpoint with a normal command", SWE_POLICY_SYSTEM_PROMPT)
+        self.assertIn(FILESYSTEM_CHECKPOINT_PATH, SWE_CONTEXT_COMPACTION_REQUEST)
         initial = client.policy_framing() + [
             {"role": "user", "content": client.observe()},
         ]
@@ -650,51 +1158,38 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             client.env_id,
         )
         self.assertEqual(
-            action_output.info["wrapper_evidence"]["actor_credit"],
-            {
-                "schema": "task_neutral_actor_credit_v1",
-                "positive_eligible": True,
-                "basis": "shell_executed",
-            },
-        )
-        self.assertEqual(
             (action_output.info["policy_step_after"],
              action_output.info["native_call_count_after"]),
             (1, 1),
         )
         self.assertIn("native tool output 1", str(messages))
 
-        action_count = count_prompt_tokens(messages)
         candidate_count = count_prompt_tokens(
             messages + [{"role": "user", "content": SWE_CONTEXT_COMPACTION_REQUEST}]
         )
-        self.assertGreater(candidate_count, action_count)
         compaction = prepare(client, messages, capacity=candidate_count + 1)
-        self.assertEqual(
-            compaction.control_request, SWE_CONTEXT_COMPACTION_REQUEST
+        self.assertEqual(compaction.control_request, SWE_CONTEXT_COMPACTION_REQUEST)
+        secret = "parser evidence retained; next inspect parser.py"
+        checkpoint_action = (
+            'shell_command {"command":"mkdir -p .agent_memory && printf %s '
+            + secret
+            + ' > .agent_memory/CONTINUATION.md","workdir":"."}'
         )
-        summary = "Progress is in .agent_memory/MEMORY.md; inspect parser.py next."
         compaction_output, messages = complete_policy_turn(
-            client, compaction, summary
+            client, compaction, checkpoint_action
         )
 
-        self.assertEqual(len(client.native_calls), 1)
-        self.assertEqual(
-            compaction_output.info["wrapper_evidence"]["workspace_continuity_id"],
-            client.env_id,
-        )
-        self.assertEqual(
-            compaction_output.info["wrapper_evidence"]["actor_credit"],
-            {
-                "schema": "task_neutral_actor_credit_v1",
-                "positive_eligible": True,
-                "basis": "policy_context_compaction",
-            },
-        )
+        self.assertEqual(len(client.native_calls), 2)
+        self.assertEqual(client.native_calls[-1], checkpoint_action)
+        evidence = compaction_output.info["wrapper_evidence"]
+        self.assertEqual(evidence["workspace_continuity_id"], client.env_id)
+        self.assertTrue(evidence["continuation_persisted"])
+        self.assertTrue(evidence["checkpoint_read_required_after"])
+        self.assertIsNotNone(client._pending_checkpoint_read)
         self.assertEqual(
             (compaction_output.info["native_call_count_before"],
              compaction_output.info["native_call_count_after"]),
-            (1, 1),
+            (1, 2),
         )
         self.assertEqual(
             (compaction_output.info["policy_step_before"],
@@ -707,15 +1202,18 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             (0, 1),
         )
         self.assertIn("Fix the failing parser", str(messages))
-        self.assertIn(summary, str(messages))
+        self.assertIn(FILESYSTEM_CHECKPOINT_PATH, str(messages))
+        self.assertNotIn(secret, str(messages))
+        self.assertNotIn(checkpoint_action, str(messages))
         self.assertNotIn("native tool output 1", str(messages))
+        self.assertNotIn("native tool output 2", str(messages))
         self.assertNotIn(SWE_CONTEXT_COMPACTION_REQUEST, str(messages))
 
         reread = prepare(client, messages, capacity=4096)
         self.assertIsNone(reread.control_request)
         reread_action = (
-            'shell_command {"command":"rg -n hypothesis '
-            '.agent_memory/debugging.md","workdir":"."}'
+            'shell_command {"command":"cat .agent_memory/CONTINUATION.md",'
+            '"workdir":"."}'
         )
         reread_output, messages = complete_policy_turn(
             client,
@@ -723,7 +1221,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             reread_action,
         )
         self.assertEqual(client.native_calls[-1], reread_action)
-        self.assertEqual(len(client.native_calls), 2)
+        self.assertEqual(len(client.native_calls), 3)
         self.assertEqual(
             reread_output.info["wrapper_evidence"]["workspace_continuity_id"],
             client.env_id,
@@ -733,7 +1231,81 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
              reread_output.info["context_epoch_after"]),
             (1, 1),
         )
-        self.assertIn("native tool output 2", str(messages))
+        self.assertEqual(
+            reread_output.info["wrapper_evidence"]["memory_event"], "read"
+        )
+        self.assertTrue(
+            reread_output.info["wrapper_evidence"]["document_read_observed"]
+        )
+        self.assertTrue(
+            reread_output.info["wrapper_evidence"]["checkpoint_read_satisfied"]
+        )
+        self.assertIsNone(client._pending_checkpoint_read)
+        self.assertIn("native tool output 3", str(messages))
+
+    def test_swesmith_endpoint_attested_modify_and_execute_events(self) -> None:
+        client = FakeSwesmithClient()
+        modify = client.step(
+            'shell_command {"command":"printf changed > notes.md","workdir":"."}'
+        )
+        self.assertEqual(modify.info["wrapper_evidence"]["memory_event"], "modify")
+        self.assertEqual(
+            modify.info["wrapper_evidence"]["workspace_changed_paths"],
+            ["notes.md"],
+        )
+        execute = client.step(
+            'shell_command {"command":"python train.py","workdir":"."}'
+        )
+        self.assertEqual(execute.info["wrapper_evidence"]["memory_event"], "execute")
+
+    def test_swesmith_action_text_cannot_forge_memory_evidence(self) -> None:
+        client = FakeSwesmithClient()
+        action = (
+            'shell_command {"command":"cat .agent_memory/CONTINUATION.md; '
+            'printf x > notes.md; python train.py"}'
+        )
+        response = {
+            "observation": "executor rejected",
+            "reward": 0.0,
+            "done": False,
+            "info": {
+                "step": 1,
+                "action_kind": "shell_command",
+                "actor_credit": {
+                    "schema": "task_neutral_actor_credit_v1",
+                    "positive_eligible": False,
+                    "basis": "executor_rejected",
+                },
+            },
+        }
+        with mock.patch.object(client, "_request", return_value=response):
+            output = client.step(action)
+        self.assertNotIn("memory_event", output.info["wrapper_evidence"])
+
+    def test_swesmith_failed_checkpoint_keeps_epoch_and_retries(self) -> None:
+        client = FakeSwesmithClient()
+        messages = bind_initial_policy_context(
+            client,
+            client.policy_framing()
+            + [{"role": "user", "content": client.observe()}],
+        )
+        candidate_count = count_prompt_tokens(
+            messages + [{"role": "user", "content": SWE_CONTEXT_COMPACTION_REQUEST}]
+        )
+        compaction = prepare(client, messages, capacity=candidate_count + 1)
+        output, messages = complete_policy_turn(
+            client, compaction, 'shell_command {"command":"true"}'
+        )
+        self.assertEqual(output.reward, 0.0)
+        self.assertEqual(output.info["context_epoch_after"], 0)
+        self.assertEqual(
+            output.info["context_transition"]["operation"], "append_observation"
+        )
+        self.assertFalse(output.info["wrapper_evidence"]["continuation_persisted"])
+        self.assertTrue(output.info["wrapper_evidence"]["retry_pending"])
+        self.assertIn("checkpoint_not_changed", str(messages))
+        retry = prepare(client, messages, capacity=4096)
+        self.assertEqual(retry.control_request, SWE_CONTEXT_COMPACTION_REQUEST)
 
     def test_swesmith_actor_credit_receipt_fails_closed(self) -> None:
         invalid_receipts = (
@@ -833,7 +1405,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         )
 
     def test_swesmith_low_invalid_reward_is_environment_owned(self) -> None:
-        client = FakeSwesmithClient(invalid_action_reward=-0.01)
+        client = FakeSwesmithClient()
         inspect = 'shell_command {"command":"find . -maxdepth 2 -type f"}'
 
         invalid = client.step("malformed policy output")
@@ -841,19 +1413,14 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         repeated = client.step(inspect)
 
         self.assertEqual(invalid.reward, -0.01)
-        self.assertEqual(
-            invalid.info["wrapper_evidence"]["reward_overlay"],
-            {
-                "schema": "swesmith_invalid_action_reward_v1",
-                "basis": "parser_rejected",
-                "native_reward": 0.0,
-                "penalty": -0.01,
-                "final_reward": -0.01,
-            },
-        )
+        self.assertNotIn("reward_overlay", invalid.info["wrapper_evidence"])
         self.assertEqual(first.reward, 0.0)
         self.assertEqual(repeated.reward, 0.0)
         self.assertNotIn("reward_overlay", repeated.info["wrapper_evidence"])
+
+    def test_swesmith_rejects_a_second_invalid_action_penalty_overlay(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must be zero"):
+            FakeSwesmithClient(invalid_action_reward=-0.01)
 
     def test_swesmith_zero_progress_repeat_resets_after_compaction(self) -> None:
         client = FakeSwesmithClient()
@@ -882,7 +1449,16 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertGreater(candidate_count, action_count)
         compaction = prepare(client, messages, capacity=candidate_count + 1)
         self.assertEqual(compaction.control_request, SWE_CONTEXT_COMPACTION_REQUEST)
-        _, messages = complete_policy_turn(client, compaction, "Resume by inspecting files.")
+        checkpoint_action = (
+            'shell_command {"command":"mkdir -p .agent_memory && printf changed > '
+            '.agent_memory/CONTINUATION.md","workdir":"."}'
+        )
+        checkpoint_output, messages = complete_policy_turn(
+            client, compaction, checkpoint_action
+        )
+        self.assertTrue(
+            checkpoint_output.info["wrapper_evidence"]["continuation_persisted"]
+        )
 
         after_compaction, _ = complete_policy_turn(
             client, prepare(client, messages), inspect
@@ -977,18 +1553,26 @@ class RolloutFakeSwesmithClient(FakeSwesmithClient):
         return None
 
 
+WEBSHOP_CHECKPOINT_ACTION = (
+    'shell_command {"command":"mkdir -p .agent_memory && printf webshop-state > '
+    '.agent_memory/CONTINUATION.md","workdir":"."}'
+)
+SWE_CHECKPOINT_ACTION = (
+    'shell_command {"command":"mkdir -p .agent_memory && printf swe-state > '
+    '.agent_memory/CONTINUATION.md","workdir":"."}'
+)
+
+
 class FakeRolloutTokenizer:
     pad_token_id = 0
 
     _responses = {
         (101, 999): "click[Buy Now]",
-        (103, 999): "notes/state.md",
+        (103, 999): WEBSHOP_CHECKPOINT_ACTION,
         (201, 202, 999): (
             'shell_command {"command":"rg -n parser .","workdir":"."}'
         ),
-        (204, 205, 999): (
-            "Progress is in .agent_memory/MEMORY.md; inspect parser.py next."
-        ),
+        (204, 205, 999): SWE_CHECKPOINT_ACTION,
     }
 
     def apply_chat_template(self, conversations, **kwargs):
@@ -1060,14 +1644,18 @@ class SharedRolloutRuntimeTest(unittest.TestCase):
                 prompt_loss_mask=[],
                 response_loss_mask=[],
                 max_response_len=8,
-                max_model_len=72,
+                # Leave realistic headroom for one failed checkpoint write and
+                # its bounded retry request. The synthetic token IDs remain tiny.
+                max_model_len=2048,
             )
             handler.parent_index = item_id
             handler.rollout_replica_index = 0
             handler.data_idx = 0
             return handler
 
-        webshop = RolloutFakeWebShopClient([webshop_buy_response()])
+        webshop = RolloutFakeWebShopClient(
+            [webshop_buy_response(), webshop_checkpoint_response()]
+        )
         swesmith = RolloutFakeSwesmithClient()
         sampled_prompts: dict[str, list[int]] = {}
 
@@ -1112,15 +1700,15 @@ class SharedRolloutRuntimeTest(unittest.TestCase):
 
         expected_actions = [
             "click[Buy Now]",
-            "notes/state.md",
+            WEBSHOP_CHECKPOINT_ACTION,
             'shell_command {"command":"rg -n parser .","workdir":"."}',
-            "Progress is in .agent_memory/MEMORY.md; inspect parser.py next.",
+            SWE_CHECKPOINT_ACTION,
         ]
         with tempfile.TemporaryDirectory() as tmpdir:
             rollout.config = SimpleNamespace(
-                prompt_length=64,
+                prompt_length=2040,
                 response_length=8,
-                max_model_len=72,
+                max_model_len=2048,
                 n=1,
                 send_interval=0,
                 rollout_log_dir=tmpdir,
@@ -1185,8 +1773,8 @@ class SharedRolloutRuntimeTest(unittest.TestCase):
             "webshop_session_handoff",
         )
         self.assertEqual(
-            handoff["wrapper_evidence"]["native_call_count_before"],
             handoff["wrapper_evidence"]["native_call_count_after"],
+            handoff["wrapper_evidence"]["native_call_count_before"] + 1,
         )
         self.assertEqual(
             handoff["wrapper_evidence"]["policy_step_after"],
@@ -1203,8 +1791,10 @@ class SharedRolloutRuntimeTest(unittest.TestCase):
         self.assertTrue(compaction["done"])
         self.assertEqual(compaction["outcome"], "success")
         self.assertEqual(compaction["horizon_finalization"]["reward"], 0.5)
-        self.assertEqual(webshop.native_calls, ["click[Buy Now]"])
-        self.assertEqual(len(swesmith.native_calls), 1)
+        self.assertEqual(
+            webshop.native_calls, ["click[Buy Now]", WEBSHOP_CHECKPOINT_ACTION]
+        )
+        self.assertEqual(len(swesmith.native_calls), 2)
 
 
 if __name__ == "__main__":

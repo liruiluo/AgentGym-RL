@@ -20,6 +20,18 @@ def load_module():
     return module
 
 
+def checkpoint_successor(checkpoint_sha256: str, size: int = 128) -> str:
+    return (
+        "task observation\n\nEarlier conversation was removed after the "
+        "continuation snapshot write succeeded. The workspace persists, but "
+        "`.agent_memory/CONTINUATION.md` was not copied into this prompt. Use "
+        "the next normal action to read that file, then continue from its "
+        "evidence and next action. Other workspace files remain available and "
+        "may still be read or updated normally. Verified receipt: "
+        f"size_bytes={size}, sha256={checkpoint_sha256}."
+    )
+
+
 class SwesmithPpoGateRowEvidenceTests(unittest.TestCase):
     @staticmethod
     def _response_cap_record() -> dict:
@@ -95,27 +107,393 @@ class SwesmithPpoGateRowEvidenceTests(unittest.TestCase):
         self.assertEqual(result["native_step_after"], 5)
         self.assertEqual(result["action_kind"], "shell_command")
 
+        checkpoint_sha256 = "a" * 64
+        checkpoint_receipt = {
+            "schema": module.FILESYSTEM_CHECKPOINT_RECEIPT_SCHEMA,
+            "path": module.FILESYSTEM_CHECKPOINT_PATH,
+            "action_kind": "shell_command",
+            "action_completed": True,
+            "changed": True,
+            "exists": True,
+            "regular_file": True,
+            "size_bytes": 128,
+            "sha256": checkpoint_sha256,
+        }
+        action = (
+            'shell_command {"command":"write .agent_memory/CONTINUATION.md"}'
+        )
         compaction = {
+            "action": action,
             "wrapper_evidence": {
                 "event": module.COMPACTION_EVENT,
                 "workspace_continuity_id": 9,
+                "continuation_path": module.FILESYSTEM_CHECKPOINT_PATH,
+                "continuation_max_bytes": module.FILESYSTEM_CHECKPOINT_MAX_BYTES,
+                "continuation_persisted": True,
+                "checkpoint_receipt": checkpoint_receipt,
+                "checkpoint_failure_reason": None,
+                "context_replaced": True,
+                "retry_pending": False,
+                "checkpoint_retry_observation_bounded": False,
+                "preserved_policy_output": True,
+                "preserved_native_observation": True,
+                "checkpoint_action_in_successor_context": False,
+                "checkpoint_observation_in_successor_context": False,
+                "checkpoint_content_in_successor_context": False,
             },
             "env_info_before": {"step": 5},
-            "env_info_after": {"step": 5, "action_kind": "shell_command"},
+            "env_info_after": {
+                "step": 6,
+                "action_kind": "shell_command",
+                "filesystem_checkpoint": checkpoint_receipt,
+            },
+            "native_step_before": 5,
+            "native_step_after": 6,
+            "native_call_count_before": 5,
+            "native_call_count_after": 6,
+            "policy_step_before": 5,
+            "policy_step_after": 6,
+            "context_epoch_before": 0,
+            "context_epoch_after": 1,
             "context_transition": {
                 "schema": "agentmemory_task_neutral_context_transition_v1",
                 "operation": "replace_messages",
-                "messages": [{"role": "system", "content": "summary"}],
+                "messages": [
+                    {"role": "system", "content": "task framing"},
+                    {
+                        "role": "user",
+                        "content": checkpoint_successor(checkpoint_sha256),
+                    },
+                ],
             },
-            "action_submission": {
-                "submitted_action": None,
-                "parser_status": "policy_context_compaction",
-            },
+            "action_submission": {"raw_policy_output": action},
+            "control_request": "Persist continuation state before compaction.",
             "immediate_reward": 0.0,
+            "trajectory_terminal": False,
+            "done": False,
         }
         result = module.verify_wrapper_transition(compaction, previous_native_step=5)
-        self.assertEqual(result["native_step_after"], 5)
-        self.assertIsNone(result["action_kind"])
+        self.assertEqual(result["native_step_after"], 6)
+        self.assertEqual(result["action_kind"], "shell_command")
+        self.assertTrue(result["context_replaced"])
+
+    def test_accepts_failed_checkpoint_as_bounded_retry_without_replacement(self) -> None:
+        module = load_module()
+        action = 'shell_command {"command":"false"}'
+        record = {
+            "action": action,
+            "wrapper_evidence": {
+                "event": module.COMPACTION_EVENT,
+                "workspace_continuity_id": 9,
+                "continuation_path": module.FILESYSTEM_CHECKPOINT_PATH,
+                "continuation_max_bytes": module.FILESYSTEM_CHECKPOINT_MAX_BYTES,
+                "continuation_persisted": False,
+                "checkpoint_receipt": None,
+                "checkpoint_failure_reason": "action_not_completed",
+                "context_replaced": False,
+                "retry_pending": True,
+                "checkpoint_retry_observation_bounded": True,
+                "preserved_policy_output": False,
+                "preserved_native_observation": False,
+                "checkpoint_action_in_successor_context": False,
+                "checkpoint_observation_in_successor_context": False,
+                "checkpoint_content_in_successor_context": False,
+            },
+            "env_info_before": {"step": 5},
+            "env_info_after": {"step": 6, "action_kind": "shell_command"},
+            "native_step_before": 5,
+            "native_step_after": 6,
+            "native_call_count_before": 5,
+            "native_call_count_after": 6,
+            "policy_step_before": 5,
+            "policy_step_after": 6,
+            "context_epoch_before": 0,
+            "context_epoch_after": 0,
+            "context_transition": {
+                "schema": "agentmemory_task_neutral_context_transition_v1",
+                "operation": "append_observation",
+                "messages": [],
+            },
+            "action_submission": {"raw_policy_output": action},
+            "immediate_reward": -0.01,
+            "trajectory_terminal": False,
+            "done": False,
+        }
+        result = module.verify_wrapper_transition(record, previous_native_step=5)
+        self.assertEqual(result["native_step_after"], 6)
+        self.assertFalse(result["context_replaced"])
+
+    def test_rejects_checkpoint_counter_or_successor_marker_mismatch(self) -> None:
+        module = load_module()
+        checkpoint_sha256 = "a" * 64
+        receipt = {
+            "schema": module.FILESYSTEM_CHECKPOINT_RECEIPT_SCHEMA,
+            "path": module.FILESYSTEM_CHECKPOINT_PATH,
+            "action_kind": "shell_command",
+            "action_completed": True,
+            "changed": True,
+            "exists": True,
+            "regular_file": True,
+            "size_bytes": 128,
+            "sha256": checkpoint_sha256,
+        }
+        base = {
+            "action": "shell_command {}",
+            "wrapper_evidence": {
+                "event": module.COMPACTION_EVENT,
+                "workspace_continuity_id": 9,
+                "continuation_path": module.FILESYSTEM_CHECKPOINT_PATH,
+                "continuation_max_bytes": module.FILESYSTEM_CHECKPOINT_MAX_BYTES,
+                "continuation_persisted": True,
+                "checkpoint_receipt": receipt,
+                "checkpoint_failure_reason": None,
+                "context_replaced": True,
+                "retry_pending": False,
+                "checkpoint_retry_observation_bounded": False,
+                "preserved_policy_output": True,
+                "preserved_native_observation": True,
+                "checkpoint_action_in_successor_context": False,
+                "checkpoint_observation_in_successor_context": False,
+                "checkpoint_content_in_successor_context": False,
+            },
+            "env_info_before": {"step": 5},
+            "env_info_after": {
+                "step": 6,
+                "action_kind": "shell_command",
+                "filesystem_checkpoint": receipt,
+            },
+            "native_step_before": 5,
+            "native_step_after": 6,
+            "native_call_count_before": 5,
+            "native_call_count_after": 6,
+            "policy_step_before": 5,
+            "policy_step_after": 6,
+            "context_epoch_before": 0,
+            "context_epoch_after": 1,
+            "context_transition": {
+                "schema": "agentmemory_task_neutral_context_transition_v1",
+                "operation": "replace_messages",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": checkpoint_successor(checkpoint_sha256),
+                    }
+                ],
+            },
+            "action_submission": {"raw_policy_output": "shell_command {}"},
+            "done": False,
+        }
+        for mutate in (
+            lambda value: value.update(policy_step_after=5),
+            lambda value: value["context_transition"]["messages"][0].update(
+                content="Read .agent_memory/CONTINUATION.md."
+            ),
+            lambda value: value["env_info_after"].pop("filesystem_checkpoint"),
+            lambda value: value["wrapper_evidence"].pop(
+                "preserved_policy_output"
+            ),
+            lambda value: value["context_transition"]["messages"][0].update(
+                content=(
+                    value["context_transition"]["messages"][0]["content"]
+                    + "\n"
+                    + value["action"]
+                )
+            ),
+        ):
+            with self.subTest(mutate=mutate):
+                record = json.loads(json.dumps(base))
+                mutate(record)
+                with self.assertRaises(AssertionError):
+                    module.verify_wrapper_transition(record, previous_native_step=5)
+
+    @staticmethod
+    def _checkpoint_read_record(module, *, digest: str = "a" * 64) -> dict:
+        receipt = {
+            "schema": module.FILESYSTEM_CHECKPOINT_READ_RECEIPT_SCHEMA,
+            "path": module.FILESYSTEM_CHECKPOINT_PATH,
+            "observed": True,
+            "size_bytes": 128,
+            "sha256": digest,
+        }
+        action = (
+            'shell_command {"command":"cat .agent_memory/CONTINUATION.md"}'
+        )
+        return {
+            "action": action,
+            "wrapper_evidence": {
+                "event": module.NATIVE_EVENT,
+                "workspace_continuity_id": 9,
+                "memory_event": "read",
+                "document_read_observed": True,
+                "filesystem_checkpoint_read": receipt,
+            },
+            "env_info_before": {"step": 6},
+            "env_info_after": {
+                "step": 7,
+                "action_kind": "shell_command",
+                "filesystem_checkpoint_read": receipt,
+            },
+            "native_step_before": 6,
+            "native_step_after": 7,
+            "native_call_count_before": 6,
+            "native_call_count_after": 7,
+            "policy_step_before": 6,
+            "policy_step_after": 7,
+            "context_epoch_before": 1,
+            "context_epoch_after": 1,
+            "context_transition": {
+                "schema": "agentmemory_task_neutral_context_transition_v1",
+                "operation": "append_observation",
+                "messages": [],
+            },
+            "action_submission": {"raw_policy_output": action},
+            "immediate_reward": 0.0,
+            "trajectory_terminal": False,
+            "done": False,
+            "outcome": "continue",
+        }
+
+    def test_accepts_endpoint_attested_checkpoint_read(self) -> None:
+        module = load_module()
+        record = self._checkpoint_read_record(module)
+        result = module.verify_wrapper_transition(record, previous_native_step=6)
+        self.assertEqual(
+            result["checkpoint_read_receipt"]["sha256"],
+            "a" * 64,
+        )
+        self.assertEqual(result["context_epoch_after"], 1)
+
+    def test_rejects_unbound_or_drifted_checkpoint_read(self) -> None:
+        module = load_module()
+        mutations = (
+            lambda value: value["env_info_after"].pop(
+                "filesystem_checkpoint_read"
+            ),
+            lambda value: value["env_info_after"][
+                "filesystem_checkpoint_read"
+            ].update(sha256="b" * 64),
+            lambda value: value.update(native_call_count_after=6),
+            lambda value: value.update(context_epoch_after=2),
+            lambda value: value["action_submission"].update(
+                raw_policy_output="shell_command {}"
+            ),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                record = json.loads(
+                    json.dumps(self._checkpoint_read_record(module))
+                )
+                mutate(record)
+                with self.assertRaises(AssertionError):
+                    module.verify_wrapper_transition(
+                        record, previous_native_step=6
+                    )
+
+    def test_checkpoint_chain_requires_immediate_matching_read(self) -> None:
+        module = load_module()
+        write = {
+            "size_bytes": 128,
+            "sha256": "a" * 64,
+        }
+        pending, chain = module.advance_checkpoint_read_chain(
+            None,
+            {
+                "checkpoint_write_receipt": write,
+                "checkpoint_read_receipt": None,
+                "context_epoch_after": 1,
+            },
+            parent_index=4,
+            task_round=6,
+        )
+        self.assertIsNone(chain)
+        self.assertIsNotNone(pending)
+        pending, chain = module.advance_checkpoint_read_chain(
+            pending,
+            {
+                "checkpoint_write_receipt": None,
+                "checkpoint_read_receipt": {
+                    "size_bytes": 128,
+                    "sha256": "a" * 64,
+                },
+                "context_epoch_after": 1,
+            },
+            parent_index=4,
+            task_round=7,
+        )
+        self.assertIsNone(pending)
+        self.assertEqual(
+            chain,
+            {
+                "parent_index": 4,
+                "write_task_round": 6,
+                "read_task_round": 7,
+                "size_bytes": 128,
+                "sha256": "a" * 64,
+            },
+        )
+
+        pending, _ = module.advance_checkpoint_read_chain(
+            None,
+            {
+                "checkpoint_write_receipt": write,
+                "checkpoint_read_receipt": None,
+                "context_epoch_after": 1,
+            },
+            parent_index=4,
+            task_round=6,
+        )
+        pending, chain = module.advance_checkpoint_read_chain(
+            pending,
+            {
+                "checkpoint_write_receipt": None,
+                "checkpoint_read_receipt": None,
+                "context_epoch_after": 1,
+            },
+            parent_index=4,
+            task_round=7,
+        )
+        self.assertIsNone(pending)
+        self.assertIsNone(chain)
+        pending, chain = module.advance_checkpoint_read_chain(
+            pending,
+            {
+                "checkpoint_write_receipt": None,
+                "checkpoint_read_receipt": {
+                    "size_bytes": 128,
+                    "sha256": "a" * 64,
+                },
+                "context_epoch_after": 1,
+            },
+            parent_index=4,
+            task_round=8,
+        )
+        self.assertIsNone(pending)
+        self.assertIsNone(chain)
+
+    def test_checkpoint_chain_rejects_digest_or_epoch_drift(self) -> None:
+        module = load_module()
+        for read_digest, read_epoch in (("b" * 64, 1), ("a" * 64, 2)):
+            with self.subTest(read_digest=read_digest, read_epoch=read_epoch):
+                pending = {
+                    "receipt": {"size_bytes": 128, "sha256": "a" * 64},
+                    "task_round": 6,
+                    "context_epoch_after": 1,
+                }
+                pending, chain = module.advance_checkpoint_read_chain(
+                    pending,
+                    {
+                        "checkpoint_write_receipt": None,
+                        "checkpoint_read_receipt": {
+                            "size_bytes": 128,
+                            "sha256": read_digest,
+                        },
+                        "context_epoch_after": read_epoch,
+                    },
+                    parent_index=4,
+                    task_round=7,
+                )
+                self.assertIsNone(pending)
+                self.assertIsNone(chain)
 
     def test_rejects_native_step_gap(self) -> None:
         module = load_module()
@@ -140,7 +518,7 @@ class SwesmithPpoGateRowEvidenceTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             module.verify_wrapper_transition(record, previous_native_step=6)
 
-    def test_accepts_hidden_reward_on_horizon_tool_row(self) -> None:
+    def test_accepts_successful_native_submission_row(self) -> None:
         module = load_module()
         record = {
             "wrapper_evidence": {
@@ -150,7 +528,7 @@ class SwesmithPpoGateRowEvidenceTests(unittest.TestCase):
             "env_info_before": {"step": 29},
             "env_info_after": {
                 "step": 30,
-                "action_kind": "shell_command",
+                "action_kind": "final",
                 "episode_success": True,
                 "terminal": True,
             },
@@ -159,16 +537,52 @@ class SwesmithPpoGateRowEvidenceTests(unittest.TestCase):
                 "operation": "append_observation",
                 "messages": [],
             },
-            "action_submission": {"submitted_action": "shell_command"},
+            "action_submission": {"submitted_action": "final"},
             "immediate_reward": 1.0,
             "trajectory_terminal": True,
             "done": True,
             "outcome": "success",
         }
         result = module.verify_wrapper_transition(record, previous_native_step=29)
-        self.assertEqual(result["action_kind"], "shell_command")
+        self.assertEqual(result["action_kind"], "final")
 
-    def test_accepts_horizon_grading_attached_to_last_native_row(self) -> None:
+    def test_accepts_one_native_invalid_penalty_and_rejects_double_penalty(self) -> None:
+        module = load_module()
+        record = {
+            "wrapper_evidence": {
+                "event": module.NATIVE_EVENT,
+                "workspace_continuity_id": 9,
+                "actor_credit": {
+                    "schema": "task_neutral_actor_credit_v1",
+                    "positive_eligible": False,
+                    "basis": "parser_rejected",
+                },
+            },
+            "env_info_before": {"step": 4},
+            "env_info_after": {
+                "step": 5,
+                "action_kind": "parser_error",
+                "episode_success": False,
+                "terminal": True,
+            },
+            "context_transition": {
+                "schema": "agentmemory_task_neutral_context_transition_v1",
+                "operation": "append_observation",
+                "messages": [],
+            },
+            "action_submission": {"raw_policy_output": "malformed"},
+            "immediate_reward": -0.01,
+            "trajectory_terminal": True,
+            "done": True,
+            "outcome": "terminal_failure",
+        }
+        result = module.verify_wrapper_transition(record, previous_native_step=4)
+        self.assertEqual(result["action_kind"], "parser_error")
+        record["immediate_reward"] = -0.02
+        with self.assertRaises(AssertionError):
+            module.verify_wrapper_transition(record, previous_native_step=4)
+
+    def test_accepts_negative_horizon_failure_attached_to_last_native_row(self) -> None:
         module = load_module()
         record = {
             "task_round": 30,
@@ -189,13 +603,13 @@ class SwesmithPpoGateRowEvidenceTests(unittest.TestCase):
                 "messages": [],
             },
             "action_submission": {"submitted_action": "shell_command"},
-            "immediate_reward": 1.0,
+            "immediate_reward": -0.01,
             "trajectory_terminal": True,
             "done": True,
-            "outcome": "success",
+            "outcome": "terminal_failure",
             "horizon_finalization": {
-                "state": "Submission accepted and graded. The issue is resolved.",
-                "reward": 1.0,
+                "state": "Episode ended without a successful official submission.",
+                "reward": -0.01,
                 "done": True,
                 "info": {
                     "env_info": {
@@ -203,7 +617,7 @@ class SwesmithPpoGateRowEvidenceTests(unittest.TestCase):
                         "step": 30,
                         "action_kind": "policy_turn_horizon",
                         "terminal": True,
-                        "episode_success": True,
+                        "episode_success": False,
                     },
                     "action_submission": {"control_action": "horizon"},
                     "native_step_before": 30,
@@ -237,10 +651,10 @@ class SwesmithPpoGateRowEvidenceTests(unittest.TestCase):
                 "messages": [],
             },
             "action_submission": {"submitted_action": "shell_command"},
-            "immediate_reward": 1.0,
+            "immediate_reward": -0.01,
             "trajectory_terminal": True,
             "done": True,
-            "outcome": "success",
+            "outcome": "terminal_failure",
             "horizon_finalization": {
                 "reward": 0.0,
                 "done": True,
@@ -267,16 +681,36 @@ class SwesmithPpoGateRowEvidenceTests(unittest.TestCase):
             module.Counter({module.NATIVE_EVENT: 10}),
             module.Counter({"shell_command": 8, "final": 2}),
             require_compaction=False,
+            successful_compactions=0,
+            successful_checkpoint_read_chains=0,
         )
 
     def test_preserves_strict_compaction_gate_when_requested(self) -> None:
         module = load_module()
-        with self.assertRaises(AssertionError):
-            module.verify_event_coverage(
-                module.Counter({module.NATIVE_EVENT: 10}),
-                module.Counter({"shell_command": 8, "final": 2}),
-                require_compaction=True,
-            )
+        for successful_compactions, read_chains in ((0, 0), (1, 0)):
+            with self.subTest(
+                successful_compactions=successful_compactions,
+                read_chains=read_chains,
+            ):
+                with self.assertRaises(AssertionError):
+                    module.verify_event_coverage(
+                        module.Counter(
+                            {module.NATIVE_EVENT: 10, module.COMPACTION_EVENT: 1}
+                        ),
+                        module.Counter({"shell_command": 8, "final": 2}),
+                        require_compaction=True,
+                        successful_compactions=successful_compactions,
+                        successful_checkpoint_read_chains=read_chains,
+                    )
+        module.verify_event_coverage(
+            module.Counter(
+                {module.NATIVE_EVENT: 10, module.COMPACTION_EVENT: 1}
+            ),
+            module.Counter({"shell_command": 8, "final": 2}),
+            require_compaction=True,
+            successful_compactions=1,
+            successful_checkpoint_read_chains=1,
+        )
 
     def test_accepts_representative_endpoint_probe_for_train64(self) -> None:
         module = load_module()
@@ -494,6 +928,7 @@ class SwesmithPpoGateRowEvidenceTests(unittest.TestCase):
 class SwesmithPpoGateAuditSelectionTests(unittest.TestCase):
     @staticmethod
     def _audit(*, audit_id: str, index: int, slot: int, started_at: str) -> dict:
+        resolved = index == 0
         return {
             "schema": "agentmemory_swesmith_private_episode_audit_v1",
             "audit_id": audit_id,
@@ -502,9 +937,28 @@ class SwesmithPpoGateAuditSelectionTests(unittest.TestCase):
             "started_at": started_at,
             "close_reason": "client_close",
             "done": True,
-            "reward": 1.0 if index == 0 else 0.0,
-            "grade": {"resolution_status": "RESOLVED_YES" if index == 0 else "RESOLVED_NO"},
+            "reward": 1.0 if resolved else 0.0,
+            "grade": {
+                "resolution_status": "RESOLVED_YES" if resolved else "RESOLVED_NO"
+            },
             "step_count": 3,
+            "sample_excluded": False,
+            "sample_exclusion_reason": None,
+            "evidence": [
+                {
+                    "event": "policy_step",
+                    "termination_reason": (
+                        "submission_sentinel" if resolved else "grader_unresolved"
+                    ),
+                    "action": {"kind": "shell_command"},
+                    "actor_credit": {
+                        "schema": "task_neutral_actor_credit_v1",
+                        "positive_eligible": True,
+                        "basis": "terminal_submission",
+                    },
+                    "observation_after": "graded",
+                }
+            ],
         }
 
     def test_excludes_stale_preflight_audits_from_reused_endpoint(self) -> None:
@@ -804,10 +1258,11 @@ class SwesmithPpoGateAuditSelectionTests(unittest.TestCase):
                 started_at="2026-08-09T01:00:01Z",
             )
             payload.update({
-                "reward": 0.0,
+                "reward": -0.01,
                 "grade": None,
                 "evidence": [{
                     "event": "policy_step",
+                    "termination_reason": "executor_rejected",
                     "action": {"kind": "shell_command"},
                     "actor_credit": {
                         "schema": "task_neutral_actor_credit_v1",
@@ -840,6 +1295,7 @@ class SwesmithPpoGateAuditSelectionTests(unittest.TestCase):
                 "step_count": 3,
                 "actor_credit_basis": "executor_rejected",
                 "action_kind": "shell_command",
+                "termination_reason": "executor_rejected",
             }],
         )
 
@@ -858,6 +1314,7 @@ class SwesmithPpoGateAuditSelectionTests(unittest.TestCase):
                 "grade": None,
                 "evidence": [{
                     "event": "policy_step",
+                    "termination_reason": "",
                     "action": {"kind": "shell_command"},
                     "actor_credit": {
                         "schema": "task_neutral_actor_credit_v1",

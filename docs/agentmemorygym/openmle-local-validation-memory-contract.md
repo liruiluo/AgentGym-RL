@@ -1,6 +1,6 @@
 # OpenMLE-fast local iteration and terminal submission contract
 
-Status: canonical for the next fresh OpenMLE-fast lineage as of 2026-08-17.
+Status: canonical for the next fresh four-environment fully asynchronous lineage as of 2026-08-27.
 
 ## 1. Decision
 
@@ -16,8 +16,11 @@ The policy may repeatedly:
    and print its own measured local metric;
 5. write hypotheses, results, failures, and next steps to ordinary workspace
    files;
-6. recover those files after a policy-authored context compaction and continue
-   changing code.
+6. at a context boundary, use one ordinary executable action to overwrite
+   `.agent_memory/CONTINUATION.md`, then read it with a later ordinary action
+   after the wrapper replaces the old message history;
+7. continue changing code and maintain any other task files or longer-lived
+   experiment notes independently of that bounded checkpoint.
 
 The policy chooses when to call `submit`.  That action reads the current
 `/workspace/submission.csv`, invokes the protected private grader exactly once,
@@ -39,10 +42,12 @@ submit
 
 Every policy reply consumes one global action.  Reading with `cat` or `grep`,
 editing, launching Python, computing local validation, writing or reading an
-experiment log, context compaction, and terminal submission are all charged.
-The reset observation and every charged-action observation report the completed
-action number and the remaining shared budget; compaction preserves that status
-in the replacement context.  Python starts, completed executions, fits, and
+experiment log, the required filesystem-checkpoint write, and terminal
+submission are all charged.  The deterministic `replace_messages` operation
+after a verified checkpoint write is not another policy action.  The reset
+observation and every charged-action observation report the completed action
+number and the remaining shared budget; replacement preserves that status in
+the successor context.  Python starts, completed executions, fits, and
 nested subprocesses remain separate audit counters and are not aliases for the
 policy-action count.
 
@@ -67,11 +72,11 @@ behalf of the policy.
 
 | Surface | Owns | Must not own |
 | --- | --- | --- |
-| OpenMLE-fast wrapper prompt | Explain the public local-validation loop, name `.agent_memory/OPENMLE_CONTINUATION.md` as an ordinary charged workspace note, require context recovery, and reserve one terminal `submit` | Hidden answers, task-specific modelling recipes, free memory actions, or private-score feedback |
+| OpenMLE-fast wrapper prompt | Explain the public local-validation loop; at a context boundary require one ordinary `shell_command` or `apply_patch` that overwrites `.agent_memory/CONTINUATION.md`; after replacement require a later ordinary read; reserve one terminal `submit` | Hidden answers, task-specific modelling recipes, free memory actions, the checkpoint body in the successor prompt, or private-score feedback |
 | OpenMLE-fast environment | Charge each ordinary action, expose the completed/remaining action budget, preserve one episode workspace, execute the terminal private grade, and enforce action/time/resource limits | Repeatable private scoring, automatic final submission, or cross-episode memory |
 | Sandbox executor | Run ordinary commands, report bounded stdout/stderr and counters, reap descendants, preserve public/private isolation | MLE strategy, metric selection, memory semantics, or terminal decisions |
 | Private grader | Authenticate and score the one terminal submission | Policy-visible iterative feedback |
-| Environment wrapper context transition | Request an ordinary charged compaction action and return a task-neutral `replace_messages` receipt while the workspace persists | Domain parsing or an extra sampling loop |
+| Environment wrapper context transition | Detect token pressure; request an ordinary charged checkpoint write; verify the exact fixed path was changed to a non-empty regular file of at most 8,192 bytes; only then return a task-neutral `replace_messages` receipt while the workspace persists.  On failure, preserve the old messages and return a bounded retry observation | A free semantic summary, checkpoint-body injection, domain parsing in shared code, or an extra sampling loop |
 | Shared rollout | Sample one policy output, call `env.step` once, preserve sampled tokens/logprobs, and mechanically apply task-neutral receipts | OpenMLE actions, validation logic, filenames, task IDs, or private grading policy |
 | Offline analyzer | Reconstruct local runs, log writes/reads, compaction, subsequent code changes, terminal submit, and outcome curves | Changing rewards or granting runtime actions |
 
@@ -83,8 +88,9 @@ The engineering gate must retain complete action/receipt evidence for at least
 one real-model trajectory showing the reachable chain:
 
 ```text
-inspect -> edit -> run/local metric -> write experiment note
--> context compaction -> read note -> edit/run again -> submit
+inspect -> edit -> run/local metric -> ordinary checkpoint-file write
+-> verified replace_messages -> ordinary checkpoint-file read
+-> edit/run again -> submit
 ```
 
 The formal analyzer reports, per trajectory and per optimizer-step block:
@@ -92,8 +98,10 @@ The formal analyzer reports, per trajectory and per optimizer-step block:
 - policy actions;
 - managed Python starts, completed executions, fits, and failures;
 - local-validation evidence in visible command output;
-- model-authored experiment-document writes;
-- post-compaction reads of those documents;
+- model-authored checkpoint writes and their exact receipt (`path`, size, SHA256);
+- proof that the successor context contains only the fixed locator and receipt
+  metadata, not the checkpoint body or sampled write/observation;
+- post-replacement reads of the checkpoint and any other experiment documents;
 - code changes and executions after the read;
 - policy-chosen terminal `submit`;
 - VSR, online PS (the same baseline-beat event reported as BBR/all), BBR
@@ -108,9 +116,10 @@ and no-memory controls.
 
 The earlier lineage already supported repeated `shell_command`/`apply_patch`
 actions followed by one terminal `submit`; it was not a single-execution
-environment.  The missing evidence is a real policy-authored chain containing
-local validation, experiment memory, compaction recovery, further code changes,
-and an intentional final submission.
+environment.  The missing evidence is a real policy-authored chain containing local
+validation, an executed bounded checkpoint write, deterministic context
+replacement, a later charged read, further code changes, and an intentional
+final submission.
 
 The next fresh lineage may change only the task-owned surfaces needed to make
 that existing protocol usable and auditable:
@@ -119,6 +128,10 @@ that existing protocol usable and auditable:
   local-validation guidance;
 - the environment observation reports completed and remaining actions without
   adding an action, reward, oracle, or free memory operation;
+- all four AMG wrappers use the same `.agent_memory/CONTINUATION.md` boundary
+  contract: the write is an ordinary sampled action, successful replacement is
+  conditional on a fresh non-empty regular file receipt bounded to 8,192 bytes,
+  and the successor contains only path/size/SHA256 plus a read-next instruction;
 - the sandbox returns `EPERM` for blocked socket creation instead of killing a
   basic utility with `SIGSYS`, while the network namespace and no-egress probes
   remain enforced;
@@ -149,32 +162,31 @@ base rather than resuming an earlier checkpoint.
 
 ## 7. Gate and formal-training scope
 
-The 64-task G64 run is an engineering and real-policy behaviour gate.  It must
-prove that the action parser, sandbox, local-validation loop, continuation-file
-chain, context replacement, terminal submission, learner update, and cleanup are
-reachable together.  G64 is not a fixed training set and cannot provide the
-formal learning result.
+A real-model activation gate must prove, in each of the four wrappers, that the
+action parser, native environment, bounded checkpoint write, receipt gate,
+context replacement, later charged read, learner packing, and cleanup are
+reachable together.  The sampled checkpoint action and exact token/logprob row
+remain in the trajectory ledger, while its body and native observation are absent
+from the successor prompt.  A source fixture alone is insufficient.
 
-The next formal run starts from fresh Qwen3.5-4B and uses the frozen full-pool
-schedule: 354 tasks from 307 source families, 64 episodes per optimizer update,
-100 optimizer updates, and 6,400 total episodes.  The schedule traverses the
-complete pool before repetition; it must not be replaced by a small fixed task
-subset.  Each update must retain 64 unique trajectory groups.  A fixed trainer
+The next formal run starts from pristine Qwen3.5-4B update 0 and uses the frozen
+four-route Multitask400 schedule: 400 optimizer updates, 64 episodes per update,
+and 25,600 total episodes, with exactly 6,400 rows for each route.  Its current
+OpenMLE-fast route is the rich-v8 train pool with 762 tasks from 664 source
+families, repeated 8 or 9 times to form 6,400 rows.  These counts must be derived
+from the immutable manifest and schedule certificate rather than copied into a
+launcher.  Each update must retain 64 unique trajectory groups.  A fixed trainer
 batch-size metric is not evidence for that count; the health gate reconstructs
-unique groups from the persisted action receipts and fails closed on any
-exclusion.
+unique groups from persisted action receipts and fails closed on any exclusion.
 
-The formal and G64 behaviour gate use the same 16,384-token prompt-width
-context-pressure contract.  This leaves room for the sampled response and the
-bounded next observation, so the wrapper requests the charged continuation-note
-action before the history reaches the hard prompt cap.  A formal launcher must
-fail closed if its prompt width drifts from the G64 contract.  Raising the
-formal width to 30,720 suppresses most context replacements, changes the tested
-memory behaviour, and roughly doubles learner token load; that configuration is
-not the admitted lineage.  Any correction of this setting starts a fresh
-optimizer lineage.
+The activation gate and formal use the same 30,720-token prompt-width contract.
+Each wrapper computes its safe trigger from the exact tokenizer, response bound,
+route-specific observation bound, action/observation envelope, checkpoint request,
+and one bounded failed-write retry.  A launcher must fail closed on width or
+trigger drift.  Changing this policy-visible boundary starts a fresh optimizer
+lineage.
 
-Before update 100, supervision uses only training-health and online receipts:
+Before update 400, supervision uses only training-health and online receipts:
 VSR, online PS/BBR over all episodes, BBR conditional on valid submissions,
 valid-only continuous normalized reward, trajectory return, stage timing, and
 the canonical continuation chain.  It does not run a held-out evaluation or

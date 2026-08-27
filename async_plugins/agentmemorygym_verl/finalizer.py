@@ -8,6 +8,7 @@ queue, or behavior event is synthesized when its owning artifact omitted it.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -33,6 +34,14 @@ _MULTITASK_SOURCE_LOCK_SCHEMA = "amg_multitask_launcher_source_lock_v1"
 _MULTITASK_SCHEDULE_CERTIFICATE_SCHEMA = "amg_multitask_schedule_certificate_v1"
 _FINAL_STATISTICS_SCHEMA = "verl_fully_async_final_statistics_v1"
 _FINAL_STATISTICS_MARKER = "[FullyAsyncTaskRunner][FinalStatistics] "
+_FILESYSTEM_CHECKPOINT_MARKER_PREFIX = (
+    "Earlier conversation was removed after the continuation snapshot write "
+    "succeeded. The workspace persists, but "
+    "`.agent_memory/CONTINUATION.md` was not copied into this prompt. Use the "
+    "next normal action to read that file, then continue from its evidence and "
+    "next action. Other workspace files remain available and may still be read "
+    "or updated normally."
+)
 _FINAL_STATISTICS_VERL_COMMIT = "f3ac28fe54c945e092b9630030f44d236a106a11"
 _FINAL_STATISTICS_FIELDS = frozenset(
     {"schema", "queue", "rollouter", "trainer", "queue_cleanup"}
@@ -107,6 +116,15 @@ _RAY_LOG_PREFIX = re.compile(r"^\([^()\r\n]* pid=[0-9]+(?:, ip=[^()\r\n]+)?\) ")
 _MEMORY_EVENTS = frozenset(
     {"write", "compaction", "read", "reuse", "modify", "execute"}
 )
+_FILESYSTEM_CHECKPOINT_RECEIPT_SCHEMA = (
+    "agentmemory_filesystem_checkpoint_receipt_v1"
+)
+_FILESYSTEM_CHECKPOINT_READ_RECEIPT_SCHEMA = (
+    "agentmemory_filesystem_checkpoint_read_receipt_v1"
+)
+_FILESYSTEM_CHECKPOINT_PATH = ".agent_memory/CONTINUATION.md"
+_FILESYSTEM_CHECKPOINT_MAX_BYTES = 8 * 1024
+_MISSING_RECEIPT = object()
 _REQUIRED_RUNTIME_ARTIFACTS = (
     "file_logger",
     "rollout_data",
@@ -558,106 +576,448 @@ def _rolling_episode_shares(
     }
 
 
+def _valid_sha256(value: Any) -> bool:
+    return bool(
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _unit_counter_increment(record: Mapping[str, Any], prefix: str) -> bool:
+    before = _nonnegative_integral(record.get(f"{prefix}_before"))
+    after = _nonnegative_integral(record.get(f"{prefix}_after"))
+    return before is not None and after == before + 1
+
+
+def _canonical_checkpoint_receipt(value: Any) -> Mapping[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    expected = {
+        "schema",
+        "path",
+        "action_kind",
+        "action_completed",
+        "changed",
+        "exists",
+        "regular_file",
+        "size_bytes",
+        "sha256",
+    }
+    size = value.get("size_bytes")
+    if (
+        set(value) != expected
+        or value.get("schema") != _FILESYSTEM_CHECKPOINT_RECEIPT_SCHEMA
+        or value.get("path") != _FILESYSTEM_CHECKPOINT_PATH
+        or value.get("action_kind") not in {"shell_command", "apply_patch"}
+        or value.get("action_completed") is not True
+        or value.get("changed") is not True
+        or value.get("exists") is not True
+        or value.get("regular_file") is not True
+        or isinstance(size, bool)
+        or not isinstance(size, int)
+        or not 0 < size <= _FILESYSTEM_CHECKPOINT_MAX_BYTES
+        or not _valid_sha256(value.get("sha256"))
+    ):
+        return None
+    return value
+
+
+def _canonical_checkpoint_read_receipt(value: Any) -> Mapping[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    size = value.get("size_bytes")
+    expected = {"schema", "path", "observed", "size_bytes", "sha256"}
+    if (
+        set(value) != expected
+        or value.get("schema") != _FILESYSTEM_CHECKPOINT_READ_RECEIPT_SCHEMA
+        or value.get("path") != _FILESYSTEM_CHECKPOINT_PATH
+        or value.get("observed") is not True
+        or isinstance(size, bool)
+        or not isinstance(size, int)
+        or not 0 < size <= _FILESYSTEM_CHECKPOINT_MAX_BYTES
+        or not _valid_sha256(value.get("sha256"))
+    ):
+        return None
+    return value
+
+
+def _endpoint_receipt_candidates(
+    record: Mapping[str, Any],
+    field: str,
+) -> tuple[Any, ...]:
+    """Return only receipts carried by the native endpoint response."""
+
+    candidates = (
+        _at(
+            record,
+            f"env_info_after.execution.{field}",
+            _MISSING_RECEIPT,
+        ),
+        _at(record, f"env_info_after.{field}", _MISSING_RECEIPT),
+        _at(
+            record,
+            f"env_info_after.wrapper_evidence.{field}",
+            _MISSING_RECEIPT,
+        ),
+    )
+    return tuple(
+        value for value in candidates if value is not _MISSING_RECEIPT
+    )
+
+
+def _wrapper_receipt_candidates(
+    evidence: Mapping[str, Any],
+    field: str,
+) -> tuple[Any, ...]:
+    candidates = (
+        _at(
+            evidence,
+            f"native_wrapper_evidence.{field}",
+            _MISSING_RECEIPT,
+        ),
+        _at(
+            evidence,
+            f"server_wrapper_evidence.{field}",
+            _MISSING_RECEIPT,
+        ),
+    )
+    return tuple(
+        value for value in candidates if value is not _MISSING_RECEIPT
+    )
+
+
+def _receipt_candidate_matches(
+    field: str,
+    candidate: Any,
+    receipt: Mapping[str, Any],
+) -> bool:
+    if field == "filesystem_checkpoint":
+        canonical = _canonical_checkpoint_receipt(candidate)
+    elif field == "filesystem_checkpoint_read":
+        canonical = _canonical_checkpoint_read_receipt(candidate)
+    else:
+        return False
+    # Validation above is intentionally performed on every copy before mapping
+    # equality.  Python otherwise considers bool/int and int/float values equal.
+    return canonical is not None and canonical == receipt
+
+
+def _endpoint_receipt_matches(
+    record: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+    field: str,
+    receipt: Mapping[str, Any],
+) -> bool:
+    endpoint_candidates = _endpoint_receipt_candidates(record, field)
+    wrapper_candidates = _wrapper_receipt_candidates(evidence, field)
+    return bool(
+        endpoint_candidates
+        and all(
+            _receipt_candidate_matches(field, candidate, receipt)
+            for candidate in endpoint_candidates
+        )
+        and all(
+            _receipt_candidate_matches(field, candidate, receipt)
+            for candidate in wrapper_candidates
+        )
+    )
+
+
+def _checkpoint_framing_sha256(messages: Sequence[tuple[str, str]]) -> str:
+    canonical = json.dumps(
+        [
+            {"role": role, "content": content}
+            for role, content in messages
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _checkpoint_successor_is_safe(
+    record: Mapping[str, Any],
+    messages: Any,
+    receipt: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+) -> bool:
+    if (
+        not isinstance(messages, Sequence)
+        or isinstance(messages, (str, bytes))
+        or not messages
+    ):
+        return False
+    normalized: list[tuple[str, str]] = []
+    for message in messages:
+        if not isinstance(message, Mapping) or set(message) != {"role", "content"}:
+            return False
+        role = message.get("role")
+        content = message.get("content")
+        if role not in {"system", "user", "assistant"} or not isinstance(
+            content, str
+        ):
+            return False
+        normalized.append((role, content))
+    expected_marker = (
+        f"{_FILESYSTEM_CHECKPOINT_MARKER_PREFIX} Verified receipt: "
+        f"size_bytes={receipt['size_bytes']}, sha256={receipt['sha256']}."
+    )
+    if normalized[-1][0] != "user":
+        return False
+    marker_suffix = "\n\n" + expected_marker
+    if normalized[-1][1] == expected_marker:
+        framing = normalized[:-1]
+        if not framing or framing[-1][0] not in {"system", "assistant"}:
+            return False
+    elif normalized[-1][1].endswith(marker_suffix):
+        framing = list(normalized)
+        framing[-1] = ("user", normalized[-1][1][: -len(marker_suffix)])
+    else:
+        return False
+    expected_framing_sha256 = evidence.get("checkpoint_framing_sha256")
+    if (
+        not framing
+        or not _valid_sha256(expected_framing_sha256)
+        or _checkpoint_framing_sha256(framing) != expected_framing_sha256
+    ):
+        return False
+    # The digest comparison above is the provenance boundary: it proves every
+    # pre-marker byte is the wrapper's immutable framing.  Substring checks
+    # against action/output text would reject legitimate trusted examples and
+    # add no protection against content inserted after that digest was made.
+    return True
+
+
+def _canonical_checkpoint_compaction_receipt(
+    record: Mapping[str, Any], evidence: Mapping[str, Any]
+) -> Mapping[str, Any] | None:
+    receipt = _canonical_checkpoint_receipt(evidence.get("checkpoint_receipt"))
+    transition = record.get("context_transition")
+    messages = transition.get("messages") if isinstance(transition, Mapping) else None
+    submission = record.get("action_submission")
+    action = record.get("action")
+    endpoint_action_kind = _at(record, "env_info_after.action_kind")
+    if endpoint_action_kind is None:
+        endpoint_action_kind = _at(record, "env_info_after.execution.action_kind")
+    if receipt is None or not (
+        evidence.get("event") in {"context_compaction", "webshop_session_handoff"}
+        and evidence.get("continuation_path") == _FILESYSTEM_CHECKPOINT_PATH
+        and evidence.get("continuation_persisted") is True
+        and evidence.get("checkpoint_failure_reason") is None
+        and evidence.get("context_replaced") is True
+        and evidence.get("retry_pending") is False
+        and evidence.get("preserved_policy_output") is True
+        and evidence.get("preserved_native_observation") is True
+        and evidence.get("checkpoint_action_in_successor_context") is False
+        and evidence.get("checkpoint_observation_in_successor_context") is False
+        and evidence.get("checkpoint_content_in_successor_context") is False
+        and evidence.get("checkpoint_read_required_after") is True
+        and isinstance(transition, Mapping)
+        and transition.get("schema")
+        == "agentmemory_task_neutral_context_transition_v1"
+        and transition.get("operation") == "replace_messages"
+        and _unit_counter_increment(record, "native_step")
+        and _unit_counter_increment(record, "native_call_count")
+        and _unit_counter_increment(record, "policy_step")
+        and _unit_counter_increment(record, "context_epoch")
+        and isinstance(submission, Mapping)
+        and isinstance(action, str)
+        and bool(action)
+        and submission.get("raw_policy_output") == action
+        and endpoint_action_kind == receipt.get("action_kind")
+        and isinstance(record.get("control_request"), str)
+        and bool(str(record.get("control_request", "")).strip())
+        and _endpoint_receipt_matches(
+            record, evidence, "filesystem_checkpoint", receipt
+        )
+        and _checkpoint_successor_is_safe(record, messages, receipt, evidence)
+    ):
+        return None
+    return receipt
+
+
+def _canonical_checkpoint_compaction(
+    record: Mapping[str, Any], evidence: Mapping[str, Any]
+) -> bool:
+    return _canonical_checkpoint_compaction_receipt(record, evidence) is not None
+
+
+def _canonical_bound_checkpoint_read_receipt(
+    record: Mapping[str, Any], evidence: Mapping[str, Any]
+) -> Mapping[str, Any] | None:
+    receipt = _canonical_checkpoint_read_receipt(
+        evidence.get("filesystem_checkpoint_read")
+    )
+    submission = record.get("action_submission")
+    action = record.get("action")
+    endpoint_action_kind = _at(record, "env_info_after.action_kind")
+    if endpoint_action_kind is None:
+        endpoint_action_kind = _at(record, "env_info_after.execution.action_kind")
+    if receipt is None or not (
+        evidence.get("memory_event") == "read"
+        and evidence.get("document_read_observed") is True
+        and evidence.get("checkpoint_read_required") is True
+        and evidence.get("checkpoint_read_satisfied") is True
+        and evidence.get("checkpoint_read_retry_pending") is False
+        and evidence.get("checkpoint_read_failure_reason") is None
+        and evidence.get("checkpoint_read_expected_size_bytes")
+        == receipt.get("size_bytes")
+        and evidence.get("checkpoint_read_expected_sha256")
+        == receipt.get("sha256")
+        and _unit_counter_increment(record, "native_step")
+        and _unit_counter_increment(record, "native_call_count")
+        and _unit_counter_increment(record, "policy_step")
+        and isinstance(submission, Mapping)
+        and isinstance(action, str)
+        and bool(action)
+        and submission.get("raw_policy_output") == action
+        and endpoint_action_kind == "shell_command"
+        and _endpoint_receipt_matches(
+            record, evidence, "filesystem_checkpoint_read", receipt
+        )
+    ):
+        return None
+    context_before = _nonnegative_integral(record.get("context_epoch_before"))
+    context_after = _nonnegative_integral(record.get("context_epoch_after"))
+    if context_before is None or context_after != context_before:
+        return None
+    return receipt
+
+
+def _endpoint_changed_paths(record: Mapping[str, Any]) -> tuple[str, ...]:
+    candidates = (
+        _at(record, "env_info_after.execution.changed_paths"),
+        _at(record, "env_info_after.workspace_changed_paths"),
+        _at(record, "env_info_after.wrapper_evidence.workspace_changed_paths"),
+    )
+    paths: set[str] = set()
+    for candidate in candidates:
+        if isinstance(candidate, Sequence) and not isinstance(candidate, (str, bytes)):
+            paths.update(
+                str(path) for path in candidate if isinstance(path, str) and path
+            )
+    return tuple(sorted(paths))
+
+
 def _emitted_memory_events(record: Mapping[str, Any]) -> tuple[str, ...]:
-    """Return only wrapper-emitted generic memory events for one action row."""
+    """Return only endpoint-attested generic memory events for one action row."""
 
     evidence = record.get("wrapper_evidence")
     if not isinstance(evidence, Mapping):
         return ()
-    raw_event = evidence.get("memory_event")
+    if _canonical_checkpoint_compaction(record, evidence):
+        return ("write", "compaction")
 
-    # Compatibility for the task-neutral compaction receipt predating the
-    # generic memory_event field.  Both events are explicitly attested by the
-    # wrapper; no action text is parsed.
-    legacy_compaction = (
-        evidence.get("event") == "context_compaction"
-        and evidence.get("continuation_persisted") is True
-        and evidence.get("preserved_policy_output") is True
-        and evidence.get("preserved_native_observation") is True
-        and isinstance(evidence.get("continuation_path"), str)
-        and bool(evidence.get("continuation_path"))
-        and isinstance(evidence.get("native_action_kind"), str)
-        and bool(evidence.get("native_action_kind"))
-        and evidence.get("native_action_status") == "completed"
-        and _at(record, "env_info_after.action_kind")
-        == evidence.get("native_action_kind")
-        and _at(record, "env_info_after.action_status") == "completed"
-        and _at(record, "context_transition.operation") == "replace_messages"
-        and isinstance(_at(record, "context_transition.messages"), Sequence)
-        and not isinstance(_at(record, "context_transition.messages"), (str, bytes))
-        and isinstance(record.get("control_request"), str)
-        and bool(record.get("control_request", "").strip())
-    )
-    if legacy_compaction:
-        # The old receipt explicitly attests that one policy action persisted the
-        # continuation document and then replaced the context.
-        return ("write", "compaction") if raw_event is None else ()
+    raw_event = evidence.get("memory_event")
     if not isinstance(raw_event, str) or raw_event not in _MEMORY_EVENTS:
         return ()
-    if raw_event == "read" and not (
-        evidence.get("value") is not None
-        or evidence.get("document_read_observed") is True
-    ):
+    if raw_event in {"write", "compaction"}:
+        # The canonical checkpoint receipt above is the only way one ordinary
+        # policy row can attest both a write and the mechanical context boundary.
         return ()
+    if raw_event == "read":
+        if _canonical_bound_checkpoint_read_receipt(record, evidence) is None:
+            return ()
+        return ("read",)
+    if raw_event == "modify":
+        paths = evidence.get("workspace_changed_paths")
+        if (
+            evidence.get("workspace_change_observed") is not True
+            or not isinstance(paths, Sequence)
+            or isinstance(paths, (str, bytes))
+        ):
+            return ()
+        normalized = tuple(
+            sorted({str(path) for path in paths if isinstance(path, str) and path})
+        )
+        if not normalized or _FILESYSTEM_CHECKPOINT_PATH in normalized:
+            return ()
+        endpoint_paths = _endpoint_changed_paths(record)
+        if not endpoint_paths or not set(normalized).issubset(endpoint_paths):
+            return ()
+        return ("modify",)
+    if raw_event == "reuse":
+        return ("reuse",) if evidence.get("reuse_observed") is True else ()
     if raw_event == "execute":
-        if evidence.get("outcome") != "success":
+        if (
+            evidence.get("outcome") != "success"
+            or evidence.get("execution_completed_observed") is not True
+        ):
             return ()
         info = record.get("env_info_after")
-        if info is not None and not isinstance(info, Mapping):
+        if not isinstance(info, Mapping):
             return ()
-        if isinstance(info, Mapping):
-            if "action_status" in info and info.get("action_status") != "completed":
+        if "action_status" in info and info.get("action_status") != "completed":
+            return ()
+        counters = info.get("counter_delta")
+        if counters is not None and not isinstance(counters, Mapping):
+            return ()
+        if isinstance(counters, Mapping) and (
+            _nonnegative_integral(counters.get("execution_completed_count")) != 1
+        ):
+            return ()
+        execution = info.get("execution")
+        if execution is not None:
+            if not isinstance(execution, Mapping):
                 return ()
-            counters = info.get("counter_delta")
-            if counters is not None and not isinstance(counters, Mapping):
+            if execution.get("status") != "completed":
+                return ()
+            if execution.get("exit_code") != 0:
+                return ()
+            if execution.get("timed_out", False) is not False:
                 return ()
             if (
-                isinstance(counters, Mapping)
-                and "execution_completed_count" in counters
-                and _nonnegative_integral(counters.get("execution_completed_count"))
+                _nonnegative_integral(
+                    execution.get("execution_completed_delta")
+                )
                 != 1
             ):
                 return ()
-            execution = info.get("execution")
-            if execution is not None and not isinstance(execution, Mapping):
-                return ()
-            if isinstance(execution, Mapping):
-                if "status" in execution and execution.get("status") != "completed":
-                    return ()
-                if "exit_code" in execution and execution.get("exit_code") not in {
-                    None,
-                    0,
-                }:
-                    return ()
-                if (
-                    "execution_completed_delta" in execution
-                    and _nonnegative_integral(
-                        execution.get("execution_completed_delta")
-                    )
-                    != 1
-                ):
-                    return ()
-    return (raw_event,)
+        elif not (
+            info.get("shell_action_succeeded") is True
+            or _at(
+                record,
+                "env_info_after.wrapper_evidence.workspace_action_completed",
+            )
+            is True
+        ):
+            return ()
+        return ("execute",)
+    return ()
 
 
 def _has_complete_memory_chain(
     episode: Sequence[tuple[Mapping[str, Any], Mapping[str, Any]]],
 ) -> bool:
     stage = 0
+    checkpoint_identity: tuple[int, str] | None = None
     for record, _document in episode:
+        evidence = record.get("wrapper_evidence")
+        evidence = evidence if isinstance(evidence, Mapping) else {}
+        compaction_receipt = _canonical_checkpoint_compaction_receipt(
+            record, evidence
+        )
+        read_receipt = _canonical_bound_checkpoint_read_receipt(record, evidence)
         events = set(_emitted_memory_events(record))
         if stage == 0:
-            if "write" in events:
-                # Only the legacy context-compaction receipt may attest these
-                # two adjacent operations on the same policy action row.
-                stage = 2 if "compaction" in events else 1
-            continue
-        if stage == 1:
-            if "compaction" in events:
+            if compaction_receipt is not None:
+                checkpoint_identity = (
+                    int(compaction_receipt["size_bytes"]),
+                    str(compaction_receipt["sha256"]),
+                )
                 stage = 2
             continue
         if stage == 2:
-            if "read" in events:
+            if (
+                read_receipt is not None
+                and checkpoint_identity
+                == (
+                    int(read_receipt["size_bytes"]),
+                    str(read_receipt["sha256"]),
+                )
+            ):
                 stage = 3
             continue
         if stage == 3:
