@@ -48,6 +48,9 @@ EXPECTED_ROUTE_IDS = (
 )
 _CONFIG_SCHEMA = "amg_multitask400_orchestrator_config_v1"
 _ROUTE_SET_CONFIG_SCHEMA = "amg_route_set_formal100_orchestrator_config_v1"
+_ROUTE_SET_CONTINUATION_CONFIG_SCHEMA = (
+    "amg_route_set_formal100_continuation_orchestrator_config_v1"
+)
 _ENDPOINT_REGISTRY_SCHEMA = "amg_multitask_endpoint_registry_v1"
 _GATE_RECEIPT_SCHEMA = "amg_single_card_optimizer_update_gate_v1"
 _GATE_ENVIRONMENT_NAMES = {
@@ -131,6 +134,13 @@ class OrchestratorConfig:
     require_exact_per_update_route_split: bool
     sampling_order: str
     holder_lock_path: Path
+    fresh_model: bool = True
+    resume_mode: str = "disable"
+    resume_from_path: Path | None = None
+    predecessor_run_dir: Path | None = None
+    predecessor_completed_updates: int = 0
+    continuation_receipt: Path | None = None
+    continuation_receipt_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -406,13 +416,17 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
         budget.get("total_episodes"), field="total episodes"
     )
 
+    is_continuation = schema == _ROUTE_SET_CONTINUATION_CONFIG_SCHEMA
     if schema == _CONFIG_SCHEMA:
         schema_exact = {
             "optimizer updates": (optimizer_updates, 400),
             "total episodes": (total_episodes, 25_600),
             "route order": (route_order, EXPECTED_ROUTE_IDS),
         }
-    elif schema == _ROUTE_SET_CONFIG_SCHEMA:
+    elif schema in {
+        _ROUTE_SET_CONFIG_SCHEMA,
+        _ROUTE_SET_CONTINUATION_CONFIG_SCHEMA,
+    }:
         canonical_subset = tuple(
             route_id for route_id in EXPECTED_ROUTE_IDS if route_id in route_order
         )
@@ -431,8 +445,12 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
     else:
         raise OrchestratorError(
             "reviewed orchestrator schema drifted: "
-            f"{schema!r} not in {(_CONFIG_SCHEMA, _ROUTE_SET_CONFIG_SCHEMA)!r}"
+            f"{schema!r} not in "
+            f"{(_CONFIG_SCHEMA, _ROUTE_SET_CONFIG_SCHEMA, _ROUTE_SET_CONTINUATION_CONFIG_SCHEMA)!r}"
         )
+
+    expected_fresh_model = not is_continuation
+    expected_resume_mode = "resume_path" if is_continuation else "disable"
 
     exact = {
         "implementation base commit": (
@@ -442,8 +460,8 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
         "veRL commit": (source.get("verl_commit"), EXPECTED_VERL_COMMIT),
         "mode": (experiment.get("mode"), "formal"),
         "model family": (experiment.get("model_family"), "Qwen3.5-4B"),
-        "fresh model": (experiment.get("fresh_model"), True),
-        "resume mode": (experiment.get("resume_mode"), "disable"),
+        "fresh model": (experiment.get("fresh_model"), expected_fresh_model),
+        "resume mode": (experiment.get("resume_mode"), expected_resume_mode),
         "agent name": (experiment.get("agent_name"), "amg_task_neutral_async"),
         "shared actor count": (experiment.get("shared_actor_count"), 1),
         "shared critic count": (experiment.get("shared_critic_count"), 1),
@@ -500,6 +518,84 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
             "consumed_episodes_per_update != total_episodes"
         )
 
+    resume_from_path: Path | None = None
+    predecessor_run_dir: Path | None = None
+    predecessor_completed_updates = 0
+    continuation_receipt: Path | None = None
+    continuation_receipt_sha256: str | None = None
+    continuation_fields = (
+        "resume_from_path",
+        "predecessor_run_dir",
+        "predecessor_completed_updates",
+        "continuation_receipt",
+        "continuation_receipt_sha256",
+    )
+    if is_continuation:
+        resume_from_path = _directory(
+            experiment.get("resume_from_path"), field="resume checkpoint"
+        )
+        predecessor_run_dir = _directory(
+            experiment.get("predecessor_run_dir"), field="predecessor run"
+        )
+        predecessor_completed_updates = _positive_int(
+            experiment.get("predecessor_completed_updates"),
+            field="predecessor completed updates",
+        )
+        if predecessor_completed_updates >= optimizer_updates:
+            raise OrchestratorError(
+                "predecessor completed updates must be below the formal endpoint"
+            )
+        if resume_from_path.name != f"global_step_{predecessor_completed_updates}":
+            raise OrchestratorError(
+                "resume checkpoint basename disagrees with predecessor step"
+            )
+        _regular_file(
+            resume_from_path / "data.pt", field="resume dataloader state"
+        )
+        continuation_receipt = _regular_file(
+            experiment.get("continuation_receipt"),
+            field="continuation receipt",
+        )
+        continuation_receipt_sha256 = _digest(
+            experiment.get("continuation_receipt_sha256"),
+            field="continuation receipt sha256",
+        )
+        if _sha256(continuation_receipt) != continuation_receipt_sha256:
+            raise OrchestratorError("continuation receipt sha256 mismatch")
+        continuation = _load_json_file(
+            continuation_receipt, field="continuation receipt"
+        )
+        expected_continuation = {
+            "schema": "amg_verl_continuation_checkpoint_v1",
+            "status": "pass",
+            "resume_from_path": str(resume_from_path),
+            "predecessor_run_dir": str(predecessor_run_dir),
+            "resume_step": predecessor_completed_updates,
+            "expected_consumed_samples": (
+                predecessor_completed_updates * samples_per_update
+            ),
+            "corrected_dataloader_samples_yielded": (
+                predecessor_completed_updates * samples_per_update
+            ),
+        }
+        for field, expected_value in expected_continuation.items():
+            if continuation.get(field) != expected_value:
+                raise OrchestratorError(
+                    f"continuation receipt {field} drifted: "
+                    f"{continuation.get(field)!r} != {expected_value!r}"
+                )
+        corrected_data = _regular_file(
+            resume_from_path / "data.pt", field="corrected resume dataloader state"
+        )
+        corrected_sha256 = _digest(
+            continuation.get("corrected_data_pt_sha256"),
+            field="corrected data.pt sha256",
+        )
+        if _sha256(corrected_data) != corrected_sha256:
+            raise OrchestratorError("corrected resume data.pt sha256 mismatch")
+    elif any(experiment.get(field) is not None for field in continuation_fields):
+        raise OrchestratorError("fresh config must not carry continuation fields")
+
     return OrchestratorConfig(
         source_path=path.resolve(),
         sha256=_sha256(path),
@@ -522,6 +618,13 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
         holder_lock_path=_absolute_path(
             holders.get("lock_path"), field="config holder lock_path"
         ),
+        fresh_model=expected_fresh_model,
+        resume_mode=expected_resume_mode,
+        resume_from_path=resume_from_path,
+        predecessor_run_dir=predecessor_run_dir,
+        predecessor_completed_updates=predecessor_completed_updates,
+        continuation_receipt=continuation_receipt,
+        continuation_receipt_sha256=continuation_receipt_sha256,
     )
 
 
@@ -708,13 +811,22 @@ def _bind_source_evidence(
     gate_receipt: Mapping[str, Any],
     gate_receipt_path: Path,
     gate_receipt_sha256: str,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     receipt_field_value = source.get("receipt_field")
     source_lock_value = source.get("source_lock")
-    if (receipt_field_value is None) == (source_lock_value is None):
+    receipt_ancestor_value = source.get("receipt_ancestor")
+    selected = sum(
+        value is not None
+        for value in (
+            receipt_field_value,
+            source_lock_value,
+            receipt_ancestor_value,
+        )
+    )
+    if selected != 1:
         raise OrchestratorError(
             f"{route_id} {verified['name']} source must select exactly one "
-            "receipt_field or immutable source_lock"
+            "receipt_field, receipt_ancestor, or immutable source_lock"
         )
 
     if receipt_field_value is not None:
@@ -732,6 +844,114 @@ def _bind_source_evidence(
             "evidence_sha256": gate_receipt_sha256,
             "commit_field": commit_field,
         }
+    elif receipt_ancestor_value is not None:
+        ancestor = _mapping(
+            receipt_ancestor_value,
+            field=f"{route_id} {verified['name']} gate-receipt ancestor",
+        )
+        commit_field = str(ancestor.get("commit_field", ""))
+        allowed_fields = _RECEIPT_SOURCE_COMMIT_FIELDS[verified["name"]]
+        if commit_field not in allowed_fields:
+            raise OrchestratorError(
+                f"{route_id} {verified['name']} source receipt_ancestor "
+                f"commit_field must name one of {sorted(allowed_fields)!r}"
+            )
+        observed_commit = str(_nested_value(gate_receipt, commit_field))
+        declared_ancestor = str(ancestor.get("commit", ""))
+        if observed_commit != declared_ancestor:
+            raise OrchestratorError(
+                f"{route_id} {verified['name']} gate ancestor drifted: "
+                f"{observed_commit!r} != {declared_ancestor!r}"
+            )
+        root = verified["root"]
+        descendant = verified["commit"]
+        try:
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    root,
+                    "merge-base",
+                    "--is-ancestor",
+                    observed_commit,
+                    descendant,
+                ],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            changed_paths = tuple(
+                line
+                for line in subprocess.check_output(
+                    [
+                        "git",
+                        "-C",
+                        root,
+                        "diff",
+                        "--name-only",
+                        f"{observed_commit}..{descendant}",
+                    ],
+                    text=True,
+                    stderr=subprocess.STDOUT,
+                ).splitlines()
+                if line
+            )
+        except subprocess.CalledProcessError as exc:
+            raise OrchestratorError(
+                f"cannot prove {route_id} {verified['name']} gate ancestry: "
+                f"{exc.stdout.strip()}"
+            ) from exc
+        expected_paths = tuple(
+            str(value)
+            for value in _sequence(
+                ancestor.get("changed_paths"),
+                field=f"{route_id} {verified['name']} gate-ancestor changed paths",
+            )
+        )
+        if not expected_paths or changed_paths != expected_paths:
+            raise OrchestratorError(
+                f"{route_id} {verified['name']} gate-ancestor diff drifted: "
+                f"{changed_paths!r} != {expected_paths!r}"
+            )
+        raw_proofs = _sequence(
+            ancestor.get("proofs"),
+            field=f"{route_id} {verified['name']} gate-ancestor proofs",
+        )
+        if not raw_proofs:
+            raise OrchestratorError(
+                f"{route_id} {verified['name']} gate-ancestor proofs are empty"
+            )
+        proofs: list[dict[str, str]] = []
+        for raw_proof in raw_proofs:
+            proof = _mapping(
+                raw_proof,
+                field=f"{route_id} {verified['name']} gate-ancestor proof",
+            )
+            proof_path = _regular_file(
+                proof.get("path"),
+                field=f"{route_id} {verified['name']} gate-ancestor proof",
+            )
+            proof_sha256 = _digest(
+                proof.get("sha256"),
+                field=f"{route_id} {verified['name']} gate-ancestor proof sha256",
+            )
+            if _sha256(proof_path) != proof_sha256:
+                raise OrchestratorError(
+                    f"{route_id} {verified['name']} gate-ancestor proof drifted: "
+                    f"{proof_path}"
+                )
+            proofs.append({"path": str(proof_path.resolve()), "sha256": proof_sha256})
+        evidence = {
+            "evidence_kind": "gate_receipt_ancestor",
+            "evidence_path": str(gate_receipt_path.resolve()),
+            "evidence_sha256": gate_receipt_sha256,
+            "commit_field": commit_field,
+            "ancestor_commit": observed_commit,
+            "changed_paths": list(changed_paths),
+            "proofs": proofs,
+        }
+        observed_commit = descendant
     else:
         source_lock = _mapping(
             source_lock_value,
@@ -945,7 +1165,8 @@ def load_endpoint_registry(
                 f"{route_id} must bind exact outer and inner source identities"
             )
         if not any(
-            source["evidence_kind"] == "gate_receipt" for source in verified_sources
+            source["evidence_kind"] in {"gate_receipt", "gate_receipt_ancestor"}
+            for source in verified_sources
         ):
             raise OrchestratorError(
                 f"{route_id} gate receipt must bind at least one launched source"
@@ -1791,6 +2012,26 @@ def build_generic_launch_command(
         command.append("--actor-use-fused-kernels")
     if plan.config.critic_use_fused_kernels:
         command.append("--critic-use-fused-kernels")
+    command.extend(("--resume-mode", plan.config.resume_mode))
+    if plan.config.resume_mode == "resume_path":
+        assert plan.config.resume_from_path is not None
+        assert plan.config.predecessor_run_dir is not None
+        assert plan.config.continuation_receipt is not None
+        assert plan.config.continuation_receipt_sha256 is not None
+        command.extend(
+            (
+                "--resume-from-path",
+                str(plan.config.resume_from_path),
+                "--predecessor-run-dir",
+                str(plan.config.predecessor_run_dir),
+                "--predecessor-completed-updates",
+                str(plan.config.predecessor_completed_updates),
+                "--continuation-receipt",
+                str(plan.config.continuation_receipt),
+                "--continuation-receipt-sha256",
+                plan.config.continuation_receipt_sha256,
+            )
+        )
     if resolve_only:
         command.extend(("--resolve-only", "--skip-runtime-preflight"))
     else:
@@ -1935,6 +2176,12 @@ def build_launch_plan(args: argparse.Namespace) -> LaunchPlan:
         route_registry_sha256=route_registry.sha256,
         multitask_source_lock=source_lock,
         multitask_schedule_certificate=certificate,
+        resume_mode=config.resume_mode,
+        resume_from_path=config.resume_from_path,
+        predecessor_run_dir=config.predecessor_run_dir,
+        predecessor_completed_updates=config.predecessor_completed_updates,
+        continuation_receipt=config.continuation_receipt,
+        continuation_receipt_sha256=config.continuation_receipt_sha256,
     )
     launch_identity = _load_multitask_identity(
         identity_inputs, schedule_report=schedule_report

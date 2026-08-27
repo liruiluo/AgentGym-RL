@@ -699,6 +699,61 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
         self.assertEqual(config.total_episodes, 6_400)
         self.assertEqual((config.trainer_gpus, config.standalone_rollout_gpus), (6, 2))
         self.assertEqual(config.trigger_parameter_sync_step, 1)
+        self.assertEqual(config.resume_mode, "disable")
+        self.assertIsNone(config.resume_from_path)
+
+    def test_reviewed_route_set_continuation_binds_exact_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            predecessor = root / "predecessor"
+            checkpoint = root / "resume" / "global_step_30"
+            predecessor.mkdir()
+            checkpoint.mkdir(parents=True)
+            data = checkpoint / "data.pt"
+            data.write_bytes(b"corrected-dataloader-state")
+            receipt = root / "continuation-receipt.json"
+            receipt_sha256 = _write_json(
+                receipt,
+                {
+                    "schema": "amg_verl_continuation_checkpoint_v1",
+                    "status": "pass",
+                    "resume_from_path": str(checkpoint),
+                    "predecessor_run_dir": str(predecessor),
+                    "resume_step": 30,
+                    "expected_consumed_samples": 1920,
+                    "corrected_dataloader_samples_yielded": 1920,
+                    "corrected_data_pt_sha256": _sha256(data),
+                },
+            )
+            config_path = root / "continuation.yaml"
+            source = LR100_CONFIG.read_text(encoding="utf-8")
+            source = source.replace(
+                "amg_route_set_formal100_orchestrator_config_v1",
+                "amg_route_set_formal100_continuation_orchestrator_config_v1",
+                1,
+            ).replace("  fresh_model: true", "  fresh_model: false", 1)
+            source = source.replace(
+                "  resume_mode: disable",
+                "\n".join(
+                    (
+                        "  resume_mode: resume_path",
+                        f"  resume_from_path: {checkpoint}",
+                        f"  predecessor_run_dir: {predecessor}",
+                        "  predecessor_completed_updates: 30",
+                        f"  continuation_receipt: {receipt}",
+                        f"  continuation_receipt_sha256: {receipt_sha256}",
+                    )
+                ),
+                1,
+            )
+            config_path.write_text(source, encoding="utf-8")
+
+            config = load_orchestrator_config(config_path)
+            self.assertFalse(config.fresh_model)
+            self.assertEqual(config.resume_mode, "resume_path")
+            self.assertEqual(config.resume_from_path, checkpoint)
+            self.assertEqual(config.predecessor_run_dir, predecessor)
+            self.assertEqual(config.predecessor_completed_updates, 30)
 
     def test_holder_acquisition_builds_complete_lifecycle_marker_records(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -925,6 +980,59 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
             evidence = report["sources"]["literesearcher"]
             self.assertEqual(evidence[0]["evidence_kind"], "source_lock")
             self.assertEqual(evidence[1]["evidence_kind"], "gate_receipt")
+
+    def test_gate_receipt_ancestor_accepts_exact_attested_descendant(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            route = fixture.registry_payload["routes"][2]
+            descendant = fixture.root / "descendant"
+            subprocess.run(
+                ["git", "clone", "-q", str(fixture.source_root), str(descendant)],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(descendant), "config", "user.email", "test@example.com"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(descendant), "config", "user.name", "Launcher Test"],
+                check=True,
+            )
+            (descendant / "source.py").write_text("VALUE = 2\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(descendant), "add", "source.py"], check=True
+            )
+            subprocess.run(
+                ["git", "-C", str(descendant), "commit", "-qm", "bounded client"],
+                check=True,
+            )
+            descendant_commit = subprocess.check_output(
+                ["git", "-C", str(descendant), "rev-parse", "HEAD"], text=True
+            ).strip()
+            proof = fixture.root / "bounded-client-proof.json"
+            proof_sha256 = _write_json(proof, {"status": "pass"})
+            inner = next(
+                source for source in route["sources"] if source["name"] == "inner"
+            )
+            inner.update({"root": str(descendant), "commit": descendant_commit})
+            inner.pop("receipt_field")
+            inner["receipt_ancestor"] = {
+                "commit_field": "source.environment_source_commit",
+                "commit": fixture.source_commit,
+                "changed_paths": ["source.py"],
+                "proofs": [{"path": str(proof), "sha256": proof_sha256}],
+            }
+            registry_sha256 = fixture.rewrite()
+
+            _, report = load_endpoint_registry(
+                fixture.registry_path,
+                expected_sha256=registry_sha256,
+                route_registry=fixture.route_registry,
+            )
+            evidence = report["sources"]["literesearcher"][1]
+            self.assertEqual(evidence["evidence_kind"], "gate_receipt_ancestor")
+            self.assertEqual(evidence["ancestor_commit"], fixture.source_commit)
+            self.assertEqual(evidence["changed_paths"], ["source.py"])
 
     def test_immutable_source_lock_commit_mismatch_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

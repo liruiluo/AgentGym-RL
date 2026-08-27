@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
@@ -96,6 +97,12 @@ class LaunchInputs:
     multitask_source_lock: Path | None = None
     multitask_schedule_certificate: Path | None = None
     multitask_orchestrator_preflight: Path | None = None
+    resume_mode: str = "disable"
+    resume_from_path: Path | None = None
+    predecessor_run_dir: Path | None = None
+    predecessor_completed_updates: int = 0
+    continuation_receipt: Path | None = None
+    continuation_receipt_sha256: str | None = None
 
 
 def _string(value: str | Path) -> str:
@@ -392,8 +399,12 @@ def build_overrides(
         f"trainer.total_training_steps={publication_cycles}",
         "trainer.val_before_train=False",
         "trainer.test_freq=-1",
-        "trainer.resume_mode=disable",
-        "trainer.resume_from_path=null",
+        f"trainer.resume_mode={inputs.resume_mode}",
+        (
+            f"trainer.resume_from_path={_string(inputs.resume_from_path)}"
+            if inputs.resume_from_path is not None
+            else "trainer.resume_from_path=null"
+        ),
         f"trainer.save_freq={save_freq}",
         f"trainer.max_actor_ckpt_to_keep={max_actor_ckpt_to_keep}",
         f"trainer.max_critic_ckpt_to_keep={max_critic_ckpt_to_keep}",
@@ -873,6 +884,55 @@ def _load_multitask_identity(
             "multitask optimizer updates are not divisible by parameter-sync cadence"
         )
     publication_cycles = optimizer_updates // trigger_parameter_sync_step
+    if inputs.resume_mode not in {"disable", "resume_path"}:
+        raise ValueError(f"unsupported resume mode {inputs.resume_mode!r}")
+    if inputs.resume_mode == "disable":
+        if any(
+            value is not None
+            for value in (
+                inputs.resume_from_path,
+                inputs.predecessor_run_dir,
+                inputs.continuation_receipt,
+                inputs.continuation_receipt_sha256,
+            )
+        ) or inputs.predecessor_completed_updates != 0:
+            raise ValueError("fresh launch must not carry continuation inputs")
+    else:
+        if inputs.mode != "formal":
+            raise ValueError("checkpoint continuation is only valid for formal mode")
+        if (
+            inputs.resume_from_path is None
+            or inputs.predecessor_run_dir is None
+            or inputs.continuation_receipt is None
+            or inputs.continuation_receipt_sha256 is None
+        ):
+            raise ValueError("resume_path requires complete predecessor lineage inputs")
+        if not 0 < inputs.predecessor_completed_updates < optimizer_updates:
+            raise ValueError(
+                "predecessor completed updates must be within the formal budget"
+            )
+        if inputs.resume_from_path.name != (
+            f"global_step_{inputs.predecessor_completed_updates}"
+        ):
+            raise ValueError("resume checkpoint basename disagrees with predecessor step")
+        for candidate, label in (
+            (inputs.resume_from_path, "resume checkpoint"),
+            (inputs.predecessor_run_dir, "predecessor run"),
+        ):
+            if candidate.is_symlink() or not candidate.is_dir():
+                raise ValueError(f"{label} must be a real directory: {candidate}")
+        _require_regular_file(
+            inputs.resume_from_path / "data.pt", label="resume dataloader state"
+        )
+        continuation_receipt = _require_regular_file(
+            inputs.continuation_receipt, label="continuation receipt"
+        )
+        expected_continuation_sha = _require_sha256(
+            inputs.continuation_receipt_sha256,
+            field="continuation receipt sha256",
+        )
+        if _sha256(continuation_receipt) != expected_continuation_sha:
+            raise ValueError("continuation receipt sha256 mismatch")
     budget_contract = {
         "schema": "amg_verl_multitask_budget_contract_v1",
         "mode": inputs.mode,
@@ -891,6 +951,22 @@ def _load_multitask_identity(
         "schedule_sha256": certificate_schedule_sha256,
         "manifest_sha256": expected_report["manifest_digest"],
         "routing_sha256": certificate_schedule_sha256,
+        "resume_mode": inputs.resume_mode,
+        "resume_from_path": (
+            str(inputs.resume_from_path) if inputs.resume_from_path is not None else None
+        ),
+        "predecessor_run_dir": (
+            str(inputs.predecessor_run_dir)
+            if inputs.predecessor_run_dir is not None
+            else None
+        ),
+        "predecessor_completed_updates": inputs.predecessor_completed_updates,
+        "continuation_receipt_path": (
+            str(inputs.continuation_receipt)
+            if inputs.continuation_receipt is not None
+            else None
+        ),
+        "continuation_receipt_sha256": inputs.continuation_receipt_sha256,
     }
     return {
         "schema": "amg_multitask_source_identity_v1",
@@ -2117,6 +2193,99 @@ def _atomic_json(path: Path, value: Any) -> None:
     os.replace(temporary, path)
 
 
+def _merge_continuation_artifacts(inputs: LaunchInputs) -> dict[str, Any] | None:
+    """Materialize one read-only predecessor+continuation evidence view.
+
+    veRL's FileLogger intentionally truncates its output on every process start,
+    while resumed rollout dumps correctly retain their global update numbers.
+    Preserve the raw continuation log, prepend only committed predecessor
+    records through the resume step, and hard-link predecessor rollout ledgers.
+    The predecessor tree is never modified.
+    """
+
+    if inputs.resume_mode == "disable":
+        return None
+    if inputs.predecessor_run_dir is None:
+        raise RuntimeError("continuation merge requires predecessor_run_dir")
+    predecessor_step = inputs.predecessor_completed_updates
+    predecessor_metrics = inputs.predecessor_run_dir / "metrics.jsonl"
+    metrics_path = inputs.run_dir / "metrics.jsonl"
+    raw_metrics_path = inputs.run_dir / "metrics-continuation.jsonl"
+    if not predecessor_metrics.is_file() or predecessor_metrics.is_symlink():
+        raise RuntimeError("predecessor metrics are missing or symlinked")
+    if raw_metrics_path.exists():
+        if not raw_metrics_path.is_file() or raw_metrics_path.is_symlink():
+            raise RuntimeError("raw continuation metrics path is unsafe")
+    else:
+        if not metrics_path.is_file() or metrics_path.is_symlink():
+            raise RuntimeError("continuation metrics are missing or symlinked")
+        os.replace(metrics_path, raw_metrics_path)
+
+    def retained_lines(path: Path, *, predecessor: bool) -> list[bytes]:
+        lines: list[bytes] = []
+        for raw in path.read_bytes().splitlines(keepends=True):
+            if not raw.strip():
+                continue
+            record = json.loads(raw)
+            step = record.get("step")
+            if isinstance(step, bool) or not isinstance(step, int):
+                raise RuntimeError(f"non-integral FileLogger step in {path}")
+            keep = step <= predecessor_step if predecessor else step > predecessor_step
+            if keep:
+                lines.append(raw if raw.endswith(b"\n") else raw + b"\n")
+        return lines
+
+    predecessor_lines = retained_lines(predecessor_metrics, predecessor=True)
+    continuation_lines = retained_lines(raw_metrics_path, predecessor=False)
+    if not predecessor_lines:
+        raise RuntimeError("predecessor metrics contain no committed prefix")
+    temporary = metrics_path.with_name(f".{metrics_path.name}.{os.getpid()}.tmp")
+    with temporary.open("wb") as handle:
+        handle.writelines(predecessor_lines)
+        handle.writelines(continuation_lines)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, metrics_path)
+
+    predecessor_rollouts = inputs.predecessor_run_dir / "rollout_data"
+    continuation_rollouts = inputs.run_dir / "rollout_data"
+    if not predecessor_rollouts.is_dir() or predecessor_rollouts.is_symlink():
+        raise RuntimeError("predecessor rollout_data is missing or symlinked")
+    continuation_rollouts.mkdir(parents=True, exist_ok=True)
+    linked: list[str] = []
+    for step in range(1, predecessor_step + 1):
+        source = predecessor_rollouts / f"{step}.jsonl"
+        target = continuation_rollouts / source.name
+        if not source.is_file() or source.is_symlink():
+            raise RuntimeError(f"predecessor rollout is missing or symlinked: {source}")
+        if target.exists():
+            if not target.is_file() or target.is_symlink():
+                raise RuntimeError(f"continuation rollout prefix path is unsafe: {target}")
+            if os.stat(source).st_ino != os.stat(target).st_ino:
+                raise RuntimeError(f"continuation rollout prefix already differs: {target}")
+        else:
+            try:
+                os.link(source, target)
+            except OSError:
+                shutil.copy2(source, target)
+        linked.append(str(target))
+
+    receipt = {
+        "schema": "amg_verl_continuation_lineage_merge_v1",
+        "status": "pass",
+        "predecessor_run_dir": str(inputs.predecessor_run_dir),
+        "predecessor_completed_updates": predecessor_step,
+        "resume_from_path": str(inputs.resume_from_path),
+        "predecessor_metric_line_count": len(predecessor_lines),
+        "continuation_metric_line_count": len(continuation_lines),
+        "merged_metric_sha256": _sha256(metrics_path),
+        "raw_continuation_metric_sha256": _sha256(raw_metrics_path),
+        "linked_predecessor_rollout_count": len(linked),
+    }
+    _atomic_json(inputs.run_dir / "continuation-lineage-merge.json", receipt)
+    return receipt
+
+
 def prepare_launch(
     inputs: LaunchInputs,
     *,
@@ -2263,6 +2432,24 @@ def prepare_launch(
             "standalone_rollout_gpus": inputs.standalone_rollout_gpus,
             "actor_use_fused_kernels": inputs.actor_use_fused_kernels,
             "critic_use_fused_kernels": inputs.critic_use_fused_kernels,
+            "resume_mode": inputs.resume_mode,
+            "resume_from_path": (
+                str(inputs.resume_from_path)
+                if inputs.resume_from_path is not None
+                else None
+            ),
+            "predecessor_run_dir": (
+                str(inputs.predecessor_run_dir)
+                if inputs.predecessor_run_dir is not None
+                else None
+            ),
+            "predecessor_completed_updates": inputs.predecessor_completed_updates,
+            "continuation_receipt": (
+                str(inputs.continuation_receipt)
+                if inputs.continuation_receipt is not None
+                else None
+            ),
+            "continuation_receipt_sha256": inputs.continuation_receipt_sha256,
         },
         "source": source_report_runtime,
         "plugin_manifest": _production_manifest(inputs.outer_root),
@@ -2321,6 +2508,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--multitask-source-lock", type=Path)
     parser.add_argument("--multitask-schedule-certificate", type=Path)
     parser.add_argument("--multitask-orchestrator-preflight", type=Path)
+    parser.add_argument(
+        "--resume-mode", choices=("disable", "resume_path"), default="disable"
+    )
+    parser.add_argument("--resume-from-path", type=Path)
+    parser.add_argument("--predecessor-run-dir", type=Path)
+    parser.add_argument("--predecessor-completed-updates", type=int, default=0)
+    parser.add_argument("--continuation-receipt", type=Path)
+    parser.add_argument("--continuation-receipt-sha256")
     parser.add_argument("--trainer-gpus", type=int, default=6)
     parser.add_argument("--standalone-rollout-gpus", type=int, default=2)
     parser.add_argument("--actor-use-fused-kernels", action="store_true")
@@ -2395,6 +2590,22 @@ def main(argv: list[str] | None = None) -> int:
             args.multitask_orchestrator_preflight,
             label="multitask orchestrator preflight",
         ),
+        resume_mode=args.resume_mode,
+        resume_from_path=(
+            _resolve_cli_directory(args.resume_from_path, label="resume checkpoint")
+            if args.resume_from_path is not None
+            else None
+        ),
+        predecessor_run_dir=(
+            _resolve_cli_directory(args.predecessor_run_dir, label="predecessor run")
+            if args.predecessor_run_dir is not None
+            else None
+        ),
+        predecessor_completed_updates=args.predecessor_completed_updates,
+        continuation_receipt=_resolve_cli_regular_file(
+            args.continuation_receipt, label="continuation receipt"
+        ),
+        continuation_receipt_sha256=args.continuation_receipt_sha256,
     )
     command, env, receipt = prepare_launch(
         inputs,
@@ -2419,6 +2630,12 @@ def main(argv: list[str] | None = None) -> int:
         trainer_exit_code = 130
     except Exception as exc:
         print(f"failed to execute native veRL trainer: {exc}", file=sys.stderr)
+    try:
+        _merge_continuation_artifacts(inputs)
+    except Exception as exc:
+        print(f"failed to merge continuation lineage artifacts: {exc}", file=sys.stderr)
+        if trainer_exit_code == 0:
+            trainer_exit_code = 74
     verdict = finalize_run(inputs.run_dir, trainer_exit_code=trainer_exit_code)
     if trainer_exit_code != 0:
         return trainer_exit_code

@@ -21,6 +21,7 @@ from agentmemorygym_verl.launch import (
     _load_launch_identity,
     _load_multitask_identity,
     _load_multitask_orchestrator_preflight,
+    _merge_continuation_artifacts,
     _parse_args,
     _partition_selected_file_hashes,
     _preserve_legacy_runtime_preflight_fields,
@@ -212,6 +213,93 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             self.assertEqual(
                 json.loads(values["data.agentgym.expected_role"]), "train_pool"
             )
+
+    def test_continuation_overrides_select_exact_resume_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inputs, identity = self._identity(root, "formal")
+            checkpoint = root / "resume" / "global_step_30"
+            predecessor = root / "predecessor"
+            checkpoint.mkdir(parents=True)
+            predecessor.mkdir()
+            receipt = root / "continuation.json"
+            receipt.write_text("{}\n", encoding="utf-8")
+            inputs = replace(
+                inputs,
+                resume_mode="resume_path",
+                resume_from_path=checkpoint,
+                predecessor_run_dir=predecessor,
+                predecessor_completed_updates=30,
+                continuation_receipt=receipt,
+                continuation_receipt_sha256=hashlib.sha256(
+                    receipt.read_bytes()
+                ).hexdigest(),
+            )
+            budget = dict(identity["budget_contract"])
+            budget.update(
+                resume_mode="resume_path", resume_from_path=str(checkpoint)
+            )
+            values = self._values(
+                build_overrides(
+                    inputs,
+                    effective_schedule=inputs.schedule,
+                    endpoint_client_config=identity["client_config"],
+                    budget_contract=budget,
+                    training_runtime=identity["training_runtime"],
+                )
+            )
+            self.assertEqual(values["trainer.resume_mode"], "resume_path")
+            self.assertEqual(values["trainer.resume_from_path"], str(checkpoint))
+            self.assertEqual(values["trainer.total_training_steps"], "100")
+
+    def test_continuation_artifact_merge_preserves_raw_suffix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            predecessor = root / "predecessor"
+            run = root / "continuation"
+            (predecessor / "rollout_data").mkdir(parents=True)
+            (run / "rollout_data").mkdir(parents=True)
+            predecessor_metrics = [
+                {"step": 1, "data": {"training/global_step": 1}},
+                {"step": 2, "data": {"training/global_step": 2}},
+                {"step": 3, "data": {"rollouter": 1}},
+            ]
+            continuation_metrics = [
+                {"step": 2, "data": {"resume": 1}},
+                {"step": 3, "data": {"training/global_step": 3}},
+            ]
+            (predecessor / "metrics.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in predecessor_metrics),
+                encoding="utf-8",
+            )
+            (run / "metrics.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in continuation_metrics),
+                encoding="utf-8",
+            )
+            for step in (1, 2):
+                (predecessor / "rollout_data" / f"{step}.jsonl").write_text(
+                    f"{{\"step\":{step}}}\n", encoding="utf-8"
+                )
+            inputs = replace(
+                self._inputs(root),
+                run_dir=run,
+                resume_mode="resume_path",
+                resume_from_path=root / "resume" / "global_step_2",
+                predecessor_run_dir=predecessor,
+                predecessor_completed_updates=2,
+            )
+
+            receipt = _merge_continuation_artifacts(inputs)
+
+            self.assertIsNotNone(receipt)
+            merged = [
+                json.loads(line)
+                for line in (run / "metrics.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual([row["step"] for row in merged], [1, 2, 3])
+            self.assertTrue((run / "metrics-continuation.jsonl").is_file())
+            self.assertTrue((run / "rollout_data/1.jsonl").is_file())
+            self.assertTrue((run / "rollout_data/2.jsonl").is_file())
 
     def test_actor_only_fused_six_plus_two_uses_upstream_native_overrides(self):
         with tempfile.TemporaryDirectory() as directory:

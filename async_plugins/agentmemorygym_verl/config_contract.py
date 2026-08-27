@@ -422,8 +422,8 @@ def verify_resolved_config(
         "trainer.total_epochs": 1,
         "trainer.val_before_train": False,
         "trainer.test_freq": -1,
-        "trainer.resume_mode": "disable",
-        "trainer.resume_from_path": None,
+        "trainer.resume_mode": str(expected.get("resume_mode", "disable")),
+        "trainer.resume_from_path": expected.get("resume_from_path"),
         "async_training.use_trainer_do_validate": False,
         "async_training.partial_rollout": True,
     }.items():
@@ -605,6 +605,8 @@ def verify_resolved_config(
         "schedule_sha256": expected.get("schedule_sha256"),
         "manifest_sha256": expected.get("manifest_sha256"),
         "routing_sha256": expected.get("routing_sha256"),
+        "resume_mode": str(expected.get("resume_mode", "disable")),
+        "resume_from_path": expected.get("resume_from_path"),
     }
 
 

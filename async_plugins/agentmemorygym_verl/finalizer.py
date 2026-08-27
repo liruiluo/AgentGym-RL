@@ -299,7 +299,7 @@ def _route_ids(value: Any) -> tuple[str, ...] | None:
         return None
     normalized = tuple(value)
     if (
-        len(normalized) != 4
+        not 1 <= len(normalized) <= 4
         or len(set(normalized)) != len(normalized)
         or any(
             not route_id or len(route_id) > 256 or "\n" in route_id or "\r" in route_id
@@ -985,7 +985,7 @@ class _Audit:
         routes = _route_ids(identity.get("route_ids"))
         if routes is None:
             self.errors.append(
-                "multitask source identity must declare four opaque routes"
+                "multitask source identity must declare one to four opaque routes"
             )
             return
         self.route_ids = routes
