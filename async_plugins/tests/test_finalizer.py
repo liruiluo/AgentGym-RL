@@ -75,6 +75,114 @@ def rewrite_chain_record(fixture: dict, order: int, mutation: JsonMutation) -> N
     )
 
 
+def rewrite_as_filesystem_checkpoint_chain(fixture: dict) -> None:
+    """Replace the legacy four-row fixture chain with the current SWE receipt."""
+
+    path = sorted(fixture["rollout_dir"].glob("*.jsonl"))[0]
+    documents = [
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    records = [json.loads(document["step_record_json"]) for document in documents]
+    chain_uids = {
+        record["trajectory_uid"]
+        for record in records
+        if record.get("wrapper_evidence", {}).get("event") == "context_compaction"
+    }
+    if len(chain_uids) != 1:
+        raise AssertionError(f"expected one chain trajectory, got {chain_uids!r}")
+    chain_uid = chain_uids.pop()
+    checkpoint_path = ".agent_memory/CONTINUATION.md"
+    digest = "c" * 64
+    base_receipt = {
+        "schema": "agentmemory_filesystem_checkpoint_receipt_v1",
+        "action_completed": True,
+        "action_kind": "shell_command",
+        "changed": False,
+        "exists": True,
+        "regular_file": True,
+        "path": checkpoint_path,
+        "sha256": digest,
+        "size_bytes": 321,
+    }
+    for document, record in zip(documents, records):
+        if record.get("trajectory_uid") != chain_uid:
+            continue
+        order = record["trajectory_row_order"]
+        info = record["env_info_after"]
+        info["filesystem_checkpoint"] = dict(base_receipt)
+        record["context_transition"] = {
+            "schema": "agentmemory_task_neutral_context_transition_v1",
+            "operation": "append_observation",
+            "messages": [],
+        }
+        record["control_request"] = None
+        record["wrapper_evidence"] = {
+            "event": "native_action",
+            "actor_credit": {
+                "schema": "task_neutral_actor_credit_v1",
+                "basis": "shell_executed",
+                "positive_eligible": True,
+            },
+        }
+        if order == 0:
+            write_receipt = dict(base_receipt, changed=True)
+            action = "shell_command " + json.dumps(
+                {
+                    "command": (
+                        "mkdir -p .agent_memory && printf 'state\\n' > "
+                        ".agent_memory/CONTINUATION.md"
+                    ),
+                    "workdir": ".",
+                },
+                separators=(",", ":"),
+            )
+            record["action"] = action
+            record["action_submission"]["raw_policy_output"] = action
+            info["filesystem_checkpoint"] = dict(write_receipt)
+            record["wrapper_evidence"] = {
+                "event": "context_compaction",
+                "actor_credit": {
+                    "schema": "task_neutral_actor_credit_v1",
+                    "basis": "shell_executed",
+                    "positive_eligible": True,
+                },
+                "checkpoint_failure_reason": None,
+                "checkpoint_receipt": dict(write_receipt),
+                "checkpoint_max_bytes": 8192,
+                "context_replaced": True,
+                "continuation_path": checkpoint_path,
+                "continuation_persisted": True,
+                "native_observation_preserved_in_ledger": True,
+                "replacement_contains_native_observation": False,
+                "replacement_contains_policy_output": False,
+                "retry_pending": False,
+                "sampled_policy_output_preserved_in_ledger": True,
+            }
+            record["context_transition"] = {
+                "schema": "agentmemory_task_neutral_context_transition_v1",
+                "operation": "replace_messages",
+                "messages": [{"role": "user", "content": "Read the checkpoint."}],
+            }
+            record["control_request"] = "Write the continuation checkpoint."
+        elif order == 1:
+            action = "shell_command " + json.dumps(
+                {
+                    "command": "cat .agent_memory/CONTINUATION.md",
+                    "workdir": ".",
+                },
+                separators=(",", ":"),
+            )
+            record["action"] = action
+            record["action_submission"]["raw_policy_output"] = action
+        document["output"] = record["action"]
+        document["step_record_json"] = json.dumps(record, sort_keys=True)
+    path.write_text(
+        "\n".join(json.dumps(document, sort_keys=True) for document in documents)
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def rewrite_metrics(fixture: dict, mutation: JsonMutation) -> None:
     path = fixture["metrics_path"]
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
@@ -370,6 +478,45 @@ class TestFinalizerFileLogger(FinalizerTestCase):
                     },
                 },
                 {"step": 1, "data": correction},
+                {"step": 1, "data": learner},
+            ]
+            fixture["metrics_path"].write_text(
+                "\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+            self.assertEqual(verdict["status"], "pass", verdict)
+
+    def test_current_runtime_split_rollouter_and_learner_rows_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+            original = json.loads(
+                fixture["metrics_path"].read_text(encoding="utf-8").splitlines()[0]
+            )
+            learner = dict(original["data"])
+            for suffix in ("kl", "k3_kl", "log_ppl_abs_diff"):
+                learner[f"actor/rollout_corr/{suffix}"] = learner.pop(
+                    f"rollout_corr/{suffix}"
+                )
+            generated = learner["fully_async/count/total_generated_samples"]
+            learner["fully_async/count/total_generated_samples"] = 0.0
+            learner["fully_async/count/dropped_stale_samples"] = 0.0
+            rollouter = {
+                "fully_async/count/total_generated_samples": generated,
+                "fully_async/count/dropped_stale_samples": 0,
+                "fully_async/rollouter/step_generated_samples": generated,
+            }
+            rows = [
+                {
+                    "step": 0,
+                    "data": {
+                        "fully_async/count/total_generated_samples": 0,
+                        "fully_async/count/dropped_stale_samples": 0,
+                        "fully_async/rollouter/step_generated_samples": 0,
+                    },
+                },
+                {"step": 1, "data": rollouter},
                 {"step": 1, "data": learner},
             ]
             fixture["metrics_path"].write_text(
@@ -730,6 +877,74 @@ class TestFinalizerRollouts(FinalizerTestCase):
                     document["step_record_json"] = json.dumps(record, sort_keys=True)
                     rewritten.append(json.dumps(document, sort_keys=True))
                 path.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
+                self.assert_failed(
+                    fixture["run_dir"],
+                    contains="policy-authored external-document chain",
+                )
+
+    def test_filesystem_checkpoint_receipts_form_operational_chain(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+            rewrite_as_filesystem_checkpoint_chain(fixture)
+
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+
+            self.assertEqual(verdict["status"], "pass", verdict)
+            self.assertEqual(verdict["counts"]["memory_chains"], 1)
+
+    def test_filesystem_checkpoint_chain_fails_closed(self):
+        cases = (
+            "write_not_changed",
+            "read_hash_mismatch",
+            "path_mentioned_but_not_read",
+            "replacement_contains_policy_output",
+            "no_later_task_action",
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                fixture = self.build(Path(directory))
+                rewrite_as_filesystem_checkpoint_chain(fixture)
+
+                def mutate(record: dict) -> None:
+                    order = record["trajectory_row_order"]
+                    if case == "write_not_changed" and order == 0:
+                        record["wrapper_evidence"]["checkpoint_receipt"][
+                            "changed"
+                        ] = False
+                        record["env_info_after"]["filesystem_checkpoint"][
+                            "changed"
+                        ] = False
+                    elif case == "read_hash_mismatch" and order == 1:
+                        record["env_info_after"]["filesystem_checkpoint"][
+                            "sha256"
+                        ] = "d" * 64
+                    elif case == "path_mentioned_but_not_read" and order == 1:
+                        action = "shell_command " + json.dumps(
+                            {
+                                "command": (
+                                    "printf checkpoint: "
+                                    ".agent_memory/CONTINUATION.md"
+                                ),
+                                "workdir": ".",
+                            },
+                            separators=(",", ":"),
+                        )
+                        record["action"] = action
+                        record["action_submission"]["raw_policy_output"] = action
+                    elif case == "replacement_contains_policy_output" and order == 0:
+                        record["wrapper_evidence"][
+                            "replacement_contains_policy_output"
+                        ] = True
+                    elif case == "no_later_task_action" and order >= 2:
+                        record["wrapper_evidence"]["actor_credit"][
+                            "positive_eligible"
+                        ] = False
+                        record["env_info_after"]["filesystem_checkpoint"][
+                            "action_completed"
+                        ] = False
+
+                for order in range(4):
+                    rewrite_chain_record(fixture, order, mutate)
                 self.assert_failed(
                     fixture["run_dir"],
                     contains="policy-authored external-document chain",

@@ -4,7 +4,7 @@ schema: amg_multitask400_orchestrator_config_v1
 # their SHA-256 digests are supplied through the CLI and endpoint registry.
 source:
   implementation_base_commit: 4d8ce04b5d40c2e79abb01b46051a230c7ab3973
-  verl_commit: 392fcdb27ad720f69d8cb5cb60e8e66b3b5d705e
+  verl_commit: 0e9b07ff4117ff61f3594f797b0f708e8a6290fa
 
 experiment:
   mode: formal

@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import shlex
 import tempfile
 from collections import Counter
 from collections.abc import Mapping, Sequence
@@ -557,17 +558,205 @@ def _rolling_episode_shares(
     }
 
 
+def _valid_filesystem_checkpoint_receipt(
+    value: Any, *, require_changed: bool | None = None
+) -> tuple[str, str, int] | None:
+    """Return a verified ``(path, sha256, size)`` checkpoint identity.
+
+    This accepts only the wrapper-owned filesystem receipt.  Policy text alone
+    never proves that a file was created, changed, or read.
+    """
+
+    if not isinstance(value, Mapping):
+        return None
+    if value.get("schema") != "agentmemory_filesystem_checkpoint_receipt_v1":
+        return None
+    if value.get("action_completed") is not True:
+        return None
+    if value.get("action_kind") not in {"shell_command", "apply_patch"}:
+        return None
+    if value.get("exists") is not True or value.get("regular_file") is not True:
+        return None
+    if require_changed is not None and value.get("changed") is not require_changed:
+        return None
+    path = value.get("path")
+    digest = value.get("sha256")
+    size = _positive_int(value.get("size_bytes"))
+    if (
+        not isinstance(path, str)
+        or not path
+        or "\n" in path
+        or "\r" in path
+        or not _sha256_text(digest)
+        or size is None
+    ):
+        return None
+    return path, str(digest), size
+
+
+def _filesystem_checkpoint_write(
+    record: Mapping[str, Any],
+) -> tuple[str, str, int] | None:
+    """Verify an executed checkpoint write followed by mechanical compaction."""
+
+    evidence = record.get("wrapper_evidence")
+    info = record.get("env_info_after")
+    transition = record.get("context_transition")
+    if not all(isinstance(value, Mapping) for value in (evidence, info, transition)):
+        return None
+    assert isinstance(evidence, Mapping)
+    assert isinstance(info, Mapping)
+    assert isinstance(transition, Mapping)
+    evidence_receipt = evidence.get("checkpoint_receipt")
+    info_receipt = info.get("filesystem_checkpoint")
+    identity = _valid_filesystem_checkpoint_receipt(
+        evidence_receipt, require_changed=True
+    )
+    if identity is None or evidence_receipt != info_receipt:
+        return None
+    path, _digest, size = identity
+    maximum = _positive_int(evidence.get("checkpoint_max_bytes", 8192))
+    if maximum is None or size > maximum:
+        return None
+    messages = transition.get("messages")
+    if (
+        evidence.get("event") != "context_compaction"
+        or evidence.get("context_replaced") is not True
+        or evidence.get("continuation_persisted") is not True
+        or evidence.get("continuation_path") != path
+        or evidence.get("replacement_contains_policy_output") is not False
+        or evidence.get("replacement_contains_native_observation") is not False
+        or evidence.get("sampled_policy_output_preserved_in_ledger") is not True
+        or evidence.get("native_observation_preserved_in_ledger") is not True
+        or transition.get("operation") != "replace_messages"
+        or not isinstance(messages, Sequence)
+        or isinstance(messages, (str, bytes))
+        or not isinstance(record.get("control_request"), str)
+        or not record.get("control_request", "").strip()
+    ):
+        return None
+    return identity
+
+
+def _shell_command_words(record: Mapping[str, Any]) -> list[str] | None:
+    raw_action = _at(record, "action_submission.raw_policy_output")
+    if not isinstance(raw_action, str) or raw_action != record.get("action"):
+        return None
+    prefix = "shell_command "
+    if not raw_action.startswith(prefix):
+        return None
+    try:
+        payload = json.loads(raw_action[len(prefix) :])
+        if not isinstance(payload, Mapping) or not isinstance(
+            payload.get("command"), str
+        ):
+            return None
+        return shlex.split(payload["command"])
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def _canonical_checkpoint_read(
+    record: Mapping[str, Any], checkpoint: tuple[str, str, int]
+) -> bool:
+    """Verify a normal shell action that reads the exact checkpoint identity."""
+
+    path, digest, size = checkpoint
+    info = record.get("env_info_after")
+    evidence = record.get("wrapper_evidence")
+    transition = record.get("context_transition")
+    if not all(isinstance(value, Mapping) for value in (info, evidence, transition)):
+        return False
+    assert isinstance(info, Mapping)
+    assert isinstance(evidence, Mapping)
+    assert isinstance(transition, Mapping)
+    observed = _valid_filesystem_checkpoint_receipt(
+        info.get("filesystem_checkpoint"), require_changed=False
+    )
+    if observed != (path, digest, size):
+        return False
+    words = _shell_command_words(record)
+    return (
+        evidence.get("event") == "native_action"
+        and _at(evidence, "actor_credit.positive_eligible") is True
+        and transition.get("operation") == "append_observation"
+        and words in (["cat", path], ["cat", "--", path])
+    )
+
+
+def _successful_post_checkpoint_action(
+    record: Mapping[str, Any], checkpoint_path: str
+) -> bool:
+    """Verify one later successful ordinary action, without claiming causality."""
+
+    evidence = record.get("wrapper_evidence")
+    transition = record.get("context_transition")
+    if not isinstance(evidence, Mapping) or not isinstance(transition, Mapping):
+        return False
+    if (
+        evidence.get("event") != "native_action"
+        or _at(evidence, "actor_credit.positive_eligible") is not True
+        or transition.get("operation") != "append_observation"
+        or _shell_command_words(record)
+        in (["cat", checkpoint_path], ["cat", "--", checkpoint_path])
+    ):
+        return False
+    # A valid native action must have been accepted by the wrapper.  Current
+    # filesystem wrappers attest this on every action; older generic wrappers
+    # may instead expose an explicit completed action status.
+    receipt = _at(record, "env_info_after.filesystem_checkpoint")
+    if isinstance(receipt, Mapping):
+        return receipt.get("action_completed") is True
+    status = _at(record, "env_info_after.action_status")
+    return status in {None, "completed"}
+
+
+def _has_filesystem_checkpoint_chain(
+    episode: Sequence[tuple[Mapping[str, Any], Mapping[str, Any]]],
+) -> bool:
+    """Find write -> replace -> same-file read -> later task action evidence."""
+
+    records = [record for record, _document in episode]
+    for write_index, record in enumerate(records):
+        checkpoint = _filesystem_checkpoint_write(record)
+        if checkpoint is None:
+            continue
+        path, _digest, _size = checkpoint
+        for read_index in range(write_index + 1, len(records)):
+            if not _canonical_checkpoint_read(records[read_index], checkpoint):
+                continue
+            if any(
+                _successful_post_checkpoint_action(candidate, path)
+                for candidate in records[read_index + 1 :]
+            ):
+                return True
+    return False
+
+
 def _emitted_memory_events(record: Mapping[str, Any]) -> tuple[str, ...]:
-    """Return only wrapper-emitted generic memory events for one action row."""
+    """Return only wrapper-emitted or receipt-verified memory events."""
 
     evidence = record.get("wrapper_evidence")
     if not isinstance(evidence, Mapping):
         return ()
     raw_event = evidence.get("memory_event")
 
+    filesystem_write = _filesystem_checkpoint_write(record)
+    if filesystem_write is not None:
+        return ("write", "compaction") if raw_event is None else ()
+    info_receipt = _valid_filesystem_checkpoint_receipt(
+        _at(record, "env_info_after.filesystem_checkpoint"),
+        require_changed=False,
+    )
+    if (
+        info_receipt is not None
+        and _canonical_checkpoint_read(record, info_receipt)
+    ):
+        return ("read",) if raw_event is None else ()
+
     # Compatibility for the task-neutral compaction receipt predating the
-    # generic memory_event field.  Both events are explicitly attested by the
-    # wrapper; no action text is parsed.
+    # filesystem-checkpoint receipt.  Both events are explicitly attested by
+    # the wrapper; no action text is parsed.
     legacy_compaction = (
         evidence.get("event") == "context_compaction"
         and evidence.get("continuation_persisted") is True
@@ -588,8 +777,6 @@ def _emitted_memory_events(record: Mapping[str, Any]) -> tuple[str, ...]:
         and bool(record.get("control_request", "").strip())
     )
     if legacy_compaction:
-        # The old receipt explicitly attests that one policy action persisted the
-        # continuation document and then replaced the context.
         return ("write", "compaction") if raw_event is None else ()
     if not isinstance(raw_event, str) or raw_event not in _MEMORY_EVENTS:
         return ()
@@ -642,13 +829,15 @@ def _emitted_memory_events(record: Mapping[str, Any]) -> tuple[str, ...]:
 def _has_complete_memory_chain(
     episode: Sequence[tuple[Mapping[str, Any], Mapping[str, Any]]],
 ) -> bool:
+    if _has_filesystem_checkpoint_chain(episode):
+        return True
     stage = 0
     for record, _document in episode:
         events = set(_emitted_memory_events(record))
         if stage == 0:
             if "write" in events:
-                # Only the legacy context-compaction receipt may attest these
-                # two adjacent operations on the same policy action row.
+                # Only a wrapper-owned compaction receipt may attest these two
+                # adjacent operations on the same policy action row.
                 stage = 2 if "compaction" in events else 1
             continue
         if stage == 1:
@@ -1536,21 +1725,55 @@ class _Audit:
             )
 
             required_rollout_corr = (
-                "rollout_corr/kl",
-                "rollout_corr/k3_kl",
-                "rollout_corr/log_ppl_abs_diff",
+                (
+                    "rollout_corr/kl",
+                    ("actor/rollout_corr/kl", "rollout_corr/kl"),
+                ),
+                (
+                    "rollout_corr/k3_kl",
+                    ("actor/rollout_corr/k3_kl", "rollout_corr/k3_kl"),
+                ),
+                (
+                    "rollout_corr/log_ppl_abs_diff",
+                    (
+                        "actor/rollout_corr/log_ppl_abs_diff",
+                        "rollout_corr/log_ppl_abs_diff",
+                    ),
+                ),
             )
             for step in range(1, publications + 1):
                 data_rows = rows_by_step.get(step, [])
-                items = [
-                    (str(key), value)
+                rollouter_rows = [
+                    data
                     for data in data_rows
+                    if "fully_async/rollouter/step_generated_samples" in data
+                ]
+                learner_rows = [data for data in data_rows if data not in rollouter_rows]
+                self.check(
+                    len(rollouter_rows) <= 1,
+                    f"FileLogger publication step {step} has multiple rollouter owner rows",
+                )
+                # Older fixtures and veRL revisions emitted a single combined row.
+                # Once the native rollouter marker is present, counters owned by
+                # that emitter must not be confused with the learner snapshot.
+                rollouter_owner_rows = rollouter_rows or data_rows
+                learner_owner_rows = learner_rows or data_rows
+                rollouter_items = [
+                    (str(key), value)
+                    for data in rollouter_owner_rows
+                    for key, value in data.items()
+                ]
+                learner_items = [
+                    (str(key), value)
+                    for data in learner_owner_rows
                     for key, value in data.items()
                 ]
 
                 for role in ("actor", "critic"):
                     grad_norms = [
-                        value for key, value in items if key == f"{role}/grad_norm"
+                        value
+                        for key, value in learner_items
+                        if key == f"{role}/grad_norm"
                     ]
                     valid_grad = len(grad_norms) == 1 and _finite_positive(
                         grad_norms[0]
@@ -1566,29 +1789,51 @@ class _Audit:
                             critic_grad_rows += 1
 
                 correction_values: dict[str, float] = {}
-                for key in required_rollout_corr:
-                    values = [value for item_key, value in items if item_key == key]
+                for label, aliases in required_rollout_corr:
+                    values = [
+                        value for key, value in learner_items if key in aliases
+                    ]
                     valid = len(values) == 1 and _finite_number(values[0])
                     self.check(
                         valid,
-                        f"FileLogger publication step {step} has no unique finite {key}",
+                        f"FileLogger publication step {step} has no unique finite {label}",
                     )
                     if valid:
-                        correction_values[key] = float(values[0])
+                        correction_values[label] = float(values[0])
                 if len(correction_values) == len(required_rollout_corr):
                     rollout_correction_rows += 1
 
                 integral_metrics = {
-                    "current_param_version": "fully_async/count/current_param_version",
-                    "stale_trajectory_processed": "fully_async/count/stale_trajectory_processed",
-                    "total_generated_samples": "fully_async/count/total_generated_samples",
-                    "dropped_stale_samples": "fully_async/count/dropped_stale_samples",
-                    "mq_queue_size": "fully_async/monitor/queue/mq_queue_size",
-                    "required_samples": "fully_async/static/required_samples",
+                    "current_param_version": (
+                        "fully_async/count/current_param_version",
+                        learner_items,
+                    ),
+                    "stale_trajectory_processed": (
+                        "fully_async/count/stale_trajectory_processed",
+                        learner_items,
+                    ),
+                    "total_generated_samples": (
+                        "fully_async/count/total_generated_samples",
+                        rollouter_items,
+                    ),
+                    "dropped_stale_samples": (
+                        "fully_async/count/dropped_stale_samples",
+                        rollouter_items,
+                    ),
+                    "mq_queue_size": (
+                        "fully_async/monitor/queue/mq_queue_size",
+                        learner_items,
+                    ),
+                    "required_samples": (
+                        "fully_async/static/required_samples",
+                        learner_items,
+                    ),
                 }
                 observed_integrals: dict[str, int] = {}
-                for label, key in integral_metrics.items():
-                    values = [value for item_key, value in items if item_key == key]
+                for label, (key, owner_items) in integral_metrics.items():
+                    values = [
+                        value for item_key, value in owner_items if item_key == key
+                    ]
                     parsed = (
                         _nonnegative_integral(values[0]) if len(values) == 1 else None
                     )
@@ -2180,7 +2425,7 @@ class _Audit:
         self.check(
             memory_chains > 0,
             "no real non-synthetic policy-authored external-document chain "
-            "write -> compaction -> read -> modify/reuse -> execute was found",
+            "write -> replace_messages -> same-file read -> later task action was found",
         )
         late_memory_chains = 0
         if self.expected is not None and self.mode == "formal":
