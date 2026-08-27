@@ -53,7 +53,19 @@ def count_prompt_tokens(messages) -> int:
     return sum(len(message["content"].split()) + 2 for message in messages)
 
 
-def prepare(client, messages, *, capacity: int = 4096):
+# The formal route reserves 12,288 observation tokens.  This smaller fixture
+# value still exceeds the OpenMLE control-request growth, so the candidate fits
+# while the projected ordinary next turn correctly triggers compaction.
+OPENMLE_PRESSURE_TEST_OBSERVATION_TOKENS = 256
+
+
+def prepare(
+    client,
+    messages,
+    *,
+    capacity: int = 4096,
+    max_observation_tokens: int = 64,
+):
     response_budget = 32
     return prepare_policy_turn(
         client,
@@ -62,7 +74,7 @@ def prepare(client, messages, *, capacity: int = 4096):
         max_prompt_tokens=capacity,
         max_model_tokens=capacity + response_budget,
         max_response_tokens=response_budget,
-        max_observation_tokens=64,
+        max_observation_tokens=max_observation_tokens,
         action_observation_envelope_tokens=4,
     )
 
@@ -452,7 +464,12 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             messages
             + [{"role": "user", "content": OPENMLE_CONTEXT_COMPACTION_REQUEST}]
         )
-        prepared = prepare(client, messages, capacity=candidate_count + 1)
+        prepared = prepare(
+            client,
+            messages,
+            capacity=candidate_count + 1,
+            max_observation_tokens=OPENMLE_PRESSURE_TEST_OBSERVATION_TOKENS,
+        )
         self.assertEqual(
             prepared.control_request,
             OPENMLE_CONTEXT_COMPACTION_REQUEST,
@@ -553,7 +570,12 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             messages
             + [{"role": "user", "content": OPENMLE_CONTEXT_COMPACTION_REQUEST}]
         )
-        prepared = prepare(client, messages, capacity=candidate_count + 1)
+        prepared = prepare(
+            client,
+            messages,
+            capacity=candidate_count + 1,
+            max_observation_tokens=OPENMLE_PRESSURE_TEST_OBSERVATION_TOKENS,
+        )
         malformed = (
             'apply_patch {"patch":"*** Begin Patch\\n'
             '# state\\n*** End Patch"}'
