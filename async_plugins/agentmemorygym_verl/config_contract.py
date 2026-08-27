@@ -59,7 +59,10 @@ def _positive_int(value: Any, *, field: str) -> int:
 _PPO_MINI_BATCH_TARGET = 512
 # Reserve the final 2,048-token response inside Qwen3.5's 32K context.
 # A valid 30-action WebShop trajectory can exceed the former 16K prompt cap.
-PPO_MAX_PROMPT_TOKENS = 30720
+# Diagnostic-only source: lower the prompt cap enough for the frozen fresh-base
+# gate slate to exercise the real filesystem checkpoint boundary.  Formal training
+# continues to use 30,720 from the reviewed source and never imports this worktree.
+PPO_MAX_PROMPT_TOKENS = 24576
 
 
 def resolve_ppo_mini_batch_size(trainer_gpus: Any) -> int:
