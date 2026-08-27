@@ -178,6 +178,35 @@ def is_context_replacement(record):
     return isinstance(transition, dict) and transition.get("operation") == "replace_messages"
 
 
+def explicitly_nonterminal(record):
+    flags = [
+        record[key]
+        for key in ("rollout_done_flag", "trajectory_terminal")
+        if key in record
+    ]
+    return bool(flags) and all(flag is False for flag in flags)
+
+
+def valid_retry_restore(record):
+    evidence = record.get("wrapper_evidence") or {}
+    transition = record.get("context_transition") or {}
+    return (
+        isinstance(evidence, dict)
+        and evidence.get("event") == "context_compaction"
+        and evidence.get("continuation_persisted") is False
+        and evidence.get("context_replaced") is False
+        and evidence.get("retry_pending") is True
+        and evidence.get("retry_context_restored") is True
+        and explicitly_nonterminal(record)
+        and isinstance(transition, dict)
+        and transition.get("schema") == TRANSITION_SCHEMA
+        and transition.get("operation") == "retry_control"
+        and transition.get("messages") == []
+        and isinstance(record.get("control_request"), str)
+        and bool(record["control_request"].strip())
+    )
+
+
 def checkpoint_read(record, checkpoint):
     path, digest, size = checkpoint
     info = record.get("env_info_after") or {}
@@ -263,6 +292,11 @@ def compact_attempt(update, uid, record):
         "workspace_action": workspace_action(record),
         "action_completed": action_completed(record),
         "replace_messages": is_context_replacement(record),
+        "retry_control": (
+            (record.get("context_transition") or {}).get("operation")
+            == "retry_control"
+        ),
+        "valid_retry_restore": valid_retry_restore(record),
         "receipt": receipt if isinstance(receipt, dict) else None,
         "valid_write_and_replacement": checkpoint_write(record) is not None,
         "response_token_count": record.get("response_token_count"),
@@ -284,6 +318,8 @@ def analyze(run_dir, through=None, route="swesmith"):
     opportunities = []
     successful_replacements = []
     invalid_replacements = []
+    bounded_retry_restores = []
+    invalid_retry_transitions = []
     strict_chains = []
     behavioral_chains = []
     proactive_write_trajectories = set()
@@ -321,6 +357,10 @@ def analyze(run_dir, through=None, route="swesmith"):
                 if is_context_replacement(record) and identity is None:
                     invalid_replacements.append(attempt)
                 if identity is None:
+                    if valid_retry_restore(record):
+                        bounded_retry_restores.append(attempt)
+                    elif explicitly_nonterminal(record):
+                        invalid_retry_transitions.append(attempt)
                     continue
                 opportunity["successful_replacement_count"] += 1
                 path, digest, size = identity
@@ -406,6 +446,8 @@ def analyze(run_dir, through=None, route="swesmith"):
         ),
         "successful_replacement_count": len(successful_replacements),
         "invalid_replacement_count": len(invalid_replacements),
+        "bounded_retry_restore_count": len(bounded_retry_restores),
+        "invalid_retry_transition_count": len(invalid_retry_transitions),
         "unresolved_compaction_opportunity_count": len(unresolved),
         "strict_write_compaction_read_chain_count": len(strict_chains),
         "strict_chain_trajectory_count": len(strict_chain_trajectories),
@@ -429,6 +471,8 @@ def analyze(run_dir, through=None, route="swesmith"):
         "compaction_opportunities": opportunities,
         "successful_replacements": successful_replacements,
         "invalid_replacements": invalid_replacements,
+        "bounded_retry_restores": bounded_retry_restores,
+        "invalid_retry_transitions": invalid_retry_transitions,
         "unresolved_compaction_opportunities": unresolved,
         "strict_chains": strict_chains,
         "behavioral_continuation_chains": behavioral_chains,
@@ -458,6 +502,8 @@ def main():
         "failed_checkpoint_action_attempt_count",
         "successful_replacement_count",
         "invalid_replacement_count",
+        "bounded_retry_restore_count",
+        "invalid_retry_transition_count",
         "unresolved_compaction_opportunity_count",
         "strict_write_compaction_read_chain_count",
         "behavioral_continuation_chain_count",

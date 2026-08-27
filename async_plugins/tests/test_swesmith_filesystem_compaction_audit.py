@@ -25,7 +25,9 @@ def receipt(*, changed: bool, completed: bool = True, sha: str = CHECKPOINT_SHA)
     }
 
 
-def row(order, action, *, event="native_action", checkpoint=None, replace=False):
+def row(
+    order, action, *, event="native_action", checkpoint=None, replace=False, retry=False
+):
     info = {
         "action_kind": "shell_command",
         "actor_credit": {
@@ -51,7 +53,8 @@ def row(order, action, *, event="native_action", checkpoint=None, replace=False)
             native_observation_preserved_in_ledger=True,
             replacement_contains_native_observation=False,
             replacement_contains_policy_output=False,
-            retry_pending=not replace,
+            retry_pending=retry,
+            retry_context_restored=retry,
             sampled_policy_output_preserved_in_ledger=True,
         )
     return {
@@ -64,12 +67,19 @@ def row(order, action, *, event="native_action", checkpoint=None, replace=False)
         "wrapper_evidence": evidence,
         "context_transition": {
             "schema": "agentmemory_task_neutral_context_transition_v1",
-            "operation": "replace_messages" if replace else "append_observation",
+            "operation": (
+                "replace_messages"
+                if replace
+                else "retry_control"
+                if retry
+                else "append_observation"
+            ),
             "messages": [],
         },
         "control_request": "write checkpoint" if event == "context_compaction" else None,
         "env_info_after": info,
         "response_token_count": 10,
+        "rollout_done_flag": False,
         "trajectory_terminal": False,
         "trajectory_return": -0.01,
         "outcome": "continue",
@@ -90,6 +100,7 @@ class AuditTest(unittest.TestCase):
             'shell_command {"command":"true","workdir":"."}',
             event="context_compaction",
             checkpoint=receipt(changed=False, completed=False),
+            retry=True,
         )
         write = row(
             4,
@@ -126,6 +137,22 @@ class AuditTest(unittest.TestCase):
             self.assertEqual(result["behavioral_continuation_chain_count"], 1)
             self.assertEqual(result["strict_chain_task_success_count"], 1)
             self.assertEqual(result["invalid_replacement_count"], 0)
+            self.assertEqual(result["bounded_retry_restore_count"], 1)
+            self.assertEqual(result["invalid_retry_transition_count"], 0)
+
+    def test_failed_checkpoint_must_restore_the_precontrol_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            failed = row(
+                3,
+                'shell_command {"command":"true","workdir":"."}',
+                event="context_compaction",
+                checkpoint=receipt(changed=False, completed=False),
+            )
+            path = Path(directory)
+            self.emit(path, [failed])
+            result = audit.analyze(path)
+            self.assertEqual(result["bounded_retry_restore_count"], 0)
+            self.assertEqual(result["invalid_retry_transition_count"], 1)
 
     def test_q_style_chain_fails_closed(self):
         cases = (

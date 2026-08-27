@@ -8,10 +8,12 @@ from dataclasses import dataclass
 from types import MappingProxyType, SimpleNamespace
 from unittest import IsolatedAsyncioTestCase, mock
 
-from agentenv.controller import StepOutput
+from agentenv.controller import PreparedPolicyTurn, StepOutput, complete_policy_turn
 from agentenv.controller.types import (
     CONTEXT_OPERATION_REPLACE,
+    CONTEXT_OPERATION_RETRY_CONTROL,
     TASK_NEUTRAL_CONTEXT_TRANSITION_SCHEMA,
+    build_task_neutral_context_transition,
     build_task_neutral_transition_info,
 )
 from agentmemorygym_verl import agent_loop as agent_loop_module
@@ -398,6 +400,49 @@ class TestPromptRendering(unittest.TestCase):
         self.assertEqual(actual, prompt_ids + [11, 12, 703])
         self.assertNotEqual(actual, [700, 701])
         self.assertEqual(loop.continuous_token_builder.initial_calls, [prepared])
+
+    def test_retry_control_restores_precontrol_context_with_full_rebuild(self):
+        loop = self._loop()
+        base = [{"role": "user", "content": "task"}]
+        control_request = "write the bounded continuation checkpoint"
+        prepared_messages = base + [
+            {"role": "user", "content": control_request}
+        ]
+        prepared_prompt_ids = loop._render_prompt_sync(prepared_messages)
+        prepared = PreparedPolicyTurn(
+            messages=tuple(prepared_messages),
+            prompt_token_count=len(prepared_prompt_ids),
+            control_request=control_request,
+        )
+        retry = build_task_neutral_context_transition(
+            CONTEXT_OPERATION_RETRY_CONTROL
+        )
+        client = SimpleNamespace(
+            step=lambda action: StepOutput(
+                state="checkpoint write rejected",
+                reward=-0.01,
+                done=False,
+                info=build_task_neutral_transition_info(
+                    context_transition=retry,
+                    wrapper_evidence={"retry_context_restored": True},
+                ),
+            )
+        )
+
+        _, next_messages = complete_policy_turn(client, prepared, "invalid action")
+        actual = loop._next_prompt_ids(
+            prepared_messages=prepared_messages,
+            prepared_prompt_ids=prepared_prompt_ids,
+            action="invalid action",
+            action_token_ids=[13, 14],
+            next_messages=next_messages,
+        )
+
+        self.assertEqual(next_messages, base)
+        self.assertEqual(actual, loop.continuous_token_builder._render(base))
+        self.assertEqual(loop.continuous_token_builder.assistant_calls, [])
+        self.assertEqual(loop.continuous_token_builder.non_assistant_calls, [])
+        self.assertEqual(loop.continuous_token_builder.initial_calls[-1], base)
 
     def test_replace_messages_forces_full_rebuild(self):
         loop = self._loop()
