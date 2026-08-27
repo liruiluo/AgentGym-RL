@@ -724,6 +724,16 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
                         "session_trace": ["search result"],
                     },
                 },
+                {
+                    "observation": "session-1 second search result",
+                    "reward": 0.0,
+                    "done": False,
+                    "info": {
+                        "current_subtask_index": 1,
+                        "tool_ops": [{"op": "SEARCH", "step": 4}],
+                        "session_trace": ["second search result"],
+                    },
+                },
                 webshop_checkpoint_response(
                     changed=False,
                     stdout=payload.decode("utf-8"),
@@ -753,10 +763,30 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertTrue(wrong_evidence["checkpoint_read_retry_pending"])
         self.assertEqual(
             wrong_output.info["context_transition"]["operation"],
-            "append_observation",
+            "replace_messages",
         )
         self.assertIn("Checkpoint read failed", messages[-1]["content"])
         self.assertIn(FILESYSTEM_CHECKPOINT_PATH, str(messages))
+        self.assertNotIn("search[blue mug]", str(messages))
+        self.assertNotIn("session-1 search result", str(messages))
+        self.assertEqual(wrong_output.info["context_epoch_after"], 1)
+        self.assertEqual(
+            wrong_output.info["action_submission"]["raw_policy_output"],
+            "search[blue mug]",
+        )
+
+        first_retry_messages = deepcopy(messages)
+        second_wrong_output, messages = complete_policy_turn(
+            client, prepare(client, messages), "search[red mug]"
+        )
+        self.assertEqual(
+            second_wrong_output.info["context_transition"]["operation"],
+            "replace_messages",
+        )
+        self.assertEqual(messages, first_retry_messages)
+        self.assertNotIn("search[red mug]", str(messages))
+        self.assertNotIn("session-1 second search result", str(messages))
+        self.assertEqual(second_wrong_output.info["context_epoch_after"], 1)
 
         read_action = (
             'shell_command {"command":"cat .agent_memory/CONTINUATION.md"}'
@@ -914,6 +944,36 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             wrong_output.info["wrapper_evidence"]["checkpoint_read_retry_pending"]
         )
         self.assertIn(FILESYSTEM_CHECKPOINT_PATH, str(replacement))
+        self.assertEqual(
+            wrong_output.info["context_transition"]["operation"],
+            "replace_messages",
+        )
+        self.assertNotIn(wrong_action, str(replacement))
+        self.assertNotIn("training complete", str(replacement))
+        self.assertEqual(wrong_output.info["context_epoch_after"], 1)
+
+        first_retry_messages = deepcopy(replacement)
+        second_wrong_info = deepcopy(wrong_info)
+        second_wrong_info["counters"]["action_count"] = 3
+        second_wrong_action = 'shell_command {"command":"python second.py"}'
+        with mock.patch.object(
+            openmle_fast_module,
+            "_validate_step_response",
+            return_value=("second training output", 0.0, False, second_wrong_info),
+        ):
+            second_wrong_output, replacement = complete_policy_turn(
+                client,
+                prepare(client, replacement),
+                second_wrong_action,
+            )
+        self.assertEqual(
+            second_wrong_output.info["context_transition"]["operation"],
+            "replace_messages",
+        )
+        self.assertEqual(replacement, first_retry_messages)
+        self.assertNotIn(second_wrong_action, str(replacement))
+        self.assertNotIn("second training output", str(replacement))
+        self.assertEqual(second_wrong_output.info["context_epoch_after"], 1)
 
         read_receipt = {
             "schema": FILESYSTEM_CHECKPOINT_READ_RECEIPT_SCHEMA,
@@ -925,7 +985,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         read_info = {
             "action_kind": "shell_command",
             "action_status": "completed",
-            "counters": {"action_count": 3},
+            "counters": {"action_count": 4},
             "counter_delta": {"execution_completed_count": 1},
             "execution": {
                 "status": "completed",
@@ -1209,6 +1269,30 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertNotIn("native tool output 2", str(messages))
         self.assertNotIn(SWE_CONTEXT_COMPACTION_REQUEST, str(messages))
 
+        wrong_action = (
+            'shell_command {"command":"python wrong.py","workdir":"."}'
+        )
+        wrong_output, messages = complete_policy_turn(
+            client,
+            prepare(client, messages, capacity=4096),
+            wrong_action,
+        )
+        self.assertEqual(
+            wrong_output.info["context_transition"]["operation"],
+            "replace_messages",
+        )
+        self.assertTrue(
+            wrong_output.info["wrapper_evidence"]["checkpoint_read_retry_pending"]
+        )
+        self.assertEqual(
+            (wrong_output.info["context_epoch_before"],
+             wrong_output.info["context_epoch_after"]),
+            (1, 1),
+        )
+        self.assertIn("Checkpoint read failed", str(messages))
+        self.assertNotIn(wrong_action, str(messages))
+        self.assertNotIn("native tool output 3", str(messages))
+
         reread = prepare(client, messages, capacity=4096)
         self.assertIsNone(reread.control_request)
         reread_action = (
@@ -1221,7 +1305,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             reread_action,
         )
         self.assertEqual(client.native_calls[-1], reread_action)
-        self.assertEqual(len(client.native_calls), 3)
+        self.assertEqual(len(client.native_calls), 4)
         self.assertEqual(
             reread_output.info["wrapper_evidence"]["workspace_continuity_id"],
             client.env_id,
@@ -1241,7 +1325,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             reread_output.info["wrapper_evidence"]["checkpoint_read_satisfied"]
         )
         self.assertIsNone(client._pending_checkpoint_read)
-        self.assertIn("native tool output 3", str(messages))
+        self.assertIn("native tool output 4", str(messages))
 
     def test_swesmith_endpoint_attested_modify_and_execute_events(self) -> None:
         client = FakeSwesmithClient()
