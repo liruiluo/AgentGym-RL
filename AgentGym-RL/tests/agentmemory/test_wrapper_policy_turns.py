@@ -548,18 +548,23 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         )
         self.assertIn("objective: finish six purchases", str(messages))
 
-    def test_failed_webshop_checkpoint_keeps_context_and_retries(self) -> None:
+    def test_failed_webshop_checkpoint_rebuilds_stable_context_and_retries(self) -> None:
         client = FakeWebShopClient(
-            [webshop_buy_response(), webshop_checkpoint_response(changed=False)]
+            [
+                webshop_buy_response(),
+                webshop_checkpoint_response(changed=False),
+                webshop_checkpoint_response(changed=False),
+            ]
         )
         messages = self.bind_webshop(client)
         buy_output, messages = complete_policy_turn(
             client, prepare(client, messages), "click[Buy Now]"
         )
         self.assertEqual(buy_output.info["session_epoch_after"], 1)
+        preboundary_messages = deepcopy(messages)
 
         invalid = "black; cat file:///Users/master/state.md"
-        handoff_output, messages = complete_policy_turn(
+        handoff_output, first_retry_messages = complete_policy_turn(
             client, prepare(client, messages), invalid
         )
         self.assertEqual(
@@ -567,17 +572,23 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         )
         self.assertEqual(
             handoff_output.info["context_transition"]["operation"],
-            "append_observation",
+            "replace_messages",
         )
         self.assertEqual(handoff_output.info["context_epoch_after"], 0)
         self.assertFalse(
             handoff_output.info["wrapper_evidence"]["continuation_persisted"]
         )
         self.assertTrue(handoff_output.info["wrapper_evidence"]["retry_pending"])
-        self.assertIn(invalid, str(messages))
-        self.assertNotIn("checkpoint unchanged", str(messages))
+        self.assertTrue(
+            handoff_output.info["wrapper_evidence"][
+                "checkpoint_retry_context_rebuilt"
+            ]
+        )
+        self.assertEqual(first_retry_messages[:-1], preboundary_messages)
+        self.assertNotIn(invalid, str(first_retry_messages))
+        self.assertNotIn("checkpoint unchanged", str(first_retry_messages))
         self.assertEqual(
-            messages[-1]["content"],
+            first_retry_messages[-1]["content"],
             "Filesystem checkpoint was not accepted (missing_receipt). "
             "The earlier context is still present. Retry now with exactly one "
             "shell_command or apply_patch that overwrites "
@@ -600,11 +611,22 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
                 "raw_history_cleared"
             ]
         )
-        retry = prepare(client, messages, capacity=4096)
+
+        retry = prepare(client, first_retry_messages, capacity=4096)
         self.assertEqual(retry.control_request, WEBSHOP_SESSION_HANDOFF_REQUEST)
+        second_invalid = "second invalid checkpoint action"
+        second_output, second_retry_messages = complete_policy_turn(
+            client, retry, second_invalid
+        )
+        self.assertEqual(
+            second_output.info["context_transition"]["operation"],
+            "replace_messages",
+        )
+        self.assertEqual(second_retry_messages, first_retry_messages)
+        self.assertNotIn(second_invalid, str(second_retry_messages))
         self.assertEqual(
             client.native_calls,
-            ["click[Buy Now]", invalid],
+            ["click[Buy Now]", invalid, second_invalid],
         )
 
     def test_failed_webshop_shell_cannot_authorize_context_replacement(self) -> None:
@@ -618,23 +640,30 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         _, messages = complete_policy_turn(
             client, prepare(client, messages), "click[Buy Now]"
         )
+        failed_action = (
+            'shell_command {"command":"false > .agent_memory/CONTINUATION.md"}'
+        )
 
         output, messages = complete_policy_turn(
             client,
             prepare(client, messages),
-            'shell_command {"command":"false > .agent_memory/CONTINUATION.md"}',
+            failed_action,
         )
 
         self.assertEqual(
             output.info["context_transition"]["operation"],
-            "append_observation",
+            "replace_messages",
         )
         self.assertFalse(output.info["wrapper_evidence"]["context_replaced"])
+        self.assertTrue(
+            output.info["wrapper_evidence"]["checkpoint_retry_context_rebuilt"]
+        )
         self.assertEqual(
             output.info["wrapper_evidence"]["checkpoint_failure_reason"],
             "action_not_completed",
         )
         self.assertIn("action_not_completed", messages[-1]["content"])
+        self.assertNotIn(failed_action, str(messages))
 
     def test_stale_webshop_workspace_event_cannot_authorize_handoff(self) -> None:
         stale = webshop_checkpoint_response(changed=True)
@@ -655,24 +684,31 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         _, messages = complete_policy_turn(
             client, prepare(client, messages), "click[Buy Now]"
         )
+        failed_action = (
+            'shell_command {"command":"printf checkpoint > '
+            '.agent_memory/CONTINUATION.md"}'
+        )
 
         output, messages = complete_policy_turn(
             client,
             prepare(client, messages),
-            'shell_command {"command":"printf checkpoint > '
-            '.agent_memory/CONTINUATION.md"}',
+            failed_action,
         )
 
         self.assertEqual(
             output.info["context_transition"]["operation"],
-            "append_observation",
+            "replace_messages",
         )
         self.assertFalse(output.info["wrapper_evidence"]["context_replaced"])
+        self.assertTrue(
+            output.info["wrapper_evidence"]["checkpoint_retry_context_rebuilt"]
+        )
         self.assertEqual(
             output.info["wrapper_evidence"]["checkpoint_failure_reason"],
             "missing_receipt",
         )
         self.assertIn("missing_receipt", messages[-1]["content"])
+        self.assertNotIn(failed_action, str(messages))
 
     def test_coherently_stale_webshop_event_is_bound_to_submitted_action(self) -> None:
         stale = webshop_checkpoint_response(changed=True)
@@ -689,24 +725,31 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         _, messages = complete_policy_turn(
             client, prepare(client, messages), "click[Buy Now]"
         )
+        failed_action = (
+            'shell_command {"command":"printf new > '
+            '.agent_memory/CONTINUATION.md"}'
+        )
 
         output, messages = complete_policy_turn(
             client,
             prepare(client, messages),
-            'shell_command {"command":"printf new > '
-            '.agent_memory/CONTINUATION.md"}',
+            failed_action,
         )
 
         self.assertEqual(
             output.info["context_transition"]["operation"],
-            "append_observation",
+            "replace_messages",
         )
         self.assertFalse(output.info["wrapper_evidence"]["context_replaced"])
+        self.assertTrue(
+            output.info["wrapper_evidence"]["checkpoint_retry_context_rebuilt"]
+        )
         self.assertEqual(
             output.info["wrapper_evidence"]["checkpoint_failure_reason"],
             "missing_receipt",
         )
         self.assertIn("missing_receipt", messages[-1]["content"])
+        self.assertNotIn(failed_action, str(messages))
 
     def test_webshop_requires_matching_checkpoint_read_before_progress(self) -> None:
         payload = b"objective: continue\nnext: search blue mug"
@@ -1015,7 +1058,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertIsNone(client._pending_checkpoint_read)
         self.assertIn("checkpoint", str(replacement))
 
-    def test_openmle_failed_checkpoint_keeps_context_and_retries(self) -> None:
+    def test_openmle_failed_checkpoint_rebuilds_stable_context_and_retries(self) -> None:
         client = FakeOpenMLEClient()
         initial = client.policy_framing() + [
             {"role": "user", "content": client.observe()},
@@ -1027,6 +1070,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
                 {"role": "user", "content": "large previous execution evidence"},
             ]
         )
+        preboundary_messages = deepcopy(messages)
         candidate_count = count_prompt_tokens(
             messages
             + [{"role": "user", "content": OPENMLE_CONTEXT_COMPACTION_REQUEST}]
@@ -1059,16 +1103,29 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
                 prepared,
                 malformed,
             )
+            retry = prepare(client, retry_messages, capacity=4096)
+            second_malformed = "second malformed checkpoint action"
+            second_output, second_retry_messages = complete_policy_turn(
+                client,
+                retry,
+                second_malformed,
+            )
 
-        self.assertEqual(client.native_calls, [malformed])
+        self.assertEqual(client.native_calls, [malformed, second_malformed])
         self.assertEqual(
             output.info["context_transition"]["operation"],
-            "append_observation",
+            "replace_messages",
         )
         self.assertEqual(output.info["wrapper_evidence"]["event"], "context_compaction")
         self.assertFalse(output.info["wrapper_evidence"]["continuation_persisted"])
         self.assertTrue(output.info["wrapper_evidence"]["retry_pending"])
-        self.assertEqual(output.info["wrapper_evidence"]["checkpoint_failure_reason"], "wrong_action_kind")
+        self.assertTrue(
+            output.info["wrapper_evidence"]["checkpoint_retry_context_rebuilt"]
+        )
+        self.assertEqual(
+            output.info["wrapper_evidence"]["checkpoint_failure_reason"],
+            "wrong_action_kind",
+        )
         self.assertEqual(
             (
                 output.info["native_call_count_before"],
@@ -1080,13 +1137,19 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             ),
             (0, 1, 0, 1, 0, 0),
         )
+        self.assertEqual(retry_messages[:-1], preboundary_messages[:-1])
         self.assertIn("large previous execution evidence", str(retry_messages))
-        self.assertTrue(
-            any(message["content"] == malformed for message in retry_messages)
+        self.assertNotIn(malformed, str(retry_messages))
+        self.assertFalse(
+            any(message["content"] == "parser error" for message in retry_messages)
         )
-        self.assertIn("parser error", str(retry_messages))
-        retry = prepare(client, retry_messages, capacity=4096)
         self.assertEqual(retry.control_request, OPENMLE_CONTEXT_COMPACTION_REQUEST)
+        self.assertEqual(second_retry_messages, retry_messages)
+        self.assertNotIn(second_malformed, str(second_retry_messages))
+        self.assertEqual(
+            second_output.info["context_transition"]["operation"],
+            "replace_messages",
+        )
 
     def test_openmle_endpoint_attested_memory_events(self) -> None:
         read_receipt = {
@@ -1366,30 +1429,47 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             output = client.step(action)
         self.assertNotIn("memory_event", output.info["wrapper_evidence"])
 
-    def test_swesmith_failed_checkpoint_keeps_epoch_and_retries(self) -> None:
+    def test_swesmith_failed_checkpoint_rebuilds_stable_context_and_retries(self) -> None:
         client = FakeSwesmithClient()
         messages = bind_initial_policy_context(
             client,
             client.policy_framing()
             + [{"role": "user", "content": client.observe()}],
         )
+        preboundary_messages = deepcopy(messages)
         candidate_count = count_prompt_tokens(
             messages + [{"role": "user", "content": SWE_CONTEXT_COMPACTION_REQUEST}]
         )
         compaction = prepare(client, messages, capacity=candidate_count + 1)
-        output, messages = complete_policy_turn(
-            client, compaction, 'shell_command {"command":"true"}'
+        failed_action = 'shell_command {"command":"true"}'
+        output, first_retry_messages = complete_policy_turn(
+            client, compaction, failed_action
         )
         self.assertEqual(output.reward, 0.0)
         self.assertEqual(output.info["context_epoch_after"], 0)
         self.assertEqual(
-            output.info["context_transition"]["operation"], "append_observation"
+            output.info["context_transition"]["operation"], "replace_messages"
         )
         self.assertFalse(output.info["wrapper_evidence"]["continuation_persisted"])
         self.assertTrue(output.info["wrapper_evidence"]["retry_pending"])
-        self.assertIn("checkpoint_not_changed", str(messages))
-        retry = prepare(client, messages, capacity=4096)
+        self.assertTrue(
+            output.info["wrapper_evidence"]["checkpoint_retry_context_rebuilt"]
+        )
+        self.assertEqual(first_retry_messages[:-1], preboundary_messages[:-1])
+        self.assertIn("checkpoint_not_changed", str(first_retry_messages))
+        self.assertNotIn(failed_action, str(first_retry_messages))
+        self.assertNotIn("native tool output", str(first_retry_messages))
+
+        retry = prepare(client, first_retry_messages, capacity=4096)
         self.assertEqual(retry.control_request, SWE_CONTEXT_COMPACTION_REQUEST)
+        second_output, second_retry_messages = complete_policy_turn(
+            client, retry, failed_action
+        )
+        self.assertEqual(
+            second_output.info["context_transition"]["operation"],
+            "replace_messages",
+        )
+        self.assertEqual(second_retry_messages, first_retry_messages)
 
     def test_swesmith_actor_credit_receipt_fails_closed(self) -> None:
         invalid_receipts = (
