@@ -259,6 +259,33 @@ class TestFinalizerTerminalPaths(FinalizerTestCase):
             )
             self.assertEqual(verdict["terminal_path"], "crash")
 
+    def test_trainer_crash_reports_observed_completed_updates_not_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory), mode="formal")
+            for path in fixture["rollout_dir"].glob("*.jsonl"):
+                if int(path.stem) > 4:
+                    path.unlink()
+            metric_rows = [
+                json.loads(line)
+                for line in fixture["metrics_path"].read_text(encoding="utf-8").splitlines()
+                if int(json.loads(line)["step"]) <= 4
+            ]
+            fixture["metrics_path"].write_text(
+                "\n".join(json.dumps(row, sort_keys=True) for row in metric_rows)
+                + "\n",
+                encoding="utf-8",
+            )
+
+            verdict = self.assert_failed(
+                fixture["run_dir"], exit_code=1, contains="trainer exit code 1"
+            )
+
+            self.assertEqual(verdict["terminal_path"], "crash")
+            self.assertEqual(verdict["counts"]["declared_learner_updates"], 100)
+            self.assertEqual(verdict["counts"]["declared_publication_cycles"], 100)
+            self.assertEqual(verdict["counts"]["complete_learner_updates"], 4)
+            self.assertEqual(verdict["counts"]["publication_cycles"], 4)
+
     def test_incomplete_native_rollout_budget_is_partial(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.build(Path(directory))

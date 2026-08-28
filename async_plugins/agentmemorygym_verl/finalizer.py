@@ -272,6 +272,20 @@ def _nonnegative_int(value: Any) -> int | None:
     return value
 
 
+def _contiguous_positive_prefix(values: Iterable[Any]) -> int:
+    """Count the observed 1..N prefix without mistaking a declared budget for work."""
+
+    observed = {
+        int(value)
+        for value in values
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0
+    }
+    completed = 0
+    while completed + 1 in observed:
+        completed += 1
+    return completed
+
+
 def _lcm(left: int, right: int) -> int:
     return abs(left * right) // math.gcd(left, right)
 
@@ -726,6 +740,8 @@ class _Audit:
         self.trainer_world_size: int | None = None
         self.counts: dict[str, int] = {
             "scheduled_episodes": 0,
+            "declared_learner_updates": 0,
+            "declared_publication_cycles": 0,
             "complete_learner_updates": 0,
             "publication_cycles": 0,
             "real_action_rows": 0,
@@ -855,8 +871,8 @@ class _Audit:
             )
             self.counts.update(
                 scheduled_episodes=episodes,
-                complete_learner_updates=updates,
-                publication_cycles=publications,
+                declared_learner_updates=updates,
+                declared_publication_cycles=publications,
             )
 
         model_path = str(_at(endpoint, "training_runtime.base_model", ""))
@@ -1016,8 +1032,8 @@ class _Audit:
             )
             self.counts.update(
                 scheduled_episodes=episodes,
-                complete_learner_updates=updates,
-                publication_cycles=publications,
+                declared_learner_updates=updates,
+                declared_publication_cycles=publications,
             )
 
         registry_digest = identity.get("route_registry_sha256")
@@ -1500,6 +1516,9 @@ class _Audit:
             validation_metrics == 0,
             f"FileLogger emitted {validation_metrics} validation metric(s)",
         )
+        self.counts["publication_cycles"] = _contiguous_positive_prefix(
+            observed_steps
+        )
         if self.expected is not None:
             publications = int(self.expected["publication_cycles"])
             samples_per_update = int(self.expected["samples_per_update"])
@@ -1809,6 +1828,9 @@ class _Audit:
                 (path for path in candidates if path.stem.isdecimal()),
                 key=lambda path: int(path.stem),
             )
+        self.counts["complete_learner_updates"] = _contiguous_positive_prefix(
+            int(path.stem) for path in paths
+        )
         if not paths:
             self.errors.append(f"required rollout JSONL is missing under: {directory}")
             return
