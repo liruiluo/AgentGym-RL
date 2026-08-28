@@ -14,6 +14,7 @@ from agentenv.envs.agentmemory import (
     IntentClarificationFilesystemAgentMemoryAdapter,
     build_procedural_conversation_start,
 )
+from agentenv.envs.webshop_handoff import WEBSHOP_SESSION_HANDOFF_REQUEST
 
 
 def procedural_metadata():
@@ -710,6 +711,82 @@ class ProceduralAgentMemoryClientContractTest(unittest.TestCase):
                 ActionFormat.REACT,
             ),
             "",
+        )
+
+    def test_filesystem_react_accepts_one_complete_qwen_xml_workspace_call(self) -> None:
+        client = self.create_client(filesystem_metadata())
+        shell = """<tool_call>
+<function=shell_command>
+<parameter=command>
+mkdir -p .agent_memory && printf '%s\n' 'next: search[red mug]' > .agent_memory/CONTINUATION.md
+</parameter>
+<parameter=workdir>
+.
+</parameter>
+<parameter=timeout_ms>
+10000
+</parameter>
+</function>
+</tool_call>"""
+        parsed = client.adapter_cls.action_parser(shell, ActionFormat.REACT)
+        self.assertEqual(
+            parsed,
+            'shell_command {"command": "mkdir -p .agent_memory && printf \'%s\\n\' \'next: search[red mug]\' > .agent_memory/CONTINUATION.md", "workdir": ".", "timeout_ms": 10000}',
+        )
+
+        patch_call = """<tool_call>
+<function=apply_patch>
+<parameter=patch>
+*** Begin Patch
+*** Add File: .agent_memory/CONTINUATION.md
++next: click[item]
+*** End Patch
+</parameter>
+</function>
+</tool_call>"""
+        self.assertEqual(
+            client.adapter_cls.action_parser(patch_call, ActionFormat.REACT),
+            "apply_patch\n*** Begin Patch\n*** Add File: "
+            ".agent_memory/CONTINUATION.md\n+next: click[item]\n*** End Patch",
+        )
+
+    def test_filesystem_react_rejects_malformed_or_multiple_qwen_calls(self) -> None:
+        client = self.create_client(filesystem_metadata())
+        malformed = """<tool_call>
+<function=shell_command>
+<parameter=command>echo x</parameter>
+</tool_call>"""
+        multiple = (
+            "<tool_call><function=shell_command><parameter=command>echo x"
+            "</parameter></function></tool_call>"
+            "<tool_call><function=shell_command><parameter=command>echo y"
+            "</parameter></function></tool_call>"
+        )
+        for raw in (malformed, multiple):
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    client.adapter_cls.action_parser(raw, ActionFormat.REACT),
+                    "",
+                )
+
+    def test_filesystem_prompt_uses_qwen_xml_for_workspace_only(self) -> None:
+        client = self.create_client(filesystem_metadata())
+        prompt = client.conversation_start[0]["value"]
+        self.assertIn("Native shopping actions remain bare", prompt)
+        self.assertIn("<function=shell_command>", prompt)
+        self.assertIn("<function=apply_patch>", prompt)
+        self.assertIn("mkdir -p .agent_memory", prompt)
+        self.assertIn(".agent_memory/CONTINUATION.md", prompt)
+        self.assertIn(
+            "system prompt's Qwen XML shell_command form",
+            WEBSHOP_SESSION_HANDOFF_REQUEST,
+        )
+        self.assertIn("mkdir -p .agent_memory", WEBSHOP_SESSION_HANDOFF_REQUEST)
+        self.assertIn(
+            ".agent_memory/CONTINUATION.md", WEBSHOP_SESSION_HANDOFF_REQUEST
+        )
+        self.assertLessEqual(
+            len(WEBSHOP_SESSION_HANDOFF_REQUEST.encode("utf-8")), 1242
         )
 
     def test_filesystem_function_schema_has_no_legacy_memory_api(self) -> None:

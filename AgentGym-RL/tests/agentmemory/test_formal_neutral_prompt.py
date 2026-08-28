@@ -453,6 +453,11 @@ class FormalPromptTests(unittest.TestCase):
         )
         for fragment in (
             "native WebShop bundled-shopping environment",
+            "Native shopping actions remain bare",
+            "<function=shell_command>",
+            "<parameter=command>",
+            "<function=apply_patch>",
+            "mkdir -p .agent_memory",
             "search[keywords]",
             "click[Buy Now]",
             "click[its displayed ASIN]",
