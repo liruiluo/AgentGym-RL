@@ -1321,6 +1321,11 @@ def assert_ports_available(specs: Sequence[EndpointLaunchSpec]) -> None:
             )
             family = socket.AF_INET6 if host == "::1" else socket.AF_INET
             probe = socket.socket(family, socket.SOCK_STREAM)
+            # Endpoint servers enable address reuse. Match that behavior so a
+            # recently closed connection in TCP TIME_WAIT is not mistaken for
+            # a live listener during rollback or immediate relaunch. An active
+            # listening socket still rejects this bind without SO_REUSEPORT.
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 probe.bind((_bindable_host(host), port))
             except OSError as exc:
