@@ -465,6 +465,10 @@ def build_runtime_env(
     env["VERL_USE_EXTERNAL_PLUGINS"] = "none"
     env["VERL_FILE_LOGGER_PATH"] = str(inputs.run_dir / "metrics.jsonl")
     env.pop("VERL_FULLY_ASYNC_RUNTIME_RECEIPT_PATH", None)
+    # Formal trajectory GAE already carries a per-row actor-credit receipt.
+    # Consume it by construction so parser/executor/control-contract failures
+    # cannot receive positive actor advantage from a later task success.
+    env["AGENTMEMORY_POSITIVE_ACTOR_CREDIT_RECEIPT"] = "1"
     env["PYTHONUNBUFFERED"] = "1"
     env["TOKENIZERS_PARALLELISM"] = "false"
     env["HYDRA_FULL_ERROR"] = "1"

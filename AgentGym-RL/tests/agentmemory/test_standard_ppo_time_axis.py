@@ -300,9 +300,22 @@ class CriticAlignmentTests(unittest.TestCase):
 
 
 class FakeDataProto:
-    def __init__(self, *, values=None, eligibility=(False, True, True)) -> None:
+    def __init__(
+        self,
+        *,
+        values=None,
+        eligibility=(False, True, True),
+        bases=None,
+    ) -> None:
         if values is None:
             values = [0.0, 0.0, 0.0]
+        if bases is None:
+            bases = tuple(
+                "shell_executed" if eligible else "parser_rejected"
+                for eligible in eligibility
+            )
+        if len(bases) != len(eligibility):
+            raise ValueError("bases and eligibility must have the same length")
         self.batch = {
             "values": torch.tensor(values, dtype=torch.float32).reshape(3, 1),
             "response_mask": torch.ones(3, 1),
@@ -324,16 +337,12 @@ class FakeDataProto:
                                 "actor_credit": {
                                     "schema": "task_neutral_actor_credit_v1",
                                     "positive_eligible": bool(eligible),
-                                    "basis": (
-                                        "parser_rejected"
-                                        if not eligible
-                                        else "shell_executed"
-                                    ),
+                                    "basis": bases[index],
                                 }
                             }
                         }
                     )
-                    for eligible in eligibility
+                    for index, eligible in enumerate(eligibility)
                 ],
                 dtype=object,
             ),
@@ -417,6 +426,36 @@ class TrainerRoutingTests(unittest.TestCase):
             data.batch["returns"].flatten(), torch.ones(3)
         )
         self.assertEqual(data.meta_info["agentmemory_positive_credit_masked_rows"], 1)
+
+    def test_checkpoint_contract_unsatisfied_masks_positive_actor_credit(self) -> None:
+        functions = load_trainer_functions([])
+        data = FakeDataProto(
+            values=[0.0, 0.0, 0.0],
+            bases=(
+                "checkpoint_contract_unsatisfied",
+                "shell_executed",
+                "terminal_submission",
+            ),
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {"AGENTMEMORY_POSITIVE_ACTOR_CREDIT_RECEIPT": "1"},
+            clear=False,
+        ):
+            functions["compute_advantage"](
+                data, "gae", gamma=1.0, lam=1.0
+            )
+
+        torch.testing.assert_close(
+            data.batch["advantages"].flatten(), torch.tensor([0.0, 1.0, 1.0])
+        )
+        torch.testing.assert_close(
+            data.batch["returns"].flatten(), torch.ones(3)
+        )
+        self.assertEqual(
+            data.meta_info["agentmemory_positive_credit_masked_rows"], 1
+        )
 
     def test_receipt_preserves_ineligible_negative_advantage(self) -> None:
         functions = load_trainer_functions([])

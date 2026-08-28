@@ -421,6 +421,9 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                 env["VERL_USE_EXTERNAL_MODULES"], "agentmemorygym_verl.action_gae"
             )
             self.assertEqual(
+                env["AGENTMEMORY_POSITIVE_ACTOR_CREDIT_RECEIPT"], "1"
+            )
+            self.assertEqual(
                 env["VERL_FILE_LOGGER_PATH"], str(inputs.run_dir / "metrics.jsonl")
             )
             self.assertNotIn("VERL_FULLY_ASYNC_RUNTIME_RECEIPT_PATH", env)
@@ -432,6 +435,17 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                     inputs,
                     training_runtime=self.source_lock["training_runtime"],
                     base_env={"PYTHONPATH": "/caller"},
+                )
+            with self.assertRaisesRegex(
+                RuntimeError, "AGENTMEMORY_POSITIVE_ACTOR_CREDIT_RECEIPT"
+            ):
+                build_runtime_env(
+                    inputs,
+                    training_runtime=self.source_lock["training_runtime"],
+                    base_env={
+                        "PATH": "/usr/bin",
+                        "AGENTMEMORY_POSITIVE_ACTOR_CREDIT_RECEIPT": "0",
+                    },
                 )
 
     def test_runtime_env_pins_cuda13_toolchain(self):
