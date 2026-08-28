@@ -148,6 +148,7 @@ class AuditTest(unittest.TestCase):
             self.assertEqual(result["invalid_replacement_count"], 0)
             self.assertEqual(result["feedback_preserving_failed_attempt_count"], 1)
             self.assertEqual(result["retry_exhausted_failed_attempt_count"], 0)
+            self.assertEqual(result["bounded_retry_restore_count"], 0)
             self.assertEqual(result["invalid_retry_transition_count"], 0)
 
     def test_failed_checkpoint_must_preserve_action_and_observation(self):

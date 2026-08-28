@@ -735,7 +735,9 @@ def analyze(run_dir, through=None, route="swesmith"):
         "strict_post_compaction_read_trajectory_count": len(
             strict_read_trajectories
         ),
-        # Compatibility aliases for existing monitors, with v2 receipt semantics.
+        # Compatibility aliases for existing monitors.  v3 never hides a
+        # failed attempt behind retry_control, so the old restore count is zero.
+        "bounded_retry_restore_count": 0,
         "compaction_event_count": len(attempts),
         "valid_executed_checkpoint_write_count": len(successful_replacements),
         "transition_without_valid_write_count": len(invalid_replacements),
@@ -743,6 +745,7 @@ def analyze(run_dir, through=None, route="swesmith"):
         "compaction_opportunities": opportunities,
         "successful_replacements": successful_replacements,
         "invalid_replacements": invalid_replacements,
+        "bounded_retry_restores": [],
         "feedback_preserving_failed_attempts": failed_checkpoint_feedback,
         "retry_exhausted_failed_attempts": retry_exhausted_failures,
         "invalid_retry_transitions": invalid_retry_transitions,
