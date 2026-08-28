@@ -51,6 +51,7 @@ from agentenv.envs.swesmith import (  # noqa: E402
     _validate_actor_credit_receipt,
 )
 from agentenv.envs.webshop_handoff import (  # noqa: E402
+    WEBSHOP_CONTEXT_COMPACTION_REQUEST,
     WEBSHOP_SESSION_HANDOFF_REQUEST,
 )
 
@@ -117,6 +118,7 @@ class FakeWebShopClient(AgentMemoryEnvClient):
         }
         self._responses = list(responses)
         self.native_calls: list[str] = []
+        self.checkpoint_commits: list[dict] = []
         self._reset_policy_transition_state(self.info["env_info"])
         self.configure_policy_system_prompt("Canonical WebShop tool contract")
 
@@ -124,6 +126,26 @@ class FakeWebShopClient(AgentMemoryEnvClient):
         return 1
 
     def post(self, path: str, data: dict) -> dict:
+        if path == "filesystem-checkpoint-commit":
+            self.checkpoint_commits.append(dict(data))
+            return {
+                "id": self.env_id,
+                "observation": "session-0 compacted observation",
+                "reward": 0.0,
+                "done": False,
+                "info": {
+                    "current_subtask_index": data["session_index"],
+                    "session_trace": [],
+                    "filesystem_checkpoint_trace_commit": {
+                        "schema": "agentmemory_webshop_trace_checkpoint_commit_v1",
+                        "session_index": data["session_index"],
+                        "step_count": data["step_count"],
+                        "cleared_trace_entries": 3,
+                        "size_bytes": data["size_bytes"],
+                        "sha256": data["sha256"],
+                    },
+                },
+            }
         if path != "step":
             raise AssertionError(f"unexpected fake WebShop path: {path}")
         self.native_calls.append(str(data["action"]))
@@ -343,6 +365,8 @@ def webshop_buy_response() -> dict:
 def webshop_checkpoint_response(
     *,
     changed: bool = True,
+    session_index: int = 1,
+    session_trace: list[str] | None = None,
     exit_code: int = 0,
     timed_out: bool = False,
     stdout: str = "",
@@ -366,9 +390,9 @@ def webshop_checkpoint_response(
         "reward": 0.0,
         "done": False,
         "info": {
-            "current_subtask_index": 1,
+            "current_subtask_index": session_index,
             "tool_ops": [{"op": "SHELL_COMMAND", "step": 3}],
-            "session_trace": [],
+            "session_trace": list(session_trace or []),
             "workspace_latest_event": {
                 "op": "SHELL_COMMAND",
                 "tool_name": "shell_command",
@@ -424,6 +448,151 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
                 {"role": "user", "content": client.observe()},
             ],
         )
+
+    def test_webshop_pressure_checkpoint_runs_before_session_advance(self) -> None:
+        checkpoint_body = "objective: finish current session; next: inspect product"
+        checkpoint_payload = checkpoint_body.encode("utf-8")
+        client = FakeWebShopClient(
+            [
+                webshop_search_response(),
+                webshop_checkpoint_response(
+                    checkpoint_payload=checkpoint_payload,
+                    session_index=0,
+                    session_trace=["search result", "checkpoint write"],
+                ),
+                webshop_checkpoint_response(
+                    changed=False,
+                    stdout=checkpoint_body,
+                    checkpoint_payload=checkpoint_payload,
+                    exists=True,
+                    session_index=0,
+                    session_trace=["checkpoint read"],
+                ),
+            ]
+        )
+        messages = self.bind_webshop(client)
+        _, messages = complete_policy_turn(
+            client, prepare(client, messages), "search[black mug]"
+        )
+
+        pressure_turn = prepare(client, messages, capacity=1800)
+        self.assertEqual(
+            pressure_turn.control_request, WEBSHOP_CONTEXT_COMPACTION_REQUEST
+        )
+        checkpoint_action = (
+            'shell_command {"command":"mkdir -p .agent_memory && printf %s '
+            + checkpoint_body
+            + ' > .agent_memory/CONTINUATION.md","workdir":"."}'
+        )
+        output, messages = complete_policy_turn(
+            client, pressure_turn, checkpoint_action
+        )
+
+        evidence = output.info["wrapper_evidence"]
+        self.assertEqual(evidence["event"], "webshop_context_compaction")
+        self.assertTrue(evidence["continuation_persisted"])
+        self.assertTrue(evidence["server_session_trace_cleared"])
+        self.assertEqual(len(client.checkpoint_commits), 1)
+        self.assertEqual(client.checkpoint_commits[0]["session_index"], 0)
+        self.assertEqual(client.checkpoint_commits[0]["step_count"], 2)
+        self.assertEqual(
+            client.checkpoint_commits[0]["size_bytes"], len(checkpoint_payload)
+        )
+        self.assertIn("session-0 compacted observation", str(messages))
+        self.assertNotIn("session-0 search result", str(messages))
+        self.assertNotIn(checkpoint_body, str(messages))
+
+        read = prepare(client, messages, capacity=1800)
+        self.assertIsNone(read.control_request)
+        read_action = (
+            'shell_command {"command":"cat .agent_memory/CONTINUATION.md",'
+            '"workdir":"."}'
+        )
+        read_output, messages = complete_policy_turn(client, read, read_action)
+        self.assertTrue(
+            read_output.info["wrapper_evidence"]["checkpoint_read_satisfied"]
+        )
+        self.assertIn(checkpoint_body, str(messages))
+
+    def test_failed_webshop_pressure_checkpoint_keeps_trace_and_bounded_retry(self) -> None:
+        client = FakeWebShopClient(
+            [
+                webshop_search_response(),
+                webshop_checkpoint_response(
+                    changed=False,
+                    session_index=0,
+                    session_trace=["search result", "failed checkpoint"],
+                ),
+            ]
+        )
+        messages = self.bind_webshop(client)
+        _, messages = complete_policy_turn(
+            client, prepare(client, messages), "search[black mug]"
+        )
+        before = deepcopy(messages)
+
+        selected = prepare(client, messages, capacity=1800)
+        output, retry_messages = complete_policy_turn(
+            client, selected, "malformed checkpoint output"
+        )
+
+        self.assertEqual(selected.control_request, WEBSHOP_CONTEXT_COMPACTION_REQUEST)
+        self.assertEqual(client.checkpoint_commits, [])
+        self.assertFalse(output.info["wrapper_evidence"]["context_replaced"])
+        self.assertTrue(output.info["wrapper_evidence"]["retry_pending"])
+        self.assertEqual(retry_messages[0], before[0])
+        self.assertTrue(
+            retry_messages[-1]["content"].startswith(before[-1]["content"])
+        )
+        self.assertNotIn("failed checkpoint", str(retry_messages))
+        retry = prepare(client, retry_messages, capacity=1800)
+        self.assertEqual(retry.control_request, WEBSHOP_CONTEXT_COMPACTION_REQUEST)
+
+    def test_webshop_pressure_native_buy_promotes_only_session_handoff(self) -> None:
+        checkpoint_payload = b"preserve the completed purchase and continue"
+        client = FakeWebShopClient(
+            [
+                webshop_search_response(),
+                webshop_buy_response(),
+                webshop_checkpoint_response(
+                    checkpoint_payload=checkpoint_payload,
+                    session_index=1,
+                ),
+            ]
+        )
+        messages = self.bind_webshop(client)
+        _, messages = complete_policy_turn(
+            client, prepare(client, messages), "search[black mug]"
+        )
+
+        pressure_turn = prepare(client, messages, capacity=1800)
+        self.assertEqual(
+            pressure_turn.control_request, WEBSHOP_CONTEXT_COMPACTION_REQUEST
+        )
+        failed_output, messages = complete_policy_turn(
+            client, pressure_turn, "click[Buy Now]"
+        )
+        self.assertEqual(
+            failed_output.info["wrapper_evidence"]["checkpoint_failure_reason"],
+            "unexpected_session_advance",
+        )
+        self.assertIsNone(client._pending_context_checkpoint)
+        self.assertIsNotNone(client._pending_session_handoff)
+
+        handoff_turn = prepare(client, messages, capacity=1800)
+        self.assertEqual(
+            handoff_turn.control_request, WEBSHOP_SESSION_HANDOFF_REQUEST
+        )
+        checkpoint_action = (
+            "apply_patch\n*** Begin Patch\n*** Add File: "
+            + FILESYSTEM_CHECKPOINT_PATH
+            + "\n+preserve the completed purchase and continue\n*** End Patch"
+        )
+        output, _ = complete_policy_turn(client, handoff_turn, checkpoint_action)
+        self.assertTrue(output.info["wrapper_evidence"]["continuation_persisted"])
+        self.assertIsNone(client._pending_session_handoff)
+        self.assertIsNone(client._pending_context_checkpoint)
+        self.assertEqual(client.checkpoint_commits, [])
 
     def test_webshop_handoff_requires_executed_checkpoint_then_real_read(self) -> None:
         checkpoint_body = "objective: finish six purchases; next: search blue mug"
