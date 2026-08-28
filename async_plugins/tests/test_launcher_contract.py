@@ -420,8 +420,8 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             self.assertEqual(
                 env["VERL_USE_EXTERNAL_MODULES"], "agentmemorygym_verl.action_gae"
             )
-            self.assertEqual(
-                env["AGENTMEMORY_POSITIVE_ACTOR_CREDIT_RECEIPT"], "1"
+            self.assertNotIn(
+                "AGENTMEMORY_POSITIVE_ACTOR_CREDIT_RECEIPT", env
             )
             self.assertEqual(
                 env["VERL_FILE_LOGGER_PATH"], str(inputs.run_dir / "metrics.jsonl")
@@ -446,6 +446,44 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                         "PATH": "/usr/bin",
                         "AGENTMEMORY_POSITIVE_ACTOR_CREDIT_RECEIPT": "0",
                     },
+                )
+
+    def test_runtime_env_enables_positive_credit_only_for_swesmith_route_set(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = self._inputs(root, mode="gate")
+            inputs = replace(
+                base,
+                env_addr=None,
+                route_registry=root / "routes.json",
+                route_registry_sha256="0" * 64,
+            )
+            with mock.patch(
+                "agentmemorygym_verl.launch.load_route_registry"
+            ) as load_registry:
+                load_registry.return_value.route_ids = ("swesmith",)
+                env = build_runtime_env(
+                    inputs,
+                    training_runtime=self.source_lock["training_runtime"],
+                    base_env={"PATH": "/usr/bin"},
+                )
+                self.assertEqual(
+                    env["AGENTMEMORY_POSITIVE_ACTOR_CREDIT_RECEIPT"], "1"
+                )
+
+                load_registry.return_value.route_ids = (
+                    "webshop",
+                    "swesmith",
+                    "literesearcher",
+                    "openmle_fast",
+                )
+                mixed_env = build_runtime_env(
+                    inputs,
+                    training_runtime=self.source_lock["training_runtime"],
+                    base_env={"PATH": "/usr/bin"},
+                )
+                self.assertNotIn(
+                    "AGENTMEMORY_POSITIVE_ACTOR_CREDIT_RECEIPT", mixed_env
                 )
 
     def test_runtime_env_pins_cuda13_toolchain(self):

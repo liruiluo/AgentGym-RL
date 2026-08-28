@@ -411,6 +411,25 @@ def build_overrides(
     return overrides
 
 
+def _route_set_supports_positive_actor_credit_receipts(
+    inputs: LaunchInputs,
+) -> bool:
+    if inputs.route_registry is None:
+        return False
+    if inputs.route_registry_sha256 is None:
+        raise ValueError(
+            "route_registry and route_registry_sha256 must be provided together"
+        )
+    registry = load_route_registry(
+        inputs.route_registry,
+        expected_sha256=inputs.route_registry_sha256,
+    )
+    # Enable fail-closed receipt consumption only when every active route emits
+    # the receipt.  SWE-smith currently owns that complete contract; mixed and
+    # legacy route sets remain unchanged until their wrappers implement it.
+    return registry.route_ids == ("swesmith",)
+
+
 def build_runtime_env(
     inputs: LaunchInputs,
     *,
@@ -465,10 +484,10 @@ def build_runtime_env(
     env["VERL_USE_EXTERNAL_PLUGINS"] = "none"
     env["VERL_FILE_LOGGER_PATH"] = str(inputs.run_dir / "metrics.jsonl")
     env.pop("VERL_FULLY_ASYNC_RUNTIME_RECEIPT_PATH", None)
-    # Formal trajectory GAE already carries a per-row actor-credit receipt.
-    # Consume it by construction so parser/executor/control-contract failures
-    # cannot receive positive actor advantage from a later task success.
-    env["AGENTMEMORY_POSITIVE_ACTOR_CREDIT_RECEIPT"] = "1"
+    if _route_set_supports_positive_actor_credit_receipts(inputs):
+        env["AGENTMEMORY_POSITIVE_ACTOR_CREDIT_RECEIPT"] = "1"
+    else:
+        env.pop("AGENTMEMORY_POSITIVE_ACTOR_CREDIT_RECEIPT", None)
     env["PYTHONUNBUFFERED"] = "1"
     env["TOKENIZERS_PARALLELISM"] = "false"
     env["HYDRA_FULL_ERROR"] = "1"
