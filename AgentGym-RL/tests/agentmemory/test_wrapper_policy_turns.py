@@ -36,6 +36,10 @@ from agentenv.envs.openmle_fast import (  # noqa: E402
     OPENMLE_FAST_POLICY_SYSTEM_PROMPT,
     OpenMLEFastEnvClient,
 )
+from agentenv.envs.filesystem_checkpoint import (  # noqa: E402
+    FILESYSTEM_CHECKPOINT_PATH,
+    build_filesystem_checkpoint_receipt,
+)
 from agentenv.envs.swesmith import (  # noqa: E402
     SWE_CONTEXT_COMPACTION_REQUEST,
     SWE_MEMORY_CONTRACT,
@@ -116,6 +120,8 @@ class FakeSwesmithClient(SwesmithEnvClient):
         self.data_len = 1
         self.metadata = {
             "task_count": 1,
+            "max_steps": 30,
+            "configured_max_policy_turns": 30,
             "memory_contract": SWE_MEMORY_CONTRACT,
         }
         self.info = {
@@ -178,35 +184,55 @@ class FakeSwesmithClient(SwesmithEnvClient):
                     },
                 },
             }
-        workspace_changed = "printf changed >" in action
+        checkpoint_write = FILESYSTEM_CHECKPOINT_PATH in action
+        workspace_changed = "printf changed >" in action or checkpoint_write
         terminal_submission = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT" in action
+        info = {
+            "step": step,
+            "action_kind": "shell_command",
+            "actor_credit": {
+                "schema": "task_neutral_actor_credit_v1",
+                "positive_eligible": True,
+                "basis": (
+                    "terminal_submission"
+                    if terminal_submission
+                    else "shell_executed"
+                ),
+            },
+            "action_progress": {
+                "schema": "swesmith_action_progress_v1",
+                "action_fingerprint": hashlib.sha256(
+                    action.encode("utf-8")
+                ).hexdigest(),
+                "result_fingerprint": hashlib.sha256(
+                    ("result:" + action).encode("utf-8")
+                ).hexdigest(),
+                "workspace_changed": workspace_changed,
+            },
+        }
+        if checkpoint_write:
+            payload = b"objective: fix parser\nnext: inspect parser.py\n"
+            info["filesystem_checkpoint"] = build_filesystem_checkpoint_receipt(
+                action_kind="shell_command",
+                action_completed=True,
+                workspace_diff={
+                    "added": [
+                        {
+                            "path": FILESYSTEM_CHECKPOINT_PATH,
+                            "bytes": len(payload),
+                            "sha256": hashlib.sha256(payload).hexdigest(),
+                        }
+                    ],
+                    "modified": [],
+                    "deleted": [],
+                },
+                workspace_snapshot={"files": []},
+            )
         return {
             "observation": f"native tool output {step}",
             "reward": float(terminal_submission),
             "done": terminal_submission,
-            "info": {
-                "step": step,
-                "action_kind": "shell_command",
-                "actor_credit": {
-                    "schema": "task_neutral_actor_credit_v1",
-                    "positive_eligible": True,
-                    "basis": (
-                        "terminal_submission"
-                        if terminal_submission
-                        else "shell_executed"
-                    ),
-                },
-                "action_progress": {
-                    "schema": "swesmith_action_progress_v1",
-                    "action_fingerprint": hashlib.sha256(
-                        action.encode("utf-8")
-                    ).hexdigest(),
-                    "result_fingerprint": hashlib.sha256(
-                        ("result:" + action).encode("utf-8")
-                    ).hexdigest(),
-                    "workspace_changed": workspace_changed,
-                },
-            },
+            "info": info,
         }
 
     def reset(self, idx: int = 0) -> dict:
@@ -647,18 +673,18 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             output.info["wrapper_evidence"]["preserved_native_observation"]
         )
 
-    def test_swesmith_compaction_uses_same_entrypoint_without_native_call(self) -> None:
+    def test_swesmith_compaction_uses_same_entrypoint_and_real_file_write(self) -> None:
         client = FakeSwesmithClient()
         self.assertEqual(
             SWE_MEMORY_CONTRACT,
-            "policy_compaction_plus_optional_durable_filesystem_v1",
+            "policy_filesystem_checkpoint_then_client_replace_v3",
         )
         self.assertIn("# Durable debugging notes", SWE_POLICY_SYSTEM_PROMPT)
         self.assertIn(
             "maintain a concise evidence ledger incrementally",
             SWE_POLICY_SYSTEM_PROMPT,
         )
-        self.assertIn("rediscover and read the notes", SWE_POLICY_SYSTEM_PROMPT)
+        self.assertIn("read any detailed notes it points to", SWE_POLICY_SYSTEM_PROMPT)
         initial = client.policy_framing() + [
             {"role": "user", "content": client.observe()},
         ]
@@ -685,64 +711,76 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             },
         )
         self.assertEqual(
-            (action_output.info["policy_step_after"],
-             action_output.info["native_call_count_after"]),
+            (
+                action_output.info["policy_step_after"],
+                action_output.info["native_call_count_after"],
+            ),
             (1, 1),
         )
         self.assertIn("native tool output 1", str(messages))
 
+        candidate = client.policy_turn_candidate()
+        self.assertIsNotNone(candidate)
         action_count = count_prompt_tokens(messages)
         candidate_count = count_prompt_tokens(
-            messages + [{"role": "user", "content": SWE_CONTEXT_COMPACTION_REQUEST}]
+            messages + [{"role": "user", "content": candidate}]
         )
         self.assertGreater(candidate_count, action_count)
         compaction = prepare(client, messages, capacity=candidate_count + 1)
-        self.assertEqual(
-            compaction.control_request, SWE_CONTEXT_COMPACTION_REQUEST
+        self.assertTrue(compaction.control_request.startswith(SWE_CONTEXT_COMPACTION_REQUEST))
+        checkpoint_action = (
+            'shell_command {"command":"printf checkpoint > '
+            '.agent_memory/CONTINUATION.md","workdir":"."}'
         )
-        summary = "Progress is in .agent_memory/MEMORY.md; inspect parser.py next."
         compaction_output, messages = complete_policy_turn(
-            client, compaction, summary
+            client, compaction, checkpoint_action
         )
 
-        self.assertEqual(len(client.native_calls), 1)
+        self.assertEqual(len(client.native_calls), 2)
+        evidence = compaction_output.info["wrapper_evidence"]
+        self.assertTrue(evidence["continuation_persisted"])
+        self.assertTrue(evidence["context_replaced"])
+        self.assertEqual(evidence["checkpoint_attempt_count"], 1)
         self.assertEqual(
-            compaction_output.info["wrapper_evidence"]["workspace_continuity_id"],
-            client.env_id,
-        )
-        self.assertEqual(
-            compaction_output.info["wrapper_evidence"]["actor_credit"],
+            evidence["actor_credit"],
             {
                 "schema": "task_neutral_actor_credit_v1",
                 "positive_eligible": True,
-                "basis": "policy_context_compaction",
+                "basis": "shell_executed",
             },
         )
         self.assertEqual(
-            (compaction_output.info["native_call_count_before"],
-             compaction_output.info["native_call_count_after"]),
-            (1, 1),
-        )
-        self.assertEqual(
-            (compaction_output.info["policy_step_before"],
-             compaction_output.info["policy_step_after"]),
+            (
+                compaction_output.info["native_call_count_before"],
+                compaction_output.info["native_call_count_after"],
+            ),
             (1, 2),
         )
         self.assertEqual(
-            (compaction_output.info["context_epoch_before"],
-             compaction_output.info["context_epoch_after"]),
+            (
+                compaction_output.info["policy_step_before"],
+                compaction_output.info["policy_step_after"],
+            ),
+            (1, 2),
+        )
+        self.assertEqual(
+            (
+                compaction_output.info["context_epoch_before"],
+                compaction_output.info["context_epoch_after"],
+            ),
             (0, 1),
         )
         self.assertIn("Fix the failing parser", str(messages))
-        self.assertIn(summary, str(messages))
+        self.assertIn(FILESYSTEM_CHECKPOINT_PATH, str(messages))
+        self.assertNotIn(checkpoint_action, str(messages))
         self.assertNotIn("native tool output 1", str(messages))
         self.assertNotIn(SWE_CONTEXT_COMPACTION_REQUEST, str(messages))
 
         reread = prepare(client, messages, capacity=4096)
         self.assertIsNone(reread.control_request)
         reread_action = (
-            'shell_command {"command":"rg -n hypothesis '
-            '.agent_memory/debugging.md","workdir":"."}'
+            'shell_command {"command":"cat .agent_memory/CONTINUATION.md",'
+            '"workdir":"."}'
         )
         reread_output, messages = complete_policy_turn(
             client,
@@ -750,17 +788,15 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             reread_action,
         )
         self.assertEqual(client.native_calls[-1], reread_action)
-        self.assertEqual(len(client.native_calls), 2)
+        self.assertEqual(len(client.native_calls), 3)
         self.assertEqual(
-            reread_output.info["wrapper_evidence"]["workspace_continuity_id"],
-            client.env_id,
-        )
-        self.assertEqual(
-            (reread_output.info["context_epoch_before"],
-             reread_output.info["context_epoch_after"]),
+            (
+                reread_output.info["context_epoch_before"],
+                reread_output.info["context_epoch_after"],
+            ),
             (1, 1),
         )
-        self.assertIn("native tool output 2", str(messages))
+        self.assertIn("native tool output 3", str(messages))
 
     def test_swesmith_actor_credit_receipt_fails_closed(self) -> None:
         invalid_receipts = (
@@ -915,14 +951,21 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             repeated.info["wrapper_evidence"]["actor_credit"]["positive_eligible"]
         )
 
+        candidate_request = client.policy_turn_candidate()
+        self.assertIsNotNone(candidate_request)
         action_count = count_prompt_tokens(messages)
         candidate_count = count_prompt_tokens(
-            messages + [{"role": "user", "content": SWE_CONTEXT_COMPACTION_REQUEST}]
+            messages + [{"role": "user", "content": candidate_request}]
         )
         self.assertGreater(candidate_count, action_count)
         compaction = prepare(client, messages, capacity=candidate_count + 1)
-        self.assertEqual(compaction.control_request, SWE_CONTEXT_COMPACTION_REQUEST)
-        _, messages = complete_policy_turn(client, compaction, "Resume by inspecting files.")
+        self.assertEqual(compaction.control_request, candidate_request)
+        self.assertTrue(compaction.control_request.startswith(SWE_CONTEXT_COMPACTION_REQUEST))
+        checkpoint_action = (
+            'shell_command {"command":"printf checkpoint > '
+            '.agent_memory/CONTINUATION.md","workdir":"."}'
+        )
+        _, messages = complete_policy_turn(client, compaction, checkpoint_action)
 
         after_compaction, _ = complete_policy_turn(
             client, prepare(client, messages), inspect
@@ -968,10 +1011,10 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertIn("Do not use cat > or a here-document", system_prompt)
         self.assertIn("re-inspect the small target region", system_prompt)
         self.assertIn("<think> tag", system_prompt)
-        self.assertIn("Think privately", system_prompt)
+        self.assertIn("Reason silently", system_prompt)
         self.assertIn("A shell command can edit", system_prompt)
         self.assertIn("workspace intentionally has no .git directory", system_prompt)
-        self.assertIn("Do not submit plain text until", system_prompt)
+        self.assertIn("Never submit a plain-text final response", system_prompt)
         self.assertIn("Prose before or after a tool action is a parser error", system_prompt)
 
 

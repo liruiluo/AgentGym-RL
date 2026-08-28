@@ -26,7 +26,16 @@ def receipt(*, changed: bool, completed: bool = True, sha: str = CHECKPOINT_SHA)
 
 
 def row(
-    order, action, *, event="native_action", checkpoint=None, replace=False, retry=False
+    order,
+    action,
+    *,
+    event="native_action",
+    checkpoint=None,
+    replace=False,
+    retry_pending=False,
+    retry_exhausted=False,
+    retry_feedback=True,
+    checkpoint_attempt_count=1,
 ):
     info = {
         "action_kind": "shell_command",
@@ -53,8 +62,12 @@ def row(
             native_observation_preserved_in_ledger=True,
             replacement_contains_native_observation=False,
             replacement_contains_policy_output=False,
-            retry_pending=retry,
-            retry_context_restored=retry,
+            retry_pending=retry_pending,
+            retry_exhausted=retry_exhausted,
+            retry_context_restored=False,
+            retry_feedback_preserved=(retry_feedback and not replace),
+            checkpoint_attempt_count=checkpoint_attempt_count,
+            checkpoint_max_attempts=2,
             sampled_policy_output_preserved_in_ledger=True,
         )
     return {
@@ -68,11 +81,7 @@ def row(
         "context_transition": {
             "schema": "agentmemory_task_neutral_context_transition_v1",
             "operation": (
-                "replace_messages"
-                if replace
-                else "retry_control"
-                if retry
-                else "append_observation"
+                "replace_messages" if replace else "append_observation"
             ),
             "messages": [],
         },
@@ -100,7 +109,7 @@ class AuditTest(unittest.TestCase):
             'shell_command {"command":"true","workdir":"."}',
             event="context_compaction",
             checkpoint=receipt(changed=False, completed=False),
-            retry=True,
+            retry_pending=True,
         )
         write = row(
             4,
@@ -129,7 +138,7 @@ class AuditTest(unittest.TestCase):
             path = Path(directory)
             self.emit(path, self.valid_chain())
             result = audit.analyze(path)
-            self.assertEqual(result["schema"], "amg_swesmith_filesystem_compaction_audit_v2")
+            self.assertEqual(result["schema"], "amg_swesmith_filesystem_compaction_audit_v3")
             self.assertEqual(result["compaction_action_attempt_count"], 2)
             self.assertEqual(result["compaction_opportunity_count"], 1)
             self.assertEqual(result["successful_replacement_count"], 1)
@@ -137,21 +146,41 @@ class AuditTest(unittest.TestCase):
             self.assertEqual(result["behavioral_continuation_chain_count"], 1)
             self.assertEqual(result["strict_chain_task_success_count"], 1)
             self.assertEqual(result["invalid_replacement_count"], 0)
-            self.assertEqual(result["bounded_retry_restore_count"], 1)
+            self.assertEqual(result["feedback_preserving_failed_attempt_count"], 1)
+            self.assertEqual(result["retry_exhausted_failed_attempt_count"], 0)
             self.assertEqual(result["invalid_retry_transition_count"], 0)
 
-    def test_failed_checkpoint_must_restore_the_precontrol_context(self):
+    def test_failed_checkpoint_must_preserve_action_and_observation(self):
         with tempfile.TemporaryDirectory() as directory:
             failed = row(
                 3,
                 'shell_command {"command":"true","workdir":"."}',
                 event="context_compaction",
                 checkpoint=receipt(changed=False, completed=False),
+                retry_pending=True,
             )
             path = Path(directory)
             self.emit(path, [failed])
             result = audit.analyze(path)
-            self.assertEqual(result["bounded_retry_restore_count"], 0)
+            self.assertEqual(result["feedback_preserving_failed_attempt_count"], 1)
+            self.assertEqual(result["invalid_retry_transition_count"], 0)
+
+    def test_hidden_or_restored_failed_checkpoint_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            failed = row(
+                3,
+                'shell_command {"command":"true","workdir":"."}',
+                event="context_compaction",
+                checkpoint=receipt(changed=False, completed=False),
+                retry_pending=True,
+                retry_feedback=False,
+            )
+            failed["context_transition"]["operation"] = "retry_control"
+            failed["wrapper_evidence"]["retry_context_restored"] = True
+            path = Path(directory)
+            self.emit(path, [failed])
+            result = audit.analyze(path)
+            self.assertEqual(result["feedback_preserving_failed_attempt_count"], 0)
             self.assertEqual(result["invalid_retry_transition_count"], 1)
 
     def test_q_style_chain_fails_closed(self):
@@ -188,6 +217,55 @@ class AuditTest(unittest.TestCase):
                 else:
                     self.assertEqual(result["strict_write_compaction_read_chain_count"], 0)
                     self.assertEqual(result["behavioral_continuation_chain_count"], 0)
+
+    def test_broader_attested_reads_are_separate_from_strict_exact_reads(self):
+        variants = (
+            'shell_command {"command":"cat /testbed/.agent_memory/CONTINUATION.md 2>/dev/null || echo missing","workdir":"."}',
+            "shell_command {\"command\":\"sed -n '1,120p' .agent_memory/CONTINUATION.md\",\"workdir\":\".\"}",
+        )
+        for action in variants:
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as directory:
+                records = self.valid_chain()
+                records[2]["action"] = action
+                records[2]["action_submission"]["raw_policy_output"] = action
+                path = Path(directory)
+                self.emit(path, records)
+                result = audit.analyze(path)
+                self.assertEqual(result["strict_write_compaction_read_chain_count"], 0)
+                self.assertEqual(result["attested_write_compaction_read_chain_count"], 1)
+                self.assertEqual(result["broader_nonexact_read_chain_count"], 1)
+                self.assertEqual(
+                    result["attested_behavioral_continuation_chain_count"], 1
+                )
+                self.assertEqual(result["behavioral_continuation_chain_count"], 0)
+
+    def test_checkpoint_path_write_is_mention_only_not_a_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            records = self.valid_chain()
+            action = 'shell_command {"command":"cat > .agent_memory/CONTINUATION.md <<EOF\\nstate\\nEOF","workdir":"."}'
+            records[2]["action"] = action
+            records[2]["action_submission"]["raw_policy_output"] = action
+            path = Path(directory)
+            self.emit(path, records)
+            result = audit.analyze(path)
+            self.assertEqual(result["attested_write_compaction_read_chain_count"], 0)
+            self.assertEqual(result["path_mentioned_without_attested_read_count"], 1)
+
+    def test_case_examples_cover_success_failure_checkpoint_and_full_chain(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            records = self.valid_chain()
+            self.emit(path, records)
+            result = audit.analyze(path)
+            cases = result["case_examples"]
+            self.assertIsNotNone(cases["native_success"])
+            self.assertIsNotNone(cases["checkpoint_failure"])
+            self.assertIsNotNone(cases["full_write_replace_read_continue_success"])
+            self.assertIsNone(cases["full_write_replace_read_continue_failure"])
+            selected = cases["full_write_replace_read_continue_success"][
+                "selected_rows"
+            ]
+            self.assertEqual([entry["row_order"] for entry in selected], [4, 5, 6])
 
     def test_replace_without_valid_receipt_is_reported_separately(self):
         with tempfile.TemporaryDirectory() as directory:
