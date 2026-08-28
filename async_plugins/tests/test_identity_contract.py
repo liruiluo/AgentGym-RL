@@ -134,6 +134,7 @@ class TestAMGFullyAsyncIdentity(unittest.TestCase):
             "AMG_ENDPOINT_CLIENT_CONFIG_JSON",
             "OPENMLE_FAST_RUNTIME_OUTER_COMMIT",
             "AGENTMEMORY_MODEL_PATH",
+            "AGENTMEMORY_POSITIVE_ACTOR_CREDIT_RECEIPT",
         ):
             with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, name):
                 reject_ambient_identity({name: "caller-value"})

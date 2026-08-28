@@ -105,6 +105,29 @@ def create_env_client(config: Any):
                 "SWE-smith invalid_action_reward must be finite and non-positive"
             )
         client_kwargs["invalid_action_reward"] = invalid_action_reward
+        raw_checkpoint_penalty = _get(config, "checkpoint_contract_penalty", 0.0)
+        if isinstance(raw_checkpoint_penalty, bool):
+            raise TypeError(
+                "SWE-smith checkpoint_contract_penalty must be numeric"
+            )
+        try:
+            checkpoint_contract_penalty = float(raw_checkpoint_penalty)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "SWE-smith checkpoint_contract_penalty must be finite and "
+                "non-positive"
+            ) from exc
+        if (
+            not math.isfinite(checkpoint_contract_penalty)
+            or checkpoint_contract_penalty > 0.0
+        ):
+            raise ValueError(
+                "SWE-smith checkpoint_contract_penalty must be finite and "
+                "non-positive"
+            )
+        client_kwargs["checkpoint_contract_penalty"] = (
+            checkpoint_contract_penalty
+        )
 
     if task_name == "openmle_fast":
         for field in _OPENMLE_IDENTITY_FIELDS:

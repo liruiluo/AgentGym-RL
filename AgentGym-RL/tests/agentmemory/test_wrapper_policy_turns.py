@@ -113,9 +113,15 @@ class FakeWebShopClient(AgentMemoryEnvClient):
 
 
 class FakeSwesmithClient(SwesmithEnvClient):
-    def __init__(self, *, invalid_action_reward: float = 0.0) -> None:
+    def __init__(
+        self,
+        *,
+        invalid_action_reward: float = 0.0,
+        checkpoint_contract_penalty: float = 0.0,
+    ) -> None:
         BaseEnvClient.__init__(self, action_format=ActionFormat.REACT)
         self.invalid_action_reward = float(invalid_action_reward)
+        self.checkpoint_contract_penalty = float(checkpoint_contract_penalty)
         self.env_id = 202
         self.data_len = 1
         self.metadata = {
