@@ -12,10 +12,11 @@ import json
 import math
 import os
 import re
+import shlex
 import tempfile
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .config_contract import inspect_schedule, verify_resolved_config
@@ -652,6 +653,295 @@ def _emitted_memory_events(record: Mapping[str, Any]) -> tuple[str, ...]:
                 ):
                     return ()
     return (raw_event,)
+
+
+_QWEN35_SHELL_ACTION = re.compile(
+    r"\A<tool_call>\n"
+    r"<function=shell_command>\n"
+    r"<parameter=command>\n?(?P<command>.*?)\n</parameter>\n"
+    r"<parameter=workdir>\n?(?P<workdir>.*?)\n</parameter>\n"
+    r"<parameter=timeout_ms>\n?(?P<timeout_ms>[0-9]+)\n</parameter>\n"
+    r"</function>\n</tool_call>\Z",
+    re.DOTALL,
+)
+_CHECKPOINT_V2_SCHEMA = "agentmemory_continuation_checkpoint_v2"
+
+
+def _safe_relative_memory_path(value: Any) -> str | None:
+    if not isinstance(value, str) or not value or any(
+        character in value for character in ("\n", "\r", "\x00")
+    ):
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9._/-]+", value) or value.startswith("-"):
+        return None
+    path = PurePosixPath(value)
+    if (
+        path.is_absolute()
+        or ".." in path.parts
+        or len(path.parts) < 2
+        or str(path) != value
+    ):
+        return None
+    return value
+
+
+def _qwen35_shell_command(record: Mapping[str, Any]) -> str | None:
+    action = record.get("action")
+    submission = record.get("action_submission")
+    if not isinstance(action, str) or not isinstance(submission, Mapping):
+        return None
+    if (
+        submission.get("raw_policy_output") != action
+        or submission.get("kind") != "workspace"
+        or submission.get("op") != "SHELL_COMMAND"
+        or submission.get("serialization") != "qwen35_native_xml"
+        or _at(submission, "serialization_attempt.kind") != "qwen35_native_xml"
+        or _at(submission, "serialization_attempt.prefix_chars") != 0
+    ):
+        return None
+    match = _QWEN35_SHELL_ACTION.fullmatch(action)
+    if match is None or match.group("workdir").strip() != ".":
+        return None
+    try:
+        timeout_ms = int(match.group("timeout_ms"))
+    except (ValueError, OverflowError):
+        return None
+    if timeout_ms <= 0 or timeout_ms > 86_400_000:
+        return None
+    return match.group("command").strip()
+
+
+def _workspace_diff_artifacts(
+    value: Any,
+) -> dict[str, tuple[int, str]] | None:
+    if not isinstance(value, Mapping):
+        return None
+    artifacts: dict[str, tuple[int, str]] = {}
+    for field in ("added", "modified"):
+        entries = value.get(field)
+        if not isinstance(entries, Sequence) or isinstance(entries, (str, bytes)):
+            return None
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                return None
+            artifact = entry
+            if field == "modified":
+                after = entry.get("after")
+                before = entry.get("before")
+                if not isinstance(after, Mapping) or not isinstance(before, Mapping):
+                    return None
+                artifact = after
+                if before.get("path") != after.get("path"):
+                    return None
+            path = _safe_relative_memory_path(artifact.get("path"))
+            size = _positive_int(artifact.get("bytes"))
+            digest = artifact.get("sha256")
+            if (
+                path is None
+                or size is None
+                or not _sha256_text(digest)
+                or path in artifacts
+            ):
+                return None
+            artifacts[path] = (size, str(digest))
+    for field in ("deleted", "directories_deleted"):
+        entries = value.get(field)
+        if entries != []:
+            return None
+    return artifacts
+
+
+def _valid_checkpoint_v2_write_path(record: Mapping[str, Any]) -> str | None:
+    evidence = record.get("wrapper_evidence")
+    submission = record.get("action_submission")
+    if not isinstance(evidence, Mapping) or not isinstance(submission, Mapping):
+        return None
+    server = evidence.get("server_wrapper_evidence")
+    checkpoint = evidence.get("continuation_checkpoint")
+    if not isinstance(server, Mapping) or not isinstance(checkpoint, Mapping):
+        return None
+    server_checkpoint = server.get("continuation_checkpoint")
+    if not isinstance(server_checkpoint, Mapping) or checkpoint != server_checkpoint:
+        return None
+    path = _safe_relative_memory_path(checkpoint.get("path"))
+    execution_sha = submission.get("executed_workspace_action_sha256")
+    if (
+        evidence.get("event") != "forced_checkpoint_write"
+        or evidence.get("endpoint_step_dispatched") is not True
+        or evidence.get("native_environment_call_count") != 0
+        or _at(record, "context_transition.operation") != "replace_messages"
+        or not isinstance(_at(record, "context_transition.messages"), Sequence)
+        or isinstance(_at(record, "context_transition.messages"), (str, bytes))
+        or checkpoint.get("schema") != _CHECKPOINT_V2_SCHEMA
+        or checkpoint.get("valid") is not True
+        or checkpoint.get("action_execution_succeeded") is not True
+        or checkpoint.get("action_kind") != "SHELL_COMMAND"
+        or checkpoint.get("changed_in_action") is not True
+        or checkpoint.get("content_changed") is not True
+        or checkpoint.get("nonempty") is not True
+        or checkpoint.get("within_size_limit") is not True
+        or _positive_int(checkpoint.get("bytes")) is None
+        or not _sha256_text(checkpoint.get("sha256"))
+        or checkpoint.get("rejection_reason") is not None
+        or path is None
+        or _qwen35_shell_command(record) is None
+        or not _sha256_text(execution_sha)
+        or server.get("executed_workspace_action_sha256") != execution_sha
+        or server.get("native_environment_call_count") != 0
+        or server.get("workspace_action_serialization") != "qwen35_native_xml"
+        or server.get("workspace_op") != "SHELL_COMMAND"
+    ):
+        return None
+    changed_artifacts = _workspace_diff_artifacts(server.get("workspace_diff"))
+    if changed_artifacts is None or changed_artifacts.get(path) != (
+        checkpoint.get("bytes"),
+        checkpoint.get("sha256"),
+    ):
+        return None
+    return path
+
+
+def _valid_checkpoint_v2_read_path(record: Mapping[str, Any]) -> str | None:
+    evidence = record.get("wrapper_evidence")
+    submission = record.get("action_submission")
+    if not isinstance(evidence, Mapping) or not isinstance(submission, Mapping):
+        return None
+    server = evidence.get("server_wrapper_evidence")
+    if not isinstance(server, Mapping):
+        return None
+    checkpoint = server.get("continuation_checkpoint")
+    if not isinstance(checkpoint, Mapping):
+        return None
+    path = _safe_relative_memory_path(checkpoint.get("path"))
+    command = _qwen35_shell_command(record)
+    try:
+        command_tokens = shlex.split(command) if command is not None else []
+    except ValueError:
+        return None
+    execution_sha = submission.get("executed_workspace_action_sha256")
+    if (
+        evidence.get("event") != "native_action"
+        or _at(record, "context_transition.operation") != "append_observation"
+        or checkpoint.get("schema") != _CHECKPOINT_V2_SCHEMA
+        or checkpoint.get("valid") is not False
+        or checkpoint.get("action_execution_succeeded") is not True
+        or checkpoint.get("action_kind") != "SHELL_COMMAND"
+        or checkpoint.get("changed_in_action") is not False
+        or checkpoint.get("content_changed") is not False
+        or checkpoint.get("rejection_reason") != "not_changed_in_action"
+        or path is None
+        or command_tokens != ["cat", path]
+        or not _sha256_text(execution_sha)
+        or server.get("executed_workspace_action_sha256") != execution_sha
+        or server.get("native_environment_call_count") != 0
+        or server.get("workspace_action_serialization") != "qwen35_native_xml"
+        or server.get("workspace_op") != "SHELL_COMMAND"
+    ):
+        return None
+    workspace_diff = server.get("workspace_diff")
+    if not isinstance(workspace_diff, Mapping):
+        return None
+    for field in (
+        "added",
+        "modified",
+        "deleted",
+        "directories_added",
+        "directories_deleted",
+    ):
+        if workspace_diff.get(field) != []:
+            return None
+    return path
+
+
+def _is_valid_later_native_action(record: Mapping[str, Any]) -> bool:
+    evidence = record.get("wrapper_evidence")
+    submission = record.get("action_submission")
+    if not isinstance(evidence, Mapping) or not isinstance(submission, Mapping):
+        return False
+    action = record.get("action")
+    if (
+        evidence.get("event") != "native_action"
+        or not isinstance(action, str)
+        or submission.get("raw_policy_output") != action
+        or submission.get("kind") == "workspace"
+        or submission.get("op") in {"SHELL_COMMAND", "APPLY_PATCH"}
+        or _at(record, "env_info_after.status") == "invalid_action"
+    ):
+        return False
+    tool = submission.get("tool")
+    if (
+        isinstance(tool, str)
+        and bool(tool)
+        and isinstance(submission.get("arguments"), Mapping)
+    ):
+        if any(
+            field in submission
+            for field in ("kind", "op", "executed_workspace_action_sha256")
+        ):
+            return False
+        return _positive_int(
+            _at(evidence, "server_wrapper_evidence.native_environment_call_count")
+        ) == 1
+    if submission.get("kind") != "answer" or any(
+        field in submission
+        for field in ("tool", "arguments", "op", "executed_workspace_action_sha256")
+    ):
+        return False
+    native_call_count = _at(
+        evidence, "server_wrapper_evidence.native_environment_call_count"
+    )
+    if native_call_count is not None and _nonnegative_int(native_call_count) != 0:
+        return False
+    answer_correct = _at(evidence, "server_wrapper_evidence.answer_correct")
+    episode_success = _at(record, "env_info_after.episode_success")
+    status = _at(record, "env_info_after.status")
+    expected_outcome = "success" if answer_correct is True else "terminal_failure"
+    expected_statuses = (
+        {"success", "terminal_success"}
+        if answer_correct is True
+        else {"terminal_failure"}
+    )
+    return (
+        isinstance(answer_correct, bool)
+        and _at(evidence, "server_wrapper_evidence.terminal_answer_only") is True
+        and record.get("trajectory_terminal") is True
+        and record.get("rollout_done_flag") is True
+        and episode_success is answer_correct
+        and record.get("outcome") == expected_outcome
+        and status in expected_statuses
+    )
+
+
+def _checkpoint_v2_recovery_chain_counts(
+    episode: Sequence[tuple[Mapping[str, Any], Mapping[str, Any]]],
+) -> tuple[int, int]:
+    if not episode or episode[-1][0].get("trajectory_terminal") is not True:
+        return (0, 0)
+    terminal = episode[-1][0]
+    successful = terminal.get("outcome") == "success" or _at(
+        terminal, "env_info_after.episode_success"
+    ) is True
+    chains = 0
+    for index in range(len(episode) - 1):
+        write_path = _valid_checkpoint_v2_write_path(episode[index][0])
+        if write_path is None:
+            continue
+        read_path = _valid_checkpoint_v2_read_path(episode[index + 1][0])
+        if read_path != write_path:
+            continue
+        if not any(
+            _is_valid_later_native_action(record)
+            for record, _document in episode[index + 2 :]
+        ):
+            continue
+        chains += 1
+    return (chains, chains if successful else 0)
+
+
+def _has_checkpoint_v2_recovery_chain(
+    episode: Sequence[tuple[Mapping[str, Any], Mapping[str, Any]]],
+) -> bool:
+    return _checkpoint_v2_recovery_chain_counts(episode)[0] > 0
 
 
 def _has_complete_memory_chain(
@@ -1585,12 +1875,30 @@ class _Audit:
             publications = int(self.expected["publication_cycles"])
             samples_per_update = int(self.expected["samples_per_update"])
 
+            step_zero_rollouter_count_keys = frozenset(
+                {
+                    "fully_async/count/total_generated_samples",
+                    "fully_async/count/rollout_dispatched_samples",
+                    "fully_async/count/rollout_inflight_samples",
+                    "fully_async/count/rollout_completed_samples",
+                    "fully_async/count/rollout_failed_samples",
+                    "fully_async/count/rollout_cancelled_samples",
+                    "fully_async/count/queue_enqueued_samples",
+                    "fully_async/count/queue_dequeued_samples",
+                    "fully_async/count/queue_overflow_evictions",
+                    "fully_async/count/queue_cleared_samples",
+                    "fully_async/count/queue_resident_samples",
+                    "fully_async/count/staleness_samples",
+                    "fully_async/count/dropped_stale_samples",
+                }
+            )
             step_zero_bad_keys = sorted(
                 str(key)
                 for data in rows_by_step.get(0, [])
                 for key in data
                 if not (
                     str(key).startswith("fully_async/rollouter/")
+                    or str(key) in step_zero_rollouter_count_keys
                     or str(key) == "dynamic_resource/rollout_resource_utilization"
                 )
             )
@@ -1616,11 +1924,26 @@ class _Audit:
                 "FileLogger publication steps are incomplete",
             )
 
-            required_rollout_corr = (
+            legacy_rollout_corr = (
                 "rollout_corr/kl",
                 "rollout_corr/k3_kl",
                 "rollout_corr/log_ppl_abs_diff",
             )
+            actor_rollout_corr = tuple(
+                f"actor/{key}" for key in legacy_rollout_corr
+            )
+            rollouter_owned_counter_keys = frozenset(
+                {
+                    "fully_async/count/total_generated_samples",
+                    "fully_async/count/dropped_stale_samples",
+                }
+            )
+            learner_owned_integral_metrics = {
+                "current_param_version": "fully_async/count/current_param_version",
+                "stale_trajectory_processed": "fully_async/count/stale_trajectory_processed",
+                "mq_queue_size": "fully_async/monitor/queue/mq_queue_size",
+                "required_samples": "fully_async/static/required_samples",
+            }
             for step in range(1, publications + 1):
                 data_rows = rows_by_step.get(step, [])
                 items = [
@@ -1628,14 +1951,65 @@ class _Audit:
                     for data in data_rows
                     for key, value in data.items()
                 ]
+                learner_rows = [
+                    data
+                    for data in data_rows
+                    if any(
+                        key in data
+                        for key in (
+                            "actor/grad_norm",
+                            "critic/grad_norm",
+                            "training/global_step",
+                        )
+                    )
+                ]
+                prefixed_rollouter_rows = [
+                    data
+                    for data in data_rows
+                    if any(
+                        str(key).startswith("fully_async/rollouter/") for key in data
+                    )
+                ]
+                current_owner_shape = bool(prefixed_rollouter_rows) or any(
+                    key in data
+                    for data in data_rows
+                    for key in actor_rollout_corr
+                )
+                if current_owner_shape:
+                    distinct_current_owners = (
+                        len(learner_rows) == 1
+                        and len(prefixed_rollouter_rows) == 1
+                        and learner_rows[0] is not prefixed_rollouter_rows[0]
+                    )
+                    learner = learner_rows[0] if distinct_current_owners else {}
+                    rollouter_rows = prefixed_rollouter_rows
+                    rollouter = (
+                        prefixed_rollouter_rows[0]
+                        if distinct_current_owners
+                        else {}
+                    )
+                else:
+                    # Compatibility with the older one-row FileLogger shape.
+                    learner = learner_rows[0] if len(learner_rows) == 1 else {}
+                    rollouter_rows = [
+                        data
+                        for data in data_rows
+                        if any(key in data for key in rollouter_owned_counter_keys)
+                    ]
+                    rollouter = rollouter_rows[0] if len(rollouter_rows) == 1 else {}
+                    distinct_current_owners = True
+                self.check(
+                    len(learner_rows) == 1 and distinct_current_owners,
+                    f"FileLogger publication step {step} has no unique learner-owner row",
+                )
+                self.check(
+                    len(rollouter_rows) == 1 and distinct_current_owners,
+                    f"FileLogger publication step {step} has no unique rollouter-owner row",
+                )
 
                 for role in ("actor", "critic"):
-                    grad_norms = [
-                        value for key, value in items if key == f"{role}/grad_norm"
-                    ]
-                    valid_grad = len(grad_norms) == 1 and _finite_positive(
-                        grad_norms[0]
-                    )
+                    grad_norm = learner.get(f"{role}/grad_norm")
+                    valid_grad = _finite_positive(grad_norm)
                     self.check(
                         valid_grad,
                         f"FileLogger publication step {step} has no unique nonzero {role}/grad_norm",
@@ -1647,32 +2021,60 @@ class _Audit:
                             critic_grad_rows += 1
 
                 correction_values: dict[str, float] = {}
-                for key in required_rollout_corr:
-                    values = [value for item_key, value in items if item_key == key]
-                    valid = len(values) == 1 and _finite_number(values[0])
+                if current_owner_shape:
+                    # Current veRL emits actor-owned correction diagnostics on
+                    # the learner row.  Never let a rollouter/stale copy satisfy
+                    # this branch.
+                    selected_corrections = (
+                        (legacy_key, actor_key, learner.get(actor_key))
+                        for legacy_key, actor_key in zip(
+                            legacy_rollout_corr, actor_rollout_corr
+                        )
+                    )
+                else:
+                    # Compatibility with the reviewed legacy FileLogger shape,
+                    # where the three unprefixed diagnostics may occupy a small
+                    # split row beside the combined learner/rollouter row.
+                    legacy_values = {
+                        key: [value for item_key, value in items if item_key == key]
+                        for key in legacy_rollout_corr
+                    }
+                    selected_corrections = (
+                        (
+                            key,
+                            key,
+                            values[0] if len(values) == 1 else None,
+                        )
+                        for key, values in legacy_values.items()
+                    )
+                for canonical_key, emitted_key, value in selected_corrections:
+                    valid = _finite_number(value)
                     self.check(
                         valid,
-                        f"FileLogger publication step {step} has no unique finite {key}",
+                        f"FileLogger publication step {step} has no unique finite {emitted_key}",
                     )
                     if valid:
-                        correction_values[key] = float(values[0])
-                if len(correction_values) == len(required_rollout_corr):
+                        correction_values[canonical_key] = float(value)
+                if len(correction_values) == len(legacy_rollout_corr):
                     rollout_correction_rows += 1
 
-                integral_metrics = {
-                    "current_param_version": "fully_async/count/current_param_version",
-                    "stale_trajectory_processed": "fully_async/count/stale_trajectory_processed",
-                    "total_generated_samples": "fully_async/count/total_generated_samples",
-                    "dropped_stale_samples": "fully_async/count/dropped_stale_samples",
-                    "mq_queue_size": "fully_async/monitor/queue/mq_queue_size",
-                    "required_samples": "fully_async/static/required_samples",
-                }
                 observed_integrals: dict[str, int] = {}
-                for label, key in integral_metrics.items():
-                    values = [value for item_key, value in items if item_key == key]
-                    parsed = (
-                        _nonnegative_integral(values[0]) if len(values) == 1 else None
-                    )
+                owned_metrics = {
+                    **{
+                        label: (learner, key)
+                        for label, key in learner_owned_integral_metrics.items()
+                    },
+                    "total_generated_samples": (
+                        rollouter,
+                        "fully_async/count/total_generated_samples",
+                    ),
+                    "dropped_stale_samples": (
+                        rollouter,
+                        "fully_async/count/dropped_stale_samples",
+                    ),
+                }
+                for label, (owner_row, key) in owned_metrics.items():
+                    parsed = _nonnegative_integral(owner_row.get(key))
                     self.check(
                         parsed is not None,
                         f"FileLogger publication step {step} has no unique integral {key}",
@@ -1760,7 +2162,9 @@ class _Audit:
     def _has_memory_chain(
         episode: Sequence[tuple[Mapping[str, Any], Mapping[str, Any]]],
     ) -> bool:
-        return _has_complete_memory_chain(episode)
+        return _has_complete_memory_chain(
+            episode
+        ) or _has_checkpoint_v2_recovery_chain(episode)
 
     def _audit_optimizer_file_logger_update(
         self,
@@ -1934,6 +2338,10 @@ class _Audit:
             route_id: Counter() for route_id in self.route_ids
         }
         route_memory_chains: Counter[str] = Counter()
+        route_checkpoint_recovery_chains: Counter[str] = Counter()
+        route_successful_checkpoint_recovery_chains: Counter[str] = Counter()
+        checkpoint_recovery_chains = 0
+        successful_checkpoint_recovery_chains = 0
         seen_uids: set[str] = set()
         samples_per_update = (
             int(self.expected["samples_per_update"]) if self.expected else 0
@@ -2175,6 +2583,13 @@ class _Audit:
                         if self.multitask and len(episode_routes) == 1
                         else ""
                     )
+                    recovery_chains, successful_recovery_chains = (
+                        _checkpoint_v2_recovery_chain_counts(sorted_episode)
+                    )
+                    checkpoint_recovery_chains += recovery_chains
+                    successful_checkpoint_recovery_chains += (
+                        successful_recovery_chains
+                    )
                     if episode_route:
                         route_episodes[episode_route] += 1
                         update_episodes[episode_route] += 1
@@ -2192,6 +2607,12 @@ class _Audit:
                             route_memory_events[episode_route].update(
                                 _emitted_memory_events(record)
                             )
+                        route_checkpoint_recovery_chains[
+                            episode_route
+                        ] += recovery_chains
+                        route_successful_checkpoint_recovery_chains[
+                            episode_route
+                        ] += successful_recovery_chains
                         if self._has_memory_chain(sorted_episode):
                             route_memory_chains[episode_route] += 1
                     if isinstance(terminal_id, str) and terminal_id:
@@ -2314,6 +2735,12 @@ class _Audit:
                     ),
                     "executions": route_memory_events[route_id]["execute"],
                     "complete_memory_chains": route_memory_chains[route_id],
+                    "checkpoint_recovery_chains": route_checkpoint_recovery_chains[
+                        route_id
+                    ],
+                    "successful_checkpoint_recovery_chains": (
+                        route_successful_checkpoint_recovery_chains[route_id]
+                    ),
                 }
                 for route_id in self.route_ids
             }
@@ -2325,6 +2752,10 @@ class _Audit:
             stale_action_rows=stale_action_rows,
             memory_chains=memory_chains,
             late_memory_chains=late_memory_chains,
+            checkpoint_recovery_chains=checkpoint_recovery_chains,
+            successful_checkpoint_recovery_chains=(
+                successful_checkpoint_recovery_chains
+            ),
             completed_episodes=len(terminal_ids),
         )
         if versions:
@@ -2342,6 +2773,10 @@ class _Audit:
             "terminal_ids": terminal_ids,
             "collection_files": len(paths),
             "memory_chain_updates": memory_chain_updates,
+            "checkpoint_recovery_chains": checkpoint_recovery_chains,
+            "successful_checkpoint_recovery_chains": (
+                successful_checkpoint_recovery_chains
+            ),
             "per_update_episodes": per_update_episodes,
             "per_update_action_rows": per_update_action_rows,
             "per_update_response_tokens": per_update_response_tokens,
@@ -2417,11 +2852,23 @@ class _Audit:
             "FinalStatistics queue cleanup did not complete exactly",
         )
 
-        def integer(mapping: Mapping[str, Any], key: str, owner: str) -> int:
-            parsed = _nonnegative_int(mapping.get(key))
+        def integer(
+            mapping: Mapping[str, Any],
+            key: str,
+            owner: str,
+            *,
+            allow_integral_float: bool = False,
+        ) -> int:
+            parser = _nonnegative_integral if allow_integral_float else _nonnegative_int
+            parsed = parser(mapping.get(key))
             if parsed is None:
+                expected_type = (
+                    "a nonnegative integral number"
+                    if allow_integral_float
+                    else "a JSON integer"
+                )
                 self.errors.append(
-                    f"FinalStatistics {owner}.{key} is missing or not a JSON integer"
+                    f"FinalStatistics {owner}.{key} is missing or not {expected_type}"
                 )
                 return 0
             return parsed
@@ -2561,7 +3008,12 @@ class _Audit:
 
         generated = integer(rollouter, "count/total_generated_samples", "rollouter")
         dropped_stale = integer(rollouter, "count/dropped_stale_samples", "rollouter")
-        required_samples = integer(rollouter, "static/required_samples", "rollouter")
+        required_samples = integer(
+            rollouter,
+            "static/required_samples",
+            "rollouter",
+            allow_integral_float=True,
+        )
         self.check(
             generated
             == lifecycle_totals["rollout_completed"]

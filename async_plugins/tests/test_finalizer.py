@@ -22,6 +22,257 @@ from finalizer_fixture import (
 JsonMutation = Callable[[dict], None]
 
 
+def qwen35_shell_action(command: str) -> str:
+    return (
+        "<tool_call>\n"
+        "<function=shell_command>\n"
+        "<parameter=command>\n"
+        f"{command}\n"
+        "</parameter>\n"
+        "<parameter=workdir>\n"
+        ".\n"
+        "</parameter>\n"
+        "<parameter=timeout_ms>\n"
+        "10000\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>"
+    )
+
+
+def rewrite_legacy_chain_as_checkpoint_v2(fixture: dict) -> None:
+    """Replace the fixture chain with the receipt shape emitted by LR v20."""
+
+    path = sorted(fixture["rollout_dir"].glob("*.jsonl"))[0]
+    documents = [
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    records = [json.loads(document["step_record_json"]) for document in documents]
+    chain_uids = {
+        record["trajectory_uid"]
+        for record in records
+        if record.get("wrapper_evidence", {}).get("event") == "context_compaction"
+    }
+    if len(chain_uids) != 1:
+        raise AssertionError(f"expected one chain trajectory, got {chain_uids!r}")
+    chain_uid = chain_uids.pop()
+    continuation_path = ".agent_memory/CONTINUATION.md"
+    action_sha256 = "c" * 64
+    content_sha256 = "d" * 64
+    checkpoint = {
+        "schema": "agentmemory_continuation_checkpoint_v2",
+        "path": continuation_path,
+        "valid": True,
+        "action_execution_succeeded": True,
+        "action_kind": "SHELL_COMMAND",
+        "changed_in_action": True,
+        "content_changed": True,
+        "nonempty": True,
+        "within_size_limit": True,
+        "bytes": 256,
+        "sha256": content_sha256,
+        "before_sha256": None,
+        "change_kind": "added",
+        "rejection_reason": None,
+    }
+    write_action = qwen35_shell_action(
+        "mkdir -p .agent_memory && cat > .agent_memory/CONTINUATION.md "
+        "<<'AMG_CHECKPOINT'\nquestion: test\nnext_action: search\nAMG_CHECKPOINT"
+    )
+    read_action = qwen35_shell_action(f"cat {continuation_path}")
+    search_action = (
+        "<tool_call>\n<function=search>\n<parameter=query>\n"
+        '["test query"]\n'
+        "</parameter>\n</function>\n</tool_call>"
+    )
+
+    for document, record in zip(documents, records):
+        if record.get("trajectory_uid") != chain_uid:
+            continue
+        order = record["trajectory_row_order"]
+        if order == 0:
+            record["action"] = write_action
+            record["action_submission"] = {
+                "raw_policy_output": write_action,
+                "kind": "workspace",
+                "op": "SHELL_COMMAND",
+                "serialization": "qwen35_native_xml",
+                "serialization_attempt": {
+                    "kind": "qwen35_native_xml",
+                    "prefix_chars": 0,
+                },
+                "executed_workspace_action_sha256": action_sha256,
+            }
+            record["context_transition"] = {
+                "schema": "agentmemory_task_neutral_context_transition_v1",
+                "operation": "replace_messages",
+                "messages": [],
+            }
+            record["wrapper_evidence"] = {
+                "event": "forced_checkpoint_write",
+                "endpoint_step_dispatched": True,
+                "native_environment_call_count": 0,
+                "continuation_checkpoint": dict(checkpoint),
+                "server_wrapper_evidence": {
+                    "continuation_checkpoint": dict(checkpoint),
+                    "executed_workspace_action_sha256": action_sha256,
+                    "native_environment_call_count": 0,
+                    "workspace_action_serialization": "qwen35_native_xml",
+                    "workspace_op": "SHELL_COMMAND",
+                    "workspace_diff": {
+                        "added": [
+                            {
+                                "path": continuation_path,
+                                "bytes": 256,
+                                "sha256": content_sha256,
+                            }
+                        ],
+                        "modified": [],
+                        "deleted": [],
+                        "directories_added": [".agent_memory"],
+                        "directories_deleted": [],
+                    },
+                },
+            }
+        elif order == 1:
+            read_receipt = {
+                **checkpoint,
+                "valid": False,
+                "changed_in_action": False,
+                "content_changed": False,
+                "nonempty": False,
+                "within_size_limit": False,
+                "bytes": None,
+                "sha256": None,
+                "change_kind": None,
+                "rejection_reason": "not_changed_in_action",
+            }
+            record["action"] = read_action
+            record["action_submission"] = {
+                "raw_policy_output": read_action,
+                "kind": "workspace",
+                "op": "SHELL_COMMAND",
+                "serialization": "qwen35_native_xml",
+                "serialization_attempt": {
+                    "kind": "qwen35_native_xml",
+                    "prefix_chars": 0,
+                },
+                "executed_workspace_action_sha256": "e" * 64,
+            }
+            record["context_transition"] = {
+                "schema": "agentmemory_task_neutral_context_transition_v1",
+                "operation": "append_observation",
+                "messages": [],
+            }
+            record["wrapper_evidence"] = {
+                "event": "native_action",
+                "server_wrapper_evidence": {
+                    "continuation_checkpoint": read_receipt,
+                    "executed_workspace_action_sha256": "e" * 64,
+                    "native_environment_call_count": 0,
+                    "workspace_action_serialization": "qwen35_native_xml",
+                    "workspace_op": "SHELL_COMMAND",
+                    "workspace_diff": {
+                        "added": [],
+                        "modified": [],
+                        "deleted": [],
+                        "directories_added": [],
+                        "directories_deleted": [],
+                    },
+                },
+            }
+        elif order == 2:
+            record["action"] = search_action
+            record["action_submission"] = {
+                "raw_policy_output": search_action,
+                "tool": "search",
+                "arguments": {"query": ["test query"]},
+                "serialization": "qwen35_native_xml",
+            }
+            record["context_transition"] = {
+                "schema": "agentmemory_task_neutral_context_transition_v1",
+                "operation": "append_observation",
+                "messages": [],
+            }
+            record["wrapper_evidence"] = {
+                "event": "native_action",
+                "server_wrapper_evidence": {
+                    "step": 3,
+                    "native_environment_call_count": 1,
+                },
+            }
+            record["env_info_after"] = {"status": "active"}
+        elif order == 3:
+            answer = "<answer>done</answer>"
+            record["action"] = answer
+            record["action_submission"] = {
+                "raw_policy_output": answer,
+                "kind": "answer",
+            }
+            record["context_transition"] = {
+                "schema": "agentmemory_task_neutral_context_transition_v1",
+                "operation": "append_observation",
+                "messages": [],
+            }
+            record["wrapper_evidence"] = {
+                "event": "native_action",
+                "server_wrapper_evidence": {
+                    "answer_correct": True,
+                    "terminal_answer_only": True,
+                },
+            }
+            record["env_info_after"] = {
+                "status": "terminal_success",
+                "episode_success": True,
+            }
+        document["output"] = record["action"]
+        document["step_record_json"] = json.dumps(record, sort_keys=True)
+
+    path.write_text(
+        "\n".join(json.dumps(document, sort_keys=True) for document in documents)
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def rewrite_checkpoint_v2_chain_record(
+    fixture: dict, order: int, mutation: JsonMutation
+) -> None:
+    path = sorted(fixture["rollout_dir"].glob("*.jsonl"))[0]
+    documents = [
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    records = [json.loads(document["step_record_json"]) for document in documents]
+    chain_uids = {
+        record["trajectory_uid"]
+        for record in records
+        if record.get("wrapper_evidence", {}).get("event")
+        == "forced_checkpoint_write"
+    }
+    if len(chain_uids) != 1:
+        raise AssertionError(f"expected one checkpoint-v2 trajectory, got {chain_uids!r}")
+    chain_uid = chain_uids.pop()
+    matches = 0
+    for document, record in zip(documents, records):
+        if (
+            record.get("trajectory_uid") == chain_uid
+            and record.get("trajectory_row_order") == order
+        ):
+            mutation(record)
+            document["output"] = record["action"]
+            document["step_record_json"] = json.dumps(record, sort_keys=True)
+            matches += 1
+    if matches != 1:
+        raise AssertionError(
+            f"expected one checkpoint-v2 row at order {order}, found {matches}"
+        )
+    path.write_text(
+        "\n".join(json.dumps(document, sort_keys=True) for document in documents)
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def rewrite_first_rollout(fixture: dict, mutation: JsonMutation) -> None:
     path = sorted(fixture["rollout_dir"].glob("*.jsonl"))[0]
     lines = path.read_text(encoding="utf-8").splitlines()
@@ -407,6 +658,195 @@ class TestFinalizerFileLogger(FinalizerTestCase):
             verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
             self.assertEqual(verdict["status"], "pass", verdict)
 
+    def test_current_verl_owner_rows_and_actor_rollout_correction_pass(self):
+        """Match the exact row ownership emitted by veRL bd9c6edb in LR v20."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+            original = json.loads(
+                fixture["metrics_path"].read_text(encoding="utf-8").splitlines()[0]
+            )["data"]
+            learner = dict(original)
+            for suffix in ("kl", "k3_kl", "log_ppl_abs_diff"):
+                learner[f"actor/rollout_corr/{suffix}"] = learner.pop(
+                    f"rollout_corr/{suffix}"
+                )
+            # The learner row carries a stale snapshot of rollouter-owned counts.
+            # The real v20 row has the same shape and must not win ownership.
+            learner["fully_async/count/total_generated_samples"] = 0.0
+            learner["fully_async/count/dropped_stale_samples"] = 0.0
+            rollouter_counts = {
+                "fully_async/count/total_generated_samples": 64,
+                "fully_async/count/rollout_dispatched_samples": 64,
+                "fully_async/count/rollout_inflight_samples": 0,
+                "fully_async/count/rollout_completed_samples": 64,
+                "fully_async/count/rollout_failed_samples": 0,
+                "fully_async/count/rollout_cancelled_samples": 0,
+                "fully_async/count/queue_enqueued_samples": 64,
+                "fully_async/count/queue_dequeued_samples": 64,
+                "fully_async/count/queue_overflow_evictions": 0,
+                "fully_async/count/queue_cleared_samples": 0,
+                "fully_async/count/queue_resident_samples": 0,
+                "fully_async/count/staleness_samples": 0,
+                "fully_async/count/dropped_stale_samples": 0,
+            }
+            bootstrap = {key: 0 for key in rollouter_counts}
+            bootstrap.update(
+                {
+                    "fully_async/rollouter/active_time": 1.0,
+                    "fully_async/rollouter/idle_ratio": 0.0,
+                    "fully_async/rollouter/step_generated_samples": 0,
+                    "fully_async/rollouter/version_time": 1.0,
+                }
+            )
+            rollouter = dict(rollouter_counts)
+            rollouter.update(
+                {
+                    "fully_async/rollouter/active_time": 1.0,
+                    "fully_async/rollouter/idle_ratio": 0.0,
+                    "fully_async/rollouter/step_generated_samples": 64,
+                    "fully_async/rollouter/version_time": 1.0,
+                }
+            )
+            fixture["metrics_path"].write_text(
+                "\n".join(
+                    json.dumps(row, sort_keys=True)
+                    for row in (
+                        {"step": 0, "data": bootstrap},
+                        {"step": 1, "data": rollouter},
+                        {"step": 1, "data": learner},
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+
+            self.assertEqual(verdict["status"], "pass", verdict)
+
+    def test_actor_prefixed_corrections_are_fail_closed(self):
+        cases = (
+            (
+                "missing",
+                lambda data: data.pop("actor/rollout_corr/kl"),
+            ),
+            (
+                "nonfinite",
+                lambda data: data.update(
+                    **{"actor/rollout_corr/k3_kl": float("nan")}
+                ),
+            ),
+        )
+        for label, mutation in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                fixture = self.build(Path(directory))
+                rows = [
+                    json.loads(line)
+                    for line in fixture["metrics_path"]
+                    .read_text(encoding="utf-8")
+                    .splitlines()
+                ]
+                learner = rows[0]["data"]
+                for suffix in ("kl", "k3_kl", "log_ppl_abs_diff"):
+                    learner[f"actor/rollout_corr/{suffix}"] = learner.pop(
+                        f"rollout_corr/{suffix}"
+                    )
+                mutation(learner)
+                rollouter = {
+                    "fully_async/rollouter/active_time": 1.0,
+                    "fully_async/count/total_generated_samples": 64,
+                    "fully_async/count/dropped_stale_samples": 0,
+                }
+                fixture["metrics_path"].write_text(
+                    "\n".join(
+                        json.dumps(row, sort_keys=True)
+                        for row in (
+                            {"step": 1, "data": rollouter},
+                            {"step": 1, "data": learner},
+                        )
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                self.assert_failed(
+                    fixture["run_dir"], contains="actor/rollout_corr"
+                )
+
+    def test_current_owner_shape_requires_distinct_owner_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+            rows = [
+                json.loads(line)
+                for line in fixture["metrics_path"]
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            combined = rows[0]["data"]
+            for suffix in ("kl", "k3_kl", "log_ppl_abs_diff"):
+                combined[f"actor/rollout_corr/{suffix}"] = combined.pop(
+                    f"rollout_corr/{suffix}"
+                )
+            combined["fully_async/rollouter/active_time"] = 1.0
+            fixture["metrics_path"].write_text(
+                json.dumps(rows[0], sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            self.assert_failed(
+                fixture["run_dir"], contains="no unique learner-owner row"
+            )
+
+    def test_current_owner_shape_rejects_legacy_corrections_off_learner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+            original = json.loads(
+                fixture["metrics_path"].read_text(encoding="utf-8").splitlines()[0]
+            )["data"]
+            learner = dict(original)
+            corrections = {
+                key: learner.pop(key)
+                for key in (
+                    "rollout_corr/kl",
+                    "rollout_corr/k3_kl",
+                    "rollout_corr/log_ppl_abs_diff",
+                )
+            }
+            rollouter = {
+                **corrections,
+                "fully_async/rollouter/active_time": 1.0,
+                "fully_async/count/total_generated_samples": 64,
+                "fully_async/count/dropped_stale_samples": 0,
+            }
+            fixture["metrics_path"].write_text(
+                "\n".join(
+                    json.dumps(row, sort_keys=True)
+                    for row in (
+                        {"step": 1, "data": rollouter},
+                        {"step": 1, "data": learner},
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            self.assert_failed(
+                fixture["run_dir"], contains="actor/rollout_corr"
+            )
+
+    def test_duplicate_current_owner_rows_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+            with fixture["metrics_path"].open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {"step": 1, "data": {"training/global_step": 1.0}},
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+            self.assert_failed(
+                fixture["run_dir"], contains="no unique learner-owner row"
+            )
+
     def test_step_zero_must_be_rollouter_only(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.build(Path(directory))
@@ -791,6 +1231,251 @@ class TestFinalizerRollouts(FinalizerTestCase):
             verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
 
             self.assertEqual(verdict["status"], "pass", verdict)
+
+    def test_checkpoint_v2_write_replace_read_native_terminal_chain_passes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+            rewrite_legacy_chain_as_checkpoint_v2(fixture)
+
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+
+            self.assertEqual(verdict["status"], "pass", verdict)
+            self.assertEqual(verdict["counts"]["memory_chains"], 1)
+            self.assertEqual(verdict["counts"]["checkpoint_recovery_chains"], 1)
+            self.assertEqual(
+                verdict["counts"]["successful_checkpoint_recovery_chains"], 1
+            )
+
+    def test_checkpoint_v2_chain_fails_closed_on_receipt_or_same_file_read_drift(self):
+        cases: tuple[tuple[str, int, JsonMutation], ...] = (
+            (
+                "invalid write receipt",
+                0,
+                lambda record: record["wrapper_evidence"][
+                    "continuation_checkpoint"
+                ].update(valid=False),
+            ),
+            (
+                "missing context replacement",
+                0,
+                lambda record: record["context_transition"].update(
+                    operation="append_observation"
+                ),
+            ),
+            (
+                "different read path",
+                1,
+                lambda record: record.update(
+                    action=qwen35_shell_action("cat .agent_memory/OTHER.md"),
+                    action_submission={
+                        **record["action_submission"],
+                        "raw_policy_output": qwen35_shell_action(
+                            "cat .agent_memory/OTHER.md"
+                        ),
+                    },
+                ),
+            ),
+            (
+                "write execution SHA drift",
+                0,
+                lambda record: record["wrapper_evidence"][
+                    "server_wrapper_evidence"
+                ].update(executed_workspace_action_sha256="f" * 64),
+            ),
+            (
+                "write diff path drift",
+                0,
+                lambda record: record["wrapper_evidence"][
+                    "server_wrapper_evidence"
+                ]["workspace_diff"]["added"][0].update(
+                    path=".agent_memory/OTHER.md"
+                ),
+            ),
+            (
+                "write diff content SHA drift",
+                0,
+                lambda record: record["wrapper_evidence"][
+                    "server_wrapper_evidence"
+                ]["workspace_diff"]["added"][0].update(sha256="f" * 64),
+            ),
+            (
+                "read receipt path drift",
+                1,
+                lambda record: record["wrapper_evidence"][
+                    "server_wrapper_evidence"
+                ]["continuation_checkpoint"].update(
+                    path=".agent_memory/OTHER.md"
+                ),
+            ),
+            (
+                "terminal row is not declared terminal",
+                3,
+                lambda record: record.update(trajectory_terminal=False),
+            ),
+            (
+                "unattested read execution",
+                1,
+                lambda record: record["action_submission"].pop(
+                    "executed_workspace_action_sha256"
+                ),
+            ),
+            (
+                "read execution SHA drift",
+                1,
+                lambda record: record["wrapper_evidence"][
+                    "server_wrapper_evidence"
+                ].update(executed_workspace_action_sha256="f" * 64),
+            ),
+        )
+        for label, order, mutation in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                fixture = self.build(Path(directory))
+                rewrite_legacy_chain_as_checkpoint_v2(fixture)
+                rewrite_checkpoint_v2_chain_record(fixture, order, mutation)
+
+                self.assert_failed(
+                    fixture["run_dir"],
+                    contains="policy-authored external-document chain",
+                )
+
+    def test_checkpoint_v2_immediate_terminal_answer_is_attested(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+            rewrite_legacy_chain_as_checkpoint_v2(fixture)
+            path = sorted(fixture["rollout_dir"].glob("*.jsonl"))[0]
+            documents = [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+            ]
+            records = [json.loads(document["step_record_json"]) for document in documents]
+            chain_uid = next(
+                record["trajectory_uid"]
+                for record in records
+                if record.get("wrapper_evidence", {}).get("event")
+                == "forced_checkpoint_write"
+            )
+            rewritten = []
+            for document, record in zip(documents, records):
+                if record.get("trajectory_uid") == chain_uid:
+                    if record.get("trajectory_row_order") == 2:
+                        continue
+                    if record.get("trajectory_row_order") == 3:
+                        record["trajectory_row_order"] = 2
+                        document["step_record_json"] = json.dumps(
+                            record, sort_keys=True
+                        )
+                rewritten.append(document)
+            path.write_text(
+                "\n".join(json.dumps(document, sort_keys=True) for document in rewritten)
+                + "\n",
+                encoding="utf-8",
+            )
+
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+
+            self.assertEqual(verdict["status"], "pass", verdict)
+            self.assertEqual(verdict["counts"]["checkpoint_recovery_chains"], 1)
+
+    def test_checkpoint_v2_requires_attested_later_native_action(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+            rewrite_legacy_chain_as_checkpoint_v2(fixture)
+            rewrite_checkpoint_v2_chain_record(
+                fixture,
+                2,
+                lambda record: record["wrapper_evidence"][
+                    "server_wrapper_evidence"
+                ].update(native_environment_call_count=0),
+            )
+            rewrite_checkpoint_v2_chain_record(
+                fixture,
+                3,
+                lambda record: record["wrapper_evidence"][
+                    "server_wrapper_evidence"
+                ].update(terminal_answer_only=False),
+            )
+            self.assert_failed(
+                fixture["run_dir"], contains="policy-authored external-document chain"
+            )
+
+    def test_checkpoint_v2_rejects_mixed_native_shape_and_boolean_count(self):
+        cases = (
+            (
+                "native tool also claims answer kind",
+                lambda record: record["action_submission"].update(kind="answer"),
+            ),
+            (
+                "boolean native call count",
+                lambda record: record["wrapper_evidence"][
+                    "server_wrapper_evidence"
+                ].update(native_environment_call_count=True),
+            ),
+        )
+        for case, mutation in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                fixture = self.build(Path(directory))
+                rewrite_legacy_chain_as_checkpoint_v2(fixture)
+                rewrite_checkpoint_v2_chain_record(fixture, 2, mutation)
+                rewrite_checkpoint_v2_chain_record(
+                    fixture,
+                    3,
+                    lambda record: record["wrapper_evidence"][
+                        "server_wrapper_evidence"
+                    ].update(terminal_answer_only=False),
+                )
+
+                self.assert_failed(
+                    fixture["run_dir"],
+                    contains="policy-authored external-document chain",
+                )
+
+    def test_checkpoint_v2_shell_path_and_timeout_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+            rewrite_legacy_chain_as_checkpoint_v2(fixture)
+            unsafe_path = ".agent_memory/$PWD"
+
+            def mutate_write(record: dict) -> None:
+                checkpoint = record["wrapper_evidence"]["continuation_checkpoint"]
+                server = record["wrapper_evidence"]["server_wrapper_evidence"]
+                checkpoint["path"] = unsafe_path
+                server["continuation_checkpoint"]["path"] = unsafe_path
+                server["workspace_diff"]["added"][0]["path"] = unsafe_path
+
+            def mutate_read(record: dict) -> None:
+                action = qwen35_shell_action(f"cat {unsafe_path}")
+                record["action"] = action
+                record["action_submission"]["raw_policy_output"] = action
+                record["wrapper_evidence"]["server_wrapper_evidence"][
+                    "continuation_checkpoint"
+                ]["path"] = unsafe_path
+
+            rewrite_checkpoint_v2_chain_record(fixture, 0, mutate_write)
+            rewrite_checkpoint_v2_chain_record(fixture, 1, mutate_read)
+            self.assert_failed(
+                fixture["run_dir"], contains="policy-authored external-document chain"
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+            rewrite_legacy_chain_as_checkpoint_v2(fixture)
+
+            def mutate_timeout(record: dict) -> None:
+                huge_timeout = "9" * 5000
+                action = record["action"].replace(
+                    "<parameter=timeout_ms>\n10000",
+                    f"<parameter=timeout_ms>\n{huge_timeout}",
+                )
+                record["action"] = action
+                record["action_submission"]["raw_policy_output"] = action
+
+            rewrite_checkpoint_v2_chain_record(fixture, 1, mutate_timeout)
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+            self.assertEqual(verdict["status"], "fail", verdict)
+            self.assertFalse(
+                any("unexpected finalizer failure" in error for error in verdict["errors"]),
+                verdict,
+            )
 
     def test_action_text_does_not_override_emitted_memory_events(self):
         orders = {
@@ -1572,6 +2257,32 @@ class TestMultitaskFinalizer(FinalizerTestCase):
                 fixture = self.build_multitask(Path(directory))
                 mutate_final_statistics(fixture["trainer_log"], mutation)
                 self.assert_failed(fixture["run_dir"], contains="FinalStatistics")
+
+    def test_final_statistics_accepts_integral_float_only_for_required_samples(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build_multitask(Path(directory))
+            mutate_final_statistics(
+                fixture["trainer_log"],
+                lambda value: value["rollouter"].update(
+                    {"static/required_samples": 64.0}
+                ),
+            )
+
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+
+            self.assertEqual(verdict["status"], "pass", verdict)
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build_multitask(Path(directory))
+            mutate_final_statistics(
+                fixture["trainer_log"],
+                lambda value: value["rollouter"].update(
+                    {"static/required_samples": 64.5}
+                ),
+            )
+            self.assert_failed(
+                fixture["run_dir"], contains="static/required_samples"
+            )
 
     def test_final_statistics_staleness_threshold_requires_a_json_number(self):
         with tempfile.TemporaryDirectory() as directory:
