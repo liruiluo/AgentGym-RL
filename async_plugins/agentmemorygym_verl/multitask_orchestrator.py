@@ -2189,6 +2189,8 @@ def build_launch_plan(args: argparse.Namespace) -> LaunchPlan:
         formal_schedule_certificate=None,
         trainer_gpus=config.trainer_gpus,
         standalone_rollout_gpus=config.standalone_rollout_gpus,
+        actor_train_token_budget=config.actor_train_token_budget,
+        critic_train_token_budget=config.critic_train_token_budget,
         actor_use_fused_kernels=config.actor_use_fused_kernels,
         critic_use_fused_kernels=config.critic_use_fused_kernels,
         route_registry=route_registry_path,
@@ -2213,6 +2215,8 @@ def build_launch_plan(args: argparse.Namespace) -> LaunchPlan:
         "samples_per_update": config.samples_per_update,
         "episodes": config.total_episodes,
         "trigger_parameter_sync_step": config.trigger_parameter_sync_step,
+        "actor_train_token_budget": config.actor_train_token_budget,
+        "critic_train_token_budget": config.critic_train_token_budget,
     }
     for field, expected in required_budget.items():
         if budget.get(field) != expected:

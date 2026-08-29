@@ -920,10 +920,32 @@ class TestAMGMultitaskLauncherContract(unittest.TestCase):
             self.assertEqual(budget["samples_per_update"], 64)
             self.assertEqual(budget["episodes"], 25_600)
             self.assertEqual(budget["publication_cycles"], 400)
+            self.assertEqual(budget["actor_train_token_budget"], 65_536)
+            self.assertEqual(budget["critic_train_token_budget"], 65_536)
             self.assertEqual(budget["route_ids"], list(self.ROUTES))
             self.assertEqual(
                 _load_launch_identity(inputs, schedule_report=schedule_report),
                 identity,
+            )
+
+    def test_multitask_identity_binds_custom_learner_token_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inputs, schedule_report, _source_lock = self._identity_fixture(
+                Path(directory)
+            )
+            inputs = replace(
+                inputs,
+                actor_train_token_budget=131_072,
+                critic_train_token_budget=131_072,
+            )
+
+            identity = _load_multitask_identity(inputs, schedule_report=schedule_report)
+
+            self.assertEqual(
+                identity["budget_contract"]["actor_train_token_budget"], 131_072
+            )
+            self.assertEqual(
+                identity["budget_contract"]["critic_train_token_budget"], 131_072
             )
 
     def _rewrite_multitask_certificate(

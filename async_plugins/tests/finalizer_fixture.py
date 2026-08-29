@@ -107,7 +107,14 @@ def endpoint_identity(mode: str) -> dict:
     }
 
 
-def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
+def resolved_config(
+    mode: str,
+    run_dir: Path,
+    schedule: Path,
+    *,
+    actor_train_token_budget: int = 65_536,
+    critic_train_token_budget: int = 65_536,
+) -> dict:
     formal = mode == "formal"
     trainer_gpus = 6 if formal else 4
     rollout_gpus = 2 if formal else 4
@@ -135,6 +142,7 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
             "actor": {
                 "ppo_mini_batch_size": ppo_mini_batch_size,
                 "ppo_micro_batch_size_per_gpu": 8,
+                "ppo_max_token_len_per_gpu": actor_train_token_budget,
                 "ppo_epochs": 1,
                 "shuffle": False,
                 "use_dynamic_bsz": True,
@@ -183,7 +191,7 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
             "strategy": "fsdp2",
             "ppo_mini_batch_size": ppo_mini_batch_size,
             "ppo_micro_batch_size_per_gpu": 8,
-            "ppo_max_token_len_per_gpu": 65536,
+            "ppo_max_token_len_per_gpu": critic_train_token_budget,
             "ppo_infer_max_token_len_per_gpu": 32768,
             "ppo_epochs": 1,
             "shuffle": False,
@@ -662,6 +670,8 @@ def build_valid_multitask_run(
     updates: int = 8,
     route_counts_by_update: list[dict[str, int]] | None = None,
     horizon_route_id: str | None = None,
+    actor_train_token_budget: int = 65_536,
+    critic_train_token_budget: int = 65_536,
 ) -> dict:
     """Build a compact four-route receipt and exact owner telemetry fixture."""
 
@@ -827,7 +837,13 @@ def build_valid_multitask_run(
         encoding="utf-8",
     )
 
-    config = resolved_config("formal", run_dir, schedule_path)
+    config = resolved_config(
+        "formal",
+        run_dir,
+        schedule_path,
+        actor_train_token_budget=actor_train_token_budget,
+        critic_train_token_budget=critic_train_token_budget,
+    )
     route_config = {
         "route_registry_path": str(registry_path),
         "route_registry_sha256": registry_sha256,
@@ -857,6 +873,8 @@ def build_valid_multitask_run(
         "max_actor_ckpt_to_keep": 1,
         "max_critic_ckpt_to_keep": 1,
         "model_path": PUBLICATION_TRAINING_RUNTIME["base_model"],
+        "actor_train_token_budget": actor_train_token_budget,
+        "critic_train_token_budget": critic_train_token_budget,
         "route_ids": list(route_ids),
         "route_registry_sha256": registry_sha256,
         "schedule_sha256": schedule_sha256,
@@ -864,7 +882,11 @@ def build_valid_multitask_run(
         "routing_sha256": schedule_sha256,
     }
     budget = verify_resolved_config(
-        config, mode="formal", expected_budget=budget_contract
+        config,
+        mode="formal",
+        expected_budget=budget_contract,
+        expected_actor_train_token_budget=actor_train_token_budget,
+        expected_critic_train_token_budget=critic_train_token_budget,
     )
 
     rollout_dir = run_dir / "rollout_data"
@@ -1077,6 +1099,8 @@ def build_valid_multitask_run(
             "run_dir": str(run_dir),
             "trainer_gpus": 6,
             "standalone_rollout_gpus": 2,
+            "actor_train_token_budget": actor_train_token_budget,
+            "critic_train_token_budget": critic_train_token_budget,
         },
         "source": {
             "verl_commit": FINAL_STATISTICS_VERL_COMMIT,

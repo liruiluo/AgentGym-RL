@@ -1012,6 +1012,57 @@ class TestMultitaskFinalizer(FinalizerTestCase):
                 self.assertEqual(route["executions"], 8)
                 self.assertEqual(route["complete_memory_chains"], 8)
 
+    def test_custom_learner_token_budget_passes_and_drift_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = build_valid_multitask_run(
+                Path(directory) / "run",
+                actor_train_token_budget=131_072,
+                critic_train_token_budget=131_072,
+            )
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+            self.assertEqual(verdict["status"], "pass", verdict)
+
+        for field in ("actor_train_token_budget", "critic_train_token_budget"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                fixture = build_valid_multitask_run(
+                    Path(directory) / "run",
+                    actor_train_token_budget=131_072,
+                    critic_train_token_budget=131_072,
+                )
+                mutate_json(
+                    fixture["launch_path"],
+                    lambda receipt, field=field: receipt["inputs"].update(
+                        {field: 65_536}
+                    ),
+                )
+                self.assert_failed(
+                    fixture["run_dir"],
+                    contains=f"launch input {field.replace('_', ' ')} differs",
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = build_valid_multitask_run(
+                Path(directory) / "run",
+                actor_train_token_budget=131_072,
+                critic_train_token_budget=131_072,
+            )
+            for path in (fixture["resolved_path"], fixture["hydra_path"]):
+                config = yaml.safe_load(path.read_text(encoding="utf-8"))
+                config["actor_rollout_ref"]["actor"][
+                    "ppo_max_token_len_per_gpu"
+                ] = 65_536
+                path.write_text(yaml.safe_dump(config, sort_keys=True), encoding="utf-8")
+            mutate_json(
+                fixture["launch_path"],
+                lambda receipt: receipt["resolved_config"].update(
+                    sha256=sha256(fixture["resolved_path"])
+                ),
+            )
+            self.assert_failed(
+                fixture["run_dir"],
+                contains="actor_rollout_ref.actor.ppo_max_token_len_per_gpu",
+            )
+
     def test_route_local_max_rounds_horizon_is_a_complete_trajectory(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = build_valid_multitask_run(

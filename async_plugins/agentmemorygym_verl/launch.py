@@ -957,6 +957,12 @@ def _load_multitask_identity(
         "max_actor_ckpt_to_keep": tuning["max_actor_ckpt_to_keep"],
         "max_critic_ckpt_to_keep": tuning["max_critic_ckpt_to_keep"],
         "model_path": training_runtime["base_model"],
+        "actor_train_token_budget": _require_positive_int(
+            inputs.actor_train_token_budget, field="actor train token budget"
+        ),
+        "critic_train_token_budget": _require_positive_int(
+            inputs.critic_train_token_budget, field="critic train token budget"
+        ),
         "route_ids": list(route_ids),
         "route_registry_sha256": registry.sha256,
         "schedule_sha256": certificate_schedule_sha256,

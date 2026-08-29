@@ -1019,9 +1019,37 @@ class _Audit:
         samples_per_update = _positive_int(budget_contract.get("samples_per_update"))
         publications = _positive_int(budget_contract.get("publication_cycles"))
         sync_step = _positive_int(budget_contract.get("trigger_parameter_sync_step"))
-        if None in (episodes, updates, samples_per_update, publications, sync_step):
+        actor_train_token_budget = _positive_int(
+            budget_contract.get("actor_train_token_budget")
+        )
+        critic_train_token_budget = _positive_int(
+            budget_contract.get("critic_train_token_budget")
+        )
+        if None in (
+            episodes,
+            updates,
+            samples_per_update,
+            publications,
+            sync_step,
+            actor_train_token_budget,
+            critic_train_token_budget,
+        ):
             self.errors.append("launch budget contains a non-positive integer")
         else:
+            self.check(
+                actor_train_token_budget == critic_train_token_budget,
+                "launch actor/critic train token budgets differ",
+            )
+            self.check(
+                _at(launch, "inputs.actor_train_token_budget")
+                == actor_train_token_budget,
+                "launch input actor train token budget differs from budget contract",
+            )
+            self.check(
+                _at(launch, "inputs.critic_train_token_budget")
+                == critic_train_token_budget,
+                "launch input critic train token budget differs from budget contract",
+            )
             self.check(
                 episodes == updates * samples_per_update,
                 "launch episode budget is not optimizer_updates * samples_per_update",
@@ -1324,11 +1352,32 @@ class _Audit:
             "launch resolved config sha256 mismatch",
         )
         self.check(resolved == hydra, "Hydra config drifted from the preflight config")
+        token_budget_kwargs: dict[str, int] = {}
+        if self.multitask:
+            actor_train_token_budget = _positive_int(
+                self.expected.get("actor_train_token_budget")
+            )
+            critic_train_token_budget = _positive_int(
+                self.expected.get("critic_train_token_budget")
+            )
+            if (
+                actor_train_token_budget is None
+                or critic_train_token_budget is None
+            ):
+                self.errors.append(
+                    "multitask launch budget has invalid learner token budgets"
+                )
+                return
+            token_budget_kwargs = {
+                "expected_actor_train_token_budget": actor_train_token_budget,
+                "expected_critic_train_token_budget": critic_train_token_budget,
+            }
         try:
             budget = verify_resolved_config(
                 resolved,
                 mode=self.mode,
                 expected_budget=self.expected,
+                **token_budget_kwargs,
             )
         except Exception as exc:
             self.error("resolved config contract", exc)

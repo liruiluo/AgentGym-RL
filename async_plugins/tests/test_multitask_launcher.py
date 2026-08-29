@@ -1618,6 +1618,8 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
                         "samples_per_update": 64,
                         "episodes": 25_600,
                         "trigger_parameter_sync_step": 1,
+                        "actor_train_token_budget": 65_536,
+                        "critic_train_token_budget": 65_536,
                     }
                 }
                 with (
