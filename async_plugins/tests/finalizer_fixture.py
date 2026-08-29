@@ -670,6 +670,7 @@ def build_valid_multitask_run(
     updates: int = 8,
     route_counts_by_update: list[dict[str, int]] | None = None,
     horizon_route_id: str | None = None,
+    learner_token_budget_profile: str = "default-65536-v1",
     actor_train_token_budget: int = 65_536,
     critic_train_token_budget: int = 65_536,
 ) -> dict:
@@ -873,6 +874,7 @@ def build_valid_multitask_run(
         "max_actor_ckpt_to_keep": 1,
         "max_critic_ckpt_to_keep": 1,
         "model_path": PUBLICATION_TRAINING_RUNTIME["base_model"],
+        "learner_token_budget_profile": learner_token_budget_profile,
         "actor_train_token_budget": actor_train_token_budget,
         "critic_train_token_budget": critic_train_token_budget,
         "route_ids": list(route_ids),
@@ -1099,6 +1101,7 @@ def build_valid_multitask_run(
             "run_dir": str(run_dir),
             "trainer_gpus": 6,
             "standalone_rollout_gpus": 2,
+            "learner_token_budget_profile": learner_token_budget_profile,
             "actor_train_token_budget": actor_train_token_budget,
             "critic_train_token_budget": critic_train_token_budget,
         },

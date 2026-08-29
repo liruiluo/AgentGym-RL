@@ -1016,11 +1016,30 @@ class TestMultitaskFinalizer(FinalizerTestCase):
         with tempfile.TemporaryDirectory() as directory:
             fixture = build_valid_multitask_run(
                 Path(directory) / "run",
+                learner_token_budget_profile="literesearcher-131072-v1",
                 actor_train_token_budget=131_072,
                 critic_train_token_budget=131_072,
             )
             verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
             self.assertEqual(verdict["status"], "pass", verdict)
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = build_valid_multitask_run(
+                Path(directory) / "run",
+                learner_token_budget_profile="literesearcher-131072-v1",
+                actor_train_token_budget=131_072,
+                critic_train_token_budget=131_072,
+            )
+            mutate_json(
+                fixture["launch_path"],
+                lambda receipt: receipt["inputs"].update(
+                    learner_token_budget_profile="stale-65536-v1"
+                ),
+            )
+            self.assert_failed(
+                fixture["run_dir"],
+                contains="launch input learner token budget profile differs",
+            )
 
         for field in ("actor_train_token_budget", "critic_train_token_budget"):
             with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
@@ -1043,6 +1062,7 @@ class TestMultitaskFinalizer(FinalizerTestCase):
         with tempfile.TemporaryDirectory() as directory:
             fixture = build_valid_multitask_run(
                 Path(directory) / "run",
+                learner_token_budget_profile="literesearcher-131072-v1",
                 actor_train_token_budget=131_072,
                 critic_train_token_budget=131_072,
             )

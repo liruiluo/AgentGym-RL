@@ -682,6 +682,7 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
         )
         self.assertEqual((config.trainer_gpus, config.standalone_rollout_gpus), (6, 2))
         self.assertEqual(config.rollout_n, 1)
+        self.assertEqual(config.learner_token_budget_profile, "default-65536-v1")
         self.assertEqual(config.actor_train_token_budget, 65_536)
         self.assertEqual(config.critic_train_token_budget, 65_536)
         self.assertEqual(config.critic_infer_token_budget, 32_768)
@@ -699,6 +700,9 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
         self.assertEqual(config.samples_per_update, 64)
         self.assertEqual(config.total_episodes, 6_400)
         self.assertEqual((config.trainer_gpus, config.standalone_rollout_gpus), (6, 2))
+        self.assertEqual(
+            config.learner_token_budget_profile, "literesearcher-131072-v1"
+        )
         self.assertEqual(config.actor_train_token_budget, 131_072)
         self.assertEqual(config.critic_train_token_budget, 131_072)
         self.assertEqual(config.trigger_parameter_sync_step, 1)
@@ -1617,6 +1621,7 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
                         "optimizer_updates": 400,
                         "samples_per_update": 64,
                         "episodes": 25_600,
+                        "learner_token_budget_profile": "default-65536-v1",
                         "trigger_parameter_sync_step": 1,
                         "actor_train_token_budget": 65_536,
                         "critic_train_token_budget": 65_536,
@@ -2026,6 +2031,9 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
         rendered = " ".join(command)
         self.assertIn("--trainer-gpus 6", rendered)
         self.assertIn("--standalone-rollout-gpus 2", rendered)
+        self.assertIn(
+            "--learner-token-budget-profile default-65536-v1", rendered
+        )
         self.assertIn("--actor-train-token-budget 65536", rendered)
         self.assertIn("--critic-train-token-budget 65536", rendered)
         self.assertIn("--multitask-orchestrator-preflight", rendered)

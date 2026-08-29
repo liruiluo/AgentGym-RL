@@ -126,6 +126,7 @@ class OrchestratorConfig:
     trainer_gpus: int
     standalone_rollout_gpus: int
     rollout_n: int
+    learner_token_budget_profile: str
     actor_train_token_budget: int
     critic_train_token_budget: int
     critic_infer_token_budget: int
@@ -255,6 +256,7 @@ class LaunchPlan:
                 trainer_gpus=6,
                 standalone_rollout_gpus=2,
                 rollout_n=1,
+                learner_token_budget_profile="default-65536-v1",
                 actor_train_token_budget=65_536,
                 critic_train_token_budget=65_536,
                 critic_infer_token_budget=32_768,
@@ -456,6 +458,11 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
     expected_train_token_budget = (
         131_072 if route_order == ("literesearcher",) else 65_536
     )
+    expected_learner_token_budget_profile = (
+        "literesearcher-131072-v1"
+        if route_order == ("literesearcher",)
+        else "default-65536-v1"
+    )
 
     exact = {
         "implementation base commit": (
@@ -483,6 +490,10 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
         "learner/hybrid GPUs": (r38.get("learner_hybrid_gpus"), 6),
         "standalone rollout GPUs": (r38.get("standalone_rollout_gpus"), 2),
         "rollout.n": (r38.get("rollout_n"), 1),
+        "learner token budget profile": (
+            r38.get("learner_token_budget_profile"),
+            expected_learner_token_budget_profile,
+        ),
         "actor train token budget": (
             r38.get("actor_train_token_budget"),
             expected_train_token_budget,
@@ -615,6 +626,7 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
         trainer_gpus=int(r38["learner_hybrid_gpus"]),
         standalone_rollout_gpus=int(r38["standalone_rollout_gpus"]),
         rollout_n=int(r38["rollout_n"]),
+        learner_token_budget_profile=str(r38["learner_token_budget_profile"]),
         actor_train_token_budget=int(r38["actor_train_token_budget"]),
         critic_train_token_budget=int(r38["critic_train_token_budget"]),
         critic_infer_token_budget=int(r38["critic_infer_token_budget"]),
@@ -2022,6 +2034,8 @@ def build_generic_launch_command(
         str(plan.config.trainer_gpus),
         "--standalone-rollout-gpus",
         str(plan.config.standalone_rollout_gpus),
+        "--learner-token-budget-profile",
+        plan.config.learner_token_budget_profile,
         "--actor-train-token-budget",
         str(plan.config.actor_train_token_budget),
         "--critic-train-token-budget",
@@ -2189,6 +2203,7 @@ def build_launch_plan(args: argparse.Namespace) -> LaunchPlan:
         formal_schedule_certificate=None,
         trainer_gpus=config.trainer_gpus,
         standalone_rollout_gpus=config.standalone_rollout_gpus,
+        learner_token_budget_profile=config.learner_token_budget_profile,
         actor_train_token_budget=config.actor_train_token_budget,
         critic_train_token_budget=config.critic_train_token_budget,
         actor_use_fused_kernels=config.actor_use_fused_kernels,
@@ -2214,6 +2229,7 @@ def build_launch_plan(args: argparse.Namespace) -> LaunchPlan:
         "optimizer_updates": config.optimizer_updates,
         "samples_per_update": config.samples_per_update,
         "episodes": config.total_episodes,
+        "learner_token_budget_profile": config.learner_token_budget_profile,
         "trigger_parameter_sync_step": config.trigger_parameter_sync_step,
         "actor_train_token_budget": config.actor_train_token_budget,
         "critic_train_token_budget": config.critic_train_token_budget,
@@ -2539,6 +2555,15 @@ class LocalBackend:
                     "optimizer_updates": plan.config.optimizer_updates,
                     "samples_per_update": plan.config.samples_per_update,
                     "episodes": plan.config.total_episodes,
+                    "learner_token_budget_profile": (
+                        plan.config.learner_token_budget_profile
+                    ),
+                    "actor_train_token_budget": (
+                        plan.config.actor_train_token_budget
+                    ),
+                    "critic_train_token_budget": (
+                        plan.config.critic_train_token_budget
+                    ),
                 },
                 "holder_transaction": {
                     "status": "acquired",

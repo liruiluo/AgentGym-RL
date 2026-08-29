@@ -92,6 +92,7 @@ class LaunchInputs:
     standalone_rollout_gpus: int = 2
     actor_use_fused_kernels: bool = False
     critic_use_fused_kernels: bool = False
+    learner_token_budget_profile: str | None = None
     actor_train_token_budget: int = 65_536
     critic_train_token_budget: int = 65_536
     route_registry: Path | None = None
@@ -668,6 +669,19 @@ def _load_multitask_identity(
         expected_sha256=inputs.route_registry_sha256,
     )
     route_ids = _route_set_ids(registry.route_ids)
+    learner_token_budget_profile = inputs.learner_token_budget_profile
+    if (
+        not isinstance(learner_token_budget_profile, str)
+        or not learner_token_budget_profile
+        or len(learner_token_budget_profile) > 128
+        or any(
+            character not in "abcdefghijklmnopqrstuvwxyz0123456789._-"
+            for character in learner_token_budget_profile
+        )
+    ):
+        raise ValueError(
+            "multitask launch requires a lowercase learner token budget profile"
+        )
     source_lock = _load_json_mapping(source_lock_path, label="multitask source lock")
     certificate = _load_json_mapping(
         certificate_path, label="multitask schedule certificate"
@@ -957,6 +971,7 @@ def _load_multitask_identity(
         "max_actor_ckpt_to_keep": tuning["max_actor_ckpt_to_keep"],
         "max_critic_ckpt_to_keep": tuning["max_critic_ckpt_to_keep"],
         "model_path": training_runtime["base_model"],
+        "learner_token_budget_profile": learner_token_budget_profile,
         "actor_train_token_budget": _require_positive_int(
             inputs.actor_train_token_budget, field="actor train token budget"
         ),
@@ -1468,6 +1483,40 @@ def _load_multitask_orchestrator_preflight(
     assert inputs.multitask_source_lock is not None
     assert inputs.multitask_schedule_certificate is not None
     route_ids = _route_set_ids(launch_identity.get("route_ids"))
+    verified_config_path = _verify_preflight_file(
+        receipt.get("config_path"),
+        receipt.get("config_sha256"),
+        label="multitask orchestrator config",
+    )
+    config_payload = _load_yaml(verified_config_path.read_text(encoding="utf-8"))
+    config_r38 = config_payload.get("r38")
+    if not isinstance(config_r38, Mapping):
+        raise RuntimeError(
+            "multitask orchestrator config omitted the r38 budget section"
+        )
+    config_budget = {
+        "learner_token_budget_profile": config_r38.get(
+            "learner_token_budget_profile"
+        ),
+        "actor_train_token_budget": config_r38.get("actor_train_token_budget"),
+        "critic_train_token_budget": config_r38.get("critic_train_token_budget"),
+    }
+    input_budget = {
+        "learner_token_budget_profile": inputs.learner_token_budget_profile,
+        "actor_train_token_budget": inputs.actor_train_token_budget,
+        "critic_train_token_budget": inputs.critic_train_token_budget,
+    }
+    contract_budget = {key: budget_contract.get(key) for key in input_budget}
+    if input_budget != config_budget:
+        raise RuntimeError(
+            "multitask learner token budget inputs differ from reviewed orchestrator config: "
+            f"{input_budget!r} != {config_budget!r}"
+        )
+    if contract_budget != config_budget:
+        raise RuntimeError(
+            "multitask learner token budget contract differs from reviewed orchestrator config: "
+            f"{contract_budget!r} != {config_budget!r}"
+        )
     expected_values = {
         "route_registry_path": str(inputs.route_registry.resolve()),
         "route_registry_sha256": inputs.route_registry_sha256,
@@ -1487,6 +1536,7 @@ def _load_multitask_orchestrator_preflight(
             "optimizer_updates": budget_contract.get("optimizer_updates"),
             "samples_per_update": budget_contract.get("samples_per_update"),
             "episodes": budget_contract.get("episodes"),
+            **config_budget,
         },
     }
     for field, expected in expected_values.items():
@@ -1497,11 +1547,6 @@ def _load_multitask_orchestrator_preflight(
                 f"{observed!r} != {expected!r}"
             )
 
-    _verify_preflight_file(
-        receipt.get("config_path"),
-        receipt.get("config_sha256"),
-        label="multitask orchestrator config",
-    )
     _verify_preflight_file(
         receipt.get("endpoint_registry_path"),
         receipt.get("endpoint_registry_sha256"),
@@ -2451,6 +2496,7 @@ def prepare_launch(
             "standalone_rollout_gpus": inputs.standalone_rollout_gpus,
             "actor_use_fused_kernels": inputs.actor_use_fused_kernels,
             "critic_use_fused_kernels": inputs.critic_use_fused_kernels,
+            "learner_token_budget_profile": inputs.learner_token_budget_profile,
             "actor_train_token_budget": inputs.actor_train_token_budget,
             "critic_train_token_budget": inputs.critic_train_token_budget,
             "resume_mode": inputs.resume_mode,
@@ -2541,6 +2587,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--standalone-rollout-gpus", type=int, default=2)
     parser.add_argument("--actor-use-fused-kernels", action="store_true")
     parser.add_argument("--critic-use-fused-kernels", action="store_true")
+    parser.add_argument("--learner-token-budget-profile")
     parser.add_argument("--actor-train-token-budget", type=int, default=65_536)
     parser.add_argument("--critic-train-token-budget", type=int, default=65_536)
     parser.add_argument("--resolve-only", action="store_true")
@@ -2598,6 +2645,7 @@ def main(argv: list[str] | None = None) -> int:
         standalone_rollout_gpus=args.standalone_rollout_gpus,
         actor_use_fused_kernels=args.actor_use_fused_kernels,
         critic_use_fused_kernels=args.critic_use_fused_kernels,
+        learner_token_budget_profile=args.learner_token_budget_profile,
         actor_train_token_budget=args.actor_train_token_budget,
         critic_train_token_budget=args.critic_train_token_budget,
         route_registry=_resolve_cli_regular_file(

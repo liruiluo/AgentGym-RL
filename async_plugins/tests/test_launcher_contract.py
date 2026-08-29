@@ -803,6 +803,7 @@ class TestAMGMultitaskLauncherContract(unittest.TestCase):
             endpoint_contract_tool=None,
             publication_receipt=None,
             formal_schedule_certificate=None,
+            learner_token_budget_profile="default-65536-v1",
             route_registry=registry,
             route_registry_sha256=registry_sha256,
             multitask_source_lock=source_lock_path,
@@ -920,6 +921,9 @@ class TestAMGMultitaskLauncherContract(unittest.TestCase):
             self.assertEqual(budget["samples_per_update"], 64)
             self.assertEqual(budget["episodes"], 25_600)
             self.assertEqual(budget["publication_cycles"], 400)
+            self.assertEqual(
+                budget["learner_token_budget_profile"], "default-65536-v1"
+            )
             self.assertEqual(budget["actor_train_token_budget"], 65_536)
             self.assertEqual(budget["critic_train_token_budget"], 65_536)
             self.assertEqual(budget["route_ids"], list(self.ROUTES))
@@ -935,12 +939,17 @@ class TestAMGMultitaskLauncherContract(unittest.TestCase):
             )
             inputs = replace(
                 inputs,
+                learner_token_budget_profile="custom-131072-v1",
                 actor_train_token_budget=131_072,
                 critic_train_token_budget=131_072,
             )
 
             identity = _load_multitask_identity(inputs, schedule_report=schedule_report)
 
+            self.assertEqual(
+                identity["budget_contract"]["learner_token_budget_profile"],
+                "custom-131072-v1",
+            )
             self.assertEqual(
                 identity["budget_contract"]["actor_train_token_budget"], 131_072
             )
@@ -1191,7 +1200,20 @@ class TestAMGMultitaskLauncherContract(unittest.TestCase):
             files = {}
             for name in ("config", "endpoint-registry", "holder-lease"):
                 path = root / f"{name}.json"
-                path.write_text("{}\n", encoding="utf-8")
+                payload = (
+                    {
+                        "r38": {
+                            "learner_token_budget_profile": "default-65536-v1",
+                            "actor_train_token_budget": 65_536,
+                            "critic_train_token_budget": 65_536,
+                        }
+                    }
+                    if name == "config"
+                    else {}
+                )
+                path.write_text(
+                    json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8"
+                )
                 files[name] = path
             files["holder-state"] = inputs.run_dir / "holder-transaction" / "state.json"
             files["holder-state"].parent.mkdir(parents=True)
@@ -1262,6 +1284,9 @@ class TestAMGMultitaskLauncherContract(unittest.TestCase):
                     "optimizer_updates": 400,
                     "samples_per_update": 64,
                     "episodes": 25_600,
+                    "learner_token_budget_profile": "default-65536-v1",
+                    "actor_train_token_budget": 65_536,
+                    "critic_train_token_budget": 65_536,
                 },
                 "holder_transaction": {
                     "status": "acquired",
@@ -1299,6 +1324,93 @@ class TestAMGMultitaskLauncherContract(unittest.TestCase):
             self.assertEqual(
                 [entry["route_id"] for entry in validated["endpoints"]],
                 list(self.ROUTES),
+            )
+
+            for field, value in (
+                ("learner_token_budget_profile", "edited-999999-v1"),
+                ("actor_train_token_budget", 999_999),
+                ("critic_train_token_budget", 999_999),
+            ):
+                with (
+                    self.subTest(stale_launch_field=field),
+                    mock.patch(
+                        "agentmemorygym_verl.launch.process_identity_alive",
+                        return_value=True,
+                    ),
+                    mock.patch(
+                        "agentmemorygym_verl.launch.os.getpgid",
+                        side_effect=lambda pid: pid,
+                    ),
+                    self.assertRaisesRegex(
+                        RuntimeError, "differ from reviewed orchestrator config"
+                    ),
+                ):
+                    stale_inputs = replace(inputs, **{field: value})
+                    stale_identity = _load_multitask_identity(
+                        stale_inputs, schedule_report=schedule_report
+                    )
+                    _load_multitask_orchestrator_preflight(
+                        stale_inputs,
+                        launch_identity=stale_identity,
+                        schedule_report=schedule_report,
+                        budget_contract=stale_identity["budget_contract"],
+                        required=True,
+                    )
+
+            arbitrary_inputs = replace(
+                inputs,
+                learner_token_budget_profile="arbitrary-999999-v1",
+                actor_train_token_budget=999_999,
+                critic_train_token_budget=999_999,
+            )
+            arbitrary_identity = _load_multitask_identity(
+                arbitrary_inputs, schedule_report=schedule_report
+            )
+            with (
+                mock.patch(
+                    "agentmemorygym_verl.launch.process_identity_alive",
+                    return_value=True,
+                ),
+                mock.patch(
+                    "agentmemorygym_verl.launch.os.getpgid", side_effect=lambda pid: pid
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError, "differ from reviewed orchestrator config"
+                ),
+            ):
+                _load_multitask_orchestrator_preflight(
+                    arbitrary_inputs,
+                    launch_identity=arbitrary_identity,
+                    schedule_report=schedule_report,
+                    budget_contract=arbitrary_identity["budget_contract"],
+                    required=True,
+                )
+
+            edited_receipt = json.loads(json.dumps(receipt))
+            edited_receipt["budget"]["actor_train_token_budget"] = 999_999
+            edited_receipt["budget"]["critic_train_token_budget"] = 999_999
+            preflight.write_text(
+                json.dumps(edited_receipt, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            with (
+                mock.patch(
+                    "agentmemorygym_verl.launch.process_identity_alive",
+                    return_value=True,
+                ),
+                mock.patch(
+                    "agentmemorygym_verl.launch.os.getpgid", side_effect=lambda pid: pid
+                ),
+                self.assertRaisesRegex(RuntimeError, "budget mismatch"),
+            ):
+                _load_multitask_orchestrator_preflight(
+                    inputs,
+                    launch_identity=identity,
+                    schedule_report=schedule_report,
+                    budget_contract=budget,
+                    required=True,
+                )
+            preflight.write_text(
+                json.dumps(receipt, sort_keys=True) + "\n", encoding="utf-8"
             )
 
             with (

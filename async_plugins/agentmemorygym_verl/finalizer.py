@@ -1019,6 +1019,9 @@ class _Audit:
         samples_per_update = _positive_int(budget_contract.get("samples_per_update"))
         publications = _positive_int(budget_contract.get("publication_cycles"))
         sync_step = _positive_int(budget_contract.get("trigger_parameter_sync_step"))
+        learner_token_budget_profile = budget_contract.get(
+            "learner_token_budget_profile"
+        )
         actor_train_token_budget = _positive_int(
             budget_contract.get("actor_train_token_budget")
         )
@@ -1036,6 +1039,16 @@ class _Audit:
         ):
             self.errors.append("launch budget contains a non-positive integer")
         else:
+            self.check(
+                isinstance(learner_token_budget_profile, str)
+                and bool(learner_token_budget_profile),
+                "launch learner token budget profile is invalid",
+            )
+            self.check(
+                _at(launch, "inputs.learner_token_budget_profile")
+                == learner_token_budget_profile,
+                "launch input learner token budget profile differs from budget contract",
+            )
             self.check(
                 actor_train_token_budget == critic_train_token_budget,
                 "launch actor/critic train token budgets differ",
