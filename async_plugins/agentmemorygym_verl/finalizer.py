@@ -509,6 +509,7 @@ def _metric_route_counter(
 def _rolling_episode_shares(
     per_update: Sequence[Mapping[str, int]], route_ids: Sequence[str]
 ) -> dict[str, Any]:
+    single_route = len(route_ids) == 1
     windows: list[dict[str, Any]] = []
     violations: list[dict[str, Any]] = []
     for end in range(8, len(per_update) + 1):
@@ -523,17 +524,25 @@ def _rolling_episode_shares(
             route_id: (counts[route_id] / total if total else 0.0)
             for route_id in route_ids
         }
-        invalid = [
-            route_id
-            for route_id, share in shares.items()
-            if share < 0.20 or share > 0.30
-        ]
+        invalid = (
+            []
+            if single_route
+            else [
+                route_id
+                for route_id, share in shares.items()
+                if share < 0.20 or share > 0.30
+            ]
+        )
         window = {
             "start_update": end - 7,
             "end_update": end,
             "episodes": counts,
             "shares": shares,
-            "status": "pass" if not invalid else "fail",
+            "status": (
+                "not_applicable"
+                if single_route
+                else ("pass" if not invalid else "fail")
+            ),
         }
         windows.append(window)
         if invalid:
@@ -550,9 +559,10 @@ def _rolling_episode_shares(
         "first_applicable_update": 8,
         "status": (
             "not_applicable"
-            if len(per_update) < 8
+            if single_route or len(per_update) < 8
             else ("pass" if not violations else "fail")
         ),
+        "reason": "single_route" if single_route else None,
         "windows": windows,
         "violations": violations,
     }

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import yaml
 from agentmemorygym_verl.config_contract import verify_resolved_config
-from agentmemorygym_verl.finalizer import finalize_run
+from agentmemorygym_verl.finalizer import _rolling_episode_shares, finalize_run
 from finalizer_fixture import (
     MULTITASK_ROUTES,
     build_valid_multitask_run,
@@ -1895,6 +1895,22 @@ class TestMultitaskFinalizer(FinalizerTestCase):
             first = fixture["rollout_dir"] / "1.jsonl"
             first.rename(fixture["rollout_dir"] / "01.jsonl")
             self.assert_failed(fixture["run_dir"], contains="filename")
+
+    def test_rolling_eight_route_share_is_not_applicable_to_single_route(self):
+        route_id = "swesmith"
+        result = _rolling_episode_shares(
+            [{route_id: 64} for _ in range(20)], (route_id,)
+        )
+        self.assertEqual(result["status"], "not_applicable")
+        self.assertEqual(result["reason"], "single_route")
+        self.assertEqual(result["violations"], [])
+        self.assertTrue(result["windows"])
+        self.assertTrue(
+            all(window["status"] == "not_applicable" for window in result["windows"])
+        )
+        self.assertTrue(
+            all(window["shares"] == {route_id: 1.0} for window in result["windows"])
+        )
 
     def test_rolling_eight_route_share_rejects_a_skewed_window(self):
         balanced_skew = [
