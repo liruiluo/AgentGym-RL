@@ -453,11 +453,9 @@ class FormalPromptTests(unittest.TestCase):
         )
         for fragment in (
             "native WebShop bundled-shopping environment",
-            "Native shopping actions remain bare",
-            "<function=shell_command>",
-            "<parameter=command>",
-            "<function=apply_patch>",
-            "mkdir -p .agent_memory",
+            "The first non-whitespace text must be exactly one native browser action",
+            "one canonical shell_command action",
+            "The canonical shell form is exactly",
             "search[keywords]",
             "click[Buy Now]",
             "click[its displayed ASIN]",
@@ -502,6 +500,8 @@ class FormalPromptTests(unittest.TestCase):
             prompt.index("Earlier turn (complete reply):"),
             prompt.index("Later turn (complete reply):"),
         )
+        self.assertNotIn("Qwen XML", prompt)
+        self.assertNotIn("<tool_call>", prompt)
         self.assertNotIn("Paula Deen", prompt)
         self.assertNotIn("Betty Crocker", prompt)
         for forbidden in (

@@ -769,22 +769,23 @@ mkdir -p .agent_memory && printf '%s\n' 'next: search[red mug]' > .agent_memory/
                     "",
                 )
 
-    def test_filesystem_prompt_uses_qwen_xml_for_workspace_only(self) -> None:
+    def test_filesystem_prompt_defaults_to_canonical_bare_workspace_actions(self) -> None:
         client = self.create_client(filesystem_metadata())
         prompt = client.conversation_start[0]["value"]
-        self.assertIn("Native shopping actions remain bare", prompt)
-        self.assertIn("<function=shell_command>", prompt)
-        self.assertIn("<function=apply_patch>", prompt)
-        self.assertIn("mkdir -p .agent_memory", prompt)
-        self.assertIn(".agent_memory/CONTINUATION.md", prompt)
+        self.assertIn("Use shell_command with one JSON object", prompt)
+        self.assertIn('shell_command {"command"', prompt)
+        self.assertIn("apply_patch followed by a multiline", prompt)
+        self.assertNotIn("Qwen XML", prompt)
+        self.assertNotIn("<tool_call>", prompt)
         self.assertIn(
-            "system prompt's Qwen XML shell_command form",
+            "system prompt's canonical bare shell_command JSON form",
             WEBSHOP_SESSION_HANDOFF_REQUEST,
         )
         self.assertIn("mkdir -p .agent_memory", WEBSHOP_SESSION_HANDOFF_REQUEST)
         self.assertIn(
             ".agent_memory/CONTINUATION.md", WEBSHOP_SESSION_HANDOFF_REQUEST
         )
+        self.assertNotIn("Qwen XML", WEBSHOP_SESSION_HANDOFF_REQUEST)
         self.assertLessEqual(
             len(WEBSHOP_SESSION_HANDOFF_REQUEST.encode("utf-8")), 1242
         )

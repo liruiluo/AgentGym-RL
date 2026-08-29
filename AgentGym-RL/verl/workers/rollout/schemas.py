@@ -216,29 +216,28 @@ _AGENTMEMORY_SELECTIVE_MEMORY_SOP = (
 # memory API exists, which is exactly the scaffold this surface is meant to
 # remove.
 _AGENTMEMORY_FILESYSTEM_REPLY_RULE_NO_THINKING = (
-    "Reply with exactly one executable action and nothing else. Native shopping actions "
-    "remain bare search[...] or click[...] actions. A workspace action should use one "
-    "complete Qwen XML tool-call envelope; the accepted legacy bare shell_command JSON "
-    "or apply_patch newline form remains available for compatibility. A bare JSON object, "
-    "markdown code fence, explanation, Thought/Action label, or <think> block is invalid. "
+    "Reply with exactly one executable action and nothing else. The first non-whitespace "
+    "text must be exactly one native browser action, one canonical shell_command action, "
+    "or one multiline apply_patch action. The canonical shell form is the literal prefix "
+    "shell_command, one space, then one JSON object. A bare JSON object, markdown code "
+    "fence, explanation, Thought/Action label, or <think> block is invalid. "
 )
 _AGENTMEMORY_FILESYSTEM_REPLY_RULE_THINKING = (
     "You may first reason inside a single <think>...</think> block. After the closing "
-    "</think>, reply with exactly one executable action and nothing else. Native shopping "
-    "actions remain bare search[...] or click[...] actions. A workspace action should use "
-    "one complete Qwen XML tool-call envelope; the accepted legacy bare shell_command JSON "
-    "or apply_patch newline form remains available for compatibility. A bare JSON object, "
-    "markdown code fence, explanation, or Thought/Action label after </think> is invalid. "
+    "</think>, reply with exactly one executable action and nothing else. The action must "
+    "be one native browser action, one canonical shell_command action, or one multiline "
+    "apply_patch action. The canonical shell form is the literal prefix shell_command, one "
+    "space, then one JSON object. A bare JSON object, markdown code fence, explanation, or "
+    "Thought/Action label after </think> is invalid. "
 )
 _AGENTMEMORY_FILESYSTEM_REPLY_RULE_REASONING = (
     "Reply with exactly two labeled fields. Write `Thought:` followed by brief free-form "
-    "reasoning, then write `Action:` followed by exactly one executable action. Native "
-    "shopping actions remain bare search[...] or click[...] actions. A workspace action "
-    "should use one complete Qwen XML tool-call envelope; the accepted legacy bare "
-    "shell_command JSON or apply_patch newline form remains available for compatibility. "
-    "The environment executes only the complete action after the final `Action:` label, "
-    "while PPO trains the complete sampled Thought-and-Action response. Do not put the "
-    "action in a markdown code fence or emit a bare JSON object. "
+    "reasoning, then write `Action:` followed by exactly one executable action: one native "
+    "browser action, one canonical shell_command action, or one multiline apply_patch "
+    "action. The canonical shell form is the literal prefix shell_command, one space, then "
+    "one JSON object. The environment executes only the complete action after the final "
+    "`Action:` label, while PPO trains the complete sampled Thought-and-Action response. "
+    "Do not put the action in a markdown code fence or emit a bare JSON object. "
 )
 _AGENTMEMORY_NO_WORKSPACE_REPLY_RULE_NO_THINKING = (
     "Reply with exactly one executable native browser action and nothing else. Output "
@@ -266,11 +265,10 @@ _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT = (
     "click[its displayed ASIN], then click[Buy Now] after the exact product page opens. A "
     "correct purchase advances to the next session; an incorrect purchase terminates the "
     "episode. A product page exposes its title, price, rating, sub-pages, options, and the "
-    "Buy Now action. Two workspace tools operate on a private episode workspace. "
-    'The accepted legacy bare shell form is shell_command {"command":"rg -n pattern .",'
-    '"workdir":".","timeout_ms":10000}; when using that form, the literal prefix and '
-    "separating space are required, and a bare JSON object is invalid. It runs one shell "
-    "command; command is "
+    "Buy Now action. Two Codex-style workspace tools operate on a private episode workspace. "
+    'The canonical shell form is exactly shell_command {"command":"rg -n pattern .",'
+    '"workdir":".","timeout_ms":10000}; the literal prefix and separating space are '
+    "required, and a bare JSON object is invalid. It runs one shell command; command is "
     "required and workdir and timeout_ms are optional. "
     "The shell includes ordinary file utilities and pinned rg, has no network, and runs with "
     "bounded time, output, processes, storage, and privileges. apply_patch is followed on the "
@@ -280,13 +278,7 @@ _AGENTMEMORY_FILESYSTEM_ACTION_CONTRACT = (
     "nested files, and is reset between episodes. Workspace actions have zero task reward "
     "and are optional; use them when a later decision needs a fact that is no longer in the "
     "current observation. There is no host-path access and no dedicated memory API. Use one "
-    "browser or workspace action per turn. The preferred Qwen XML workspace form is a "
-    "complete <tool_call> envelope. For shell_command, put the command in "
-    "<function=shell_command><parameter=command>...</parameter> and optionally add workdir "
-    "and timeout_ms parameter blocks. For apply_patch, put the complete patch in "
-    "<function=apply_patch><parameter=patch>...</parameter>. At a required continuation "
-    "checkpoint, use shell_command with `mkdir -p .agent_memory` before overwriting "
-    "`.agent_memory/CONTINUATION.md`. Never wrap search[...] or click[...] in XML."
+    "browser or workspace action per turn."
 )
 _AGENTMEMORY_FILESYSTEM_MEMORY_GUIDANCE = (
     " The workspace starts empty and contains only files that you create; it is not a "
