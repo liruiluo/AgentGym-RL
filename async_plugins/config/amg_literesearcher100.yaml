@@ -31,7 +31,8 @@ r38:
   learner_hybrid_gpus: 6
   standalone_rollout_gpus: 2
   rollout_n: 1
-  critic_train_token_budget: 65536
+  actor_train_token_budget: 131072
+  critic_train_token_budget: 131072
   critic_infer_token_budget: 32768
   trigger_parameter_sync_step: 1
   actor_use_fused_kernels: false

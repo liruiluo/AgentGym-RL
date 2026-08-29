@@ -92,6 +92,8 @@ def verify_resolved_config(
     *,
     mode: str,
     expected_budget: Mapping[str, Any],
+    expected_actor_train_token_budget: int = 65_536,
+    expected_critic_train_token_budget: int = 65_536,
 ) -> dict[str, Any]:
     """Validate the resolved Hydra config against a publication-derived budget."""
 
@@ -125,6 +127,19 @@ def verify_resolved_config(
             "expected_budget is missing: " + ", ".join(missing_budget_fields)
         )
     expected = dict(expected_budget)
+    actor_train_token_budget = _positive_int(
+        expected_actor_train_token_budget,
+        field="expected actor train token budget",
+    )
+    critic_train_token_budget = _positive_int(
+        expected_critic_train_token_budget,
+        field="expected critic train token budget",
+    )
+    if actor_train_token_budget != critic_train_token_budget:
+        raise ValueError(
+            "expected actor and critic train token budgets must match for the "
+            "reviewed learner packed-token tuning axis"
+        )
 
     if (
         _at(config, "algorithm.adv_estimator") != "amg_action_axis_gae"
@@ -399,6 +414,7 @@ def verify_resolved_config(
         "actor_rollout_ref.actor.shuffle": False,
         "actor_rollout_ref.actor.use_dynamic_bsz": True,
         "actor_rollout_ref.actor.loss_agg_mode": "token-mean",
+        "actor_rollout_ref.actor.ppo_max_token_len_per_gpu": actor_train_token_budget,
         "actor_rollout_ref.actor.use_prefix_grouper": False,
         "actor_rollout_ref.actor.strategy": "fsdp2",
         "actor_rollout_ref.actor.fsdp_config.strategy": "fsdp2",
@@ -412,7 +428,7 @@ def verify_resolved_config(
         "critic.shuffle": False,
         "critic.use_dynamic_bsz": True,
         "critic.loss_agg_mode": "token-mean",
-        "critic.ppo_max_token_len_per_gpu": 65536,
+        "critic.ppo_max_token_len_per_gpu": critic_train_token_budget,
         "critic.ppo_infer_max_token_len_per_gpu": 32768,
         "critic.strategy": "fsdp2",
         "algorithm.gamma": 1.0,
@@ -575,7 +591,8 @@ def verify_resolved_config(
         "standalone_rollout_gpus": standalone_rollout_gpus,
         "dynamic_hybrid_enabled": True,
         "gradient_checkpointing": {"actor": True, "critic": True},
-        "critic_train_token_budget": 65536,
+        "actor_train_token_budget": actor_train_token_budget,
+        "critic_train_token_budget": critic_train_token_budget,
         "critic_infer_token_budget": 32768,
         "rollout_backend": "sglang",
         "fsdp2_reshard_after_forward": {"actor": True, "critic": True},

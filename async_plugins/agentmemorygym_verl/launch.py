@@ -92,6 +92,8 @@ class LaunchInputs:
     standalone_rollout_gpus: int = 2
     actor_use_fused_kernels: bool = False
     critic_use_fused_kernels: bool = False
+    actor_train_token_budget: int = 65_536
+    critic_train_token_budget: int = 65_536
     route_registry: Path | None = None
     route_registry_sha256: str | None = None
     multitask_source_lock: Path | None = None
@@ -187,6 +189,17 @@ def build_overrides(
             "publication budget does not match the reviewed checkpoint retention"
         )
     ppo_mini_batch_size = resolve_ppo_mini_batch_size(inputs.trainer_gpus)
+    actor_train_token_budget = _require_positive_int(
+        inputs.actor_train_token_budget, field="actor train token budget"
+    )
+    critic_train_token_budget = _require_positive_int(
+        inputs.critic_train_token_budget, field="critic train token budget"
+    )
+    if actor_train_token_budget != critic_train_token_budget:
+        raise ValueError(
+            "actor and critic train token budgets must match for the reviewed "
+            "learner packed-token tuning axis"
+        )
     require_batches = samples_per_update / ppo_mini_batch_size
     if (
         require_batches <= 0
@@ -294,10 +307,9 @@ def build_overrides(
         "actor_rollout_ref.actor.ppo_epochs=1",
         "actor_rollout_ref.actor.shuffle=False",
         "actor_rollout_ref.actor.use_dynamic_bsz=True",
-        # Six-way FSDP leaves less activation headroom than the historical
-        # eight-way synchronous trainer. Keep microbatch=8 but bound packed
-        # training tokens; formal tuning may raise these after measured headroom.
-        "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=65536",
+        # Dynamic batching owns the physical micro-batch shape. The reviewed
+        # orchestrator config supplies one matched actor/critic packing budget.
+        f"actor_rollout_ref.actor.ppo_max_token_len_per_gpu={actor_train_token_budget}",
         "actor_rollout_ref.actor.use_rollout_log_probs=True",
         "actor_rollout_ref.actor.optim.lr=1e-6",
         "actor_rollout_ref.actor.optim.weight_decay=0.01",
@@ -330,10 +342,9 @@ def build_overrides(
         "critic.shuffle=False",
         "critic.use_dynamic_bsz=True",
         "critic.loss_agg_mode=token-mean",
-        # Preserve r38's verified 65,536-token critic training budget. Latest
-        # veRL splits critic inference packing into its own knob, which remains
-        # at the upstream 32,768-token default; do not conflate the two.
-        "critic.ppo_max_token_len_per_gpu=65536",
+        # Keep training packing paired with the actor while leaving critic
+        # inference at the separately reviewed 32,768-token budget.
+        f"critic.ppo_max_token_len_per_gpu={critic_train_token_budget}",
         "+critic.ppo_infer_max_token_len_per_gpu=32768",
         "critic.forward_max_token_len_per_gpu=262144",
         "critic.optim.lr=1e-5",
@@ -2383,6 +2394,8 @@ def prepare_launch(
         resolved_config,
         mode=inputs.mode,
         expected_budget=budget_contract,
+        expected_actor_train_token_budget=inputs.actor_train_token_budget,
+        expected_critic_train_token_budget=inputs.critic_train_token_budget,
     )
 
     train_files = resolved_config["data"]["train_files"]
@@ -2432,6 +2445,8 @@ def prepare_launch(
             "standalone_rollout_gpus": inputs.standalone_rollout_gpus,
             "actor_use_fused_kernels": inputs.actor_use_fused_kernels,
             "critic_use_fused_kernels": inputs.critic_use_fused_kernels,
+            "actor_train_token_budget": inputs.actor_train_token_budget,
+            "critic_train_token_budget": inputs.critic_train_token_budget,
             "resume_mode": inputs.resume_mode,
             "resume_from_path": (
                 str(inputs.resume_from_path)
@@ -2520,6 +2535,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--standalone-rollout-gpus", type=int, default=2)
     parser.add_argument("--actor-use-fused-kernels", action="store_true")
     parser.add_argument("--critic-use-fused-kernels", action="store_true")
+    parser.add_argument("--actor-train-token-budget", type=int, default=65_536)
+    parser.add_argument("--critic-train-token-budget", type=int, default=65_536)
     parser.add_argument("--resolve-only", action="store_true")
     parser.add_argument(
         "--skip-runtime-preflight",
@@ -2575,6 +2592,8 @@ def main(argv: list[str] | None = None) -> int:
         standalone_rollout_gpus=args.standalone_rollout_gpus,
         actor_use_fused_kernels=args.actor_use_fused_kernels,
         critic_use_fused_kernels=args.critic_use_fused_kernels,
+        actor_train_token_budget=args.actor_train_token_budget,
+        critic_train_token_budget=args.critic_train_token_budget,
         route_registry=_resolve_cli_regular_file(
             args.route_registry, label="route registry"
         ),

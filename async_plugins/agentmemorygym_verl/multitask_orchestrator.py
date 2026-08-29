@@ -126,6 +126,7 @@ class OrchestratorConfig:
     trainer_gpus: int
     standalone_rollout_gpus: int
     rollout_n: int
+    actor_train_token_budget: int
     critic_train_token_budget: int
     critic_infer_token_budget: int
     trigger_parameter_sync_step: int
@@ -254,6 +255,7 @@ class LaunchPlan:
                 trainer_gpus=6,
                 standalone_rollout_gpus=2,
                 rollout_n=1,
+                actor_train_token_budget=65_536,
                 critic_train_token_budget=65_536,
                 critic_infer_token_budget=32_768,
                 trigger_parameter_sync_step=1,
@@ -451,6 +453,9 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
 
     expected_fresh_model = not is_continuation
     expected_resume_mode = "resume_path" if is_continuation else "disable"
+    expected_train_token_budget = (
+        131_072 if route_order == ("literesearcher",) else 65_536
+    )
 
     exact = {
         "implementation base commit": (
@@ -478,9 +483,13 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
         "learner/hybrid GPUs": (r38.get("learner_hybrid_gpus"), 6),
         "standalone rollout GPUs": (r38.get("standalone_rollout_gpus"), 2),
         "rollout.n": (r38.get("rollout_n"), 1),
+        "actor train token budget": (
+            r38.get("actor_train_token_budget"),
+            expected_train_token_budget,
+        ),
         "critic train token budget": (
             r38.get("critic_train_token_budget"),
-            65_536,
+            expected_train_token_budget,
         ),
         "critic inference token budget": (
             r38.get("critic_infer_token_budget"),
@@ -606,6 +615,7 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
         trainer_gpus=int(r38["learner_hybrid_gpus"]),
         standalone_rollout_gpus=int(r38["standalone_rollout_gpus"]),
         rollout_n=int(r38["rollout_n"]),
+        actor_train_token_budget=int(r38["actor_train_token_budget"]),
         critic_train_token_budget=int(r38["critic_train_token_budget"]),
         critic_infer_token_budget=int(r38["critic_infer_token_budget"]),
         trigger_parameter_sync_step=int(r38["trigger_parameter_sync_step"]),
@@ -2012,6 +2022,10 @@ def build_generic_launch_command(
         str(plan.config.trainer_gpus),
         "--standalone-rollout-gpus",
         str(plan.config.standalone_rollout_gpus),
+        "--actor-train-token-budget",
+        str(plan.config.actor_train_token_budget),
+        "--critic-train-token-budget",
+        str(plan.config.critic_train_token_budget),
     ]
     if plan.config.actor_use_fused_kernels:
         command.append("--actor-use-fused-kernels")

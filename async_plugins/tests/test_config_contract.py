@@ -82,6 +82,7 @@ def _config(*, mode: str = "formal") -> dict:
             "actor": {
                 "ppo_mini_batch_size": ppo_mini_batch_size,
                 "ppo_micro_batch_size_per_gpu": 8,
+                "ppo_max_token_len_per_gpu": 65536,
                 "ppo_epochs": 1,
                 "shuffle": False,
                 "use_dynamic_bsz": True,
@@ -255,6 +256,7 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         self.assertEqual(report["samples_per_update"], 64)
         self.assertEqual(report["trainer_gpus"], 6)
         self.assertEqual(report["standalone_rollout_gpus"], 2)
+        self.assertEqual(report["actor_train_token_budget"], 65536)
         self.assertEqual(report["critic_train_token_budget"], 65536)
         self.assertEqual(report["critic_infer_token_budget"], 32768)
         self.assertEqual(
@@ -273,6 +275,28 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         config["critic"]["ppo_mini_batch_size"] = 512
         config["async_training"]["require_batches"] = 64 / 512
         with self.assertRaisesRegex(ValueError, r"formal.*6\+2"):
+            _verify(config, mode="formal")
+
+    def test_accepts_explicit_paired_learner_training_budget(self):
+        config = _config(mode="formal")
+        config["actor_rollout_ref"]["actor"]["ppo_max_token_len_per_gpu"] = 131_072
+        config["critic"]["ppo_max_token_len_per_gpu"] = 131_072
+        report = verify_resolved_config(
+            config,
+            mode="formal",
+            expected_budget=_budget("formal"),
+            expected_actor_train_token_budget=131_072,
+            expected_critic_train_token_budget=131_072,
+        )
+        self.assertEqual(report["actor_train_token_budget"], 131_072)
+        self.assertEqual(report["critic_train_token_budget"], 131_072)
+
+    def test_rejects_actor_training_budget_drift(self):
+        config = _config(mode="formal")
+        config["actor_rollout_ref"]["actor"]["ppo_max_token_len_per_gpu"] = 32_768
+        with self.assertRaisesRegex(
+            ValueError, "actor_rollout_ref.actor.ppo_max_token_len_per_gpu"
+        ):
             _verify(config, mode="formal")
 
     def test_rejects_critic_training_budget_drift(self):

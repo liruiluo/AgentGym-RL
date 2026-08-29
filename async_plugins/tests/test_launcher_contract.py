@@ -214,6 +214,29 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                 json.loads(values["data.agentgym.expected_role"]), "train_pool"
             )
 
+    def test_literesearcher_learner_token_budget_is_threaded_to_hydra(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inputs, identity = self._identity(Path(directory), "formal")
+            inputs = replace(
+                inputs,
+                actor_train_token_budget=131_072,
+                critic_train_token_budget=131_072,
+            )
+            values = self._values(
+                build_overrides(
+                    inputs,
+                    effective_schedule=inputs.schedule,
+                    endpoint_client_config=identity["client_config"],
+                    budget_contract=identity["budget_contract"],
+                    training_runtime=identity["training_runtime"],
+                )
+            )
+            self.assertEqual(
+                values["actor_rollout_ref.actor.ppo_max_token_len_per_gpu"],
+                "131072",
+            )
+            self.assertEqual(values["critic.ppo_max_token_len_per_gpu"], "131072")
+
     def test_continuation_overrides_select_exact_resume_checkpoint(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
