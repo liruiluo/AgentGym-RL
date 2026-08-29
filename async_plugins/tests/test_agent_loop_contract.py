@@ -299,6 +299,27 @@ class _HorizonClient(_MemoryChainClient):
         )
 
 
+class _PromptCapacityClient(_HorizonClient):
+    def __init__(self):
+        super().__init__()
+        self.finalize_calls = 0
+
+    def step(self, action):
+        self.actions.append(action)
+        return StepOutput(
+            state="oversized observation " * 100,
+            reward=0.25,
+            done=False,
+            info=build_task_neutral_transition_info(
+                wrapper_evidence={"outcome": "continue"}
+            ),
+        )
+
+    def finalize_policy_horizon(self):
+        self.finalize_calls += 1
+        return super().finalize_policy_horizon()
+
+
 class _PressureHorizonClient(_HorizonClient):
     def __init__(self):
         super().__init__()
@@ -803,6 +824,40 @@ class TestAMGAgentLoop(IsolatedAsyncioTestCase):
             record["horizon_finalization"]["wrapper_evidence"]["source"], "horizon"
         )
         self.assertTrue(record["horizon_finalization"]["env_info"]["resolved"])
+
+    async def test_prompt_capacity_finalization_reuses_the_last_sampled_row(self):
+        client = _PromptCapacityClient()
+        loop = self._loop(["WRITE candidate.py"], max_turns=3)
+
+        with mock.patch.object(
+            agent_loop_module, "create_env_client", return_value=client
+        ):
+            outputs = await loop.run(
+                {"max_tokens": 8},
+                item_id="prompt-capacity-task",
+                data_idx=2,
+                uid="trajectory-prompt-capacity",
+                raw_prompt=[{"role": "system", "content": "system"}],
+            )
+
+        self.assertEqual(client.actions, ["WRITE candidate.py"])
+        self.assertEqual(client.finalize_calls, 1)
+        self.assertEqual(len(loop.server_manager.calls), 1)
+        self.assertEqual(len(outputs), 1)
+        output = outputs[0]
+        record = json.loads(output.extra_fields["step_record_json"])
+        self.assertAlmostEqual(output.reward_score, 1.0)
+        self.assertAlmostEqual(record["immediate_reward"], 1.0)
+        self.assertTrue(record["rollout_done_flag"])
+        self.assertEqual(record["outcome"], "success")
+        self.assertEqual(
+            record["horizon_finalization"]["trigger"],
+            "prompt_capacity_exhausted",
+        )
+        self.assertGreater(
+            record["horizon_finalization"]["prompt_token_count"],
+            loop.rollout_config.prompt_length,
+        )
 
     async def test_excluded_attempt_is_closed_and_resampled_as_a_whole_trajectory(self):
         excluded = _ExcludedClient(exclude_on_action=2)

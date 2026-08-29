@@ -155,6 +155,64 @@ def _outcome(
     return "success" if reward > 0 else "terminal_failure"
 
 
+def _apply_terminal_finalization_to_latest_row(
+    rows: list[dict[str, Any]],
+    outputs: list[AgentLoopOutput],
+    terminal_output: Any,
+    *,
+    trigger: str,
+    prompt_token_count: int | None = None,
+) -> None:
+    """Attach one wrapper-owned terminal transition to the latest sampled row."""
+
+    if not rows or not outputs:
+        raise RuntimeError(
+            "task-neutral terminal finalization has no sampled policy row"
+        )
+    if not bool(getattr(terminal_output, "done", False)):
+        raise RuntimeError(
+            "task-neutral terminal finalization must terminate the episode"
+        )
+    terminal_reward = float(terminal_output.reward)
+    terminal_env_info, terminal_action_submission, terminal_receipt = (
+        _receipt_parts(terminal_output, "")
+    )
+    terminal_context_transition = terminal_receipt["context_transition"]
+    terminal_wrapper_evidence = terminal_receipt["wrapper_evidence"]
+    rows[-1]["immediate_reward"] += terminal_reward
+    rows[-1]["rollout_done_flag"] = True
+    rows[-1]["outcome"] = _outcome(
+        done=True,
+        reward=float(rows[-1]["immediate_reward"]),
+        env_info=terminal_env_info,
+        wrapper_evidence=terminal_wrapper_evidence,
+    )
+    terminal_finalization = {
+        "trigger": trigger,
+        "state": terminal_output.state,
+        "reward": terminal_reward,
+        "done": True,
+        "info": terminal_output.info,
+        "env_info": terminal_env_info,
+        "action_submission": terminal_action_submission,
+        "context_transition": terminal_context_transition,
+        "wrapper_evidence": terminal_wrapper_evidence,
+    }
+    if prompt_token_count is not None:
+        terminal_finalization["prompt_token_count"] = int(prompt_token_count)
+    terminal_finalization = _json_safe(terminal_finalization)
+    rows[-1]["horizon_finalization"] = terminal_finalization
+    outputs[-1].reward_score = float(rows[-1]["immediate_reward"])
+    outputs[-1].extra_fields.update(
+        {
+            "immediate_reward": float(rows[-1]["immediate_reward"]),
+            "rollout_done_flag": True,
+            "outcome": rows[-1]["outcome"],
+            "horizon_finalization": terminal_finalization,
+        }
+    )
+
+
 class AMGTaskNeutralAgentLoop(AgentLoopBase):
     """Emit one upstream ``AgentLoopOutput`` per ordinary AMG policy action.
 
@@ -384,13 +442,6 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
             current_prompt_ids = self._render_prompt_sync(current_messages)
 
             for row_order in range(route.max_rounds):
-                if len(current_prompt_ids) > max_prompt_tokens:
-                    raise RuntimeError(
-                        "AMG prompt exceeded PPO width before a trainable compaction action: "
-                        f"item_id={item_id!r} data_idx={data_idx} row_order={row_order} "
-                        f"tokens={len(current_prompt_ids)} width={max_prompt_tokens}"
-                    )
-
                 prepared = prepare_policy_turn(
                     client,
                     current_messages,
@@ -405,6 +456,23 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                         current_messages, current_prompt_ids
                     ),
                 )
+                pre_sampling_terminal = getattr(
+                    prepared, "pre_sampling_terminal", None
+                )
+                if pre_sampling_terminal is not None:
+                    if getattr(client, "sample_excluded", False):
+                        raise _SampleExcluded(
+                            _sample_exclusion_summary(pre_sampling_terminal)
+                        )
+                    _apply_terminal_finalization_to_latest_row(
+                        rows,
+                        outputs,
+                        pre_sampling_terminal,
+                        trigger="prompt_capacity_exhausted",
+                        prompt_token_count=prepared.prompt_token_count,
+                    )
+                    break
+
                 prepared_messages = [dict(message) for message in prepared.messages]
                 prompt_ids = self._prompt_for_candidate(
                     current_messages, current_prompt_ids, prepared_messages
@@ -587,45 +655,11 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                         raise _SampleExcluded(
                             _sample_exclusion_summary(horizon_output)
                         )
-                    if not bool(horizon_output.done):
-                        raise RuntimeError(
-                            "AMG horizon finalization must terminate the episode"
-                        )
-                    horizon_reward = float(horizon_output.reward)
-                    horizon_env_info, horizon_action_submission, horizon_receipt = (
-                        _receipt_parts(horizon_output, "")
-                    )
-                    horizon_context_transition = horizon_receipt["context_transition"]
-                    horizon_wrapper_evidence = horizon_receipt["wrapper_evidence"]
-                    rows[-1]["immediate_reward"] += horizon_reward
-                    rows[-1]["rollout_done_flag"] = True
-                    rows[-1]["outcome"] = _outcome(
-                        done=True,
-                        reward=float(rows[-1]["immediate_reward"]),
-                        env_info=horizon_env_info,
-                        wrapper_evidence=horizon_wrapper_evidence,
-                    )
-                    horizon_finalization = _json_safe(
-                        {
-                            "state": horizon_output.state,
-                            "reward": horizon_reward,
-                            "done": True,
-                            "info": horizon_output.info,
-                            "env_info": horizon_env_info,
-                            "action_submission": horizon_action_submission,
-                            "context_transition": horizon_context_transition,
-                            "wrapper_evidence": horizon_wrapper_evidence,
-                        }
-                    )
-                    rows[-1]["horizon_finalization"] = horizon_finalization
-                    outputs[-1].reward_score = float(rows[-1]["immediate_reward"])
-                    outputs[-1].extra_fields.update(
-                        {
-                            "immediate_reward": float(rows[-1]["immediate_reward"]),
-                            "rollout_done_flag": True,
-                            "outcome": rows[-1]["outcome"],
-                            "horizon_finalization": horizon_finalization,
-                        }
+                    _apply_terminal_finalization_to_latest_row(
+                        rows,
+                        outputs,
+                        horizon_output,
+                        trigger="max_policy_turns",
                     )
                 else:
                     rows[-1]["outcome"] = "max_rounds"
