@@ -33,7 +33,7 @@ _MULTITASK_SOURCE_LOCK_SCHEMA = "amg_multitask_launcher_source_lock_v1"
 _MULTITASK_SCHEDULE_CERTIFICATE_SCHEMA = "amg_multitask_schedule_certificate_v1"
 _FINAL_STATISTICS_SCHEMA = "verl_fully_async_final_statistics_v1"
 _FINAL_STATISTICS_MARKER = "[FullyAsyncTaskRunner][FinalStatistics] "
-_FINAL_STATISTICS_VERL_COMMIT = "f3ac28fe54c945e092b9630030f44d236a106a11"
+_FINAL_STATISTICS_VERL_COMMIT = "bd9c6edbda4a768f2fd7dcabd7b43f25bf348f6a"
 _FINAL_STATISTICS_FIELDS = frozenset(
     {"schema", "queue", "rollouter", "trainer", "queue_cleanup"}
 )

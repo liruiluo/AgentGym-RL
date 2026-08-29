@@ -468,14 +468,8 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
     expected_mode = "gate" if is_gate else "formal"
     expected_fresh_model = not is_continuation
     expected_resume_mode = "resume_path" if is_continuation else "disable"
-    expected_train_token_budget = (
-        131_072 if route_order == ("literesearcher",) else 65_536
-    )
-    expected_learner_token_budget_profile = (
-        "literesearcher-131072-v1"
-        if route_order == ("literesearcher",)
-        else "default-65536-v1"
-    )
+    expected_train_token_budget = 65_536
+    expected_learner_token_budget_profile = "default-65536-v1"
 
     exact = {
         "implementation base commit": (

@@ -19,7 +19,7 @@ from typing import Any
 # current-cycle metrics, current PPO critic initialization, and instance-scoped
 # fused forward selection are reviewed and committed. It is intentionally not
 # caller-selectable.
-EXPECTED_VERL_COMMIT = "f3ac28fe54c945e092b9630030f44d236a106a11"
+EXPECTED_VERL_COMMIT = "bd9c6edbda4a768f2fd7dcabd7b43f25bf348f6a"
 
 # Files needed to load the exact Qwen3.5-4B text model and tokenizer.  The model
 # root itself comes from the publication's training_runtime section, so a newer
