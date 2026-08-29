@@ -702,10 +702,10 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
         self.assertEqual(config.total_episodes, 6_400)
         self.assertEqual((config.trainer_gpus, config.standalone_rollout_gpus), (6, 2))
         self.assertEqual(
-            config.learner_token_budget_profile, "default-65536-v1"
+            config.learner_token_budget_profile, "literesearcher-131072-v1"
         )
-        self.assertEqual(config.actor_train_token_budget, 65_536)
-        self.assertEqual(config.critic_train_token_budget, 65_536)
+        self.assertEqual(config.actor_train_token_budget, 131_072)
+        self.assertEqual(config.critic_train_token_budget, 131_072)
         self.assertEqual(config.trigger_parameter_sync_step, 1)
         self.assertEqual(config.resume_mode, "disable")
         self.assertIsNone(config.resume_from_path)
@@ -720,10 +720,10 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
         self.assertEqual(config.total_episodes, 64)
         self.assertEqual((config.trainer_gpus, config.standalone_rollout_gpus), (6, 2))
         self.assertEqual(
-            config.learner_token_budget_profile, "default-65536-v1"
+            config.learner_token_budget_profile, "literesearcher-131072-v1"
         )
-        self.assertEqual(config.actor_train_token_budget, 65_536)
-        self.assertEqual(config.critic_train_token_budget, 65_536)
+        self.assertEqual(config.actor_train_token_budget, 131_072)
+        self.assertEqual(config.critic_train_token_budget, 131_072)
         self.assertEqual(config.resume_mode, "disable")
 
     def test_formal_schema_rejects_gate_mode(self) -> None:
@@ -2185,8 +2185,8 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
             orchestrator_preflight=Path("/run/orchestrator-preflight.json"),
         )
         self.assertEqual(command[command.index("--mode") + 1], "gate")
-        self.assertIn("--actor-train-token-budget 65536", " ".join(command))
-        self.assertIn("--critic-train-token-budget 65536", " ".join(command))
+        self.assertIn("--actor-train-token-budget 131072", " ".join(command))
+        self.assertIn("--critic-train-token-budget 131072", " ".join(command))
 
     def test_one_click_shell_uses_locked_runtime_and_thin_orchestrator(self) -> None:
         script = ROOT / "async_plugins/scripts/launch_amg_multitask_fully_async.sh"
