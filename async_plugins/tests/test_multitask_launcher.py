@@ -48,6 +48,7 @@ from agentmemorygym_verl.routes import (
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "async_plugins/config/amg_multitask400.yaml"
 LR100_CONFIG = ROOT / "async_plugins/config/amg_literesearcher100.yaml"
+LR_GATE_CONFIG = ROOT / "async_plugins/config/amg_literesearcher_gate1.yaml"
 
 
 def _sha256(path: Path) -> str:
@@ -708,6 +709,140 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
         self.assertEqual(config.trigger_parameter_sync_step, 1)
         self.assertEqual(config.resume_mode, "disable")
         self.assertIsNone(config.resume_from_path)
+
+    def test_reviewed_route_set_gate_supports_literesearcher_one_update(self) -> None:
+        config = load_orchestrator_config(LR_GATE_CONFIG)
+
+        self.assertEqual(config.mode, "gate")
+        self.assertEqual(config.route_order, ("literesearcher",))
+        self.assertEqual(config.optimizer_updates, 1)
+        self.assertEqual(config.samples_per_update, 64)
+        self.assertEqual(config.total_episodes, 64)
+        self.assertEqual((config.trainer_gpus, config.standalone_rollout_gpus), (6, 2))
+        self.assertEqual(
+            config.learner_token_budget_profile, "literesearcher-131072-v1"
+        )
+        self.assertEqual(config.actor_train_token_budget, 131_072)
+        self.assertEqual(config.critic_train_token_budget, 131_072)
+        self.assertEqual(config.resume_mode, "disable")
+
+    def test_formal_schema_rejects_gate_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "formal-with-gate-mode.yaml"
+            source = LR100_CONFIG.read_text(encoding="utf-8").replace(
+                "  mode: formal", "  mode: gate", 1
+            )
+            path.write_text(source, encoding="utf-8")
+
+            with self.assertRaisesRegex(OrchestratorError, "mode drifted"):
+                load_orchestrator_config(path)
+
+    def test_gate_schema_rejects_non_literesearcher_route(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "gate-webshop.yaml"
+            source = LR_GATE_CONFIG.read_text(encoding="utf-8").replace(
+                "    - literesearcher", "    - webshop", 1
+            )
+            path.write_text(source, encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                OrchestratorError, "restricted to the LiteResearcher route"
+            ):
+                load_orchestrator_config(path)
+
+    def test_gate_schema_rejects_non_one_update_budget(self) -> None:
+        mutations = (
+            ("  optimizer_updates: 1", "  optimizer_updates: 2", "optimizer updates"),
+            ("  total_episodes: 64", "  total_episodes: 128", "total episodes"),
+        )
+        for old, new, expected_error in mutations:
+            with self.subTest(field=expected_error), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "gate-budget-drift.yaml"
+                source = LR_GATE_CONFIG.read_text(encoding="utf-8").replace(
+                    old, new, 1
+                )
+                path.write_text(source, encoding="utf-8")
+
+                with self.assertRaisesRegex(OrchestratorError, expected_error):
+                    load_orchestrator_config(path)
+
+    def test_gate_schema_rejects_continuation_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "gate-continuation.yaml"
+            source = LR_GATE_CONFIG.read_text(encoding="utf-8").replace(
+                "  resume_mode: disable",
+                "  resume_mode: disable\n  resume_from_path: /tmp/forbidden-gate-checkpoint",
+                1,
+            )
+            path.write_text(source, encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                OrchestratorError, "fresh config must not carry continuation fields"
+            ):
+                load_orchestrator_config(path)
+
+    def test_gate_build_plan_requires_gate_only_schedule_role(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outer = root / "outer"
+            verl = root / "verl"
+            outer.mkdir()
+            verl.mkdir()
+            immutable = {}
+            for name in (
+                "route_registry",
+                "schedule",
+                "multitask_source_lock",
+                "multitask_schedule_certificate",
+                "endpoint_registry",
+            ):
+                path = root / f"{name}.json"
+                path.write_text("{}\n", encoding="utf-8")
+                immutable[name] = path
+            args = argparse.Namespace(
+                config=LR_GATE_CONFIG,
+                outer_root=outer,
+                verl_root=verl,
+                schedule=immutable["schedule"],
+                route_registry=immutable["route_registry"],
+                route_registry_sha256="1" * 64,
+                multitask_source_lock=immutable["multitask_source_lock"],
+                multitask_schedule_certificate=immutable[
+                    "multitask_schedule_certificate"
+                ],
+                endpoint_registry=immutable["endpoint_registry"],
+                endpoint_registry_sha256="2" * 64,
+                holder_lease=None,
+                holder_lease_sha256=None,
+                run_dir=root / "run",
+                experiment_name="literesearcher-gate-role-test",
+                resolve_only=True,
+            )
+            registry = mock.Mock(
+                sha256="1" * 64, route_ids=("literesearcher",)
+            )
+
+            def reject_after_role_check(
+                _schedule: Path, **kwargs: object
+            ) -> dict[str, object]:
+                self.assertEqual(kwargs["expected_count"], 64)
+                self.assertEqual(kwargs["expected_role"], "gate_only")
+                self.assertEqual(kwargs["expected_route_ids"], ("literesearcher",))
+                raise OrchestratorError("gate-role-sentinel")
+
+            with (
+                mock.patch(
+                    "agentmemorygym_verl.multitask_orchestrator.load_route_registry",
+                    return_value=registry,
+                ),
+                mock.patch(
+                    "agentmemorygym_verl.multitask_orchestrator.inspect_schedule",
+                    side_effect=reject_after_role_check,
+                ) as inspect,
+                self.assertRaisesRegex(OrchestratorError, "gate-role-sentinel"),
+            ):
+                build_launch_plan(args)
+            inspect.assert_called_once()
 
     def test_reviewed_route_set_continuation_binds_exact_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2040,6 +2175,18 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
         self.assertNotIn("--actor-use-fused-kernels", command)
         self.assertNotIn("--critic-use-fused-kernels", command)
         self.assertNotIn("--env-addr", command)
+
+    def test_generic_command_propagates_gate_mode(self) -> None:
+        config = load_orchestrator_config(LR_GATE_CONFIG)
+        plan = LaunchPlan.for_test(resolve_only=False, config=config)
+        command = build_generic_launch_command(
+            plan,
+            resolve_only=False,
+            orchestrator_preflight=Path("/run/orchestrator-preflight.json"),
+        )
+        self.assertEqual(command[command.index("--mode") + 1], "gate")
+        self.assertIn("--actor-train-token-budget 131072", " ".join(command))
+        self.assertIn("--critic-train-token-budget 131072", " ".join(command))
 
     def test_one_click_shell_uses_locked_runtime_and_thin_orchestrator(self) -> None:
         script = ROOT / "async_plugins/scripts/launch_amg_multitask_fully_async.sh"

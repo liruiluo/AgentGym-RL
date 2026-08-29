@@ -48,6 +48,7 @@ EXPECTED_ROUTE_IDS = (
 )
 _CONFIG_SCHEMA = "amg_multitask400_orchestrator_config_v1"
 _ROUTE_SET_CONFIG_SCHEMA = "amg_route_set_formal100_orchestrator_config_v1"
+_ROUTE_SET_GATE_CONFIG_SCHEMA = "amg_route_set_gate1_orchestrator_config_v1"
 _ROUTE_SET_CONTINUATION_CONFIG_SCHEMA = (
     "amg_route_set_formal100_continuation_orchestrator_config_v1"
 )
@@ -136,6 +137,7 @@ class OrchestratorConfig:
     require_exact_per_update_route_split: bool
     sampling_order: str
     holder_lock_path: Path
+    mode: str = "formal"
     fresh_model: bool = True
     resume_mode: str = "disable"
     resume_from_path: Path | None = None
@@ -420,12 +422,22 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
         budget.get("total_episodes"), field="total episodes"
     )
 
+    is_gate = schema == _ROUTE_SET_GATE_CONFIG_SCHEMA
     is_continuation = schema == _ROUTE_SET_CONTINUATION_CONFIG_SCHEMA
     if schema == _CONFIG_SCHEMA:
         schema_exact = {
             "optimizer updates": (optimizer_updates, 400),
             "total episodes": (total_episodes, 25_600),
             "route order": (route_order, EXPECTED_ROUTE_IDS),
+        }
+    elif is_gate:
+        if route_order != ("literesearcher",):
+            raise OrchestratorError(
+                "gate1 config is restricted to the LiteResearcher route"
+            )
+        schema_exact = {
+            "optimizer updates": (optimizer_updates, 1),
+            "total episodes": (total_episodes, 64),
         }
     elif schema in {
         _ROUTE_SET_CONFIG_SCHEMA,
@@ -450,9 +462,10 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
         raise OrchestratorError(
             "reviewed orchestrator schema drifted: "
             f"{schema!r} not in "
-            f"{(_CONFIG_SCHEMA, _ROUTE_SET_CONFIG_SCHEMA, _ROUTE_SET_CONTINUATION_CONFIG_SCHEMA)!r}"
+            f"{(_CONFIG_SCHEMA, _ROUTE_SET_GATE_CONFIG_SCHEMA, _ROUTE_SET_CONFIG_SCHEMA, _ROUTE_SET_CONTINUATION_CONFIG_SCHEMA)!r}"
         )
 
+    expected_mode = "gate" if is_gate else "formal"
     expected_fresh_model = not is_continuation
     expected_resume_mode = "resume_path" if is_continuation else "disable"
     expected_train_token_budget = (
@@ -470,7 +483,7 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
             _IMPLEMENTATION_BASE_COMMIT,
         ),
         "veRL commit": (source.get("verl_commit"), EXPECTED_VERL_COMMIT),
-        "mode": (experiment.get("mode"), "formal"),
+        "mode": (experiment.get("mode"), expected_mode),
         "model family": (experiment.get("model_family"), "Qwen3.5-4B"),
         "fresh model": (experiment.get("fresh_model"), expected_fresh_model),
         "resume mode": (experiment.get("resume_mode"), expected_resume_mode),
@@ -640,6 +653,7 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
         holder_lock_path=_absolute_path(
             holders.get("lock_path"), field="config holder lock_path"
         ),
+        mode=expected_mode,
         fresh_model=expected_fresh_model,
         resume_mode=expected_resume_mode,
         resume_from_path=resume_from_path,
@@ -2013,7 +2027,7 @@ def build_generic_launch_command(
     command = [
         str(plan.generic_launcher),
         "--mode",
-        "formal",
+        plan.config.mode,
         "--verl-root",
         str(plan.verl_root),
         "--schedule",
@@ -2185,12 +2199,12 @@ def build_launch_plan(args: argparse.Namespace) -> LaunchPlan:
     schedule_report = inspect_schedule(
         schedule,
         expected_count=config.total_episodes,
-        expected_role="train_pool",
+        expected_role=("gate_only" if config.mode == "gate" else "train_pool"),
         expected_route_ids=config.route_order,
         expected_route_registry_sha256=route_registry.sha256,
     )
     identity_inputs = LaunchInputs(
-        mode="formal",
+        mode=config.mode,
         verl_root=verl_root,
         outer_root=outer_root,
         schedule=schedule,
