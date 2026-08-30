@@ -64,6 +64,8 @@ _CONFIG_PROFILES = {
 }
 _ENDPOINT_REGISTRY_SCHEMA = "amg_multitask_endpoint_registry_v1"
 _GATE_RECEIPT_SCHEMA = "amg_single_card_optimizer_update_gate_v1"
+_SOURCE_BINDING_POLICY_GATE_RECEIPT = "gate_receipt_v1"
+_SOURCE_BINDING_POLICY_DIAGNOSTIC = "diagnostic_gate_source_locks_v1"
 _GATE_ENVIRONMENT_NAMES = {
     "webshop": "webshop",
     "swesmith": "swesmith",
@@ -238,6 +240,7 @@ class LaunchPlan:
     launch_identity: Mapping[str, Any]
     generic_launcher: Path
     resolve_only: bool
+    allow_diagnostic_source_bootstrap: bool = False
     holder_lease: HolderLease | None = None
 
     @classmethod
@@ -798,6 +801,7 @@ def load_endpoint_registry(
     *,
     expected_sha256: str,
     route_registry: RouteRegistry,
+    allow_diagnostic_source_bootstrap: bool = False,
 ) -> tuple[tuple[EndpointLaunchSpec, ...], dict[str, Any]]:
     """Validate all endpoint identities before any process or holder mutation."""
 
@@ -830,6 +834,7 @@ def load_endpoint_registry(
     specs: list[EndpointLaunchSpec] = []
     receipt_report: dict[str, Any] = {}
     source_report: dict[str, Any] = {}
+    source_binding_policies: dict[str, str] = {}
     asset_report: dict[str, Any] = {}
     ports: set[tuple[str, int]] = set()
     for position, (expected_route_id, raw_route) in enumerate(
@@ -934,11 +939,35 @@ def load_endpoint_registry(
             raise OrchestratorError(
                 f"{route_id} must bind exact outer and inner source identities"
             )
-        if not any(
-            source["evidence_kind"] == "gate_receipt" for source in verified_sources
-        ):
+        source_binding_policy = str(
+            route.get("source_binding_policy")
+            or _SOURCE_BINDING_POLICY_GATE_RECEIPT
+        )
+        if source_binding_policy == _SOURCE_BINDING_POLICY_GATE_RECEIPT:
+            if not any(
+                source["evidence_kind"] == "gate_receipt"
+                for source in verified_sources
+            ):
+                raise OrchestratorError(
+                    f"{route_id} gate receipt must bind at least one launched source"
+                )
+        elif source_binding_policy == _SOURCE_BINDING_POLICY_DIAGNOSTIC:
+            if not allow_diagnostic_source_bootstrap:
+                raise OrchestratorError(
+                    f"{route_id} diagnostic source bootstrap is not authorized"
+                )
+            if not all(
+                source["evidence_kind"] == "source_lock"
+                for source in verified_sources
+            ):
+                raise OrchestratorError(
+                    f"{route_id} diagnostic source bootstrap must bind every "
+                    "launched source by immutable source lock"
+                )
+        else:
             raise OrchestratorError(
-                f"{route_id} gate receipt must bind at least one launched source"
+                f"{route_id} source_binding_policy is unsupported: "
+                f"{source_binding_policy!r}"
             )
 
         raw_assets = _sequence(route.get("assets"), field=f"{route_id} assets")
@@ -1063,6 +1092,7 @@ def load_endpoint_registry(
             "run_id": receipt.get("run_id"),
         }
         source_report[route_id] = verified_sources
+        source_binding_policies[route_id] = source_binding_policy
         asset_report[route_id] = verified_assets
     return tuple(specs), {
         "schema": _ENDPOINT_REGISTRY_SCHEMA,
@@ -1071,6 +1101,7 @@ def load_endpoint_registry(
         "route_order": list(route_order),
         "gate_receipts": receipt_report,
         "sources": source_report,
+        "source_binding_policies": source_binding_policies,
         "assets": asset_report,
     }
 
@@ -1995,6 +2026,7 @@ def build_launch_plan(args: argparse.Namespace) -> LaunchPlan:
         launch_identity=launch_identity,
         generic_launcher=generic_launcher,
         resolve_only=args.resolve_only,
+        allow_diagnostic_source_bootstrap=False,
         holder_lease=holder_lease,
     )
 
@@ -2205,6 +2237,9 @@ class LocalBackend:
             plan.endpoint_registry_path,
             expected_sha256=plan.endpoint_registry_sha256,
             route_registry=route_registry,
+            allow_diagnostic_source_bootstrap=(
+                plan.allow_diagnostic_source_bootstrap
+            ),
         )
         if revalidated_endpoints != plan.endpoints:
             raise OrchestratorError(

@@ -926,6 +926,89 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
             self.assertEqual(evidence[0]["evidence_kind"], "source_lock")
             self.assertEqual(evidence[1]["evidence_kind"], "gate_receipt")
 
+    def test_diagnostic_gate_bootstrap_requires_explicit_source_lock_policy(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            route = fixture.registry_payload["routes"][1]
+            route["source_binding_policy"] = (
+                "diagnostic_gate_source_locks_v1"
+            )
+            for source in route["sources"]:
+                source.pop("receipt_field")
+                source_lock = fixture.root / f"{source['name']}-source-lock.json"
+                source_lock_sha256 = _write_json(
+                    source_lock,
+                    {f"{source['name']}_commit": fixture.source_commit},
+                )
+                source["source_lock"] = {
+                    "path": str(source_lock),
+                    "sha256": source_lock_sha256,
+                    "commit_field": f"{source['name']}_commit",
+                }
+            registry_sha256 = fixture.rewrite()
+
+            with self.assertRaisesRegex(
+                OrchestratorError, "diagnostic source bootstrap is not authorized"
+            ):
+                load_endpoint_registry(
+                    fixture.registry_path,
+                    expected_sha256=registry_sha256,
+                    route_registry=fixture.route_registry,
+                )
+
+            specs, report = load_endpoint_registry(
+                fixture.registry_path,
+                expected_sha256=registry_sha256,
+                route_registry=fixture.route_registry,
+                allow_diagnostic_source_bootstrap=True,
+            )
+            self.assertEqual(len(specs), 4)
+            self.assertEqual(
+                report["source_binding_policies"]["swesmith"],
+                "diagnostic_gate_source_locks_v1",
+            )
+            self.assertEqual(
+                [
+                    evidence["evidence_kind"]
+                    for evidence in report["sources"]["swesmith"]
+                ],
+                ["source_lock", "source_lock"],
+            )
+
+    def test_diagnostic_gate_bootstrap_rejects_mixed_source_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RegistryFixture(Path(directory))
+            route = fixture.registry_payload["routes"][1]
+            route["source_binding_policy"] = (
+                "diagnostic_gate_source_locks_v1"
+            )
+            outer = next(
+                source for source in route["sources"] if source["name"] == "outer"
+            )
+            outer.pop("receipt_field")
+            source_lock = fixture.root / "outer-source-lock.json"
+            source_lock_sha256 = _write_json(
+                source_lock, {"outer_commit": fixture.source_commit}
+            )
+            outer["source_lock"] = {
+                "path": str(source_lock),
+                "sha256": source_lock_sha256,
+                "commit_field": "outer_commit",
+            }
+            registry_sha256 = fixture.rewrite()
+
+            with self.assertRaisesRegex(
+                OrchestratorError, "must bind every launched source by immutable source lock"
+            ):
+                load_endpoint_registry(
+                    fixture.registry_path,
+                    expected_sha256=registry_sha256,
+                    route_registry=fixture.route_registry,
+                    allow_diagnostic_source_bootstrap=True,
+                )
+
     def test_immutable_source_lock_commit_mismatch_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = RegistryFixture(Path(directory))
