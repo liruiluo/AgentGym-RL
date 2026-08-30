@@ -89,22 +89,28 @@ def _parse_native_shell_payload(text: str) -> Mapping[str, Any] | None:
     return parameters
 
 
-def parse_shell_command_text(raw_output: str) -> str | None:
-    """Return one shell command from a delimiter-light, JSON, or native envelope.
+def parse_shell_command_text(
+    raw_output: str,
+    *,
+    allow_checkpoint_shell_block: bool = False,
+) -> str | None:
+    """Return one shell command from a supported policy envelope.
 
-    Leading/trailing whitespace and one generated ``</s>`` token are normalized
-    exactly as the endpoint parser does.  Visible prose, multiple actions,
-    unsupported functions, duplicate parameters, and incomplete blocks remain
-    rejected.
+    Ordinary actions use canonical JSON or the Qwen native tool envelope.  The
+    raw checkpoint heredoc is accepted only when its caller supplies the
+    wrapper-owned control state, and it must begin at byte zero.
     """
 
     if not isinstance(raw_output, str):
         return None
-    text = raw_output.strip()
+    raw_checkpoint = raw_output.startswith(_SHELL_BLOCK_PREFIX)
+    text = raw_output.rstrip()
     if text.endswith("</s>"):
         text = text[: -len("</s>")].rstrip()
 
-    if text.startswith(_SHELL_BLOCK_PREFIX):
+    if raw_checkpoint:
+        if not allow_checkpoint_shell_block:
+            return None
         command = text[len(_SHELL_BLOCK_PREFIX) :]
         if not (
             command.startswith(_CHECKPOINT_SHELL_PREFIX)
@@ -122,6 +128,9 @@ def parse_shell_command_text(raw_output: str) -> str | None:
             return None
         return command
 
+    text = text.strip()
+    if text.startswith(_SHELL_BLOCK_PREFIX):
+        return None
     if text.startswith(_SHELL_PREFIX):
         try:
             payload = json.loads(text[len(_SHELL_PREFIX) :])

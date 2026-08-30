@@ -16,7 +16,7 @@ class TestParseShellCommandText(unittest.TestCase):
             "cat .agent_memory/CONTINUATION.md",
         )
 
-    def test_checkpoint_only_shell_block(self):
+    def test_checkpoint_only_shell_block_is_opt_in(self):
         raw = (
             "shell_command\n"
             "cat > .agent_memory/CONTINUATION.md <<'AGENT_MEMORY_EOF'\n"
@@ -24,13 +24,33 @@ class TestParseShellCommandText(unittest.TestCase):
             "evidence: verified\n"
             "AGENT_MEMORY_EOF"
         )
+        self.assertIsNone(parse_shell_command_text(raw))
         self.assertEqual(
-            parse_shell_command_text(raw),
+            parse_shell_command_text(raw, allow_checkpoint_shell_block=True),
             "cat > .agent_memory/CONTINUATION.md <<'AGENT_MEMORY_EOF'\n"
             "objective: user's task\n"
             "evidence: verified\n"
             "AGENT_MEMORY_EOF",
         )
+
+    def test_checkpoint_shell_block_is_byte_zero_strict(self):
+        block = (
+            "shell_command\n"
+            "cat > .agent_memory/CONTINUATION.md <<'AGENT_MEMORY_EOF'\n"
+            "objective: task\n"
+            "AGENT_MEMORY_EOF"
+        )
+        for raw in (
+            "I will checkpoint now.\n" + block,
+            "<think>save state</think>\n" + block,
+            " " + block,
+        ):
+            with self.subTest(raw=raw):
+                self.assertIsNone(
+                    parse_shell_command_text(
+                        raw, allow_checkpoint_shell_block=True
+                    )
+                )
 
     def test_noncheckpoint_shell_blocks_are_rejected(self):
         for raw in (

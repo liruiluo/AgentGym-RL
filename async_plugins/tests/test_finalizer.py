@@ -892,6 +892,59 @@ class TestFinalizerRollouts(FinalizerTestCase):
             self.assertEqual(verdict["status"], "pass", verdict)
             self.assertEqual(verdict["counts"]["memory_chains"], 1)
 
+    def test_raw_checkpoint_block_requires_control_receipt_and_byte_zero(self):
+        checkpoint = (
+            "shell_command\n"
+            "cat > .agent_memory/CONTINUATION.md <<'AGENT_MEMORY_EOF'\n"
+            "objective: repair the issue\n"
+            "evidence: source inspected\n"
+            "next: edit src/value.py\n"
+            "AGENT_MEMORY_EOF"
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+            rewrite_as_filesystem_checkpoint_chain(fixture)
+
+            def use_controlled_raw_checkpoint(record: dict) -> None:
+                record["action"] = checkpoint
+                record["action_submission"]["raw_policy_output"] = checkpoint
+                record["env_info_after"]["policy_control"] = {
+                    "schema": "task_neutral_policy_control_v1",
+                    "kind": "context_compaction",
+                }
+
+            rewrite_chain_record(fixture, 0, use_controlled_raw_checkpoint)
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+            self.assertEqual(verdict["status"], "pass", verdict)
+            self.assertEqual(verdict["counts"]["memory_chains"], 1)
+
+        invalid_cases = {
+            "missing_control": checkpoint,
+            "visible_prefix": "I will checkpoint now.\n" + checkpoint,
+            "think_prefix": "<think>save state</think>\n" + checkpoint,
+            "leading_space": " " + checkpoint,
+        }
+        for case, action in invalid_cases.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                fixture = self.build(Path(directory))
+                rewrite_as_filesystem_checkpoint_chain(fixture)
+
+                def use_invalid_raw_checkpoint(record: dict) -> None:
+                    record["action"] = action
+                    record["action_submission"]["raw_policy_output"] = action
+                    if case != "missing_control":
+                        record["env_info_after"]["policy_control"] = {
+                            "schema": "task_neutral_policy_control_v1",
+                            "kind": "context_compaction",
+                        }
+
+                rewrite_chain_record(fixture, 0, use_invalid_raw_checkpoint)
+                self.assert_failed(
+                    fixture["run_dir"],
+                    contains="policy-authored external-document chain",
+                )
+
     def test_qwen_native_shell_checkpoint_chain_is_recognized(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.build(Path(directory))

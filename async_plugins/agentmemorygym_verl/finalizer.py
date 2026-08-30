@@ -618,6 +618,23 @@ def _filesystem_checkpoint_write(
     assert isinstance(evidence, Mapping)
     assert isinstance(info, Mapping)
     assert isinstance(transition, Mapping)
+    raw_action = _at(record, "action_submission.raw_policy_output")
+    if not isinstance(raw_action, str) or raw_action != record.get("action"):
+        return None
+    ordinary_command = parse_shell_command_text(raw_action)
+    if ordinary_command is None:
+        checkpoint_command = parse_shell_command_text(
+            raw_action, allow_checkpoint_shell_block=True
+        )
+        if (
+            checkpoint_command is None
+            or info.get("policy_control")
+            != {
+                "schema": "task_neutral_policy_control_v1",
+                "kind": "context_compaction",
+            }
+        ):
+            return None
     evidence_receipt = evidence.get("checkpoint_receipt")
     info_receipt = info.get("filesystem_checkpoint")
     identity = _valid_filesystem_checkpoint_receipt(

@@ -57,7 +57,13 @@ def count_prompt_tokens(messages) -> int:
     return sum(len(message["content"].split()) + 2 for message in messages)
 
 
-def prepare(client, messages, *, capacity: int = 4096):
+def prepare(
+    client,
+    messages,
+    *,
+    capacity: int = 4096,
+    max_observation_tokens: int = 64,
+):
     response_budget = 32
     return prepare_policy_turn(
         client,
@@ -66,7 +72,7 @@ def prepare(client, messages, *, capacity: int = 4096):
         max_prompt_tokens=capacity,
         max_model_tokens=capacity + response_budget,
         max_response_tokens=response_budget,
-        max_observation_tokens=64,
+        max_observation_tokens=max_observation_tokens,
         action_observation_envelope_tokens=4,
     )
 
@@ -216,6 +222,9 @@ class FakeSwesmithClient(SwesmithEnvClient):
                 "workspace_changed": workspace_changed,
             },
         }
+        policy_control = kwargs["json"].get("policy_control")
+        if policy_control is not None:
+            info["policy_control"] = deepcopy(policy_control)
         if checkpoint_write:
             payload = b"objective: fix parser\nnext: inspect parser.py\n"
             info["filesystem_checkpoint"] = build_filesystem_checkpoint_receipt(
@@ -511,7 +520,12 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             messages
             + [{"role": "user", "content": OPENMLE_CONTEXT_COMPACTION_REQUEST}]
         )
-        prepared = prepare(client, messages, capacity=candidate_count + 1)
+        prepared = prepare(
+            client,
+            messages,
+            capacity=candidate_count + 1,
+            max_observation_tokens=candidate_count,
+        )
         self.assertEqual(
             prepared.control_request,
             OPENMLE_CONTEXT_COMPACTION_REQUEST,
@@ -612,7 +626,12 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             messages
             + [{"role": "user", "content": OPENMLE_CONTEXT_COMPACTION_REQUEST}]
         )
-        prepared = prepare(client, messages, capacity=candidate_count + 1)
+        prepared = prepare(
+            client,
+            messages,
+            capacity=candidate_count + 1,
+            max_observation_tokens=candidate_count,
+        )
         malformed = (
             'apply_patch {"patch":"*** Begin Patch\\n'
             '# state\\n*** End Patch"}'
@@ -683,7 +702,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         client = FakeSwesmithClient()
         self.assertEqual(
             SWE_MEMORY_CONTRACT,
-            "policy_filesystem_checkpoint_then_client_replace_v3",
+            "policy_filesystem_checkpoint_then_client_replace_v4",
         )
         self.assertIn("# Durable debugging notes", SWE_POLICY_SYSTEM_PROMPT)
         self.assertIn(
@@ -732,7 +751,12 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             messages + [{"role": "user", "content": candidate}]
         )
         self.assertGreater(candidate_count, action_count)
-        compaction = prepare(client, messages, capacity=candidate_count + 1)
+        compaction = prepare(
+            client,
+            messages,
+            capacity=candidate_count + 1,
+            max_observation_tokens=candidate_count,
+        )
         self.assertTrue(compaction.control_request.startswith(SWE_CONTEXT_COMPACTION_REQUEST))
         checkpoint_action = (
             'shell_command {"command":"printf checkpoint > '
@@ -964,7 +988,12 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             messages + [{"role": "user", "content": candidate_request}]
         )
         self.assertGreater(candidate_count, action_count)
-        compaction = prepare(client, messages, capacity=candidate_count + 1)
+        compaction = prepare(
+            client,
+            messages,
+            capacity=candidate_count + 1,
+            max_observation_tokens=candidate_count,
+        )
         self.assertEqual(compaction.control_request, candidate_request)
         self.assertTrue(compaction.control_request.startswith(SWE_CONTEXT_COMPACTION_REQUEST))
         checkpoint_action = (
