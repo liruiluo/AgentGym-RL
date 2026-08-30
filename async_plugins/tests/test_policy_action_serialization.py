@@ -16,20 +16,33 @@ class TestParseShellCommandText(unittest.TestCase):
             "cat .agent_memory/CONTINUATION.md",
         )
 
-    def test_delimiter_light_shell_command(self):
+    def test_checkpoint_only_shell_block(self):
         raw = (
             "shell_command\n"
-            "python - <<'PY'\n"
-            "print({\"quoted\": r\"C:\\\\tmp\"})\n"
-            "PY"
+            "cat > .agent_memory/CONTINUATION.md <<'AGENT_MEMORY_EOF'\n"
+            "objective: user's task\n"
+            "evidence: verified\n"
+            "AGENT_MEMORY_EOF"
         )
         self.assertEqual(
             parse_shell_command_text(raw),
-            "python - <<'PY'\nprint({\"quoted\": r\"C:\\\\tmp\"})\nPY",
+            "cat > .agent_memory/CONTINUATION.md <<'AGENT_MEMORY_EOF'\n"
+            "objective: user's task\n"
+            "evidence: verified\n"
+            "AGENT_MEMORY_EOF",
         )
 
-    def test_empty_delimiter_light_shell_command_is_rejected(self):
-        self.assertIsNone(parse_shell_command_text("shell_command\n"))
+    def test_noncheckpoint_shell_blocks_are_rejected(self):
+        for raw in (
+            "shell_command\npwd",
+            "shell_command\npython - <<'PY'\nprint(1)\nPY",
+            "shell_command\n",
+            "shell_command\n"
+            "cat > .agent_memory/CONTINUATION.md <<'AGENT_MEMORY_EOF'\n"
+            "objective: task\nAGENT_MEMORY_EOF\necho unsafe\nAGENT_MEMORY_EOF",
+        ):
+            with self.subTest(raw=raw):
+                self.assertIsNone(parse_shell_command_text(raw))
 
     def test_qwen_native_shell_command_from_gate_ledger(self):
         raw = """<tool_call>

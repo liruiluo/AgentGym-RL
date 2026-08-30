@@ -14,6 +14,12 @@ from typing import Any
 
 _SHELL_PREFIX = "shell_command "
 _SHELL_BLOCK_PREFIX = "shell_command\n"
+_CHECKPOINT_PATH = ".agent_memory/CONTINUATION.md"
+_CHECKPOINT_HEREDOC = "AGENT_MEMORY_EOF"
+_CHECKPOINT_SHELL_PREFIX = (
+    f"cat > {_CHECKPOINT_PATH} <<'{_CHECKPOINT_HEREDOC}'\n"
+)
+_CHECKPOINT_SHELL_SUFFIX = f"\n{_CHECKPOINT_HEREDOC}"
 _NATIVE_TOOL_START = "<tool_call>"
 _NATIVE_TOOL_END = "</tool_call>"
 _NATIVE_FUNCTION_END = "</function>"
@@ -100,7 +106,19 @@ def parse_shell_command_text(raw_output: str) -> str | None:
 
     if text.startswith(_SHELL_BLOCK_PREFIX):
         command = text[len(_SHELL_BLOCK_PREFIX) :]
-        if not command.strip() or "\x00" in command:
+        if not (
+            command.startswith(_CHECKPOINT_SHELL_PREFIX)
+            and command.endswith(_CHECKPOINT_SHELL_SUFFIX)
+        ):
+            return None
+        body = command[
+            len(_CHECKPOINT_SHELL_PREFIX) : -len(_CHECKPOINT_SHELL_SUFFIX)
+        ]
+        if (
+            not body.strip()
+            or "\x00" in body
+            or _CHECKPOINT_HEREDOC in body.splitlines()
+        ):
             return None
         return command
 
