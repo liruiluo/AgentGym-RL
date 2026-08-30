@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from .config_contract import inspect_schedule, verify_resolved_config
+from .policy_action_serialization import parse_shell_command_text
 from .identity import (
     EXPECTED_VERL_COMMIT,
     LOCKED_MODEL_FILE_SHA256,
@@ -652,17 +653,12 @@ def _shell_command_words(record: Mapping[str, Any]) -> list[str] | None:
     raw_action = _at(record, "action_submission.raw_policy_output")
     if not isinstance(raw_action, str) or raw_action != record.get("action"):
         return None
-    prefix = "shell_command "
-    if not raw_action.startswith(prefix):
+    command = parse_shell_command_text(raw_action)
+    if command is None:
         return None
     try:
-        payload = json.loads(raw_action[len(prefix) :])
-        if not isinstance(payload, Mapping) or not isinstance(
-            payload.get("command"), str
-        ):
-            return None
-        return shlex.split(payload["command"])
-    except (json.JSONDecodeError, TypeError, ValueError):
+        return shlex.split(command)
+    except ValueError:
         return None
 
 

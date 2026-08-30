@@ -892,6 +892,48 @@ class TestFinalizerRollouts(FinalizerTestCase):
             self.assertEqual(verdict["status"], "pass", verdict)
             self.assertEqual(verdict["counts"]["memory_chains"], 1)
 
+    def test_qwen_native_shell_checkpoint_chain_is_recognized(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+            rewrite_as_filesystem_checkpoint_chain(fixture)
+
+            def use_native_shell(record: dict) -> None:
+                raw = record["action_submission"]["raw_policy_output"]
+                if not raw.startswith("shell_command "):
+                    return
+                payload = json.loads(raw[len("shell_command ") :])
+                parts = [
+                    "<tool_call>",
+                    "<function=shell_command>",
+                    "<parameter=command>",
+                    payload["command"],
+                    "</parameter>",
+                ]
+                if "workdir" in payload:
+                    parts.extend(
+                        ("<parameter=workdir>", payload["workdir"], "</parameter>")
+                    )
+                if "timeout_ms" in payload:
+                    parts.extend(
+                        (
+                            "<parameter=timeout_ms>",
+                            str(payload["timeout_ms"]),
+                            "</parameter>",
+                        )
+                    )
+                parts.extend(("</function>", "</tool_call>"))
+                action = "\n".join(parts)
+                record["action"] = action
+                record["action_submission"]["raw_policy_output"] = action
+
+            for order in (0, 1, 3):
+                rewrite_chain_record(fixture, order, use_native_shell)
+
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+
+            self.assertEqual(verdict["status"], "pass", verdict)
+            self.assertEqual(verdict["counts"]["memory_chains"], 1)
+
     def test_filesystem_checkpoint_chain_fails_closed(self):
         cases = (
             "write_not_changed",
