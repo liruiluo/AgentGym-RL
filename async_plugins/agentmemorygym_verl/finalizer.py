@@ -524,6 +524,16 @@ def _metric_route_counter(
 def _rolling_episode_shares(
     per_update: Sequence[Mapping[str, int]], route_ids: Sequence[str]
 ) -> dict[str, Any]:
+    if len(route_ids) != 4:
+        return {
+            "window_size": 8,
+            "bounds": {"minimum": 0.20, "maximum": 0.30},
+            "first_applicable_update": 8,
+            "status": "not_applicable",
+            "windows": [],
+            "violations": [],
+        }
+
     windows: list[dict[str, Any]] = []
     violations: list[dict[str, Any]] = []
     for end in range(8, len(per_update) + 1):
