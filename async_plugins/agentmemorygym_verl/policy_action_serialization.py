@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from typing import Any
 
 _SHELL_PREFIX = "shell_command "
+_SHELL_BLOCK_PREFIX = "shell_command\n"
 _NATIVE_TOOL_START = "<tool_call>"
 _NATIVE_TOOL_END = "</tool_call>"
 _NATIVE_FUNCTION_END = "</function>"
@@ -83,7 +84,7 @@ def _parse_native_shell_payload(text: str) -> Mapping[str, Any] | None:
 
 
 def parse_shell_command_text(raw_output: str) -> str | None:
-    """Return one shell command from a canonical or Qwen-native envelope.
+    """Return one shell command from a delimiter-light, JSON, or native envelope.
 
     Leading/trailing whitespace and one generated ``</s>`` token are normalized
     exactly as the endpoint parser does.  Visible prose, multiple actions,
@@ -96,6 +97,12 @@ def parse_shell_command_text(raw_output: str) -> str | None:
     text = raw_output.strip()
     if text.endswith("</s>"):
         text = text[: -len("</s>")].rstrip()
+
+    if text.startswith(_SHELL_BLOCK_PREFIX):
+        command = text[len(_SHELL_BLOCK_PREFIX) :]
+        if not command.strip() or "\x00" in command:
+            return None
+        return command
 
     if text.startswith(_SHELL_PREFIX):
         try:

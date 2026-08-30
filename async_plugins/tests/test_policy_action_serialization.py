@@ -16,6 +16,21 @@ class TestParseShellCommandText(unittest.TestCase):
             "cat .agent_memory/CONTINUATION.md",
         )
 
+    def test_delimiter_light_shell_command(self):
+        raw = (
+            "shell_command\n"
+            "python - <<'PY'\n"
+            "print({\"quoted\": r\"C:\\\\tmp\"})\n"
+            "PY"
+        )
+        self.assertEqual(
+            parse_shell_command_text(raw),
+            "python - <<'PY'\nprint({\"quoted\": r\"C:\\\\tmp\"})\nPY",
+        )
+
+    def test_empty_delimiter_light_shell_command_is_rejected(self):
+        self.assertIsNone(parse_shell_command_text("shell_command\n"))
+
     def test_qwen_native_shell_command_from_gate_ledger(self):
         raw = """<tool_call>
 <function=shell_command>
