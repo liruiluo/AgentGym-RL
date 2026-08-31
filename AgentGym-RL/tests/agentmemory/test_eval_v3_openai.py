@@ -2641,9 +2641,11 @@ class EvalV3OpenAITest(unittest.TestCase):
             "without shortening it",
             prompt,
         )
-        self.assertIn("Never invent a `Confirmed ... to buy:` field", prompt)
+        self.assertIn("Preserve the exact `Confirmed <field>: <value>` evidence", prompt)
         self.assertIn("reading a different file is not reading the checkpoint", prompt)
-        self.assertIn("every Add File content line must begin with `+`", prompt)
+        self.assertIn("After one successful non-empty checkpoint read", prompt)
+        self.assertIn("Other workspace documents remain optional", prompt)
+        self.assertNotIn("write a concise note on a separate workspace turn before advancing", prompt)
         self.assertEqual(
             MODULE.extract_webshop_v2_action(
                 patch_action,

@@ -327,13 +327,13 @@ class FakeOpenMLEClient(OpenMLEFastEnvClient):
         raise AssertionError("test fixture is already reset")
 
 
-def webshop_search_response() -> dict:
+def webshop_search_response(*, session_index: int = 0) -> dict:
     return {
-        "observation": "session-0 search result",
+        "observation": f"session-{session_index} search result",
         "reward": 0.0,
         "done": False,
         "info": {
-            "current_subtask_index": 0,
+            "current_subtask_index": session_index,
             "tool_ops": [{"op": "SEARCH", "step": 1}],
             "session_trace": ["search result"],
         },
@@ -608,6 +608,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
                     checkpoint_payload=checkpoint_payload,
                     exists=True,
                 ),
+                webshop_search_response(session_index=1),
             ]
         )
         messages = self.bind_webshop(client)
@@ -716,6 +717,15 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             read_output.info["wrapper_evidence"]["memory_event"], "read"
         )
         self.assertIn("objective: finish six purchases", str(messages))
+
+        next_turn = prepare(client, messages)
+        self.assertIsNone(next_turn.control_request)
+        next_action = "search[blue mug]"
+        next_output, messages = complete_policy_turn(client, next_turn, next_action)
+        self.assertEqual(client.native_calls[-1], next_action)
+        self.assertEqual(next_output.info["context_transition"]["operation"], "replace_messages")
+        self.assertIsNone(client._pending_checkpoint_read)
+        self.assertNotIn("Checkpoint read failed", str(messages))
 
     def test_failed_webshop_checkpoint_rebuilds_stable_context_and_retries(self) -> None:
         client = FakeWebShopClient(
