@@ -2633,16 +2633,16 @@ class EvalV3OpenAITest(unittest.TestCase):
         self.assertIn(patch_action, prompt)
         self.assertIn(shell_action, prompt)
         self.assertIn("latest-observation-only input", prompt)
-        self.assertIn("rg --hidden -n '^Confirmed ' .", prompt)
-        self.assertIn("`rg` without `--hidden` is insufficient", prompt)
-        self.assertIn("Only in such a later dependent session, if stdout is empty", prompt)
+        self.assertIn("cat .agent_memory/CONTINUATION.md", prompt)
+        self.assertIn("retry the exact `cat` command once", prompt)
+        self.assertIn("never loop on an unchanged successful read", prompt)
         self.assertIn(
             "copy the chosen approved card's complete Product title into search[...] "
             "without shortening it",
             prompt,
         )
         self.assertIn("Never invent a `Confirmed ... to buy:` field", prompt)
-        self.assertIn("do not guess a path", prompt)
+        self.assertIn("reading a different file is not reading the checkpoint", prompt)
         self.assertIn("every Add File content line must begin with `+`", prompt)
         self.assertEqual(
             MODULE.extract_webshop_v2_action(
