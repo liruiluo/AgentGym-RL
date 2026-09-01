@@ -92,6 +92,7 @@ class TestSwesmithRewardForwarding(unittest.TestCase):
             "timeout": 240,
             "max_retries": 0,
             "invalid_action_reward": -0.01,
+            "checkpoint_contract_penalty": -0.1,
         }
         with mock.patch(
             "agentmemorygym_verl.env_client._client_classes",
@@ -105,8 +106,50 @@ class TestSwesmithRewardForwarding(unittest.TestCase):
                 "data_len": None,
                 "timeout": 240.0,
                 "invalid_action_reward": -0.01,
+                "checkpoint_contract_penalty": -0.1,
             }],
         )
+
+    def test_forwards_literesearcher_invalid_action_reward(self):
+        config = {
+            "task_name": "literesearcher",
+            "env_addr": "http://127.0.0.1:65122",
+            "timeout": 240,
+            "max_retries": 0,
+            "invalid_action_reward": -0.01,
+        }
+        with mock.patch(
+            "agentmemorygym_verl.env_client._client_classes",
+            return_value={"literesearcher": _RecordingClient},
+        ):
+            create_env_client(config)
+        self.assertEqual(
+            _RecordingClient.calls,
+            [{
+                "env_server_base": "http://127.0.0.1:65122",
+                "data_len": None,
+                "timeout": 240.0,
+                "invalid_action_reward": -0.01,
+            }],
+        )
+
+    def test_rejects_positive_or_nonfinite_checkpoint_penalty(self):
+        for value in (0.01, float("inf"), "not-a-number", True):
+            with self.subTest(value=value):
+                config = {
+                    "task_name": "swesmith",
+                    "env_addr": "http://127.0.0.1:65125",
+                    "max_retries": 0,
+                    "checkpoint_contract_penalty": value,
+                }
+                with (
+                    mock.patch(
+                        "agentmemorygym_verl.env_client._client_classes",
+                        return_value={"swesmith": _RecordingClient},
+                    ),
+                    self.assertRaises((TypeError, ValueError)),
+                ):
+                    create_env_client(config)
 
     def test_rejects_positive_or_nonfinite_invalid_action_reward(self):
         for value in (0.01, float("inf"), "not-a-number", True):

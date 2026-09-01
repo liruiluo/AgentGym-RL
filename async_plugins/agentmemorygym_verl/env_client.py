@@ -90,21 +90,48 @@ def create_env_client(config: Any):
         "data_len": None,
         "timeout": timeout,
     }
-    if task_name == "swesmith":
+    if task_name in {"swesmith", "literesearcher"}:
         raw_invalid_reward = _get(config, "invalid_action_reward", 0.0)
+        reward_label = "SWE-smith" if task_name == "swesmith" else "LiteResearcher"
         if isinstance(raw_invalid_reward, bool):
-            raise TypeError("SWE-smith invalid_action_reward must be numeric")
+            raise TypeError(f"{reward_label} invalid_action_reward must be numeric")
         try:
             invalid_action_reward = float(raw_invalid_reward)
         except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError(
-                "SWE-smith invalid_action_reward must be finite and non-positive"
+                f"{reward_label} invalid_action_reward must be finite and non-positive"
             ) from exc
         if not math.isfinite(invalid_action_reward) or invalid_action_reward > 0.0:
             raise ValueError(
-                "SWE-smith invalid_action_reward must be finite and non-positive"
+                f"{reward_label} invalid_action_reward must be finite and non-positive"
             )
         client_kwargs["invalid_action_reward"] = invalid_action_reward
+        if task_name == "swesmith":
+            raw_checkpoint_penalty = _get(
+                config, "checkpoint_contract_penalty", 0.0
+            )
+            if isinstance(raw_checkpoint_penalty, bool):
+                raise TypeError(
+                    "SWE-smith checkpoint_contract_penalty must be numeric"
+                )
+            try:
+                checkpoint_contract_penalty = float(raw_checkpoint_penalty)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    "SWE-smith checkpoint_contract_penalty must be finite and "
+                    "non-positive"
+                ) from exc
+            if (
+                not math.isfinite(checkpoint_contract_penalty)
+                or checkpoint_contract_penalty > 0.0
+            ):
+                raise ValueError(
+                    "SWE-smith checkpoint_contract_penalty must be finite and "
+                    "non-positive"
+                )
+            client_kwargs["checkpoint_contract_penalty"] = (
+                checkpoint_contract_penalty
+            )
 
     if task_name == "openmle_fast":
         for field in _OPENMLE_IDENTITY_FIELDS:
