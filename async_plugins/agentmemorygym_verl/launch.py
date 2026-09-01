@@ -96,6 +96,9 @@ class LaunchInputs:
     multitask_source_lock: Path | None = None
     multitask_schedule_certificate: Path | None = None
     multitask_orchestrator_preflight: Path | None = None
+    learner_token_budget_profile: str = "default-65536-v1"
+    actor_train_token_budget: int = 65_536
+    critic_train_token_budget: int = 65_536
 
 
 def _string(value: str | Path) -> str:
@@ -117,6 +120,31 @@ def build_overrides(
 
     if inputs.mode not in {"gate", "formal"}:
         raise ValueError(f"unsupported launch mode {inputs.mode!r}")
+    token_budget_profiles = {
+        "default-65536-v1": (65_536, 65_536),
+        "multitask-131072-v1": (131_072, 131_072),
+    }
+    expected_token_budgets = token_budget_profiles.get(
+        inputs.learner_token_budget_profile
+    )
+    if expected_token_budgets is None:
+        raise ValueError(
+            "unsupported learner token-budget profile: "
+            f"{inputs.learner_token_budget_profile!r}"
+        )
+    actor_train_token_budget = _require_positive_int(
+        inputs.actor_train_token_budget, field="actor train token budget"
+    )
+    critic_train_token_budget = _require_positive_int(
+        inputs.critic_train_token_budget, field="critic train token budget"
+    )
+    if (actor_train_token_budget, critic_train_token_budget) != expected_token_budgets:
+        raise ValueError(
+            "learner token budgets do not match profile "
+            f"{inputs.learner_token_budget_profile!r}: "
+            f"{actor_train_token_budget}/{critic_train_token_budget} != "
+            f"{expected_token_budgets[0]}/{expected_token_budgets[1]}"
+        )
     if (inputs.trainer_gpus, inputs.standalone_rollout_gpus) not in {(4, 4), (6, 2)}:
         raise ValueError(
             "reviewed AMG Hybrid + Standalone topologies are 4+4 and 6+2, got "
@@ -276,7 +304,7 @@ def build_overrides(
         # Six-way FSDP leaves less activation headroom than the historical
         # eight-way synchronous trainer. Keep microbatch=8 but bound packed
         # training tokens; formal tuning may raise these after measured headroom.
-        "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=65536",
+        f"actor_rollout_ref.actor.ppo_max_token_len_per_gpu={actor_train_token_budget}",
         "actor_rollout_ref.actor.use_rollout_log_probs=True",
         "actor_rollout_ref.actor.optim.lr=1e-6",
         "actor_rollout_ref.actor.optim.weight_decay=0.01",
@@ -312,7 +340,7 @@ def build_overrides(
         # Preserve r38's verified 65,536-token critic training budget. Latest
         # veRL splits critic inference packing into its own knob, which remains
         # at the upstream 32,768-token default; do not conflate the two.
-        "critic.ppo_max_token_len_per_gpu=65536",
+        f"critic.ppo_max_token_len_per_gpu={critic_train_token_budget}",
         "+critic.ppo_infer_max_token_len_per_gpu=32768",
         "critic.forward_max_token_len_per_gpu=262144",
         "critic.optim.lr=1e-5",
@@ -867,6 +895,9 @@ def _load_multitask_identity(
         "optimizer_updates": optimizer_updates,
         "samples_per_update": samples_per_update,
         "episodes": scheduled_episode_count,
+        "learner_token_budget_profile": inputs.learner_token_budget_profile,
+        "actor_train_token_budget": inputs.actor_train_token_budget,
+        "critic_train_token_budget": inputs.critic_train_token_budget,
         "save_freq": tuning["save_freq"],
         "max_actor_ckpt_to_keep": tuning["max_actor_ckpt_to_keep"],
         "max_critic_ckpt_to_keep": tuning["max_critic_ckpt_to_keep"],
@@ -1234,6 +1265,9 @@ def _load_endpoint_identity(
         "optimizer_updates": optimizer_updates,
         "samples_per_update": samples_per_update,
         "episodes": expected_schedule_count,
+        "learner_token_budget_profile": inputs.learner_token_budget_profile,
+        "actor_train_token_budget": inputs.actor_train_token_budget,
+        "critic_train_token_budget": inputs.critic_train_token_budget,
         "save_freq": tuning["save_freq"],
         "max_actor_ckpt_to_keep": tuning["max_actor_ckpt_to_keep"],
         "max_critic_ckpt_to_keep": tuning["max_critic_ckpt_to_keep"],
@@ -2307,6 +2341,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--multitask-orchestrator-preflight", type=Path)
     parser.add_argument("--trainer-gpus", type=int, default=6)
     parser.add_argument("--standalone-rollout-gpus", type=int, default=2)
+    parser.add_argument(
+        "--learner-token-budget-profile", default="default-65536-v1"
+    )
+    parser.add_argument("--actor-train-token-budget", type=int, default=65_536)
+    parser.add_argument("--critic-train-token-budget", type=int, default=65_536)
     parser.add_argument("--actor-use-fused-kernels", action="store_true")
     parser.add_argument("--critic-use-fused-kernels", action="store_true")
     parser.add_argument("--resolve-only", action="store_true")
@@ -2362,6 +2401,9 @@ def main(argv: list[str] | None = None) -> int:
         ),
         trainer_gpus=args.trainer_gpus,
         standalone_rollout_gpus=args.standalone_rollout_gpus,
+        learner_token_budget_profile=args.learner_token_budget_profile,
+        actor_train_token_budget=args.actor_train_token_budget,
+        critic_train_token_budget=args.critic_train_token_budget,
         actor_use_fused_kernels=args.actor_use_fused_kernels,
         critic_use_fused_kernels=args.critic_use_fused_kernels,
         route_registry=_resolve_cli_regular_file(

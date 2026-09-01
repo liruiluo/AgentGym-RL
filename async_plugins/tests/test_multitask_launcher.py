@@ -47,6 +47,7 @@ from agentmemorygym_verl.routes import (
 
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "async_plugins/config/amg_multitask400.yaml"
+CONFIG_131K = ROOT / "async_plugins/config/amg_multitask400_131k.yaml"
 
 
 def _sha256(path: Path) -> str:
@@ -681,6 +682,8 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
         )
         self.assertEqual((config.trainer_gpus, config.standalone_rollout_gpus), (6, 2))
         self.assertEqual(config.rollout_n, 1)
+        self.assertEqual(config.learner_token_budget_profile, "default-65536-v1")
+        self.assertEqual(config.actor_train_token_budget, 65_536)
         self.assertEqual(config.critic_train_token_budget, 65_536)
         self.assertEqual(config.critic_infer_token_budget, 32_768)
         self.assertEqual(config.trigger_parameter_sync_step, 1)
@@ -688,6 +691,33 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
         self.assertFalse(config.critic_use_fused_kernels)
         self.assertFalse(config.require_exact_per_update_route_split)
         self.assertEqual(config.sampling_order, "round_robin")
+
+    def test_reviewed_131k_profile_is_explicit_and_forwarded(self) -> None:
+        config = load_orchestrator_config(CONFIG_131K)
+        self.assertEqual(config.learner_token_budget_profile, "multitask-131072-v1")
+        self.assertEqual(config.actor_train_token_budget, 131_072)
+        self.assertEqual(config.critic_train_token_budget, 131_072)
+        plan = LaunchPlan.for_test(resolve_only=False, config=config)
+        command = build_generic_launch_command(
+            plan,
+            resolve_only=False,
+            orchestrator_preflight=Path("/run/orchestrator-preflight.json"),
+        )
+        rendered = " ".join(command)
+        self.assertIn("--learner-token-budget-profile multitask-131072-v1", rendered)
+        self.assertIn("--actor-train-token-budget 131072", rendered)
+        self.assertIn("--critic-train-token-budget 131072", rendered)
+
+    def test_rejects_mismatched_learner_token_budget_profile(self) -> None:
+        payload = CONFIG_131K.read_text(encoding="utf-8").replace(
+            "actor_train_token_budget: 131072",
+            "actor_train_token_budget: 65536",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bad.yaml"
+            path.write_text(payload, encoding="utf-8")
+            with self.assertRaisesRegex(OrchestratorError, "actor train token budget"):
+                load_orchestrator_config(path)
 
     def test_holder_acquisition_builds_complete_lifecycle_marker_records(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

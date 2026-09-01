@@ -213,6 +213,40 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                 json.loads(values["data.agentgym.expected_role"]), "train_pool"
             )
 
+    def test_131k_profile_changes_only_learner_packing_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inputs, _identity = self._identity(Path(directory), "formal")
+            inputs = replace(
+                inputs,
+                learner_token_budget_profile="multitask-131072-v1",
+                actor_train_token_budget=131_072,
+                critic_train_token_budget=131_072,
+            )
+            identity = _load_endpoint_identity(
+                inputs,
+                schedule_report=inspect_schedule(
+                    inputs.schedule, expected_role="train_pool"
+                ),
+            )
+            values = self._values(
+                build_overrides(
+                    inputs,
+                    effective_schedule=inputs.schedule,
+                    endpoint_client_config=identity["client_config"],
+                    budget_contract=identity["budget_contract"],
+                    training_runtime=identity["training_runtime"],
+                )
+            )
+            self.assertEqual(
+                values["actor_rollout_ref.actor.ppo_max_token_len_per_gpu"],
+                "131072",
+            )
+            self.assertEqual(values["critic.ppo_max_token_len_per_gpu"], "131072")
+            self.assertEqual(
+                identity["budget_contract"]["learner_token_budget_profile"],
+                "multitask-131072-v1",
+            )
+
     def test_actor_only_fused_six_plus_two_uses_upstream_native_overrides(self):
         with tempfile.TemporaryDirectory() as directory:
             inputs, identity = self._identity(Path(directory), "gate")

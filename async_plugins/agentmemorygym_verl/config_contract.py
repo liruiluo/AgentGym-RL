@@ -112,6 +112,9 @@ def verify_resolved_config(
         "optimizer_updates",
         "samples_per_update",
         "episodes",
+        "learner_token_budget_profile",
+        "actor_train_token_budget",
+        "critic_train_token_budget",
         "save_freq",
         "max_actor_ckpt_to_keep",
         "max_critic_ckpt_to_keep",
@@ -384,6 +387,12 @@ def verify_resolved_config(
     )
 
     ppo_mini_batch_size = resolve_ppo_mini_batch_size(trainer_gpus)
+    actor_train_token_budget = _positive_int(
+        expected["actor_train_token_budget"], field="expected actor train token budget"
+    )
+    critic_train_token_budget = _positive_int(
+        expected["critic_train_token_budget"], field="expected critic train token budget"
+    )
     for path, expected_value in {
         "data.train_batch_size": 0,
         "data.gen_batch_size": 1,
@@ -399,6 +408,9 @@ def verify_resolved_config(
         "actor_rollout_ref.actor.ppo_epochs": 1,
         "actor_rollout_ref.actor.shuffle": False,
         "actor_rollout_ref.actor.use_dynamic_bsz": True,
+        "actor_rollout_ref.actor.ppo_max_token_len_per_gpu": (
+            actor_train_token_budget
+        ),
         "actor_rollout_ref.actor.loss_agg_mode": "token-mean",
         "actor_rollout_ref.actor.use_prefix_grouper": False,
         "actor_rollout_ref.actor.strategy": "fsdp2",
@@ -413,7 +425,7 @@ def verify_resolved_config(
         "critic.shuffle": False,
         "critic.use_dynamic_bsz": True,
         "critic.loss_agg_mode": "token-mean",
-        "critic.ppo_max_token_len_per_gpu": 65536,
+        "critic.ppo_max_token_len_per_gpu": critic_train_token_budget,
         "critic.ppo_infer_max_token_len_per_gpu": 32768,
         "critic.strategy": "fsdp2",
         "algorithm.gamma": 1.0,
@@ -576,7 +588,11 @@ def verify_resolved_config(
         "standalone_rollout_gpus": standalone_rollout_gpus,
         "dynamic_hybrid_enabled": True,
         "gradient_checkpointing": {"actor": True, "critic": True},
-        "critic_train_token_budget": 65536,
+        "learner_token_budget_profile": str(
+            expected["learner_token_budget_profile"]
+        ),
+        "actor_train_token_budget": actor_train_token_budget,
+        "critic_train_token_budget": critic_train_token_budget,
         "critic_infer_token_budget": 32768,
         "rollout_backend": "sglang",
         "fsdp2_reshard_after_forward": {"actor": True, "critic": True},

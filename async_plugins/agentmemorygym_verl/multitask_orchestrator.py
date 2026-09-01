@@ -47,6 +47,10 @@ EXPECTED_ROUTE_IDS = (
     "openmle_fast",
 )
 _CONFIG_SCHEMA = "amg_multitask400_orchestrator_config_v1"
+_LEARNER_TOKEN_BUDGET_PROFILES = {
+    "default-65536-v1": (65_536, 65_536),
+    "multitask-131072-v1": (131_072, 131_072),
+}
 _ENDPOINT_REGISTRY_SCHEMA = "amg_multitask_endpoint_registry_v1"
 _GATE_RECEIPT_SCHEMA = "amg_single_card_optimizer_update_gate_v1"
 _SOURCE_EVIDENCE_POLICY = "base_gate_plus_all_immutable_source_locks_v1"
@@ -123,6 +127,8 @@ class OrchestratorConfig:
     trainer_gpus: int
     standalone_rollout_gpus: int
     rollout_n: int
+    learner_token_budget_profile: str
+    actor_train_token_budget: int
     critic_train_token_budget: int
     critic_infer_token_budget: int
     trigger_parameter_sync_step: int
@@ -244,6 +250,8 @@ class LaunchPlan:
                 trainer_gpus=6,
                 standalone_rollout_gpus=2,
                 rollout_n=1,
+                learner_token_budget_profile="default-65536-v1",
+                actor_train_token_budget=65_536,
                 critic_train_token_budget=65_536,
                 critic_infer_token_budget=32_768,
                 trigger_parameter_sync_step=1,
@@ -394,6 +402,16 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
         "holder_lease": "cli:--holder-lease",
         "holder_lease_sha256": "cli:--holder-lease-sha256",
     }
+    learner_token_budget_profile = r38.get("learner_token_budget_profile")
+    if learner_token_budget_profile not in _LEARNER_TOKEN_BUDGET_PROFILES:
+        raise OrchestratorError(
+            "reviewed Multitask400 learner token-budget profile is unsupported: "
+            f"{learner_token_budget_profile!r}"
+        )
+    expected_actor_budget, expected_critic_budget = _LEARNER_TOKEN_BUDGET_PROFILES[
+        str(learner_token_budget_profile)
+    ]
+
     exact = {
         "schema": (payload.get("schema"), _CONFIG_SCHEMA),
         "implementation base commit": (
@@ -427,9 +445,13 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
         "learner/hybrid GPUs": (r38.get("learner_hybrid_gpus"), 6),
         "standalone rollout GPUs": (r38.get("standalone_rollout_gpus"), 2),
         "rollout.n": (r38.get("rollout_n"), 1),
+        "actor train token budget": (
+            r38.get("actor_train_token_budget"),
+            expected_actor_budget,
+        ),
         "critic train token budget": (
             r38.get("critic_train_token_budget"),
-            65_536,
+            expected_critic_budget,
         ),
         "critic inference token budget": (
             r38.get("critic_infer_token_budget"),
@@ -482,7 +504,9 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
         trainer_gpus=6,
         standalone_rollout_gpus=2,
         rollout_n=1,
-        critic_train_token_budget=65_536,
+        learner_token_budget_profile=str(learner_token_budget_profile),
+        actor_train_token_budget=expected_actor_budget,
+        critic_train_token_budget=expected_critic_budget,
         critic_infer_token_budget=32_768,
         trigger_parameter_sync_step=1,
         actor_use_fused_kernels=False,
@@ -1770,6 +1794,12 @@ def build_generic_launch_command(
         str(plan.config.trainer_gpus),
         "--standalone-rollout-gpus",
         str(plan.config.standalone_rollout_gpus),
+        "--learner-token-budget-profile",
+        plan.config.learner_token_budget_profile,
+        "--actor-train-token-budget",
+        str(plan.config.actor_train_token_budget),
+        "--critic-train-token-budget",
+        str(plan.config.critic_train_token_budget),
     ]
     if plan.config.actor_use_fused_kernels:
         command.append("--actor-use-fused-kernels")
