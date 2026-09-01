@@ -801,8 +801,12 @@ def _canonical_checkpoint_compaction_receipt(
     endpoint_action_kind = _at(record, "env_info_after.action_kind")
     if endpoint_action_kind is None:
         endpoint_action_kind = _at(record, "env_info_after.execution.action_kind")
+    # The finalizer consumes only the task-neutral checkpoint receipt.
+    # Environment-specific lifecycle/event names remain owned by wrappers.
+    event = evidence.get("event")
     if receipt is None or not (
-        evidence.get("event") in {"context_compaction", "webshop_session_handoff"}
+        isinstance(event, str)
+        and bool(event.strip())
         and evidence.get("continuation_path") == _FILESYSTEM_CHECKPOINT_PATH
         and evidence.get("continuation_persisted") is True
         and evidence.get("checkpoint_failure_reason") is None
