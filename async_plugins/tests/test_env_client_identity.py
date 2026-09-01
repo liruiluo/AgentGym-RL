@@ -170,6 +170,93 @@ class TestSwesmithRewardForwarding(unittest.TestCase):
                     create_env_client(config)
 
 
+class TestContextMemoryForwarding(unittest.TestCase):
+    def setUp(self):
+        _RecordingClient.calls.clear()
+
+    def test_forwards_explicit_compactionrl_contract(self):
+        config = {
+            "task_name": "literesearcher",
+            "env_addr": "http://127.0.0.1:65122",
+            "max_retries": 0,
+            "context_memory_mode": "compactionrl",
+            "compaction_recent_steps": 2,
+            "compaction_summary_max_bytes": 8192,
+        }
+        with mock.patch(
+            "agentmemorygym_verl.env_client._client_classes",
+            return_value={"literesearcher": _RecordingClient},
+        ):
+            create_env_client(config)
+
+        self.assertEqual(
+            _RecordingClient.calls,
+            [
+                {
+                    "env_server_base": "http://127.0.0.1:65122",
+                    "data_len": None,
+                    "timeout": 240.0,
+                    "context_memory_mode": "compactionrl",
+                    "compaction_recent_steps": 2,
+                    "compaction_summary_max_bytes": 8192,
+                    "invalid_action_reward": 0.0,
+                }
+            ],
+        )
+
+    def test_rejects_invalid_compaction_contract_before_construction(self):
+        invalid_fields = (
+            ("context_memory_mode", "unknown"),
+            ("compaction_recent_steps", -1),
+            ("compaction_recent_steps", True),
+            ("compaction_summary_max_bytes", 0),
+            ("compaction_summary_max_bytes", True),
+        )
+        for field, value in invalid_fields:
+            with self.subTest(field=field, value=value):
+                config = {
+                    "task_name": "swesmith",
+                    "env_addr": "http://127.0.0.1:65125",
+                    "max_retries": 0,
+                    "context_memory_mode": "compactionrl",
+                    field: value,
+                }
+                with (
+                    mock.patch(
+                        "agentmemorygym_verl.env_client._client_classes",
+                        return_value={"swesmith": _RecordingClient},
+                    ),
+                    self.assertRaises((TypeError, ValueError)),
+                ):
+                    create_env_client(config)
+        self.assertEqual(_RecordingClient.calls, [])
+
+    def test_rejects_compaction_fields_without_compaction_mode(self):
+        for config in (
+            {
+                "task_name": "swesmith",
+                "env_addr": "http://127.0.0.1:65125",
+                "compaction_recent_steps": 2,
+            },
+            {
+                "task_name": "swesmith",
+                "env_addr": "http://127.0.0.1:65125",
+                "context_memory_mode": "filesystem",
+                "compaction_summary_max_bytes": 8192,
+            },
+        ):
+            with self.subTest(config=config):
+                with (
+                    mock.patch(
+                        "agentmemorygym_verl.env_client._client_classes",
+                        return_value={"swesmith": _RecordingClient},
+                    ),
+                    self.assertRaises(ValueError),
+                ):
+                    create_env_client(config)
+        self.assertEqual(_RecordingClient.calls, [])
+
+
 class TestOpenMLEClientIdentityForwarding(unittest.TestCase):
     def setUp(self):
         _RecordingClient.calls.clear()

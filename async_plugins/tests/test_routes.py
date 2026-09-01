@@ -139,6 +139,94 @@ class RouteRegistryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "policy_framing_sha256"):
                 load_route_registry(path, expected_sha256=digest)
 
+    def test_compactionrl_contract_is_explicit_and_uniform_across_routes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            payload = _registry_payload()
+            for route in payload["routes"]:
+                route["client"].update(
+                    {
+                        "context_memory_mode": "compactionrl",
+                        "compaction_recent_steps": 2,
+                        "compaction_summary_max_bytes": 8192,
+                    }
+                )
+            path, digest = self._write(directory, payload)
+            registry = load_route_registry(path, expected_sha256=digest)
+
+            self.assertTrue(
+                all(
+                    route.client_config["context_memory_mode"] == "compactionrl"
+                    and route.client_config["compaction_recent_steps"] == 2
+                    and route.client_config["compaction_summary_max_bytes"] == 8192
+                    for route in registry.routes
+                )
+            )
+
+    def test_compactionrl_contract_rejects_partial_or_drifted_routes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            partial = _registry_payload()
+            partial["routes"][0]["client"].update(
+                {
+                    "context_memory_mode": "compactionrl",
+                    "compaction_recent_steps": 2,
+                    "compaction_summary_max_bytes": 8192,
+                }
+            )
+            path, digest = self._write(directory, partial)
+            with self.assertRaisesRegex(ValueError, "every route"):
+                load_route_registry(path, expected_sha256=digest)
+
+            missing = _registry_payload()
+            for route in missing["routes"]:
+                route["client"].update(
+                    {
+                        "context_memory_mode": "compactionrl",
+                        "compaction_recent_steps": 2,
+                        "compaction_summary_max_bytes": 8192,
+                    }
+                )
+            del missing["routes"][2]["client"]["compaction_recent_steps"]
+            path, digest = self._write(directory, missing)
+            with self.assertRaisesRegex(ValueError, "missing explicit"):
+                load_route_registry(path, expected_sha256=digest)
+
+            drifted = _registry_payload()
+            for route in drifted["routes"]:
+                route["client"].update(
+                    {
+                        "context_memory_mode": "compactionrl",
+                        "compaction_recent_steps": 2,
+                        "compaction_summary_max_bytes": 8192,
+                    }
+                )
+            drifted["routes"][-1]["client"]["compaction_recent_steps"] = 1
+            path, digest = self._write(directory, drifted)
+            with self.assertRaisesRegex(ValueError, "one shared"):
+                load_route_registry(path, expected_sha256=digest)
+
+    def test_filesystem_registry_omits_compaction_fields_byte_for_byte(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path, digest = self._write(directory, _registry_payload())
+            registry = load_route_registry(path, expected_sha256=digest)
+
+            for route in registry.routes:
+                self.assertNotIn("context_memory_mode", route.client_config)
+                self.assertNotIn("compaction_recent_steps", route.client_config)
+                self.assertNotIn("compaction_summary_max_bytes", route.client_config)
+
+    def test_compaction_fields_require_explicit_compaction_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            for mode in (None, "filesystem"):
+                payload = _registry_payload()
+                client = payload["routes"][0]["client"]
+                if mode is not None:
+                    client["context_memory_mode"] = mode
+                client["compaction_recent_steps"] = 2
+                path, digest = self._write(directory, payload)
+                with self.subTest(mode=mode):
+                    with self.assertRaisesRegex(ValueError, "CompactionRL fields"):
+                        load_route_registry(path, expected_sha256=digest)
+
     def test_resolve_row_requires_matching_top_level_and_extra_route_id(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path, digest = self._write(directory, _registry_payload())

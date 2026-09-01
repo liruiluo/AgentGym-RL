@@ -20,6 +20,10 @@ _CLIENT_CLASS_NAMES = {
 }
 
 _AGENTMEMORY_POLICY_PROMPT_FIELD = "policy_system_prompt"
+_CONTEXT_MEMORY_TASKS = frozenset(
+    {"agentmemory", "swesmith", "literesearcher", "openmle_fast"}
+)
+_CONTEXT_MEMORY_MODES = frozenset({"filesystem", "compactionrl"})
 
 _OPENMLE_IDENTITY_FIELDS = (
     "expected_manifest_sha256",
@@ -90,6 +94,58 @@ def create_env_client(config: Any):
         "data_len": None,
         "timeout": timeout,
     }
+    raw_context_memory_mode = _get(config, "context_memory_mode")
+    orphan_compaction_fields = [
+        field
+        for field in ("compaction_recent_steps", "compaction_summary_max_bytes")
+        if _get(config, field) is not None
+    ]
+    if raw_context_memory_mode is None and orphan_compaction_fields:
+        raise ValueError(
+            "CompactionRL client fields require explicit context_memory_mode: "
+            + ", ".join(orphan_compaction_fields)
+        )
+    if raw_context_memory_mode is not None:
+        if task_name not in _CONTEXT_MEMORY_TASKS:
+            raise ValueError(
+                f"task {task_name!r} does not support context_memory_mode"
+            )
+        context_memory_mode = str(raw_context_memory_mode).strip().lower()
+        if context_memory_mode not in _CONTEXT_MEMORY_MODES:
+            raise ValueError(
+                "context_memory_mode must be one of "
+                f"{sorted(_CONTEXT_MEMORY_MODES)}, got {raw_context_memory_mode!r}"
+            )
+        if context_memory_mode != "compactionrl" and orphan_compaction_fields:
+            raise ValueError(
+                "compaction_recent_steps and compaction_summary_max_bytes are only "
+                "valid when context_memory_mode='compactionrl'"
+            )
+        recent_steps = _get(config, "compaction_recent_steps", 2)
+        if (
+            isinstance(recent_steps, bool)
+            or not isinstance(recent_steps, int)
+            or recent_steps < 0
+        ):
+            raise ValueError(
+                "compaction_recent_steps must be a non-negative integer"
+            )
+        summary_max_bytes = _get(config, "compaction_summary_max_bytes", 8192)
+        if (
+            isinstance(summary_max_bytes, bool)
+            or not isinstance(summary_max_bytes, int)
+            or summary_max_bytes <= 0
+        ):
+            raise ValueError(
+                "compaction_summary_max_bytes must be a positive integer"
+            )
+        client_kwargs.update(
+            {
+                "context_memory_mode": context_memory_mode,
+                "compaction_recent_steps": recent_steps,
+                "compaction_summary_max_bytes": summary_max_bytes,
+            }
+        )
     if task_name in {"swesmith", "literesearcher"}:
         raw_invalid_reward = _get(config, "invalid_action_reward", 0.0)
         reward_label = "SWE-smith" if task_name == "swesmith" else "LiteResearcher"

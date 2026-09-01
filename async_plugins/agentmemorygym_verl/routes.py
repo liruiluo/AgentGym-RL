@@ -35,6 +35,11 @@ _CONTROL_FIELDS = {
     "route_registry_expected_ids",
     "route_id",
 }
+_CONTEXT_MEMORY_MODES = frozenset({"filesystem", "compactionrl"})
+_COMPACTIONRL_CONFIG_FIELDS = (
+    "compaction_recent_steps",
+    "compaction_summary_max_bytes",
+)
 
 
 def _get(config: Any, key: str, default: Any = None) -> Any:
@@ -65,6 +70,21 @@ def _positive_int(value: Any, *, field: str) -> int:
         raise ValueError(f"{field} must be a positive integer, got {value!r}") from exc
     if not exact or integer <= 0:
         raise ValueError(f"{field} must be a positive integer, got {value!r}")
+    return integer
+
+
+def _nonnegative_int(value: Any, *, field: str) -> int:
+    if isinstance(value, bool):
+        raise TypeError(f"{field} must be a non-negative integer, not bool")
+    try:
+        integer = int(value)
+        exact = float(value) == float(integer)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"{field} must be a non-negative integer, got {value!r}"
+        ) from exc
+    if not exact or integer < 0:
+        raise ValueError(f"{field} must be a non-negative integer, got {value!r}")
     return integer
 
 
@@ -294,6 +314,45 @@ def _route_spec(raw: Any, *, require_attestation: bool) -> RouteSpec:
     if not retries_exact or retries_int < 0:
         raise ValueError(f"route {route_id} client.max_retries must be non-negative")
     client["max_retries"] = retries_int
+    raw_context_memory_mode = client.get("context_memory_mode")
+    orphan_compaction_fields = [
+        field for field in _COMPACTIONRL_CONFIG_FIELDS if field in client
+    ]
+    if raw_context_memory_mode is None and orphan_compaction_fields:
+        raise ValueError(
+            f"route {route_id} CompactionRL fields require explicit "
+            "client.context_memory_mode: " + ", ".join(orphan_compaction_fields)
+        )
+    if raw_context_memory_mode is not None:
+        context_memory_mode = str(raw_context_memory_mode).strip().lower()
+        if context_memory_mode not in _CONTEXT_MEMORY_MODES:
+            raise ValueError(
+                f"route {route_id} client.context_memory_mode must be one of "
+                f"{sorted(_CONTEXT_MEMORY_MODES)}, got {raw_context_memory_mode!r}"
+            )
+        client["context_memory_mode"] = context_memory_mode
+        if context_memory_mode != "compactionrl" and orphan_compaction_fields:
+            raise ValueError(
+                f"route {route_id} CompactionRL fields are only valid when "
+                "client.context_memory_mode='compactionrl'"
+            )
+        if context_memory_mode == "compactionrl":
+            missing = [
+                field for field in _COMPACTIONRL_CONFIG_FIELDS if field not in client
+            ]
+            if missing:
+                raise ValueError(
+                    f"route {route_id} CompactionRL config is missing explicit "
+                    + ", ".join(missing)
+                )
+            client["compaction_recent_steps"] = _nonnegative_int(
+                client["compaction_recent_steps"],
+                field=f"route {route_id} client.compaction_recent_steps",
+            )
+            client["compaction_summary_max_bytes"] = _positive_int(
+                client["compaction_summary_max_bytes"],
+                field=f"route {route_id} client.compaction_summary_max_bytes",
+            )
     if require_attestation:
         client_attestation_raw = client.pop("route_attestation_sha256", None)
         client_attestation = (
@@ -326,6 +385,36 @@ def _route_spec(raw: Any, *, require_attestation: bool) -> RouteSpec:
     )
 
 
+def _validate_uniform_context_memory_contract(routes: Sequence[RouteSpec]) -> None:
+    """Fail closed when only part of a registry selects CompactionRL."""
+
+    compaction_routes = [
+        route
+        for route in routes
+        if route.client_config.get("context_memory_mode") == "compactionrl"
+    ]
+    if not compaction_routes:
+        return
+    if len(compaction_routes) != len(routes):
+        selected = sorted(route.route_id for route in compaction_routes)
+        raise ValueError(
+            "CompactionRL route registry must select the mode explicitly for every "
+            f"route; selected={selected!r}"
+        )
+    contracts = {
+        (
+            route.client_config.get("compaction_recent_steps"),
+            route.client_config.get("compaction_summary_max_bytes"),
+        )
+        for route in compaction_routes
+    }
+    if len(contracts) != 1:
+        raise ValueError(
+            "CompactionRL route registry must use one shared recent-step and "
+            "summary-byte contract"
+        )
+
+
 def load_route_registry(
     path: str | Path,
     *,
@@ -355,8 +444,10 @@ def load_route_registry(
     raw_routes = payload.get("routes")
     if isinstance(raw_routes, (str, bytes)) or not isinstance(raw_routes, Sequence):
         raise TypeError("AMG route registry routes must be a sequence")
+    routes = [_route_spec(route, require_attestation=True) for route in raw_routes]
+    _validate_uniform_context_memory_contract(routes)
     registry = RouteRegistry(
-        routes=[_route_spec(route, require_attestation=True) for route in raw_routes],
+        routes=routes,
         sha256=observed_digest,
         source_path=registry_path.resolve(),
         agent_name=str(payload.get("agent_name", "")),
