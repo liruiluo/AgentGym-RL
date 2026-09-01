@@ -381,6 +381,188 @@ class TestFinalizerFileLogger(FinalizerTestCase):
             verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
             self.assertEqual(verdict["status"], "pass", verdict)
 
+    def test_current_verl_owner_rows_and_actor_rollout_correction_pass(self):
+        """Match the distinct owner rows emitted by the pinned current veRL."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+            original = json.loads(
+                fixture["metrics_path"].read_text(encoding="utf-8").splitlines()[0]
+            )["data"]
+            learner = dict(original)
+            for suffix in ("kl", "k3_kl", "log_ppl_abs_diff"):
+                learner[f"actor/rollout_corr/{suffix}"] = learner.pop(
+                    f"rollout_corr/{suffix}"
+                )
+            # Current learner rows can contain stale copies of rollouter-owned
+            # counters.  Those copies must never win ownership.
+            learner["fully_async/count/total_generated_samples"] = 0.0
+            learner["fully_async/count/dropped_stale_samples"] = 0.0
+            rollouter_counts = {
+                "fully_async/count/total_generated_samples": 64,
+                "fully_async/count/rollout_dispatched_samples": 64,
+                "fully_async/count/rollout_inflight_samples": 0,
+                "fully_async/count/rollout_completed_samples": 64,
+                "fully_async/count/rollout_failed_samples": 0,
+                "fully_async/count/rollout_cancelled_samples": 0,
+                "fully_async/count/queue_enqueued_samples": 64,
+                "fully_async/count/queue_dequeued_samples": 64,
+                "fully_async/count/queue_overflow_evictions": 0,
+                "fully_async/count/queue_cleared_samples": 0,
+                "fully_async/count/queue_resident_samples": 0,
+                "fully_async/count/staleness_samples": 0,
+                "fully_async/count/dropped_stale_samples": 0,
+            }
+            bootstrap = {key: 0 for key in rollouter_counts}
+            bootstrap.update(
+                {
+                    "fully_async/rollouter/active_time": 1.0,
+                    "fully_async/rollouter/idle_ratio": 0.0,
+                    "fully_async/rollouter/step_generated_samples": 0,
+                    "fully_async/rollouter/version_time": 1.0,
+                }
+            )
+            rollouter = dict(rollouter_counts)
+            rollouter.update(
+                {
+                    "fully_async/rollouter/active_time": 1.0,
+                    "fully_async/rollouter/idle_ratio": 0.0,
+                    "fully_async/rollouter/step_generated_samples": 64,
+                    "fully_async/rollouter/version_time": 1.0,
+                }
+            )
+            fixture["metrics_path"].write_text(
+                "\n".join(
+                    json.dumps(row, sort_keys=True)
+                    for row in (
+                        {"step": 0, "data": bootstrap},
+                        {"step": 1, "data": rollouter},
+                        {"step": 1, "data": learner},
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+
+            self.assertEqual(verdict["status"], "pass", verdict)
+
+    def test_actor_prefixed_corrections_are_fail_closed(self):
+        cases = (
+            ("missing", lambda data: data.pop("actor/rollout_corr/kl")),
+            (
+                "nonfinite",
+                lambda data: data.update(
+                    **{"actor/rollout_corr/k3_kl": float("nan")}
+                ),
+            ),
+        )
+        for label, mutation in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                fixture = self.build(Path(directory))
+                original = json.loads(
+                    fixture["metrics_path"]
+                    .read_text(encoding="utf-8")
+                    .splitlines()[0]
+                )["data"]
+                learner = dict(original)
+                for suffix in ("kl", "k3_kl", "log_ppl_abs_diff"):
+                    learner[f"actor/rollout_corr/{suffix}"] = learner.pop(
+                        f"rollout_corr/{suffix}"
+                    )
+                mutation(learner)
+                rollouter = {
+                    "fully_async/rollouter/active_time": 1.0,
+                    "fully_async/count/total_generated_samples": 64,
+                    "fully_async/count/dropped_stale_samples": 0,
+                }
+                fixture["metrics_path"].write_text(
+                    "\n".join(
+                        json.dumps(row, sort_keys=True)
+                        for row in (
+                            {"step": 1, "data": rollouter},
+                            {"step": 1, "data": learner},
+                        )
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                self.assert_failed(
+                    fixture["run_dir"], contains="actor/rollout_corr"
+                )
+
+    def test_current_owner_shape_requires_distinct_owner_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+            row = json.loads(
+                fixture["metrics_path"].read_text(encoding="utf-8").splitlines()[0]
+            )
+            combined = row["data"]
+            for suffix in ("kl", "k3_kl", "log_ppl_abs_diff"):
+                combined[f"actor/rollout_corr/{suffix}"] = combined.pop(
+                    f"rollout_corr/{suffix}"
+                )
+            combined["fully_async/rollouter/active_time"] = 1.0
+            fixture["metrics_path"].write_text(
+                json.dumps(row, sort_keys=True) + "\n", encoding="utf-8"
+            )
+
+            self.assert_failed(
+                fixture["run_dir"], contains="no unique learner-owner row"
+            )
+
+    def test_current_owner_shape_rejects_legacy_corrections_off_learner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+            original = json.loads(
+                fixture["metrics_path"].read_text(encoding="utf-8").splitlines()[0]
+            )["data"]
+            learner = dict(original)
+            corrections = {
+                key: learner.pop(key)
+                for key in (
+                    "rollout_corr/kl",
+                    "rollout_corr/k3_kl",
+                    "rollout_corr/log_ppl_abs_diff",
+                )
+            }
+            rollouter = {
+                **corrections,
+                "fully_async/rollouter/active_time": 1.0,
+                "fully_async/count/total_generated_samples": 64,
+                "fully_async/count/dropped_stale_samples": 0,
+            }
+            fixture["metrics_path"].write_text(
+                "\n".join(
+                    json.dumps(row, sort_keys=True)
+                    for row in (
+                        {"step": 1, "data": rollouter},
+                        {"step": 1, "data": learner},
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            self.assert_failed(fixture["run_dir"], contains="actor/rollout_corr")
+
+    def test_duplicate_current_owner_rows_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+            with fixture["metrics_path"].open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {"step": 1, "data": {"training/global_step": 1.0}},
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+
+            self.assert_failed(
+                fixture["run_dir"], contains="no unique learner-owner row"
+            )
+
     def test_step_zero_must_be_rollouter_only(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.build(Path(directory))
@@ -1732,6 +1914,32 @@ class TestMultitaskFinalizer(FinalizerTestCase):
                 fixture = self.build_multitask(Path(directory))
                 mutate_final_statistics(fixture["trainer_log"], mutation)
                 self.assert_failed(fixture["run_dir"], contains="FinalStatistics")
+
+    def test_final_statistics_accepts_integral_float_only_for_required_samples(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build_multitask(Path(directory))
+            mutate_final_statistics(
+                fixture["trainer_log"],
+                lambda value: value["rollouter"].update(
+                    {"static/required_samples": 64.0}
+                ),
+            )
+
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+
+            self.assertEqual(verdict["status"], "pass", verdict)
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build_multitask(Path(directory))
+            mutate_final_statistics(
+                fixture["trainer_log"],
+                lambda value: value["rollouter"].update(
+                    {"static/required_samples": 64.5}
+                ),
+            )
+            self.assert_failed(
+                fixture["run_dir"], contains="static/required_samples"
+            )
 
     def test_final_statistics_staleness_threshold_requires_a_json_number(self):
         with tempfile.TemporaryDirectory() as directory:

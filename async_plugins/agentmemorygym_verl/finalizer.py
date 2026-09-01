@@ -1864,12 +1864,30 @@ class _Audit:
             publications = int(self.expected["publication_cycles"])
             samples_per_update = int(self.expected["samples_per_update"])
 
+            step_zero_rollouter_count_keys = frozenset(
+                {
+                    "fully_async/count/total_generated_samples",
+                    "fully_async/count/rollout_dispatched_samples",
+                    "fully_async/count/rollout_inflight_samples",
+                    "fully_async/count/rollout_completed_samples",
+                    "fully_async/count/rollout_failed_samples",
+                    "fully_async/count/rollout_cancelled_samples",
+                    "fully_async/count/queue_enqueued_samples",
+                    "fully_async/count/queue_dequeued_samples",
+                    "fully_async/count/queue_overflow_evictions",
+                    "fully_async/count/queue_cleared_samples",
+                    "fully_async/count/queue_resident_samples",
+                    "fully_async/count/staleness_samples",
+                    "fully_async/count/dropped_stale_samples",
+                }
+            )
             step_zero_bad_keys = sorted(
                 str(key)
                 for data in rows_by_step.get(0, [])
                 for key in data
                 if not (
                     str(key).startswith("fully_async/rollouter/")
+                    or str(key) in step_zero_rollouter_count_keys
                     or str(key) == "dynamic_resource/rollout_resource_utilization"
                 )
             )
@@ -1895,11 +1913,26 @@ class _Audit:
                 "FileLogger publication steps are incomplete",
             )
 
-            required_rollout_corr = (
+            legacy_rollout_corr = (
                 "rollout_corr/kl",
                 "rollout_corr/k3_kl",
                 "rollout_corr/log_ppl_abs_diff",
             )
+            actor_rollout_corr = tuple(
+                f"actor/{key}" for key in legacy_rollout_corr
+            )
+            rollouter_owned_counter_keys = frozenset(
+                {
+                    "fully_async/count/total_generated_samples",
+                    "fully_async/count/dropped_stale_samples",
+                }
+            )
+            learner_owned_integral_metrics = {
+                "current_param_version": "fully_async/count/current_param_version",
+                "stale_trajectory_processed": "fully_async/count/stale_trajectory_processed",
+                "mq_queue_size": "fully_async/monitor/queue/mq_queue_size",
+                "required_samples": "fully_async/static/required_samples",
+            }
             for step in range(1, publications + 1):
                 data_rows = rows_by_step.get(step, [])
                 items = [
@@ -1907,14 +1940,65 @@ class _Audit:
                     for data in data_rows
                     for key, value in data.items()
                 ]
+                learner_rows = [
+                    data
+                    for data in data_rows
+                    if any(
+                        key in data
+                        for key in (
+                            "actor/grad_norm",
+                            "critic/grad_norm",
+                            "training/global_step",
+                        )
+                    )
+                ]
+                prefixed_rollouter_rows = [
+                    data
+                    for data in data_rows
+                    if any(
+                        str(key).startswith("fully_async/rollouter/") for key in data
+                    )
+                ]
+                current_owner_shape = bool(prefixed_rollouter_rows) or any(
+                    key in data
+                    for data in data_rows
+                    for key in actor_rollout_corr
+                )
+                if current_owner_shape:
+                    distinct_current_owners = (
+                        len(learner_rows) == 1
+                        and len(prefixed_rollouter_rows) == 1
+                        and learner_rows[0] is not prefixed_rollouter_rows[0]
+                    )
+                    learner = learner_rows[0] if distinct_current_owners else {}
+                    rollouter_rows = prefixed_rollouter_rows
+                    rollouter = (
+                        prefixed_rollouter_rows[0]
+                        if distinct_current_owners
+                        else {}
+                    )
+                else:
+                    # Compatibility with the older one-row FileLogger shape.
+                    learner = learner_rows[0] if len(learner_rows) == 1 else {}
+                    rollouter_rows = [
+                        data
+                        for data in data_rows
+                        if any(key in data for key in rollouter_owned_counter_keys)
+                    ]
+                    rollouter = rollouter_rows[0] if len(rollouter_rows) == 1 else {}
+                    distinct_current_owners = True
+                self.check(
+                    len(learner_rows) == 1 and distinct_current_owners,
+                    f"FileLogger publication step {step} has no unique learner-owner row",
+                )
+                self.check(
+                    len(rollouter_rows) == 1 and distinct_current_owners,
+                    f"FileLogger publication step {step} has no unique rollouter-owner row",
+                )
 
                 for role in ("actor", "critic"):
-                    grad_norms = [
-                        value for key, value in items if key == f"{role}/grad_norm"
-                    ]
-                    valid_grad = len(grad_norms) == 1 and _finite_positive(
-                        grad_norms[0]
-                    )
+                    grad_norm = learner.get(f"{role}/grad_norm")
+                    valid_grad = _finite_positive(grad_norm)
                     self.check(
                         valid_grad,
                         f"FileLogger publication step {step} has no unique nonzero {role}/grad_norm",
@@ -1926,32 +2010,56 @@ class _Audit:
                             critic_grad_rows += 1
 
                 correction_values: dict[str, float] = {}
-                for key in required_rollout_corr:
-                    values = [value for item_key, value in items if item_key == key]
-                    valid = len(values) == 1 and _finite_number(values[0])
+                if current_owner_shape:
+                    # Current veRL emits actor-owned correction diagnostics on
+                    # the learner row.  Never let a rollouter/stale copy satisfy
+                    # this branch.
+                    selected_corrections = (
+                        (legacy_key, actor_key, learner.get(actor_key))
+                        for legacy_key, actor_key in zip(
+                            legacy_rollout_corr, actor_rollout_corr
+                        )
+                    )
+                else:
+                    # Compatibility with the reviewed legacy FileLogger shape,
+                    # where the three unprefixed diagnostics may occupy a small
+                    # split row beside the combined learner/rollouter row.
+                    legacy_values = {
+                        key: [value for item_key, value in items if item_key == key]
+                        for key in legacy_rollout_corr
+                    }
+                    selected_corrections = (
+                        (key, key, values[0] if len(values) == 1 else None)
+                        for key, values in legacy_values.items()
+                    )
+                for canonical_key, emitted_key, value in selected_corrections:
+                    valid = _finite_number(value)
                     self.check(
                         valid,
-                        f"FileLogger publication step {step} has no unique finite {key}",
+                        f"FileLogger publication step {step} has no unique finite {emitted_key}",
                     )
                     if valid:
-                        correction_values[key] = float(values[0])
-                if len(correction_values) == len(required_rollout_corr):
+                        correction_values[canonical_key] = float(value)
+                if len(correction_values) == len(legacy_rollout_corr):
                     rollout_correction_rows += 1
 
-                integral_metrics = {
-                    "current_param_version": "fully_async/count/current_param_version",
-                    "stale_trajectory_processed": "fully_async/count/stale_trajectory_processed",
-                    "total_generated_samples": "fully_async/count/total_generated_samples",
-                    "dropped_stale_samples": "fully_async/count/dropped_stale_samples",
-                    "mq_queue_size": "fully_async/monitor/queue/mq_queue_size",
-                    "required_samples": "fully_async/static/required_samples",
-                }
                 observed_integrals: dict[str, int] = {}
-                for label, key in integral_metrics.items():
-                    values = [value for item_key, value in items if item_key == key]
-                    parsed = (
-                        _nonnegative_integral(values[0]) if len(values) == 1 else None
-                    )
+                owned_metrics = {
+                    **{
+                        label: (learner, key)
+                        for label, key in learner_owned_integral_metrics.items()
+                    },
+                    "total_generated_samples": (
+                        rollouter,
+                        "fully_async/count/total_generated_samples",
+                    ),
+                    "dropped_stale_samples": (
+                        rollouter,
+                        "fully_async/count/dropped_stale_samples",
+                    ),
+                }
+                for label, (owner_row, key) in owned_metrics.items():
+                    parsed = _nonnegative_integral(owner_row.get(key))
                     self.check(
                         parsed is not None,
                         f"FileLogger publication step {step} has no unique integral {key}",
@@ -2693,11 +2801,23 @@ class _Audit:
             "FinalStatistics queue cleanup did not complete exactly",
         )
 
-        def integer(mapping: Mapping[str, Any], key: str, owner: str) -> int:
-            parsed = _nonnegative_int(mapping.get(key))
+        def integer(
+            mapping: Mapping[str, Any],
+            key: str,
+            owner: str,
+            *,
+            allow_integral_float: bool = False,
+        ) -> int:
+            parser = _nonnegative_integral if allow_integral_float else _nonnegative_int
+            parsed = parser(mapping.get(key))
             if parsed is None:
+                expected_type = (
+                    "a nonnegative integral number"
+                    if allow_integral_float
+                    else "a JSON integer"
+                )
                 self.errors.append(
-                    f"FinalStatistics {owner}.{key} is missing or not a JSON integer"
+                    f"FinalStatistics {owner}.{key} is missing or not {expected_type}"
                 )
                 return 0
             return parsed
@@ -2837,7 +2957,12 @@ class _Audit:
 
         generated = integer(rollouter, "count/total_generated_samples", "rollouter")
         dropped_stale = integer(rollouter, "count/dropped_stale_samples", "rollouter")
-        required_samples = integer(rollouter, "static/required_samples", "rollouter")
+        required_samples = integer(
+            rollouter,
+            "static/required_samples",
+            "rollouter",
+            allow_integral_float=True,
+        )
         self.check(
             generated
             == lifecycle_totals["rollout_completed"]
