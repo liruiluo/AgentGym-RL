@@ -20,6 +20,8 @@ _CLIENT_CLASS_NAMES = {
 }
 
 _AGENTMEMORY_POLICY_PROMPT_FIELD = "policy_system_prompt"
+_AGEMEM_ROUTE_SCHEMA = "camg_agemem_style_route_v1"
+_AGEMEM_ADAPTER_NAME = "agemem_style"
 
 _OPENMLE_IDENTITY_FIELDS = (
     "expected_manifest_sha256",
@@ -163,8 +165,58 @@ def create_env_client(config: Any):
                         "configure_policy_system_prompt()"
                     )
                 configure_prompt(policy_system_prompt)
-            return client
+            return _wrap_memory_adapter(client, _get(config, "memory_adapter"))
     assert last_error is not None
     raise RuntimeError(
         f"failed to create AMG {task_name} client after {retries + 1} attempts"
     ) from last_error
+
+
+def _wrap_memory_adapter(client: Any, raw_adapter: Any):
+    """Apply an explicitly configured task-neutral memory adapter."""
+
+    if raw_adapter is None:
+        return client
+    if not isinstance(raw_adapter, Mapping):
+        _close_quietly(client)
+        raise TypeError("AMG memory_adapter must be a mapping")
+    adapter = {str(key): value for key, value in raw_adapter.items()}
+    unknown = sorted(set(adapter) - {"schema", "name", "config"})
+    if unknown:
+        _close_quietly(client)
+        raise ValueError(
+            "unknown AMG memory_adapter fields: " + ", ".join(unknown)
+        )
+    if adapter.get("schema") != _AGEMEM_ROUTE_SCHEMA:
+        _close_quietly(client)
+        raise ValueError(
+            f"AMG memory_adapter.schema must be {_AGEMEM_ROUTE_SCHEMA!r}"
+        )
+    if adapter.get("name") != _AGEMEM_ADAPTER_NAME:
+        _close_quietly(client)
+        raise ValueError(
+            f"AMG memory_adapter.name must be {_AGEMEM_ADAPTER_NAME!r}"
+        )
+    config = adapter.get("config", {})
+    if not isinstance(config, Mapping):
+        _close_quietly(client)
+        raise TypeError("AMG memory_adapter.config must be a mapping")
+    try:
+        from agentenv.envs import AgeMemAdapterConfig, AgeMemEnvClientAdapter
+
+        return AgeMemEnvClientAdapter(
+            client,
+            AgeMemAdapterConfig.from_mapping(config),
+        )
+    except Exception:
+        _close_quietly(client)
+        raise
+
+
+def _close_quietly(client: Any) -> None:
+    close = getattr(client, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
