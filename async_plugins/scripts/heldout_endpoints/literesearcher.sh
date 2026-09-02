@@ -30,8 +30,10 @@ HELDOUT_ROUTING=$CAMG_HELDOUT_ASSET_ROUTING_PATH
 HELDOUT_RUNTIME_ROWS=$CAMG_HELDOUT_ASSET_RUNTIME_ROWS_PATH
 OUTER_SOURCE_ROOT=$CAMG_HELDOUT_SOURCE_OUTER_ROOT
 INNER_SOURCE_ROOT=$CAMG_HELDOUT_SOURCE_INNER_ROOT
+LITERESEARCHER_ENDPOINT_SOURCE_ROOT=$CAMG_HELDOUT_SOURCE_ENDPOINT_ROOT
 OUTER_SOURCE_COMMIT=$CAMG_HELDOUT_SOURCE_OUTER_COMMIT
 INNER_SOURCE_COMMIT=$CAMG_HELDOUT_SOURCE_INNER_COMMIT
+LITERESEARCHER_ENDPOINT_SOURCE_COMMIT=$CAMG_HELDOUT_SOURCE_ENDPOINT_COMMIT
 ENV_PYTHON=$(heldout_python)
 WORKSPACE_RG_BINARY=$WS/runtime/tools/ripgrep/15.1.0-x86_64-unknown-linux-musl/rg
 WORKSPACE_RG_SHA256=ebeaf56f8a25e102e9419933423738b3a2a613a444fd749d695e15eba53f71f2
@@ -112,7 +114,14 @@ heldout_assert_executable "$WORKSPACE_RG_BINARY" "LiteResearcher workspace ripgr
 [[ "$(basename -- "$OUTER_SOURCE_ROOT")" == AgentGym-RL && -d "$OUTER_SOURCE_ROOT/async_plugins" ]] \
   || heldout_die "LiteResearcher outer source is not the AgentGym-RL checkout"
 [[ -d "$INNER_SOURCE_ROOT/agentenv" && -d "$INNER_SOURCE_ROOT/agentenv-agentmemory" ]] \
-  || heldout_die "LiteResearcher inner source lacks endpoint packages"
+  || heldout_die "LiteResearcher inner client source is incomplete"
+heldout_assert_source \
+  "$LITERESEARCHER_ENDPOINT_SOURCE_ROOT" \
+  "$LITERESEARCHER_ENDPOINT_SOURCE_COMMIT" \
+  "LiteResearcher endpoint"
+[[ -d "$LITERESEARCHER_ENDPOINT_SOURCE_ROOT/agentenv" \
+   && -d "$LITERESEARCHER_ENDPOINT_SOURCE_ROOT/agentenv-agentmemory/agentenv_agentmemory/literesearcher" ]] \
+  || heldout_die "LiteResearcher endpoint source lacks server packages"
 
 # The upstream loader still calls this split ``train``.  The immutable CAMG
 # binding is authoritative for its held-out role and maps runtime indices
@@ -967,7 +976,7 @@ persist_shim_load_log
 mkdir -p -m 700 "$RUN_TMP/workspaces"
 env \
   PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
-  PYTHONPATH="$OUTER_SOURCE_ROOT:$INNER_SOURCE_ROOT/agentenv:$INNER_SOURCE_ROOT/agentenv-agentmemory" \
+  PYTHONPATH="$OUTER_SOURCE_ROOT:$LITERESEARCHER_ENDPOINT_SOURCE_ROOT/agentenv:$LITERESEARCHER_ENDPOINT_SOURCE_ROOT/agentenv-agentmemory" \
   AGENTMEMORY_ENABLE_THINKING=0 AGENTMEMORY_ALLOW_REASONING=0 \
   AGENTMEMORY_RUN_ID="amg_${RUN_ID}_literesearcher" \
   AGENTMEMORY_SANDBOX_ROOTFS_PARENT="$SANDBOX_ROOTFS_PARENT" \
@@ -977,7 +986,7 @@ env \
     --surface agentmemory_literesearcher_fullpool_upstream_hybrid_v1 \
     --run-id "amg_${RUN_ID}_literesearcher" --split train \
     --service-role formal \
-    --runtime-source-id "${OUTER_SOURCE_COMMIT}_${INNER_SOURCE_COMMIT}" \
+    --runtime-source-id "${OUTER_SOURCE_COMMIT}_${LITERESEARCHER_ENDPOINT_SOURCE_COMMIT}" \
     --workspace-rg-binary "$WORKSPACE_RG_BINARY" \
     --workspace-rg-sha256 "$WORKSPACE_RG_SHA256" \
     --workspace-root-parent "$RUN_TMP/workspaces" \
@@ -1019,7 +1028,7 @@ done
 [[ "$ready" == 1 ]] || { echo "LiteResearcher endpoint did not become ready" >&2; exit 24; }
 "$ENV_PYTHON" -B - "$ENDPOINT_RUN_DIR/environment-metadata.json" \
   "$CAMG_HELDOUT_TASK_COUNT" "$CAMG_HELDOUT_ASSET_HELDOUT_MANIFEST_SHA256" \
-  "${OUTER_SOURCE_COMMIT}_${INNER_SOURCE_COMMIT}" \
+  "${OUTER_SOURCE_COMMIT}_${LITERESEARCHER_ENDPOINT_SOURCE_COMMIT}" \
   "$ENDPOINT_RUN_DIR/heldout-binding-attestation.json" <<'PY_LR_METADATA'
 import json
 import os

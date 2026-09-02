@@ -38,6 +38,12 @@ _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 _HEX = frozenset("0123456789abcdef")
 _RESERVED_ENVIRONMENT_PREFIX = "CAMG_HELDOUT_"
 _LOADER_OWNED_ENVIRONMENT_KEYS = frozenset({"SWESMITH_DETAIL_TOKEN"})
+_REQUIRED_SOURCES = {
+    "webshop": ("outer", "inner"),
+    "swesmith": ("outer", "inner"),
+    "literesearcher": ("outer", "inner", "endpoint"),
+    "openmle_fast": ("outer", "inner"),
+}
 _REQUIRED_ASSETS = {
     "webshop": frozenset(
         {"heldout_episodes", "product_pool", "routing", "runtime_manifest"}
@@ -231,7 +237,7 @@ def _parse_endpoint(value: Any, *, field: str) -> tuple[str, str, int]:
 def _verify_source(value: Any, *, route_id: str) -> HeldoutSource:
     source = _mapping(value, field=f"{route_id} source")
     name = str(source.get("name", ""))
-    if name not in {"outer", "inner"}:
+    if name not in {"outer", "inner", "endpoint"}:
         raise OrchestratorError(f"{route_id} source name is invalid: {name!r}")
     root = _directory(source.get("root"), field=f"{route_id} {name} source root")
     commit = str(source.get("commit", ""))
@@ -635,7 +641,12 @@ def load_heldout_endpoint_registry(
             _verify_source(value, route_id=route_id)
             for value in _sequence(route.get("sources"), field=f"{route_id} sources")
         )
-        if tuple(source.name for source in sources) != ("outer", "inner"):
+        source_names = tuple(source.name for source in sources)
+        if source_names != _REQUIRED_SOURCES[route_id]:
+            if route_id == "literesearcher":
+                raise OrchestratorError(
+                    "literesearcher must bind outer, inner, then endpoint source"
+                )
             raise OrchestratorError(f"{route_id} must bind outer then inner source")
 
         assets = tuple(
