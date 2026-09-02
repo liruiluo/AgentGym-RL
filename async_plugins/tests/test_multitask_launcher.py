@@ -48,6 +48,7 @@ from agentmemorygym_verl.routes import (
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "async_plugins/config/amg_multitask400.yaml"
 CONFIG_131K = ROOT / "async_plugins/config/amg_multitask400_131k.yaml"
+CONFIG_200 = ROOT / "async_plugins/config/amg_multitask200.yaml"
 
 
 def _sha256(path: Path) -> str:
@@ -666,6 +667,24 @@ class ProductionResolveFixture:
 
 
 class TestMultitaskOrchestratorContract(unittest.TestCase):
+    def test_reviewed_config_freezes_formal200_r38(self) -> None:
+        config = load_orchestrator_config(CONFIG_200)
+
+        self.assertEqual(config.route_order, EXPECTED_ROUTE_IDS)
+        self.assertEqual(config.optimizer_updates, 200)
+        self.assertEqual(config.samples_per_update, 64)
+        self.assertEqual(config.total_episodes, 12_800)
+        self.assertEqual(
+            config.total_episodes,
+            config.optimizer_updates * config.samples_per_update,
+        )
+        self.assertEqual(
+            (config.trainer_gpus, config.standalone_rollout_gpus),
+            (6, 2),
+        )
+        self.assertEqual(config.trigger_parameter_sync_step, 1)
+        self.assertEqual(config.sampling_order, "round_robin")
+
     def test_reviewed_config_freezes_formal400_r38(self) -> None:
         config = load_orchestrator_config(CONFIG)
 

@@ -46,7 +46,10 @@ EXPECTED_ROUTE_IDS = (
     "literesearcher",
     "openmle_fast",
 )
-_CONFIG_SCHEMA = "amg_multitask400_orchestrator_config_v1"
+_CONFIG_BUDGETS = {
+    "amg_multitask200_orchestrator_config_v1": (200, 12_800),
+    "amg_multitask400_orchestrator_config_v1": (400, 25_600),
+}
 _LEARNER_TOKEN_BUDGET_PROFILES = {
     "default-65536-v1": (65_536, 65_536),
     "multitask-131072-v1": (131_072, 131_072),
@@ -390,6 +393,12 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
     holders = _mapping(
         payload.get("holder_transaction"), field="config.holder_transaction"
     )
+    schema = payload.get("schema")
+    if schema not in _CONFIG_BUDGETS:
+        raise OrchestratorError(
+            f"reviewed multitask config schema is unsupported: {schema!r}"
+        )
+    expected_updates, expected_episodes = _CONFIG_BUDGETS[str(schema)]
     required_runtime_inputs = {
         "route_registry": "cli:--route-registry",
         "route_registry_sha256": "cli:--route-registry-sha256",
@@ -413,7 +422,6 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
     ]
 
     exact = {
-        "schema": (payload.get("schema"), _CONFIG_SCHEMA),
         "implementation base commit": (
             source.get("implementation_base_commit"),
             _IMPLEMENTATION_BASE_COMMIT,
@@ -430,12 +438,15 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
             experiment.get("checkpoint_lineage_count"),
             1,
         ),
-        "optimizer updates": (budget.get("optimizer_updates"), 400),
+        "optimizer updates": (
+            budget.get("optimizer_updates"),
+            expected_updates,
+        ),
         "episodes per update": (
             budget.get("consumed_episodes_per_update"),
             64,
         ),
-        "total episodes": (budget.get("total_episodes"), 25_600),
+        "total episodes": (budget.get("total_episodes"), expected_episodes),
         "route order": (tuple(routing.get("order", ())), EXPECTED_ROUTE_IDS),
         "sampling": (routing.get("sampling"), "round_robin"),
         "per-update route quota": (
@@ -480,7 +491,7 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
     for field, (observed, expected) in exact.items():
         if observed != expected:
             raise OrchestratorError(
-                f"reviewed Multitask400 {field} drifted: {observed!r} != {expected!r}"
+                f"reviewed multitask {field} drifted: {observed!r} != {expected!r}"
             )
     optimizer_updates = _positive_int(
         budget["optimizer_updates"], field="optimizer updates"
@@ -491,7 +502,7 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
     total_episodes = _positive_int(budget["total_episodes"], field="total episodes")
     if optimizer_updates * samples_per_update != total_episodes:
         raise OrchestratorError(
-            "Multitask400 arithmetic drift: optimizer_updates * "
+            "multitask arithmetic drift: optimizer_updates * "
             "consumed_episodes_per_update != total_episodes"
         )
     return OrchestratorConfig(
