@@ -640,10 +640,14 @@ class TestAMGMultitaskLauncherContract(unittest.TestCase):
         return path, hashlib.sha256(path.read_bytes()).hexdigest()
 
     def _identity_fixture(
-        self, root: Path, *, mode: str = "formal"
+        self,
+        root: Path,
+        *,
+        mode: str = "formal",
+        formal_updates: int = 400,
     ) -> tuple[LaunchInputs, dict, dict]:
         registry, registry_sha256 = self._registry(root)
-        updates = 400 if mode == "formal" else 1
+        updates = formal_updates if mode == "formal" else 1
         role = "train_pool" if mode == "formal" else "gate_only"
         row_count = updates * 64
         rows_per_route = row_count // len(self.ROUTES)
@@ -822,6 +826,20 @@ class TestAMGMultitaskLauncherContract(unittest.TestCase):
             )
             self.assertEqual(values["data.shuffle"], "False")
 
+    def test_multitask_identity_accepts_formal200_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inputs, schedule_report, _ = self._identity_fixture(
+                Path(directory), formal_updates=200
+            )
+
+            identity = _load_multitask_identity(inputs, schedule_report=schedule_report)
+
+            budget = identity["budget_contract"]
+            self.assertEqual(budget["optimizer_updates"], 200)
+            self.assertEqual(budget["publication_cycles"], 200)
+            self.assertEqual(budget["samples_per_update"], 64)
+            self.assertEqual(budget["episodes"], 12_800)
+
     def test_multitask_identity_binds_formal400_sources_runtime_and_routes(self):
         with tempfile.TemporaryDirectory() as directory:
             inputs, schedule_report, source_lock = self._identity_fixture(
@@ -848,6 +866,21 @@ class TestAMGMultitaskLauncherContract(unittest.TestCase):
                 _load_launch_identity(inputs, schedule_report=schedule_report),
                 identity,
             )
+
+    def test_multitask_identity_accepts_reviewed_formal200_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inputs, schedule_report, _ = self._identity_fixture(
+                Path(directory),
+                formal_updates=200,
+            )
+
+            identity = _load_multitask_identity(inputs, schedule_report=schedule_report)
+
+            budget = identity["budget_contract"]
+            self.assertEqual(budget["optimizer_updates"], 200)
+            self.assertEqual(budget["samples_per_update"], 64)
+            self.assertEqual(budget["episodes"], 12_800)
+            self.assertEqual(budget["publication_cycles"], 200)
 
     def _rewrite_multitask_certificate(
         self, inputs: LaunchInputs, source_lock: dict, certificate: dict

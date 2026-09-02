@@ -52,6 +52,7 @@ from agentenv.envs.swesmith import (  # noqa: E402
 )
 from agentenv.envs.webshop_handoff import (  # noqa: E402
     WEBSHOP_CONTEXT_COMPACTION_REQUEST,
+    WEBSHOP_POST_CHECKPOINT_READ_MARKER,
     WEBSHOP_SESSION_HANDOFF_REQUEST,
 )
 
@@ -340,13 +341,13 @@ def webshop_search_response(*, session_index: int = 0) -> dict:
     }
 
 
-def webshop_buy_response() -> dict:
+def webshop_buy_response(*, session_index: int = 1) -> dict:
     return {
-        "observation": "session-1 fresh observation",
+        "observation": f"session-{session_index} fresh observation",
         "reward": 1.0,
         "done": False,
         "info": {
-            "current_subtask_index": 1,
+            "current_subtask_index": session_index,
             "tool_ops": [
                 {
                     "op": "BUY",
@@ -370,6 +371,7 @@ def webshop_checkpoint_response(
     exit_code: int = 0,
     timed_out: bool = False,
     stdout: str = "",
+    observation: str | None = None,
     checkpoint_payload: bytes = b"checkpoint",
     exists: bool | None = None,
 ) -> dict:
@@ -383,9 +385,13 @@ def webshop_checkpoint_response(
     }
     return {
         "observation": (
-            stdout
-            if stdout
-            else ("workspace write completed" if changed else "checkpoint unchanged")
+            observation
+            if observation is not None
+            else (
+                stdout
+                if stdout
+                else ("workspace write completed" if changed else "checkpoint unchanged")
+            )
         ),
         "reward": 0.0,
         "done": False,
@@ -605,6 +611,12 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
                 webshop_checkpoint_response(
                     changed=False,
                     stdout=checkpoint_body,
+                    observation=(
+                        checkpoint_body
+                        + "\n\nsession-1 fresh observation\n"
+                        + "As the first action, issue exactly shell_command to read "
+                        + FILESYSTEM_CHECKPOINT_PATH
+                    ),
                     checkpoint_payload=checkpoint_payload,
                     exists=True,
                 ),
@@ -717,6 +729,34 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             read_output.info["wrapper_evidence"]["memory_event"], "read"
         )
         self.assertIn("objective: finish six purchases", str(messages))
+        self.assertIn("session-1 fresh observation", str(messages))
+        self.assertIn(
+            "The required continuation checkpoint read succeeded",
+            str(messages),
+        )
+        self.assertIn(
+            "continue shopping now with one bare search[...] or click[...] action",
+            str(messages),
+        )
+        self.assertIn(
+            "Do not read `.agent_memory/CONTINUATION.md` again unless a later",
+            str(messages),
+        )
+        self.assertGreater(
+            read_output.state.rindex(
+                "The required continuation checkpoint read succeeded"
+            ),
+            read_output.state.rindex(
+                "As the first action, issue exactly shell_command"
+            ),
+        )
+        self.assertTrue(
+            read_output.state.endswith(WEBSHOP_POST_CHECKPOINT_READ_MARKER)
+        )
+        self.assertEqual(read_output.state, messages[-1]["content"])
+        self.assertTrue(
+            read_output.info["wrapper_evidence"]["checkpoint_read_consumed"]
+        )
 
         next_turn = prepare(client, messages)
         self.assertIsNone(next_turn.control_request)
@@ -726,6 +766,159 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertEqual(next_output.info["context_transition"]["operation"], "replace_messages")
         self.assertIsNone(client._pending_checkpoint_read)
         self.assertNotIn("Checkpoint read failed", str(messages))
+        self.assertNotIn("required continuation checkpoint read succeeded", str(messages))
+        self.assertNotIn(checkpoint_body, str(messages))
+
+    def test_webshop_repeated_checkpoint_read_keeps_progress_cue_until_browser_action(
+        self,
+    ) -> None:
+        checkpoint_body = "objective: finish six purchases; next: search blue mug"
+        checkpoint_payload = checkpoint_body.encode("utf-8")
+        ordinary_note = "voluntary note that is not the canonical checkpoint"
+        client = FakeWebShopClient(
+            [
+                webshop_buy_response(),
+                webshop_checkpoint_response(checkpoint_payload=checkpoint_payload),
+                webshop_checkpoint_response(
+                    changed=False,
+                    stdout=checkpoint_body,
+                    checkpoint_payload=checkpoint_payload,
+                    exists=True,
+                ),
+                webshop_checkpoint_response(
+                    changed=False,
+                    stdout=ordinary_note,
+                    checkpoint_payload=checkpoint_payload,
+                    exists=True,
+                ),
+                webshop_checkpoint_response(
+                    changed=False,
+                    stdout=checkpoint_body,
+                    checkpoint_payload=checkpoint_payload,
+                    exists=True,
+                ),
+                webshop_search_response(session_index=1),
+                webshop_checkpoint_response(
+                    changed=False,
+                    stdout=checkpoint_body,
+                    checkpoint_payload=checkpoint_payload,
+                    exists=True,
+                ),
+                webshop_buy_response(session_index=2),
+                webshop_checkpoint_response(
+                    checkpoint_payload=b"objective: session three; next: search lamp",
+                    session_index=2,
+                ),
+                webshop_checkpoint_response(
+                    changed=False,
+                    stdout="objective: session three; next: search lamp",
+                    checkpoint_payload=b"objective: session three; next: search lamp",
+                    exists=True,
+                    session_index=2,
+                ),
+            ]
+        )
+        messages = self.bind_webshop(client)
+        _, messages = complete_policy_turn(
+            client, prepare(client, messages), "click[Buy Now]"
+        )
+        checkpoint_action = (
+            'shell_command {"command":"mkdir -p .agent_memory && printf %s '
+            + checkpoint_body
+            + ' > .agent_memory/CONTINUATION.md","workdir":"."}'
+        )
+        _, messages = complete_policy_turn(
+            client, prepare(client, messages), checkpoint_action
+        )
+        read_action = (
+            'shell_command {"command":"cat .agent_memory/CONTINUATION.md",'
+            '"workdir":"."}'
+        )
+        first_read, messages = complete_policy_turn(
+            client, prepare(client, messages), read_action
+        )
+        self.assertTrue(
+            first_read.info["wrapper_evidence"]["checkpoint_read_satisfied"]
+        )
+        self.assertIsNotNone(client._consumed_checkpoint_read)
+
+        other_read_action = (
+            'shell_command {"command":"cat notes.md","workdir":"."}'
+        )
+        other_read, messages = complete_policy_turn(
+            client, prepare(client, messages), other_read_action
+        )
+        self.assertNotIn(
+            "checkpoint_read_already_consumed",
+            other_read.info["wrapper_evidence"],
+        )
+        self.assertEqual(other_read.state, ordinary_note)
+        self.assertIsNotNone(client._consumed_checkpoint_read)
+
+        repeated_read, messages = complete_policy_turn(
+            client, prepare(client, messages), read_action
+        )
+        repeated_evidence = repeated_read.info["wrapper_evidence"]
+        self.assertTrue(repeated_evidence["checkpoint_read_already_consumed"])
+        self.assertEqual(
+            repeated_evidence["checkpoint_read_consumed_session_index"], 1
+        )
+        self.assertIn("session-1 fresh observation", repeated_read.state)
+        self.assertIn(checkpoint_body, repeated_read.state)
+        progress_cue = (
+            "This checkpoint has already been read in the current shopping session."
+        )
+        self.assertIn(progress_cue, repeated_read.state)
+        self.assertGreater(
+            repeated_read.state.index(progress_cue),
+            repeated_read.state.index(checkpoint_body),
+        )
+        self.assertEqual(repeated_read.state, messages[-1]["content"])
+        self.assertIsNotNone(client._consumed_checkpoint_read)
+
+        browser_output, messages = complete_policy_turn(
+            client, prepare(client, messages), "search[blue mug]"
+        )
+        self.assertEqual(browser_output.state, "session-1 search result")
+        self.assertIsNone(client._consumed_checkpoint_read)
+
+        ordinary_reread, messages = complete_policy_turn(
+            client, prepare(client, messages), read_action
+        )
+        self.assertEqual(ordinary_reread.state, checkpoint_body)
+        self.assertNotIn(
+            "checkpoint_read_already_consumed",
+            ordinary_reread.info["wrapper_evidence"],
+        )
+        self.assertNotIn(progress_cue, ordinary_reread.state)
+
+        _, messages = complete_policy_turn(
+            client, prepare(client, messages), "click[Buy Now]"
+        )
+        second_handoff = prepare(client, messages)
+        self.assertEqual(
+            second_handoff.control_request, WEBSHOP_SESSION_HANDOFF_REQUEST
+        )
+        second_checkpoint_action = (
+            'shell_command {"command":"printf session-three > '
+            '.agent_memory/CONTINUATION.md"}'
+        )
+        _, messages = complete_policy_turn(
+            client, second_handoff, second_checkpoint_action
+        )
+        self.assertIsNotNone(client._pending_checkpoint_read)
+        self.assertIsNone(client._consumed_checkpoint_read)
+        second_first_read, _ = complete_policy_turn(
+            client, prepare(client, messages), read_action
+        )
+        self.assertTrue(
+            second_first_read.info["wrapper_evidence"]["checkpoint_read_satisfied"]
+        )
+        self.assertNotIn(
+            "checkpoint_read_already_consumed",
+            second_first_read.info["wrapper_evidence"],
+        )
+        self.assertEqual(client._consumed_checkpoint_read["session_index"], 2)
 
     def test_failed_webshop_checkpoint_rebuilds_stable_context_and_retries(self) -> None:
         client = FakeWebShopClient(
