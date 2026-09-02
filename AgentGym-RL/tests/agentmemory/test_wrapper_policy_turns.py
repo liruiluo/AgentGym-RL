@@ -52,6 +52,7 @@ from agentenv.envs.swesmith import (  # noqa: E402
 )
 from agentenv.envs.webshop_handoff import (  # noqa: E402
     WEBSHOP_CONTEXT_COMPACTION_REQUEST,
+    WEBSHOP_POST_CHECKPOINT_READ_MARKER,
     WEBSHOP_SESSION_HANDOFF_REQUEST,
 )
 
@@ -370,6 +371,7 @@ def webshop_checkpoint_response(
     exit_code: int = 0,
     timed_out: bool = False,
     stdout: str = "",
+    observation: str | None = None,
     checkpoint_payload: bytes = b"checkpoint",
     exists: bool | None = None,
 ) -> dict:
@@ -383,9 +385,13 @@ def webshop_checkpoint_response(
     }
     return {
         "observation": (
-            stdout
-            if stdout
-            else ("workspace write completed" if changed else "checkpoint unchanged")
+            observation
+            if observation is not None
+            else (
+                stdout
+                if stdout
+                else ("workspace write completed" if changed else "checkpoint unchanged")
+            )
         ),
         "reward": 0.0,
         "done": False,
@@ -605,6 +611,12 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
                 webshop_checkpoint_response(
                     changed=False,
                     stdout=checkpoint_body,
+                    observation=(
+                        checkpoint_body
+                        + "\n\nsession-1 fresh observation\n"
+                        + "As the first action, issue exactly shell_command to read "
+                        + FILESYSTEM_CHECKPOINT_PATH
+                    ),
                     checkpoint_payload=checkpoint_payload,
                     exists=True,
                 ),
@@ -729,6 +741,17 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertIn(
             "Do not read `.agent_memory/CONTINUATION.md` again unless a later",
             str(messages),
+        )
+        self.assertGreater(
+            read_output.state.rindex(
+                "The required continuation checkpoint read succeeded"
+            ),
+            read_output.state.rindex(
+                "As the first action, issue exactly shell_command"
+            ),
+        )
+        self.assertTrue(
+            read_output.state.endswith(WEBSHOP_POST_CHECKPOINT_READ_MARKER)
         )
         self.assertEqual(read_output.state, messages[-1]["content"])
         self.assertTrue(
