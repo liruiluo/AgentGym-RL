@@ -35,6 +35,11 @@ _OPENMLE_IDENTITY_FIELDS = (
     "expected_max_observation_tokens",
 )
 
+_SWESMITH_PRIVATE_IDENTITY_FIELDS = (
+    "detail_token_path",
+    "detail_token_sha256",
+)
+
 
 def _get(config: Any, key: str, default: Any = None) -> Any:
     if isinstance(config, Mapping):
@@ -134,6 +139,22 @@ def create_env_client(config: Any):
             client_kwargs["checkpoint_contract_penalty"] = (
                 checkpoint_contract_penalty
             )
+
+    if task_name == "swesmith":
+        private_identity = {
+            field: _get(config, field) for field in _SWESMITH_PRIVATE_IDENTITY_FIELDS
+        }
+        populated = {
+            field for field, value in private_identity.items() if value not in (None, "")
+        }
+        if populated and populated != set(_SWESMITH_PRIVATE_IDENTITY_FIELDS):
+            missing = sorted(set(_SWESMITH_PRIVATE_IDENTITY_FIELDS) - populated)
+            raise ValueError(
+                "SWE-smith private identity configuration is incomplete: "
+                + ", ".join(missing)
+            )
+        if populated:
+            client_kwargs.update(private_identity)
 
     if task_name == "openmle_fast":
         for field in _OPENMLE_IDENTITY_FIELDS:

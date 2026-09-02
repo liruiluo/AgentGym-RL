@@ -18,6 +18,7 @@ class FakeClient(BaseEnvClient):
         self.kwargs = kwargs
         self.closed = False
         self.info = {"observation": "task"}
+        self.episode_source_identity = None
         self.__class__.instances.append(self)
 
     def __len__(self) -> int:
@@ -33,6 +34,11 @@ class FakeClient(BaseEnvClient):
         return StepOutput(state=action, reward=0.0, done=False, info={})
 
     def reset(self, idx: int):
+        self.episode_source_identity = {
+            "schema": "camg_native_episode_source_identity_v1",
+            "route_id": "webshop",
+            "data_idx": idx,
+        }
         return None
 
     def close(self):
@@ -93,6 +99,31 @@ class AgeMemEnvClientConstructionTests(unittest.TestCase):
             client = env_client.create_env_client(config("webshop", adapter=None))
         self.assertIsInstance(client, FakeClient)
         self.assertNotIsInstance(client, AgeMemEnvClientAdapter)
+
+    def test_swesmith_private_detail_token_binding_is_forwarded(self) -> None:
+        value = config("swesmith", adapter=None)
+        value.update(
+            {
+                "detail_token_path": "/run/heldout/swesmith-detail.token",
+                "detail_token_sha256": "a" * 64,
+            }
+        )
+        with patch.object(
+            env_client, "_client_classes", return_value={"swesmith": FakeClient}
+        ):
+            client = env_client.create_env_client(value)
+        self.assertEqual(
+            client.kwargs["detail_token_path"],
+            "/run/heldout/swesmith-detail.token",
+        )
+        self.assertEqual(client.kwargs["detail_token_sha256"], "a" * 64)
+
+        incomplete = config("swesmith", adapter=None)
+        incomplete["detail_token_path"] = "/run/heldout/swesmith-detail.token"
+        with patch.object(
+            env_client, "_client_classes", return_value={"swesmith": FakeClient}
+        ), self.assertRaisesRegex(ValueError, "incomplete"):
+            env_client.create_env_client(incomplete)
 
     def test_invalid_adapter_fails_closed_and_closes_native_client(self) -> None:
         with patch.object(
