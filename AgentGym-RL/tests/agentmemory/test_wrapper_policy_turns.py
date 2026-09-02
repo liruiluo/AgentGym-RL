@@ -717,6 +717,23 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             read_output.info["wrapper_evidence"]["memory_event"], "read"
         )
         self.assertIn("objective: finish six purchases", str(messages))
+        self.assertIn("session-1 fresh observation", str(messages))
+        self.assertIn(
+            "The required continuation checkpoint read succeeded",
+            str(messages),
+        )
+        self.assertIn(
+            "continue shopping now with one bare search[...] or click[...] action",
+            str(messages),
+        )
+        self.assertIn(
+            "Do not read `.agent_memory/CONTINUATION.md` again unless a later",
+            str(messages),
+        )
+        self.assertEqual(read_output.state, messages[-1]["content"])
+        self.assertTrue(
+            read_output.info["wrapper_evidence"]["checkpoint_read_consumed"]
+        )
 
         next_turn = prepare(client, messages)
         self.assertIsNone(next_turn.control_request)
@@ -726,6 +743,8 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertEqual(next_output.info["context_transition"]["operation"], "replace_messages")
         self.assertIsNone(client._pending_checkpoint_read)
         self.assertNotIn("Checkpoint read failed", str(messages))
+        self.assertNotIn("required continuation checkpoint read succeeded", str(messages))
+        self.assertNotIn(checkpoint_body, str(messages))
 
     def test_failed_webshop_checkpoint_rebuilds_stable_context_and_retries(self) -> None:
         client = FakeWebShopClient(
