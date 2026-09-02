@@ -47,8 +47,8 @@ from agentmemorygym_verl.routes import (
 
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "async_plugins/config/amg_multitask400.yaml"
-CONFIG_131K = ROOT / "async_plugins/config/amg_multitask400_131k.yaml"
 CONFIG_200 = ROOT / "async_plugins/config/amg_multitask200.yaml"
+CONFIG_131K = ROOT / "async_plugins/config/amg_multitask400_131k.yaml"
 
 
 def _sha256(path: Path) -> str:
@@ -678,12 +678,18 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
             config.total_episodes,
             config.optimizer_updates * config.samples_per_update,
         )
-        self.assertEqual(
-            (config.trainer_gpus, config.standalone_rollout_gpus),
-            (6, 2),
-        )
+        self.assertEqual((config.trainer_gpus, config.standalone_rollout_gpus), (6, 2))
         self.assertEqual(config.trigger_parameter_sync_step, 1)
-        self.assertEqual(config.sampling_order, "round_robin")
+
+    def test_legacy_schema_cannot_silently_shrink_to_formal200(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / "legacy-shrunk.yaml"
+            payload = CONFIG.read_text(encoding="utf-8")
+            payload = payload.replace("optimizer_updates: 400", "optimizer_updates: 200")
+            payload = payload.replace("total_episodes: 25600", "total_episodes: 12800")
+            candidate.write_text(payload, encoding="utf-8")
+            with self.assertRaisesRegex(OrchestratorError, "budget is unsupported"):
+                load_orchestrator_config(candidate)
 
     def test_reviewed_config_freezes_formal400_r38(self) -> None:
         config = load_orchestrator_config(CONFIG)

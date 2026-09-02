@@ -46,9 +46,11 @@ EXPECTED_ROUTE_IDS = (
     "literesearcher",
     "openmle_fast",
 )
-_CONFIG_BUDGETS = {
-    "amg_multitask200_orchestrator_config_v1": (200, 12_800),
-    "amg_multitask400_orchestrator_config_v1": (400, 25_600),
+_LEGACY_CONFIG_SCHEMA = "amg_multitask400_orchestrator_config_v1"
+_CONFIG_SCHEMA = "amg_multitask_orchestrator_config_v2"
+_REVIEWED_FORMAL_BUDGETS = {
+    _LEGACY_CONFIG_SCHEMA: frozenset({(400, 25_600)}),
+    _CONFIG_SCHEMA: frozenset({(200, 12_800), (400, 25_600)}),
 }
 _LEARNER_TOKEN_BUDGET_PROFILES = {
     "default-65536-v1": (65_536, 65_536),
@@ -393,12 +395,6 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
     holders = _mapping(
         payload.get("holder_transaction"), field="config.holder_transaction"
     )
-    schema = payload.get("schema")
-    if schema not in _CONFIG_BUDGETS:
-        raise OrchestratorError(
-            f"reviewed multitask config schema is unsupported: {schema!r}"
-        )
-    expected_updates, expected_episodes = _CONFIG_BUDGETS[str(schema)]
     required_runtime_inputs = {
         "route_registry": "cli:--route-registry",
         "route_registry_sha256": "cli:--route-registry-sha256",
@@ -411,10 +407,37 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
         "holder_lease": "cli:--holder-lease",
         "holder_lease_sha256": "cli:--holder-lease-sha256",
     }
+    schema = payload.get("schema")
+    if schema not in _REVIEWED_FORMAL_BUDGETS:
+        raise OrchestratorError(f"unsupported reviewed multitask schema: {schema!r}")
+    optimizer_updates = _positive_int(
+        budget.get("optimizer_updates"), field="optimizer updates"
+    )
+    samples_per_update = _positive_int(
+        budget.get("consumed_episodes_per_update"), field="episodes per update"
+    )
+    total_episodes = _positive_int(
+        budget.get("total_episodes"), field="total episodes"
+    )
+    if samples_per_update != 64:
+        raise OrchestratorError(
+            f"reviewed multitask episodes per update drifted: {samples_per_update} != 64"
+        )
+    if (optimizer_updates, total_episodes) not in _REVIEWED_FORMAL_BUDGETS[schema]:
+        raise OrchestratorError(
+            "reviewed multitask formal budget is unsupported for its schema: "
+            f"updates={optimizer_updates}, episodes={total_episodes}, schema={schema!r}"
+        )
+    if optimizer_updates * samples_per_update != total_episodes:
+        raise OrchestratorError(
+            "multitask arithmetic drift: optimizer_updates * "
+            "consumed_episodes_per_update != total_episodes"
+        )
+
     learner_token_budget_profile = r38.get("learner_token_budget_profile")
     if learner_token_budget_profile not in _LEARNER_TOKEN_BUDGET_PROFILES:
         raise OrchestratorError(
-            "reviewed Multitask400 learner token-budget profile is unsupported: "
+            "reviewed multitask learner token-budget profile is unsupported: "
             f"{learner_token_budget_profile!r}"
         )
     expected_actor_budget, expected_critic_budget = _LEARNER_TOKEN_BUDGET_PROFILES[
@@ -438,15 +461,6 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
             experiment.get("checkpoint_lineage_count"),
             1,
         ),
-        "optimizer updates": (
-            budget.get("optimizer_updates"),
-            expected_updates,
-        ),
-        "episodes per update": (
-            budget.get("consumed_episodes_per_update"),
-            64,
-        ),
-        "total episodes": (budget.get("total_episodes"), expected_episodes),
         "route order": (tuple(routing.get("order", ())), EXPECTED_ROUTE_IDS),
         "sampling": (routing.get("sampling"), "round_robin"),
         "per-update route quota": (
@@ -493,18 +507,6 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
             raise OrchestratorError(
                 f"reviewed multitask {field} drifted: {observed!r} != {expected!r}"
             )
-    optimizer_updates = _positive_int(
-        budget["optimizer_updates"], field="optimizer updates"
-    )
-    samples_per_update = _positive_int(
-        budget["consumed_episodes_per_update"], field="episodes per update"
-    )
-    total_episodes = _positive_int(budget["total_episodes"], field="total episodes")
-    if optimizer_updates * samples_per_update != total_episodes:
-        raise OrchestratorError(
-            "multitask arithmetic drift: optimizer_updates * "
-            "consumed_episodes_per_update != total_episodes"
-        )
     return OrchestratorConfig(
         source_path=path.resolve(),
         sha256=_sha256(path),

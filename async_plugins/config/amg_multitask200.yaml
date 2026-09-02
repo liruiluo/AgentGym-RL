@@ -1,4 +1,4 @@
-schema: amg_multitask200_orchestrator_config_v1
+schema: amg_multitask_orchestrator_config_v2
 
 # This file freezes experiment semantics. Runtime-specific absolute paths and
 # their SHA-256 digests are supplied through the CLI and endpoint registry.

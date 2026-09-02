@@ -826,6 +826,20 @@ class TestAMGMultitaskLauncherContract(unittest.TestCase):
             )
             self.assertEqual(values["data.shuffle"], "False")
 
+    def test_multitask_identity_accepts_formal200_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inputs, schedule_report, _ = self._identity_fixture(
+                Path(directory), formal_updates=200
+            )
+
+            identity = _load_multitask_identity(inputs, schedule_report=schedule_report)
+
+            budget = identity["budget_contract"]
+            self.assertEqual(budget["optimizer_updates"], 200)
+            self.assertEqual(budget["publication_cycles"], 200)
+            self.assertEqual(budget["samples_per_update"], 64)
+            self.assertEqual(budget["episodes"], 12_800)
+
     def test_multitask_identity_binds_formal400_sources_runtime_and_routes(self):
         with tempfile.TemporaryDirectory() as directory:
             inputs, schedule_report, source_lock = self._identity_fixture(
