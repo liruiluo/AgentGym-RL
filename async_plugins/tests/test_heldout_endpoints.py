@@ -205,6 +205,12 @@ def _fixture(root: Path):
             "root": str(source_root),
             "commit": _git_source(source_root, name),
         }
+    literesearcher_endpoint_root = root / "source-literesearcher-endpoint"
+    literesearcher_endpoint_source = {
+        "name": "endpoint",
+        "root": str(literesearcher_endpoint_root),
+        "commit": _git_source(literesearcher_endpoint_root, "literesearcher-endpoint"),
+    }
     token = root / "swesmith-detail.token"
     token.write_text("private-token\n", encoding="utf-8")
     token.chmod(0o600)
@@ -334,12 +340,15 @@ def _fixture(root: Path):
                     ).hexdigest(),
                 }
             )
+        route_sources = copy.deepcopy(list(sources.values()))
+        if route_id == "literesearcher":
+            route_sources.append(copy.deepcopy(literesearcher_endpoint_source))
         registry_routes.append(
             {
                 "route_id": route_id,
                 "route_attestation_sha256": route.route_attestation_sha256,
                 "endpoint": route.client_config["env_addr"],
-                "sources": copy.deepcopy(list(sources.values())),
+                "sources": route_sources,
                 "assets": assets,
                 "endpoint_launcher": {
                     "path": str(launcher),
@@ -406,8 +415,13 @@ class HeldoutEndpointRegistryTests(unittest.TestCase):
                 self.assertEqual(
                     set(asset.name for asset in spec.assets), ASSET_NAMES[spec.route_id]
                 )
+                expected_source_names = (
+                    ("outer", "inner", "endpoint")
+                    if spec.route_id == "literesearcher"
+                    else ("outer", "inner")
+                )
                 self.assertEqual(
-                    tuple(source.name for source in spec.sources), ("outer", "inner")
+                    tuple(source.name for source in spec.sources), expected_source_names
                 )
                 self.assertEqual(
                     spec.environment["CAMG_HELDOUT_ROUTE_ID"], spec.route_id
@@ -437,6 +451,31 @@ class HeldoutEndpointRegistryTests(unittest.TestCase):
                 else:
                     self.assertNotIn("SWESMITH_DETAIL_TOKEN", spec.environment)
             self.assertEqual(report["task_counts"], TASK_COUNTS)
+
+    def test_literesearcher_requires_independent_endpoint_source(self):
+        from agentmemorygym_verl.heldout_endpoints import (
+            load_heldout_endpoint_registry,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            route_registry, path, _digest, registry = _fixture(root)
+            literesearcher = next(
+                route
+                for route in registry["routes"]
+                if route["route_id"] == "literesearcher"
+            )
+            literesearcher["sources"] = literesearcher["sources"][:2]
+            digest = _write_json(path, registry)
+            with self.assertRaisesRegex(
+                OrchestratorError,
+                "literesearcher must bind outer, inner, then endpoint source",
+            ):
+                load_heldout_endpoint_registry(
+                    path,
+                    expected_sha256=digest,
+                    route_registry=route_registry,
+                )
 
     def test_registry_cannot_override_loader_owned_heldout_environment(self):
         from agentmemorygym_verl.heldout_endpoints import (
@@ -617,6 +656,12 @@ class HeldoutEndpointLauncherTests(unittest.TestCase):
         source = (LAUNCHER_ROOT / "literesearcher.sh").read_text()
         self.assertIn("camg_literesearcher_heldout_runtime_binding_v1", source)
         self.assertIn("CAMG_HELDOUT_ASSET_RUNTIME_ROWS_PATH", source)
+        self.assertIn("CAMG_HELDOUT_SOURCE_ENDPOINT_ROOT", source)
+        self.assertIn("CAMG_HELDOUT_SOURCE_ENDPOINT_COMMIT", source)
+        self.assertIn(
+            "$LITERESEARCHER_ENDPOINT_SOURCE_ROOT/agentenv-agentmemory",
+            source,
+        )
         self.assertIn("LITERESEARCHER_CAMG_ROLE=heldout", source)
         self.assertNotIn("literesearcher-only-r46.jsonl", source)
 
