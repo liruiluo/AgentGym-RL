@@ -19,7 +19,7 @@ COMMITS = {
 }
 
 
-def _make_checkpoint(root: Path, *, step: int = 400, world_size: int = 2) -> Path:
+def _make_checkpoint(root: Path, *, step: int = 200, world_size: int = 2) -> Path:
     run = root / "run"
     actor = run / f"checkpoints/global_step_{step}/actor"
     (actor / "huggingface").mkdir(parents=True)
@@ -52,7 +52,7 @@ class CheckpointPublicationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             report = inspect_fsdp_actor_checkpoint(_make_checkpoint(Path(temp)))
         self.assertEqual(report["status"], "pass")
-        self.assertEqual(report["checkpoint_step"], 400)
+        self.assertEqual(report["checkpoint_step"], 200)
         self.assertEqual(report["world_size"], 2)
         self.assertEqual(len(report["model_shards"]), 2)
         self.assertEqual(len(report["huggingface_metadata"]), 2)
@@ -60,7 +60,7 @@ class CheckpointPublicationTest(unittest.TestCase):
     def test_rejects_incomplete_or_wrong_endpoint_checkpoint(self):
         with tempfile.TemporaryDirectory() as temp:
             run = _make_checkpoint(Path(temp))
-            (run / "checkpoints/global_step_400/actor/model_world_size_2_rank_1.pt").unlink()
+            (run / "checkpoints/global_step_200/actor/model_world_size_2_rank_1.pt").unlink()
             with self.assertRaisesRegex(ValueError, "shard set mismatch"):
                 inspect_fsdp_actor_checkpoint(run)
 
@@ -77,12 +77,12 @@ class CheckpointPublicationTest(unittest.TestCase):
             model = _make_model(Path(temp))
             manifest = build_merged_hf_manifest(
                 model,
-                training_run_id="amg_compactionrl_formal400",
-                checkpoint_step=400,
+                training_run_id="amg_compactionrl_formal200",
+                checkpoint_step=200,
                 **COMMITS,
             )
         self.assertEqual(manifest["schema"], MODEL_MANIFEST_SCHEMA)
-        self.assertEqual(manifest["checkpoint_step"], 400)
+        self.assertEqual(manifest["checkpoint_step"], 200)
         self.assertEqual(manifest["source_commits"]["outer"], "1" * 40)
         self.assertEqual(len(manifest["files"]), 3)
 
@@ -95,13 +95,13 @@ class CheckpointPublicationTest(unittest.TestCase):
                 build_merged_hf_manifest(
                     model,
                     training_run_id="run",
-                    checkpoint_step=400,
+                    checkpoint_step=200,
                     **COMMITS,
                 )
 
         with tempfile.TemporaryDirectory() as temp:
             model = _make_model(Path(temp))
-            with self.assertRaisesRegex(ValueError, "only at update400"):
+            with self.assertRaisesRegex(ValueError, "only at update200"):
                 build_merged_hf_manifest(
                     model,
                     training_run_id="run",

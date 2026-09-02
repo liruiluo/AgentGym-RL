@@ -50,16 +50,19 @@ receipt gap.
 4. Four-route attestation proving the route registry selects
    `context_memory_mode=compactionrl` and hashes the effective policy framing.
 5. A real four-environment update-1 gate before continuing the declared
-   400-update run.
+   formal run.
 
 ## Matched experiment contract
 
 - fresh Qwen3.5-4B base
-- 400 learner updates, 64 consumed episodes/update, 25,600 total episodes
-- four routes with 6,400 episodes each under the frozen round-robin schedule
+- formal endpoint at 200 learner updates, 64 consumed episodes/update, 12,800
+  total episodes
+- four routes with 3,200 consumed episodes each under the frozen round-robin
+  schedule; the immutable launcher retains a longer 400-update schedule only
+  as launch provenance, and unconsumed rows are not an endpoint requirement
 - six learner/hybrid GPUs plus two standalone rollout GPUs
 - `rollout.n=1`, same decoder, native rewards, graders, action budgets, and
   fully asynchronous PPO/GAE path as the current joint run
-- shared-storage checkpoints every 10 updates, including a verified step-400
+- shared-storage checkpoints every 10 updates, including a verified step-200
   terminal checkpoint
 - no native held-out evaluation before the declared training endpoint

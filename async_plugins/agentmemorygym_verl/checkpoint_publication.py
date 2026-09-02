@@ -13,7 +13,7 @@ from typing import Any
 
 MODEL_MANIFEST_SCHEMA = "camg_merged_hf_checkpoint_manifest_v1"
 CHECKPOINT_INSPECTION_SCHEMA = "camg_fsdp_actor_checkpoint_inspection_v1"
-EXPECTED_CHECKPOINT_STEP = 400
+EXPECTED_CHECKPOINT_STEP = 200
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$")
 
@@ -78,7 +78,7 @@ def inspect_fsdp_actor_checkpoint(
     """Verify the complete FSDP actor shard set at the declared endpoint."""
 
     if checkpoint_step != EXPECTED_CHECKPOINT_STEP:
-        raise ValueError("native held-out publication is permitted only at update400")
+        raise ValueError("native held-out publication is permitted only at update200")
     run = _absolute_directory(run_dir, field="training run directory")
     latest = _regular_file(
         run / "checkpoints/latest_checkpointed_iteration.txt",
@@ -178,7 +178,7 @@ def build_merged_hf_manifest(
     """Hash an exact merged-HF directory using the evaluator's schema."""
 
     if checkpoint_step != EXPECTED_CHECKPOINT_STEP:
-        raise ValueError("native held-out publication is permitted only at update400")
+        raise ValueError("native held-out publication is permitted only at update200")
     if not _RUN_ID.fullmatch(training_run_id):
         raise ValueError("training_run_id contains unsupported characters or length")
     model = _absolute_directory(model_path, field="merged-HF model directory")
