@@ -774,10 +774,11 @@ def _load_multitask_identity(
     scheduled_episode_count = _require_positive_int(
         certificate.get("row_count"), field="multitask certificate row_count"
     )
-    expected_updates = 1 if inputs.mode == "gate" else 400
-    if optimizer_updates != expected_updates or samples_per_update != 64:
+    expected_updates = {1} if inputs.mode == "gate" else {200, 400}
+    if optimizer_updates not in expected_updates or samples_per_update != 64:
+        allowed = "gate1" if inputs.mode == "gate" else "formal200 or formal400"
         raise ValueError(
-            "multitask budget must be gate1 or formal400 with 64 episodes/update: "
+            f"multitask budget must be {allowed} with 64 episodes/update: "
             f"updates={optimizer_updates}, samples_per_update={samples_per_update}"
         )
     if scheduled_episode_count != optimizer_updates * samples_per_update:

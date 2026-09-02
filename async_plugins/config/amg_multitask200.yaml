@@ -1,0 +1,65 @@
+schema: amg_multitask_orchestrator_config_v2
+
+# This file freezes experiment semantics. Runtime-specific absolute paths and
+# their SHA-256 digests are supplied through the CLI and endpoint registry.
+source:
+  implementation_base_commit: 4d8ce04b5d40c2e79abb01b46051a230c7ab3973
+  verl_commit: f3ac28fe54c945e092b9630030f44d236a106a11
+
+experiment:
+  mode: formal
+  model_family: Qwen3.5-4B
+  fresh_model: true
+  resume_mode: disable
+  agent_name: amg_task_neutral_async
+  shared_actor_count: 1
+  shared_critic_count: 1
+  checkpoint_lineage_count: 1
+
+budget:
+  optimizer_updates: 200
+  consumed_episodes_per_update: 64
+  total_episodes: 12800
+
+routing:
+  order:
+    - webshop
+    - swesmith
+    - literesearcher
+    - openmle_fast
+  sampling: round_robin
+  require_exact_per_update_route_split: false
+
+r38:
+  learner_hybrid_gpus: 6
+  standalone_rollout_gpus: 2
+  rollout_n: 1
+  learner_token_budget_profile: default-65536-v1
+  actor_train_token_budget: 65536
+  critic_train_token_budget: 65536
+  critic_infer_token_budget: 32768
+  trigger_parameter_sync_step: 1
+  actor_use_fused_kernels: false
+  critic_use_fused_kernels: false
+
+runtime_inputs:
+  route_registry: cli:--route-registry
+  route_registry_sha256: cli:--route-registry-sha256
+  multitask_manifest: cli:--schedule
+  multitask_schedule_certificate: cli:--multitask-schedule-certificate
+  multitask_source_lock: cli:--multitask-source-lock
+  endpoint_registry: cli:--endpoint-registry
+  endpoint_registry_sha256: cli:--endpoint-registry-sha256
+  gate_receipts: endpoint_registry.routes[*].gate_receipt
+  holder_lease: cli:--holder-lease
+  holder_lease_sha256: cli:--holder-lease-sha256
+
+holder_transaction:
+  schema: amg_marker_transaction_v1
+  lock_path: /tmp/amg-holder-marker-transaction.lock
+  required_markers:
+    - cpu
+    - gpu
+  marker_paths:
+    cpu: /tmp/agentmemory-formal-cpu-active
+    gpu: /tmp/crg-holder-yield
