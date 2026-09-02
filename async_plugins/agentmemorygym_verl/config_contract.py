@@ -128,6 +128,9 @@ def verify_resolved_config(
             "expected_budget is missing: " + ", ".join(missing_budget_fields)
         )
     expected = dict(expected_budget)
+    resume_budget = expected.get("resume")
+    if resume_budget is not None and not isinstance(resume_budget, Mapping):
+        raise TypeError("expected_budget.resume must be a mapping or null")
 
     if (
         _at(config, "algorithm.adv_estimator") != "amg_action_axis_gae"
@@ -435,12 +438,19 @@ def verify_resolved_config(
         "trainer.total_epochs": 1,
         "trainer.val_before_train": False,
         "trainer.test_freq": -1,
-        "trainer.resume_mode": "disable",
-        "trainer.resume_from_path": None,
         "async_training.use_trainer_do_validate": False,
         "async_training.partial_rollout": True,
     }.items():
         _require_equal(config, path, expected_value)
+    if resume_budget is None:
+        _require_equal(config, "trainer.resume_mode", "disable")
+        _require_equal(config, "trainer.resume_from_path", None)
+    else:
+        _require_equal(config, "trainer.resume_mode", "resume_path")
+        resume_path = str(resume_budget.get("resume_from_path") or "")
+        if not resume_path:
+            raise ValueError("resume budget must bind resume_from_path")
+        _require_equal(config, "trainer.resume_from_path", resume_path)
     rollout_data_dir = _at(config, "trainer.rollout_data_dir")
     if not isinstance(rollout_data_dir, str) or not rollout_data_dir.strip():
         raise ValueError(
@@ -575,7 +585,7 @@ def verify_resolved_config(
         ),
     )
 
-    return {
+    report = {
         "schema": "amg_verl_fully_async_budget_v2",
         "mode": mode,
         "role": str(expected["role"]),
@@ -623,6 +633,69 @@ def verify_resolved_config(
         "manifest_sha256": expected.get("manifest_sha256"),
         "routing_sha256": expected.get("routing_sha256"),
     }
+    if resume_budget is not None:
+        for field in (
+            "schema",
+            "resume_from_path",
+            "resume_prefix_run_dir",
+            "resume_start_update",
+            "target_optimizer_updates",
+            "target_episodes",
+            "invocation_optimizer_updates",
+            "invocation_episodes",
+            "sampler_samples_yielded",
+            "schedule_capacity_optimizer_updates",
+            "schedule_capacity_episodes",
+        ):
+            if field not in resume_budget:
+                raise ValueError(f"resume budget is missing {field}")
+        start = _positive_int(
+            resume_budget["resume_start_update"], field="resume start update"
+        )
+        target = _positive_int(
+            resume_budget["target_optimizer_updates"],
+            field="resume target optimizer updates",
+        )
+        invocation = _positive_int(
+            resume_budget["invocation_optimizer_updates"],
+            field="resume invocation optimizer updates",
+        )
+        invocation_episodes = _positive_int(
+            resume_budget["invocation_episodes"],
+            field="resume invocation episodes",
+        )
+        sampler_yielded = _positive_int(
+            resume_budget["sampler_samples_yielded"],
+            field="resume sampler samples yielded",
+        )
+        capacity = _positive_int(
+            resume_budget["schedule_capacity_episodes"],
+            field="resume schedule capacity episodes",
+        )
+        if (
+            resume_budget.get("schema") != "amg_verl_resume_budget_v1"
+            or start + invocation != target
+            or target != optimizer_updates
+            or int(resume_budget["target_episodes"]) != episodes
+            or invocation_episodes != invocation * samples_per_update
+            or capacity - sampler_yielded < invocation_episodes
+        ):
+            raise ValueError("resume budget arithmetic or capacity is inconsistent")
+        report["resume"] = dict(resume_budget)
+        report["schedule_capacity_episodes"] = capacity
+        report["schedule_capacity_optimizer_updates"] = _positive_int(
+            resume_budget["schedule_capacity_optimizer_updates"],
+            field="resume schedule capacity optimizer updates",
+        )
+    else:
+        report["resume"] = None
+        report["schedule_capacity_episodes"] = int(
+            expected.get("schedule_capacity_episodes", episodes)
+        )
+        report["schedule_capacity_optimizer_updates"] = int(
+            expected.get("schedule_capacity_optimizer_updates", optimizer_updates)
+        )
+    return report
 
 
 def inspect_schedule(

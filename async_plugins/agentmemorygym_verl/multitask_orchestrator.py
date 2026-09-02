@@ -47,6 +47,7 @@ EXPECTED_ROUTE_IDS = (
     "openmle_fast",
 )
 _CONFIG_SCHEMA = "amg_multitask400_orchestrator_config_v1"
+_RESUME_CONFIG_SCHEMA = "amg_multitask200_resume_orchestrator_config_v1"
 _LEARNER_TOKEN_BUDGET_PROFILES = {
     "default-65536-v1": (65_536, 65_536),
     "multitask-131072-v1": (131_072, 131_072),
@@ -137,6 +138,12 @@ class OrchestratorConfig:
     require_exact_per_update_route_split: bool
     sampling_order: str
     holder_lock_path: Path
+    schedule_capacity_episodes: int = 25_600
+    resume_start_update: int | None = None
+    resume_target_update: int | None = None
+    resume_sampler_samples_yielded: int | None = None
+    invocation_optimizer_updates: int | None = None
+    invocation_episodes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -231,6 +238,8 @@ class LaunchPlan:
     generic_launcher: Path
     resolve_only: bool
     holder_lease: HolderLease | None = None
+    resume_from_path: Path | None = None
+    resume_prefix_run_dir: Path | None = None
 
     @classmethod
     def for_test(
@@ -390,6 +399,15 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
     holders = _mapping(
         payload.get("holder_transaction"), field="config.holder_transaction"
     )
+    schema = payload.get("schema")
+    resume_enabled = schema == _RESUME_CONFIG_SCHEMA
+    if schema not in {_CONFIG_SCHEMA, _RESUME_CONFIG_SCHEMA}:
+        raise OrchestratorError(f"unsupported orchestrator config schema: {schema!r}")
+    resume = (
+        _mapping(payload.get("resume"), field="config.resume")
+        if resume_enabled
+        else {}
+    )
     required_runtime_inputs = {
         "route_registry": "cli:--route-registry",
         "route_registry_sha256": "cli:--route-registry-sha256",
@@ -402,6 +420,13 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
         "holder_lease": "cli:--holder-lease",
         "holder_lease_sha256": "cli:--holder-lease-sha256",
     }
+    if resume_enabled:
+        required_runtime_inputs.update(
+            {
+                "resume_from_path": "cli:--resume-from-path",
+                "resume_prefix_run_dir": "cli:--resume-prefix-run-dir",
+            }
+        )
     learner_token_budget_profile = r38.get("learner_token_budget_profile")
     if learner_token_budget_profile not in _LEARNER_TOKEN_BUDGET_PROFILES:
         raise OrchestratorError(
@@ -413,7 +438,10 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
     ]
 
     exact = {
-        "schema": (payload.get("schema"), _CONFIG_SCHEMA),
+        "schema": (
+            schema,
+            _RESUME_CONFIG_SCHEMA if resume_enabled else _CONFIG_SCHEMA,
+        ),
         "implementation base commit": (
             source.get("implementation_base_commit"),
             _IMPLEMENTATION_BASE_COMMIT,
@@ -421,8 +449,11 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
         "veRL commit": (source.get("verl_commit"), EXPECTED_VERL_COMMIT),
         "mode": (experiment.get("mode"), "formal"),
         "model family": (experiment.get("model_family"), "Qwen3.5-4B"),
-        "fresh model": (experiment.get("fresh_model"), True),
-        "resume mode": (experiment.get("resume_mode"), "disable"),
+        "fresh model": (experiment.get("fresh_model"), not resume_enabled),
+        "resume mode": (
+            experiment.get("resume_mode"),
+            "resume_path" if resume_enabled else "disable",
+        ),
         "agent name": (experiment.get("agent_name"), "amg_task_neutral_async"),
         "shared actor count": (experiment.get("shared_actor_count"), 1),
         "shared critic count": (experiment.get("shared_critic_count"), 1),
@@ -430,12 +461,22 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
             experiment.get("checkpoint_lineage_count"),
             1,
         ),
-        "optimizer updates": (budget.get("optimizer_updates"), 400),
+        "optimizer updates": (
+            budget.get("optimizer_updates"),
+            200 if resume_enabled else 400,
+        ),
         "episodes per update": (
             budget.get("consumed_episodes_per_update"),
             64,
         ),
-        "total episodes": (budget.get("total_episodes"), 25_600),
+        "total episodes": (
+            budget.get("total_episodes"),
+            12_800 if resume_enabled else 25_600,
+        ),
+        "schedule capacity episodes": (
+            budget.get("schedule_capacity_episodes", budget.get("total_episodes")),
+            25_600,
+        ),
         "route order": (tuple(routing.get("order", ())), EXPECTED_ROUTE_IDS),
         "sampling": (routing.get("sampling"), "round_robin"),
         "per-update route quota": (
@@ -489,11 +530,49 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
         budget["consumed_episodes_per_update"], field="episodes per update"
     )
     total_episodes = _positive_int(budget["total_episodes"], field="total episodes")
+    schedule_capacity_episodes = _positive_int(
+        budget.get("schedule_capacity_episodes", total_episodes),
+        field="schedule capacity episodes",
+    )
     if optimizer_updates * samples_per_update != total_episodes:
         raise OrchestratorError(
             "Multitask400 arithmetic drift: optimizer_updates * "
             "consumed_episodes_per_update != total_episodes"
         )
+    resume_start_update: int | None = None
+    resume_target_update: int | None = None
+    resume_sampler_samples_yielded: int | None = None
+    invocation_optimizer_updates: int | None = None
+    invocation_episodes: int | None = None
+    if resume_enabled:
+        resume_start_update = _positive_int(
+            resume.get("start_update"), field="resume start update"
+        )
+        resume_target_update = _positive_int(
+            resume.get("target_update"), field="resume target update"
+        )
+        resume_sampler_samples_yielded = _positive_int(
+            resume.get("sampler_samples_yielded"),
+            field="resume sampler samples_yielded",
+        )
+        invocation_optimizer_updates = _positive_int(
+            resume.get("invocation_optimizer_updates"),
+            field="resume invocation optimizer updates",
+        )
+        invocation_episodes = _positive_int(
+            resume.get("invocation_episodes"), field="resume invocation episodes"
+        )
+        if (
+            resume_target_update != optimizer_updates
+            or resume_target_update - resume_start_update
+            != invocation_optimizer_updates
+            or invocation_episodes
+            != invocation_optimizer_updates * samples_per_update
+            or schedule_capacity_episodes - resume_sampler_samples_yielded
+            < invocation_episodes
+        ):
+            raise OrchestratorError("formal200 resume arithmetic or capacity drifted")
+
     return OrchestratorConfig(
         source_path=path.resolve(),
         sha256=_sha256(path),
@@ -516,6 +595,12 @@ def load_orchestrator_config(path: Path) -> OrchestratorConfig:
         holder_lock_path=_absolute_path(
             holders.get("lock_path"), field="config holder lock_path"
         ),
+        schedule_capacity_episodes=schedule_capacity_episodes,
+        resume_start_update=resume_start_update,
+        resume_target_update=resume_target_update,
+        resume_sampler_samples_yielded=resume_sampler_samples_yielded,
+        invocation_optimizer_updates=invocation_optimizer_updates,
+        invocation_episodes=invocation_episodes,
     )
 
 
@@ -1805,6 +1890,29 @@ def build_generic_launch_command(
         command.append("--actor-use-fused-kernels")
     if plan.config.critic_use_fused_kernels:
         command.append("--critic-use-fused-kernels")
+    if plan.resume_from_path is not None or plan.resume_prefix_run_dir is not None:
+        if (
+            plan.resume_from_path is None
+            or plan.resume_prefix_run_dir is None
+            or plan.config.resume_start_update is None
+            or plan.config.resume_target_update is None
+            or plan.config.resume_sampler_samples_yielded is None
+        ):
+            raise OrchestratorError("resume launch plan is incomplete")
+        command.extend(
+            (
+                "--resume-from-path",
+                str(plan.resume_from_path),
+                "--resume-prefix-run-dir",
+                str(plan.resume_prefix_run_dir),
+                "--resume-start-update",
+                str(plan.config.resume_start_update),
+                "--resume-target-update",
+                str(plan.config.resume_target_update),
+                "--resume-sampler-samples-yielded",
+                str(plan.config.resume_sampler_samples_yielded),
+            )
+        )
     if resolve_only:
         command.extend(("--resolve-only", "--skip-runtime-preflight"))
     else:
@@ -1924,10 +2032,35 @@ def build_launch_plan(args: argparse.Namespace) -> LaunchPlan:
     run_dir = _validate_fresh_run_dir(args.run_dir, outer_root=outer_root)
     schedule_report = inspect_schedule(
         schedule,
-        expected_count=config.total_episodes,
+        expected_count=config.schedule_capacity_episodes,
         expected_role="train_pool",
         expected_route_ids=config.route_order,
         expected_route_registry_sha256=route_registry.sha256,
+    )
+    raw_resume_from_path = getattr(args, "resume_from_path", None)
+    raw_resume_prefix_run_dir = getattr(args, "resume_prefix_run_dir", None)
+    resume_fields = (
+        raw_resume_from_path,
+        raw_resume_prefix_run_dir,
+        config.resume_start_update,
+        config.resume_target_update,
+        config.resume_sampler_samples_yielded,
+    )
+    if any(value is not None for value in resume_fields) and not all(
+        value is not None for value in resume_fields
+    ):
+        raise OrchestratorError(
+            "resume config and --resume-from-path/--resume-prefix-run-dir must be complete"
+        )
+    resume_from_path = (
+        _directory(raw_resume_from_path, field="resume checkpoint")
+        if raw_resume_from_path is not None
+        else None
+    )
+    resume_prefix_run_dir = (
+        _directory(raw_resume_prefix_run_dir, field="resume prefix run")
+        if raw_resume_prefix_run_dir is not None
+        else None
     )
     identity_inputs = LaunchInputs(
         mode="formal",
@@ -1949,6 +2082,11 @@ def build_launch_plan(args: argparse.Namespace) -> LaunchPlan:
         route_registry_sha256=route_registry.sha256,
         multitask_source_lock=source_lock,
         multitask_schedule_certificate=certificate,
+        resume_from_path=resume_from_path,
+        resume_prefix_run_dir=resume_prefix_run_dir,
+        resume_start_update=config.resume_start_update,
+        resume_target_update=config.resume_target_update,
+        resume_sampler_samples_yielded=config.resume_sampler_samples_yielded,
     )
     launch_identity = _load_multitask_identity(
         identity_inputs, schedule_report=schedule_report
@@ -1960,13 +2098,25 @@ def build_launch_plan(args: argparse.Namespace) -> LaunchPlan:
         "optimizer_updates": config.optimizer_updates,
         "samples_per_update": config.samples_per_update,
         "episodes": config.total_episodes,
+        "schedule_capacity_episodes": config.schedule_capacity_episodes,
         "trigger_parameter_sync_step": config.trigger_parameter_sync_step,
     }
     for field, expected in required_budget.items():
-        if budget.get(field) != expected:
+        observed = budget.get(field)
+        # Pre-resume launch receipts did not carry a distinct schedule-capacity
+        # field because their target and capacity were identical.  Preserve
+        # that representation for fresh launches while requiring the explicit
+        # field for resume lineages, where target and capacity differ.
+        if (
+            field == "schedule_capacity_episodes"
+            and observed is None
+            and config.resume_start_update is None
+        ):
+            observed = budget.get("episodes")
+        if observed != expected:
             raise OrchestratorError(
                 f"multitask launch budget {field} mismatch: "
-                f"{budget.get(field)!r} != {expected!r}"
+                f"{observed!r} != {expected!r}"
             )
     endpoint_registry_path = _regular_file(
         args.endpoint_registry, field="endpoint registry"
@@ -2020,6 +2170,8 @@ def build_launch_plan(args: argparse.Namespace) -> LaunchPlan:
         generic_launcher=generic_launcher,
         resolve_only=args.resolve_only,
         holder_lease=holder_lease,
+        resume_from_path=resume_from_path,
+        resume_prefix_run_dir=resume_prefix_run_dir,
     )
 
 
@@ -2521,6 +2673,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--holder-lease-sha256")
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--experiment-name", required=True)
+    parser.add_argument("--resume-from-path", type=Path)
+    parser.add_argument("--resume-prefix-run-dir", type=Path)
     parser.add_argument("--resolve-only", action="store_true")
     return parser.parse_args(argv)
 

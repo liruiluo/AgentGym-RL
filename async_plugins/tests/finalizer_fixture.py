@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from collections import Counter
 from pathlib import Path
 
@@ -1229,6 +1230,280 @@ def build_valid_multitask_run(
         "launch_path": launch_path,
         "trainer_log": trainer_log,
     }
+
+
+def build_valid_resume_multitask_run(
+    run_dir: Path,
+    *,
+    start_update: int = 2,
+    target_updates: int = 8,
+    schedule_capacity_updates: int = 10,
+) -> dict:
+    """Convert a compact fresh fixture into one native resume lineage.
+
+    The prefix owns updates 1..start, while the successor keeps global update
+    numbers start+1..target.  Process-local cumulative counters reset at the
+    successor boundary, matching veRL resume behavior; policy versions and
+    checkpoint ordinals remain global.
+    """
+
+    if not 0 < start_update < target_updates <= schedule_capacity_updates:
+        raise ValueError("invalid resume fixture update range")
+    fixture = build_valid_multitask_run(
+        run_dir, updates=schedule_capacity_updates
+    )
+    samples_per_update = 64
+    prefix_run = run_dir.parent / "prefix-run"
+    prefix_rollout_dir = prefix_run / "rollout_data"
+    prefix_rollout_dir.mkdir(parents=True)
+    for step in range(1, start_update + 1):
+        shutil.copy2(
+            fixture["rollout_dir"] / f"{step}.jsonl",
+            prefix_rollout_dir / f"{step}.jsonl",
+        )
+
+    all_metrics = [
+        json.loads(line)
+        for line in fixture["metrics_path"].read_text(encoding="utf-8").splitlines()
+    ]
+    prefix_metrics = prefix_run / "metrics.jsonl"
+    prefix_metrics.write_text(
+        "\n".join(
+            json.dumps(row, sort_keys=True)
+            for row in all_metrics
+            if 0 < int(row["step"]) <= start_update
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    original_launch = json.loads(fixture["launch_path"].read_text(encoding="utf-8"))
+    prefix_launch = prefix_run / "launch-receipt.json"
+    prefix_launch.write_text(
+        json.dumps(
+            {
+                "schedule": original_launch["schedule"],
+                "inputs": {
+                    "route_registry_sha256": original_launch["inputs"][
+                        "route_registry_sha256"
+                    ]
+                },
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _checkpoint(prefix_run, start_update, world_size=6)
+    resume_checkpoint = prefix_run / "checkpoints" / f"global_step_{start_update}"
+
+    for path in list(fixture["rollout_dir"].glob("*.jsonl")):
+        step = int(path.stem)
+        if step <= start_update or step > target_updates:
+            path.unlink()
+
+    prefix_cumulative = all_metrics[start_update - 1]["data"]
+    successor_metrics: list[dict] = []
+    for row in all_metrics[start_update:target_updates]:
+        row = json.loads(json.dumps(row))
+        data = row["data"]
+        for key, value in list(data.items()):
+            if key.startswith("fully_async/count/optimizer_consumed_"):
+                data[key] = value - prefix_cumulative[key]
+        data["fully_async/count/total_generated_samples"] = (
+            int(row["step"]) - start_update
+        ) * samples_per_update
+        data["fully_async/count/dropped_stale_samples"] = 0
+        data["fully_async/count/stale_trajectory_processed"] = 0
+        successor_metrics.append(row)
+    fixture["metrics_path"].write_text(
+        "\n".join(json.dumps(row, sort_keys=True) for row in successor_metrics)
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config = yaml.safe_load(fixture["resolved_path"].read_text(encoding="utf-8"))
+    config["trainer"]["total_training_steps"] = target_updates
+    config["trainer"]["resume_mode"] = "resume_path"
+    config["trainer"]["resume_from_path"] = str(resume_checkpoint)
+    config["rollout"]["total_rollout_steps"] = target_updates * samples_per_update
+    for path in (fixture["resolved_path"], fixture["hydra_path"]):
+        path.write_text(yaml.safe_dump(config, sort_keys=True), encoding="utf-8")
+
+    if target_updates != schedule_capacity_updates:
+        shutil.rmtree(
+            fixture["checkpoint_root"] / f"global_step_{schedule_capacity_updates}"
+        )
+    _checkpoint(run_dir, target_updates, world_size=6)
+
+    successor_documents = []
+    successor_routes = Counter()
+    successor_actions = Counter()
+    successor_tokens = Counter()
+    for path in sorted(
+        fixture["rollout_dir"].glob("*.jsonl"), key=lambda item: int(item.stem)
+    ):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            document = json.loads(line)
+            record = json.loads(document["step_record_json"])
+            successor_documents.append(document)
+            route_id = record["route_id"]
+            successor_actions[route_id] += 1
+            successor_tokens[route_id] += int(record["response_token_count"])
+            if record["trajectory_terminal"] is True:
+                successor_routes[route_id] += 1
+    successor_episodes = (target_updates - start_update) * samples_per_update
+    statistics_lines = fixture["trainer_log"].read_text(encoding="utf-8").splitlines()
+    marker = "[FullyAsyncTaskRunner][FinalStatistics] "
+    index = next(i for i, line in enumerate(statistics_lines) if marker in line)
+    prefix, encoded = statistics_lines[index].split(marker, 1)
+    statistics = json.loads(encoded)
+    queue = statistics["queue"]
+    queue.update(
+        queue_size=0,
+        total_produced=successor_episodes,
+        total_consumed=successor_episodes,
+        dropped_samples=0,
+        total_cleared=0,
+        enqueued_by_data_source=dict(successor_routes),
+        consumed_by_data_source=dict(successor_routes),
+        evicted_by_data_source={},
+        cleared_by_data_source={},
+        resident_by_data_source={},
+    )
+    rollouter = statistics["rollouter"]
+    for key in tuple(rollouter):
+        if "/data_source/" in key:
+            del rollouter[key]
+    rollouter.update(
+        {
+            "count/total_generated_samples": successor_episodes,
+            "count/rollout_dispatched_samples": successor_episodes,
+            "count/rollout_inflight_samples": 0,
+            "count/rollout_completed_samples": successor_episodes,
+            "count/rollout_failed_samples": 0,
+            "count/rollout_cancelled_samples": 0,
+            "count/queue_enqueued_samples": successor_episodes,
+            "count/queue_dequeued_samples": successor_episodes,
+            "count/queue_overflow_evictions": 0,
+            "count/queue_cleared_samples": 0,
+            "count/queue_resident_samples": 0,
+            "count/staleness_samples": 0,
+            "count/dropped_stale_samples": 0,
+        }
+    )
+    for event in (
+        "rollout_dispatched",
+        "rollout_completed",
+        "queue_enqueued",
+        "queue_dequeued",
+    ):
+        for route_id in MULTITASK_ROUTES:
+            rollouter[f"count/{event}/data_source/{route_id}"] = successor_routes[
+                route_id
+            ]
+    for event in ("rollout_inflight", "rollout_failed", "rollout_cancelled"):
+        for route_id in MULTITASK_ROUTES:
+            rollouter[f"count/{event}/data_source/{route_id}"] = 0
+    trainer = statistics["trainer"]
+    trainer.update(
+        optimizer_consumed_episodes=successor_episodes,
+        optimizer_consumed_action_rows=sum(successor_actions.values()),
+        optimizer_consumed_policy_response_tokens=sum(successor_tokens.values()),
+        optimizer_consumed_episodes_by_data_source=dict(successor_routes),
+        optimizer_consumed_action_rows_by_data_source=dict(successor_actions),
+        optimizer_consumed_policy_response_tokens_by_data_source=dict(successor_tokens),
+        stale_action_rows=0,
+        stale_action_rows_by_data_source={},
+        current_param_version=target_updates,
+    )
+    statistics_lines[index] = prefix + marker + json.dumps(statistics, sort_keys=True)
+    fixture["trainer_log"].write_text(
+        "\n".join(statistics_lines) + "\n", encoding="utf-8"
+    )
+
+    launch = json.loads(fixture["launch_path"].read_text(encoding="utf-8"))
+    budget = launch["budget_contract"]
+    budget.update(
+        publication_cycles=target_updates,
+        optimizer_updates=target_updates,
+        episodes=target_updates * samples_per_update,
+        schedule_capacity_optimizer_updates=schedule_capacity_updates,
+        schedule_capacity_episodes=schedule_capacity_updates * samples_per_update,
+    )
+    resume_budget = {
+        "schema": "amg_verl_resume_budget_v1",
+        "resume_from_path": str(resume_checkpoint),
+        "resume_prefix_run_dir": str(prefix_run),
+        "resume_start_update": start_update,
+        "target_optimizer_updates": target_updates,
+        "target_episodes": target_updates * samples_per_update,
+        "invocation_optimizer_updates": target_updates - start_update,
+        "invocation_episodes": successor_episodes,
+        "sampler_samples_yielded": start_update * samples_per_update,
+        "schedule_capacity_optimizer_updates": schedule_capacity_updates,
+        "schedule_capacity_episodes": schedule_capacity_updates * samples_per_update,
+    }
+    budget["resume"] = resume_budget
+    launch["launch_identity"]["budget_contract"] = budget
+    launch["budget_contract"] = budget
+    launch["inputs"].update(
+        resume_from_path=str(resume_checkpoint),
+        resume_prefix_run_dir=str(prefix_run),
+        resume_start_update=start_update,
+        resume_target_update=target_updates,
+        resume_sampler_samples_yielded=start_update * samples_per_update,
+    )
+    launch["resume_contract"] = {
+        "schema": "amg_verl_resume_contract_v1",
+        "prefix_run_dir": str(prefix_run),
+        "prefix_launch_receipt": {
+            "path": str(prefix_launch),
+            "sha256": sha256(prefix_launch),
+        },
+        "prefix_file_logger": {
+            "path": str(prefix_metrics),
+            "sha256": sha256(prefix_metrics),
+        },
+        "prefix_rollout_data": {
+            "path": str(prefix_rollout_dir),
+            "files": {
+                str(step): sha256(prefix_rollout_dir / f"{step}.jsonl")
+                for step in range(1, start_update + 1)
+            },
+        },
+        "resume_from_path": str(resume_checkpoint),
+        "resume_checkpoint_step": start_update,
+        "resume_checkpoint_data": {
+            "path": str(resume_checkpoint / "data.pt"),
+            "sha256": sha256(resume_checkpoint / "data.pt"),
+        },
+        "sampler_samples_yielded": start_update * samples_per_update,
+        "schedule_capacity_episodes": schedule_capacity_updates
+        * samples_per_update,
+        "target_optimizer_updates": target_updates,
+        "target_episodes": target_updates * samples_per_update,
+        "invocation_optimizer_updates": target_updates - start_update,
+        "invocation_episodes": successor_episodes,
+    }
+    launch["resolved_config"]["sha256"] = sha256(fixture["resolved_path"])
+    launch["budget"] = verify_resolved_config(
+        config, mode="formal", expected_budget=budget
+    )
+    fixture["launch_path"].write_text(
+        json.dumps(launch, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    fixture.update(
+        prefix_run=prefix_run,
+        prefix_rollout_dir=prefix_rollout_dir,
+        prefix_metrics_path=prefix_metrics,
+        resume_checkpoint=resume_checkpoint,
+        start_update=start_update,
+        target_updates=target_updates,
+        schedule_capacity_updates=schedule_capacity_updates,
+        successor_episodes=successor_episodes,
+    )
+    return fixture
 
 
 def mutate_final_statistics(path: Path, mutate) -> None:

@@ -269,6 +269,48 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
             {"actor": True, "critic": True},
         )
 
+    def test_resume_budget_separates_target_invocation_and_schedule_capacity(self):
+        config = _config(mode="formal")
+        config["trainer"].update(
+            total_training_steps=200,
+            resume_mode="resume_path",
+            resume_from_path="/prefix/checkpoints/global_step_30",
+        )
+        config["rollout"]["total_rollout_steps"] = 12_800
+        budget = _budget("formal")
+        budget.update(
+            publication_cycles=200,
+            optimizer_updates=200,
+            episodes=12_800,
+            schedule_capacity_optimizer_updates=400,
+            schedule_capacity_episodes=25_600,
+            resume={
+                "schema": "amg_verl_resume_budget_v1",
+                "resume_from_path": "/prefix/checkpoints/global_step_30",
+                "resume_prefix_run_dir": "/prefix",
+                "resume_start_update": 30,
+                "target_optimizer_updates": 200,
+                "target_episodes": 12_800,
+                "invocation_optimizer_updates": 170,
+                "invocation_episodes": 10_880,
+                "sampler_samples_yielded": 2119,
+                "schedule_capacity_optimizer_updates": 400,
+                "schedule_capacity_episodes": 25_600,
+            },
+        )
+
+        report = verify_resolved_config(config, mode="formal", expected_budget=budget)
+
+        self.assertEqual(report["optimizer_updates"], 200)
+        self.assertEqual(report["episodes"], 12_800)
+        self.assertEqual(report["schedule_capacity_episodes"], 25_600)
+        self.assertEqual(report["resume"]["invocation_episodes"], 10_880)
+
+        bad = copy.deepcopy(budget)
+        bad["resume"]["invocation_episodes"] = 10_879
+        with self.assertRaisesRegex(ValueError, "arithmetic or capacity"):
+            verify_resolved_config(config, mode="formal", expected_budget=bad)
+
     def test_formal_rejects_every_topology_except_six_plus_two(self):
         config = _config(mode="formal")
         config["trainer"]["n_gpus_per_node"] = 4

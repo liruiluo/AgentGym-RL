@@ -13,6 +13,7 @@ from agentmemorygym_verl.finalizer import finalize_run
 from finalizer_fixture import (
     MULTITASK_ROUTES,
     build_valid_multitask_run,
+    build_valid_resume_multitask_run,
     build_valid_run,
     mutate_final_statistics,
     mutate_json,
@@ -1424,6 +1425,112 @@ class TestMultitaskFinalizer(FinalizerTestCase):
                 self.assertEqual(route["memory_reuses_or_modifications"], 8)
                 self.assertEqual(route["executions"], 8)
                 self.assertEqual(route["complete_memory_chains"], 8)
+
+    def test_resume_lineage_passes_with_combined_and_successor_accounting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = build_valid_resume_multitask_run(Path(directory) / "run")
+
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+
+            self.assertEqual(verdict["status"], "pass", verdict)
+            self.assertEqual(verdict["counts"]["complete_learner_updates"], 8)
+            self.assertEqual(verdict["counts"]["completed_episodes"], 8 * 64)
+            self.assertEqual(
+                verdict["final_accounting"]["optimizer_consumed"]["episodes"],
+                fixture["successor_episodes"],
+            )
+            self.assertEqual(verdict["counts"]["resume_prefix_yielded_unconsumed"], 0)
+
+    def test_resume_successor_cumulative_counters_must_reset_at_first_update(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = build_valid_resume_multitask_run(Path(directory) / "run")
+            rows = [
+                json.loads(line)
+                for line in fixture["metrics_path"].read_text(encoding="utf-8").splitlines()
+            ]
+            first = rows[0]["data"]
+            key = "fully_async/count/optimizer_consumed_episodes"
+            first[key] += fixture["start_update"] * 64
+            fixture["metrics_path"].write_text(
+                "\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+
+            self.assert_failed(
+                fixture["run_dir"],
+                contains="cumulative optimizer-consumed episodes global total mismatch",
+            )
+
+    def test_resume_prefix_schedule_position_must_precede_sampler_offset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = build_valid_resume_multitask_run(Path(directory) / "run")
+            prefix_path = fixture["prefix_rollout_dir"] / "1.jsonl"
+            rows = [
+                json.loads(line)
+                for line in prefix_path.read_text(encoding="utf-8").splitlines()
+            ]
+            first_uid = json.loads(rows[0]["step_record_json"])["trajectory_uid"]
+            replacement = fixture["schedule_rows"][fixture["start_update"] * 64]
+            for document in rows:
+                record = json.loads(document["step_record_json"])
+                if record["trajectory_uid"] == first_uid:
+                    record["item_id"] = replacement["item_id"]
+                    record["data_idx"] = replacement["data_idx"]
+                    document["step_record_json"] = json.dumps(record, sort_keys=True)
+            prefix_path.write_text(
+                "\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+            receipt = json.loads(fixture["launch_path"].read_text(encoding="utf-8"))
+            receipt["resume_contract"]["prefix_rollout_data"]["files"]["1"] = sha256(
+                prefix_path
+            )
+            fixture["launch_path"].write_text(
+                json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+
+            self.assert_failed(
+                fixture["run_dir"],
+                contains="prefix consumed a schedule position at or after",
+            )
+
+    def test_resume_successor_schedule_position_must_not_replay_prefix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = build_valid_resume_multitask_run(Path(directory) / "run")
+            successor_path = fixture["rollout_dir"] / f"{fixture['start_update'] + 1}.jsonl"
+            rows = [
+                json.loads(line)
+                for line in successor_path.read_text(encoding="utf-8").splitlines()
+            ]
+            first_uid = json.loads(rows[0]["step_record_json"])["trajectory_uid"]
+            replacement = fixture["schedule_rows"][0]
+            for document in rows:
+                record = json.loads(document["step_record_json"])
+                if record["trajectory_uid"] == first_uid:
+                    record["item_id"] = replacement["item_id"]
+                    record["data_idx"] = replacement["data_idx"]
+                    document["step_record_json"] = json.dumps(record, sort_keys=True)
+            successor_path.write_text(
+                "\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+
+            self.assert_failed(
+                fixture["run_dir"],
+                contains="successor replayed a schedule position before",
+            )
+
+    def test_resume_prefix_artifact_digest_drift_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = build_valid_resume_multitask_run(Path(directory) / "run")
+            prefix_path = fixture["prefix_rollout_dir"] / "1.jsonl"
+            prefix_path.write_text(
+                prefix_path.read_text(encoding="utf-8") + "\n", encoding="utf-8"
+            )
+
+            self.assert_failed(
+                fixture["run_dir"], contains="resume prefix rollout 1 drifted"
+            )
 
     def test_route_local_max_rounds_horizon_is_a_complete_trajectory(self):
         with tempfile.TemporaryDirectory() as directory:

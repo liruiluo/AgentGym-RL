@@ -1080,9 +1080,13 @@ class _Audit:
         self.multitask = False
         self.route_ids: tuple[str, ...] = ()
         self.route_max_rounds: dict[str, int] = {}
+        self.resume_contract: Mapping[str, Any] | None = None
+        self.resume_start_update = 0
+        self.resume_prefix_run_dir: Path | None = None
         self.runtime_paths: dict[str, Path] = {}
         self.route_summaries: dict[str, Any] = {}
         self.schedule_routes: dict[tuple[str, int], str] = {}
+        self.schedule_positions: dict[tuple[str, int], int] = {}
         self.rolling_8: dict[str, Any] = {}
         self.accounting: dict[str, Any] = {}
         self.batch_multiple: int | None = None
@@ -1307,6 +1311,233 @@ class _Audit:
             "launch validation_enabled must be false",
         )
 
+    def _audit_resume_contract(
+        self,
+        launch: Mapping[str, Any],
+        budget_contract: Mapping[str, Any],
+    ) -> None:
+        contract = launch.get("resume_contract")
+        budget_resume = budget_contract.get("resume")
+        if contract is None and budget_resume is None:
+            return
+        if not isinstance(contract, Mapping) or not isinstance(
+            budget_resume, Mapping
+        ):
+            self.errors.append("resume contract and resume budget must both be mappings")
+            return
+        if contract.get("schema") != "amg_verl_resume_contract_v1":
+            self.errors.append("resume contract schema mismatch")
+            return
+        if budget_resume.get("schema") != "amg_verl_resume_budget_v1":
+            self.errors.append("resume budget schema mismatch")
+            return
+
+        integer_pairs = (
+            ("resume_checkpoint_step", "resume_start_update"),
+            ("target_optimizer_updates", "target_optimizer_updates"),
+            ("target_episodes", "target_episodes"),
+            ("invocation_optimizer_updates", "invocation_optimizer_updates"),
+            ("invocation_episodes", "invocation_episodes"),
+            ("sampler_samples_yielded", "sampler_samples_yielded"),
+            ("schedule_capacity_episodes", "schedule_capacity_episodes"),
+        )
+        for contract_field, budget_field in integer_pairs:
+            self.check(
+                _positive_int(contract.get(contract_field))
+                == _positive_int(budget_resume.get(budget_field)),
+                f"resume contract {contract_field} differs from resume budget",
+            )
+        start = _positive_int(contract.get("resume_checkpoint_step"))
+        target = _positive_int(contract.get("target_optimizer_updates"))
+        invocation = _positive_int(contract.get("invocation_optimizer_updates"))
+        samples_per_update = _positive_int(budget_contract.get("samples_per_update"))
+        target_episodes = _positive_int(contract.get("target_episodes"))
+        invocation_episodes = _positive_int(contract.get("invocation_episodes"))
+        sampler_yielded = _positive_int(contract.get("sampler_samples_yielded"))
+        capacity_episodes = _positive_int(
+            contract.get("schedule_capacity_episodes")
+        )
+        capacity_updates = _positive_int(
+            budget_resume.get("schedule_capacity_optimizer_updates")
+        )
+        if None in (
+            start,
+            target,
+            invocation,
+            samples_per_update,
+            target_episodes,
+            invocation_episodes,
+            sampler_yielded,
+            capacity_episodes,
+            capacity_updates,
+        ):
+            self.errors.append("resume contract update arithmetic is invalid")
+            return
+        assert start is not None
+        assert target is not None
+        assert invocation is not None
+        assert samples_per_update is not None
+        assert target_episodes is not None
+        assert invocation_episodes is not None
+        assert sampler_yielded is not None
+        assert capacity_episodes is not None
+        assert capacity_updates is not None
+        self.check(start + invocation == target, "resume update arithmetic drifted")
+        self.check(
+            target == _positive_int(budget_contract.get("optimizer_updates")),
+            "resume target differs from global launch budget",
+        )
+        self.check(
+            target_episodes == target * samples_per_update
+            and target_episodes == _positive_int(budget_contract.get("episodes")),
+            "resume target episode arithmetic drifted",
+        )
+        self.check(
+            invocation_episodes == invocation * samples_per_update,
+            "resume invocation episode arithmetic drifted",
+        )
+        self.check(
+            capacity_episodes == capacity_updates * samples_per_update
+            and capacity_episodes
+            == _positive_int(budget_contract.get("schedule_capacity_episodes"))
+            and capacity_updates
+            == _positive_int(
+                budget_contract.get("schedule_capacity_optimizer_updates")
+            ),
+            "resume schedule-capacity arithmetic drifted",
+        )
+        self.check(
+            start * samples_per_update <= sampler_yielded
+            and sampler_yielded + invocation_episodes <= capacity_episodes,
+            "resume sampler offset cannot cover the prefix and successor",
+        )
+
+        prefix_run = Path(str(contract.get("prefix_run_dir"))).resolve()
+        checkpoint = Path(str(contract.get("resume_from_path"))).resolve()
+        self.resume_contract = contract
+        self.resume_start_update = start
+        self.resume_prefix_run_dir = prefix_run
+        self.check(
+            _same_path(budget_resume.get("resume_prefix_run_dir"), prefix_run)
+            and _same_path(_at(launch, "inputs.resume_prefix_run_dir"), prefix_run),
+            "resume prefix run differs across launch bindings",
+        )
+        self.check(
+            _same_path(budget_resume.get("resume_from_path"), checkpoint)
+            and _same_path(_at(launch, "inputs.resume_from_path"), checkpoint),
+            "resume checkpoint differs across launch bindings",
+        )
+        self.check(
+            _positive_int(_at(launch, "inputs.resume_start_update")) == start
+            and _positive_int(_at(launch, "inputs.resume_target_update")) == target
+            and _positive_int(
+                _at(launch, "inputs.resume_sampler_samples_yielded")
+            )
+            == sampler_yielded,
+            "resume integer inputs differ from the bound contract",
+        )
+
+        try:
+            if prefix_run == self.run_dir or not prefix_run.is_dir():
+                raise ValueError("resume prefix run is missing or aliases successor")
+            expected_checkpoint = (
+                prefix_run / "checkpoints" / f"global_step_{start}"
+            ).resolve()
+            if checkpoint != expected_checkpoint or not checkpoint.is_dir():
+                raise ValueError(
+                    "resume checkpoint does not match the bound prefix global step"
+                )
+            prefix_launch_binding = contract.get("prefix_launch_receipt")
+            prefix_metrics_binding = contract.get("prefix_file_logger")
+            prefix_rollout_binding = contract.get("prefix_rollout_data")
+            checkpoint_binding = contract.get("resume_checkpoint_data")
+            if not all(
+                isinstance(value, Mapping)
+                for value in (
+                    prefix_launch_binding,
+                    prefix_metrics_binding,
+                    prefix_rollout_binding,
+                    checkpoint_binding,
+                )
+            ):
+                raise ValueError("resume artifact bindings are incomplete")
+            assert isinstance(prefix_launch_binding, Mapping)
+            assert isinstance(prefix_metrics_binding, Mapping)
+            assert isinstance(prefix_rollout_binding, Mapping)
+            assert isinstance(checkpoint_binding, Mapping)
+            expected_artifacts = (
+                (
+                    "prefix launch receipt",
+                    prefix_launch_binding,
+                    prefix_run / "launch-receipt.json",
+                ),
+                (
+                    "prefix FileLogger",
+                    prefix_metrics_binding,
+                    prefix_run / "metrics.jsonl",
+                ),
+                (
+                    "resume dataloader checkpoint",
+                    checkpoint_binding,
+                    checkpoint / "data.pt",
+                ),
+            )
+            for label, binding, expected_path in expected_artifacts:
+                path = Path(str(binding.get("path"))).resolve()
+                digest = binding.get("sha256")
+                self.check(
+                    path == expected_path.resolve()
+                    and path.is_file()
+                    and not path.is_symlink()
+                    and _sha256_text(digest)
+                    and sha256_file(path) == digest,
+                    f"{label} digest/path drifted",
+                )
+            prefix_launch_path = Path(
+                str(prefix_launch_binding.get("path"))
+            ).resolve()
+            prefix_launch = _load_json(prefix_launch_path, "resume prefix launch receipt")
+            self.check(
+                _at(prefix_launch, "schedule.sha256")
+                == _at(launch, "schedule.sha256"),
+                "resume prefix schedule differs from successor schedule",
+            )
+            self.check(
+                _at(prefix_launch, "schedule.count") == capacity_episodes
+                and _at(launch, "schedule.count") == capacity_episodes,
+                "resume prefix/successor schedule capacity differs from contract",
+            )
+            self.check(
+                _at(prefix_launch, "inputs.route_registry_sha256")
+                == _at(launch, "inputs.route_registry_sha256"),
+                "resume prefix route registry differs from successor",
+            )
+            rollout_dir = Path(str(prefix_rollout_binding.get("path"))).resolve()
+            self.check(
+                rollout_dir == (prefix_run / "rollout_data").resolve()
+                and rollout_dir.is_dir()
+                and not rollout_dir.is_symlink(),
+                "resume prefix rollout directory drifted",
+            )
+            files = prefix_rollout_binding.get("files")
+            if not isinstance(files, Mapping):
+                raise ValueError("resume prefix rollout file manifest is missing")
+            self.check(
+                set(files) == {str(step) for step in range(1, start + 1)},
+                "resume prefix rollout manifest does not cover exactly the prefix",
+            )
+            for step, digest in files.items():
+                path = rollout_dir / f"{step}.jsonl"
+                self.check(
+                    path.is_file()
+                    and not path.is_symlink()
+                    and _sha256_text(digest)
+                    and sha256_file(path) == digest,
+                    f"resume prefix rollout {step} drifted",
+                )
+        except Exception as exc:
+            self.error("resume contract", exc)
+
     def _audit_multitask_launch(self, launch: Mapping[str, Any]) -> None:
         budget_contract = launch.get("budget_contract")
         identity = launch.get("launch_identity")
@@ -1317,6 +1548,7 @@ class _Audit:
             self.errors.append("multitask launch has no source identity")
             return
         self.expected = budget_contract
+        self._audit_resume_contract(launch, budget_contract)
         self.role = str(budget_contract.get("role", ""))
         expected_role = "gate_only" if self.mode == "gate" else "train_pool"
         self.check(self.role == expected_role, "launch budget role does not match mode")
@@ -1487,9 +1719,12 @@ class _Audit:
             "launch model path differs from multitask source identity",
         )
 
+        schedule_capacity_episodes = int(
+            budget_contract.get("schedule_capacity_episodes", budget_contract.get("episodes", 0))
+        )
         schedule_checks = (
             ("role", self.role),
-            ("count", budget_contract.get("episodes")),
+            ("count", schedule_capacity_episodes),
             ("sha256", budget_contract.get("schedule_sha256")),
             ("manifest_digest", budget_contract.get("manifest_sha256")),
             ("route_registry_sha256", registry_digest),
@@ -1501,7 +1736,7 @@ class _Audit:
                 f"launch schedule {field} mismatch",
             )
         self.check(
-            identity.get("schedule_count") == budget_contract.get("episodes")
+            identity.get("schedule_count") == schedule_capacity_episodes
             and identity.get("schedule_sha256")
             == budget_contract.get("schedule_sha256"),
             "multitask identity schedule budget mismatch",
@@ -1609,14 +1844,23 @@ class _Audit:
             certificate.get("schema") == _MULTITASK_SCHEDULE_CERTIFICATE_SCHEMA,
             "multitask schedule certificate schema mismatch",
         )
+        schedule_capacity_updates = int(
+            budget_contract.get(
+                "schedule_capacity_optimizer_updates",
+                budget_contract.get("optimizer_updates", 0),
+            )
+        )
+        schedule_capacity_episodes = int(
+            budget_contract.get("schedule_capacity_episodes", budget_contract.get("episodes", 0))
+        )
         certificate_checks = (
             ("route_registry_sha256", identity.get("route_registry_sha256")),
             ("schedule_sha256", budget_contract.get("schedule_sha256")),
             ("spec_sha256", budget_contract.get("manifest_sha256")),
             ("role", budget_contract.get("role")),
-            ("optimizer_updates", budget_contract.get("optimizer_updates")),
+            ("optimizer_updates", schedule_capacity_updates),
             ("samples_per_update", budget_contract.get("samples_per_update")),
-            ("row_count", budget_contract.get("episodes")),
+            ("row_count", schedule_capacity_episodes),
             ("route_order", list(routes)),
             ("panel_id", _at(self.launch, "schedule.panel_id")),
             ("agent_name", _at(self.launch, "schedule.agent_name")),
@@ -1638,7 +1882,7 @@ class _Audit:
         expected_route_rows = _at(self.launch, "schedule.per_route_counts")
         self.check(
             set(per_route_rows) == set(routes)
-            and sum(per_route_rows.values()) == budget_contract.get("episodes")
+            and sum(per_route_rows.values()) == schedule_capacity_episodes
             and per_route_rows == expected_route_rows,
             "multitask schedule certificate per-route rows differ from launch schedule",
         )
@@ -1763,9 +2007,14 @@ class _Audit:
         if len(train_paths) == 1:
             schedule_path = Path(train_paths[0])
             try:
+                schedule_capacity = int(
+                    self.expected.get(
+                        "schedule_capacity_episodes", self.expected["episodes"]
+                    )
+                )
                 schedule_report = inspect_schedule(
                     schedule_path,
-                    expected_count=int(self.expected["episodes"]),
+                    expected_count=schedule_capacity,
                     expected_sha256=str(self.expected["schedule_sha256"]),
                     expected_role=str(self.expected["role"]),
                     expected_route_ids=(self.route_ids if self.multitask else None),
@@ -1789,6 +2038,16 @@ class _Audit:
                     (str(row["item_id"]), int(row["data_idx"])) for row in schedule_rows
                 ]
                 if self.multitask:
+                    if len(set(self._schedule_instances)) != len(
+                        self._schedule_instances
+                    ):
+                        self.errors.append(
+                            "multitask schedule item_id/data_idx identities are not unique"
+                        )
+                    self.schedule_positions = {
+                        instance: position
+                        for position, instance in enumerate(self._schedule_instances)
+                    }
                     self.schedule_routes = {
                         (str(row["item_id"]), int(row["data_idx"])): str(
                             row.get("route_id")
@@ -1824,10 +2083,44 @@ class _Audit:
             self.errors.append("FileLogger path is not receipt-bound")
             return
         try:
-            rows = _jsonl(path, "FileLogger JSONL")
+            successor_rows = _jsonl(path, "FileLogger JSONL")
         except Exception as exc:
             self.error("FileLogger JSONL", exc)
             return
+        rows = successor_rows
+        if self.resume_contract is not None:
+            prefix_binding = self.resume_contract.get("prefix_file_logger")
+            if not isinstance(prefix_binding, Mapping):
+                self.errors.append("resume prefix FileLogger binding is missing")
+                return
+            prefix_path = Path(str(prefix_binding.get("path"))).resolve()
+            try:
+                prefix_rows = _jsonl(prefix_path, "resume prefix FileLogger JSONL")
+            except Exception as exc:
+                self.error("resume prefix FileLogger JSONL", exc)
+                return
+            prefix_rows = [
+                row
+                for row in prefix_rows
+                if isinstance(row.get("step"), int)
+                and not isinstance(row.get("step"), bool)
+                and 0 < int(row["step"]) <= self.resume_start_update
+            ]
+            successor_prefix_steps = sorted(
+                {
+                    int(row["step"])
+                    for row in successor_rows
+                    if isinstance(row.get("step"), int)
+                    and not isinstance(row.get("step"), bool)
+                    and 0 < int(row["step"]) <= self.resume_start_update
+                }
+            )
+            self.check(
+                not successor_prefix_steps,
+                "resume successor FileLogger rewrote prefix publication steps: "
+                + ", ".join(map(str, successor_prefix_steps)),
+            )
+            rows = [*prefix_rows, *successor_rows]
 
         validation_metrics = 0
         actor_grad_rows = 0
@@ -2120,11 +2413,18 @@ class _Audit:
                 ("native dropped-stale-samples count", dropped_samples),
             ):
                 if len(values) == publications:
-                    sequence = [values[step] for step in range(1, publications + 1)]
-                    self.check(
-                        sequence == sorted(sequence),
-                        f"FileLogger {label} is not cumulative",
-                    )
+                    segment_ranges = [range(1, publications + 1)]
+                    if self.resume_start_update:
+                        segment_ranges = [
+                            range(1, self.resume_start_update + 1),
+                            range(self.resume_start_update + 1, publications + 1),
+                        ]
+                    for segment in segment_ranges:
+                        sequence = [values[step] for step in segment]
+                        self.check(
+                            sequence == sorted(sequence),
+                            f"FileLogger {label} is not cumulative within one lineage segment",
+                        )
 
         self.counts["validation_events"] += validation_metrics
         current_param_versions_by_update: dict[int, int] = {}
@@ -2145,6 +2445,7 @@ class _Audit:
             "native_dropped_stale_samples_by_publication": dropped_samples,
             "native_mq_queue_size_by_publication": queue_sizes,
             "rows_by_step": rows_by_step,
+            "resume_start_update": self.resume_start_update,
         }
 
     @staticmethod
@@ -2168,6 +2469,17 @@ class _Audit:
             rows_by_step.get(update, []) if isinstance(rows_by_step, Mapping) else []
         )
         items = [(str(key), value) for row in data_rows for key, value in row.items()]
+        # veRL restores the global learner step from the checkpoint, but the
+        # queue/trainer owner's route counters are process-local.  The first
+        # successor publication is therefore global step start+1 while its
+        # cumulative counters begin from this invocation's first batch.
+        if self.resume_start_update and update == self.resume_start_update + 1:
+            self._optimizer_logger_cumulative = {
+                "episodes": Counter(),
+                "action_rows": Counter(),
+                "policy_response_tokens": Counter(),
+                "stale_action_rows": Counter(),
+            }
         cumulative = getattr(
             self,
             "_optimizer_logger_cumulative",
@@ -2266,7 +2578,7 @@ class _Audit:
         if directory is None:
             self.errors.append("rollout data path is not receipt-bound")
             return
-        paths: list[Path] = []
+        successor_paths: list[Path] = []
         if directory.is_dir():
             candidates = list(directory.glob("*.jsonl"))
             non_numeric = sorted(
@@ -2277,26 +2589,73 @@ class _Audit:
                     "rollout JSONL filenames must be numeric optimizer steps: "
                     + ", ".join(non_numeric)
                 )
-            paths = sorted(
+            successor_paths = sorted(
                 (path for path in candidates if path.stem.isdecimal()),
                 key=lambda path: int(path.stem),
             )
-        if not paths:
+        if not successor_paths:
             self.errors.append(f"required rollout JSONL is missing under: {directory}")
             return
+        path_entries: list[tuple[int, Path, str]] = []
         if self.expected is not None:
-            self.check(
-                len(paths) == int(self.expected["optimizer_updates"]),
-                "rollout JSONL file count does not match optimizer-update horizon",
-            )
-            expected_names = [
-                f"{step}.jsonl"
-                for step in range(1, int(self.expected["optimizer_updates"]) + 1)
+            target_updates = int(self.expected["optimizer_updates"])
+            if self.resume_contract is None:
+                self.check(
+                    len(successor_paths) == target_updates,
+                    "rollout JSONL file count does not match optimizer-update horizon",
+                )
+                expected_names = [
+                    f"{step}.jsonl" for step in range(1, target_updates + 1)
+                ]
+                self.check(
+                    [path.name for path in successor_paths] == expected_names,
+                    "rollout JSONL filename is not bound to its optimizer step",
+                )
+                path_entries = [
+                    (int(path.stem), path, "single") for path in successor_paths
+                ]
+            else:
+                prefix_binding = self.resume_contract.get("prefix_rollout_data")
+                files = (
+                    prefix_binding.get("files")
+                    if isinstance(prefix_binding, Mapping)
+                    else None
+                )
+                prefix_directory = (
+                    Path(str(prefix_binding.get("path"))).resolve()
+                    if isinstance(prefix_binding, Mapping)
+                    else None
+                )
+                if not isinstance(files, Mapping) or prefix_directory is None:
+                    self.errors.append("resume prefix rollout binding is incomplete")
+                    return
+                prefix_paths = [
+                    prefix_directory / f"{step}.jsonl"
+                    for step in range(1, self.resume_start_update + 1)
+                ]
+                expected_successor_names = [
+                    f"{step}.jsonl"
+                    for step in range(self.resume_start_update + 1, target_updates + 1)
+                ]
+                self.check(
+                    [path.name for path in successor_paths]
+                    == expected_successor_names,
+                    "resume successor rollout filenames do not cover exactly the "
+                    "post-checkpoint optimizer steps",
+                )
+                path_entries = [
+                    (int(path.stem), path, "prefix") for path in prefix_paths
+                ] + [
+                    (int(path.stem), path, "successor") for path in successor_paths
+                ]
+                self.check(
+                    len(path_entries) == target_updates,
+                    "combined resume rollout file count does not match target horizon",
+                )
+        else:
+            path_entries = [
+                (int(path.stem), path, "single") for path in successor_paths
             ]
-            self.check(
-                [path.name for path in paths] == expected_names,
-                "rollout JSONL filename is not bound to its optimizer step",
-            )
 
         real_rows = 0
         derived_padding_rows = 0
@@ -2322,6 +2681,15 @@ class _Audit:
             route_id: Counter() for route_id in self.route_ids
         }
         route_memory_chains: Counter[str] = Counter()
+        successor_route_action_rows: Counter[str] = Counter()
+        successor_route_response_tokens: Counter[str] = Counter()
+        successor_route_stale_rows: Counter[str] = Counter()
+        successor_route_episodes: Counter[str] = Counter()
+        successor_real_rows = 0
+        successor_real_tokens = 0
+        successor_stale_action_rows = 0
+        successor_terminal_instances: list[tuple[str, int]] = []
+        prefix_terminal_instances: list[tuple[str, int]] = []
         seen_uids: set[str] = set()
         samples_per_update = (
             int(self.expected["samples_per_update"]) if self.expected else 0
@@ -2336,7 +2704,10 @@ class _Audit:
             else {}
         )
 
-        for ordinal, path in enumerate(paths, start=1):
+        segment_stale_action_rows = 0
+        for ordinal, path, segment in path_entries:
+            if segment == "successor" and ordinal == self.resume_start_update + 1:
+                segment_stale_action_rows = 0
             try:
                 documents = _jsonl(path, "rollout JSONL")
             except Exception as exc:
@@ -2415,6 +2786,8 @@ class _Audit:
 
                 real_rows += 1
                 real_rows_in_file += 1
+                if segment == "successor":
+                    successor_real_rows += 1
                 token_count = record.get("response_token_count")
                 if (
                     not isinstance(token_count, int)
@@ -2426,11 +2799,16 @@ class _Audit:
                     )
                     token_count = 0
                 real_tokens += int(token_count)
+                if segment == "successor":
+                    successor_real_tokens += int(token_count)
                 if route_id:
                     route_action_rows[route_id] += 1
                     route_response_tokens[route_id] += int(token_count)
                     update_action_rows[route_id] += 1
                     update_response_tokens[route_id] += int(token_count)
+                    if segment == "successor":
+                        successor_route_action_rows[route_id] += 1
+                        successor_route_response_tokens[route_id] += int(token_count)
                 minimum = record.get("min_global_steps")
                 maximum = record.get("max_global_steps")
                 if (
@@ -2454,9 +2832,14 @@ class _Audit:
                         if staleness >= 0:
                             staleness_diffs[staleness] += 1
                             stale_action_rows += int(staleness >= 1)
+                            segment_stale_action_rows += int(staleness >= 1)
+                            if segment == "successor":
+                                successor_stale_action_rows += int(staleness >= 1)
                             if route_id and staleness >= 1:
                                 route_stale_rows[route_id] += 1
                                 update_stale_rows[route_id] += 1
+                                if segment == "successor":
+                                    successor_route_stale_rows[route_id] += 1
 
                 uid = record.get("trajectory_uid")
                 item_id = record.get("item_id")
@@ -2566,6 +2949,8 @@ class _Audit:
                     if episode_route:
                         route_episodes[episode_route] += 1
                         update_episodes[episode_route] += 1
+                        if segment == "successor":
+                            successor_route_episodes[episode_route] += 1
                         terminal_record = sorted_episode[-1][0]
                         reward = terminal_record.get("trajectory_return")
                         if _finite_number(reward):
@@ -2586,6 +2971,14 @@ class _Audit:
                         terminal_ids.append(terminal_id)
                         if valid_data_idx:
                             terminal_instances.append((terminal_id, terminal_data_idx))
+                            if segment == "prefix":
+                                prefix_terminal_instances.append(
+                                    (terminal_id, terminal_data_idx)
+                                )
+                            elif segment == "successor":
+                                successor_terminal_instances.append(
+                                    (terminal_id, terminal_data_idx)
+                                )
                             if self.multitask:
                                 scheduled_route = self.schedule_routes.get(
                                     (terminal_id, terminal_data_idx)
@@ -2625,7 +3018,9 @@ class _Audit:
             if self.batch_multiple is not None:
                 derived_padding_rows += (-real_rows_in_file) % self.batch_multiple
             if trigger > 0 and ordinal % trigger == 0:
-                stale_action_rows_by_publication[ordinal // trigger] = stale_action_rows
+                stale_action_rows_by_publication[ordinal // trigger] = (
+                    segment_stale_action_rows
+                )
 
         if versions and self.expected is not None:
             publication_cycles = int(self.expected["publication_cycles"])
@@ -2728,7 +3123,7 @@ class _Audit:
             "version_pairs": dict(sorted(version_pairs.items())),
             "versions": sorted(versions),
             "terminal_ids": terminal_ids,
-            "collection_files": len(paths),
+            "collection_files": len(path_entries),
             "memory_chain_updates": memory_chain_updates,
             "per_update_episodes": per_update_episodes,
             "per_update_action_rows": per_update_action_rows,
@@ -2737,19 +3132,80 @@ class _Audit:
             "action_rows_by_route": dict(route_action_rows),
             "response_tokens_by_route": dict(route_response_tokens),
             "stale_action_rows_by_route": dict(route_stale_rows),
+            "successor_real_rows": successor_real_rows,
+            "successor_real_tokens": successor_real_tokens,
+            "successor_stale_action_rows": successor_stale_action_rows,
+            "successor_episodes_by_route": dict(successor_route_episodes),
+            "successor_action_rows_by_route": dict(successor_route_action_rows),
+            "successor_response_tokens_by_route": dict(
+                successor_route_response_tokens
+            ),
+            "successor_stale_action_rows_by_route": dict(
+                successor_route_stale_rows
+            ),
         }
         schedule_ids = getattr(self, "_schedule_ids", None)
-        if schedule_ids is not None:
+        if schedule_ids is not None and self.resume_contract is None:
             self.check(
                 Counter(terminal_ids) == Counter(schedule_ids),
                 "rollout terminal trajectory identity/occurrences differ from the publication schedule",
             )
         schedule_instances = getattr(self, "_schedule_instances", None)
-        if schedule_instances is not None:
+        if schedule_instances is not None and self.resume_contract is None:
             self.check(
                 Counter(terminal_instances) == Counter(schedule_instances),
                 "rollout terminal item_id/data_idx occurrences differ from the publication schedule",
             )
+        if self.resume_contract is not None and self.expected is not None:
+            sampler_yielded = _positive_int(
+                self.resume_contract.get("sampler_samples_yielded")
+            )
+            invocation_episodes = _positive_int(
+                self.resume_contract.get("invocation_episodes")
+            )
+            target_episodes = int(self.expected["episodes"])
+            if sampler_yielded is None or invocation_episodes is None:
+                self.errors.append("resume rollout position contract is invalid")
+            else:
+                prefix_positions = [
+                    self.schedule_positions.get(instance)
+                    for instance in prefix_terminal_instances
+                ]
+                successor_positions = [
+                    self.schedule_positions.get(instance)
+                    for instance in successor_terminal_instances
+                ]
+                self.check(
+                    len(prefix_positions)
+                    == self.resume_start_update * samples_per_update,
+                    "resume prefix rollout episode count differs from checkpoint horizon",
+                )
+                self.check(
+                    len(successor_positions) == invocation_episodes,
+                    "resume successor rollout episode count differs from invocation budget",
+                )
+                self.check(
+                    len(terminal_instances) == target_episodes
+                    and len(set(terminal_instances)) == target_episodes,
+                    "combined resume rollout identities are incomplete or duplicated",
+                )
+                self.check(
+                    all(
+                        isinstance(position, int) and position < sampler_yielded
+                        for position in prefix_positions
+                    ),
+                    "resume prefix consumed a schedule position at or after the saved sampler offset",
+                )
+                self.check(
+                    all(
+                        isinstance(position, int) and position >= sampler_yielded
+                        for position in successor_positions
+                    ),
+                    "resume successor replayed a schedule position before the saved sampler offset",
+                )
+                self.counts["resume_prefix_yielded_unconsumed"] = (
+                    sampler_yielded - len(prefix_positions)
+                )
 
     def audit_final_statistics(self) -> None:
         if not self.multitask or self.expected is None:
@@ -3097,21 +3553,53 @@ class _Audit:
         )
 
         rollout = getattr(self, "_rollout_summary", {})
+        resume_budget = self.expected.get("resume")
+        successor_only = isinstance(resume_budget, Mapping)
         expected_routes = {
             "episodes": _normalized_counter(
-                rollout.get("episodes_by_route", {}), self.route_ids
+                rollout.get(
+                    "successor_episodes_by_route"
+                    if successor_only
+                    else "episodes_by_route",
+                    {},
+                ),
+                self.route_ids,
             ),
             "action_rows": _normalized_counter(
-                rollout.get("action_rows_by_route", {}), self.route_ids
+                rollout.get(
+                    "successor_action_rows_by_route"
+                    if successor_only
+                    else "action_rows_by_route",
+                    {},
+                ),
+                self.route_ids,
             ),
             "policy_response_tokens": _normalized_counter(
-                rollout.get("response_tokens_by_route", {}), self.route_ids
+                rollout.get(
+                    "successor_response_tokens_by_route"
+                    if successor_only
+                    else "response_tokens_by_route",
+                    {},
+                ),
+                self.route_ids,
             ),
         }
         expected_totals = {
-            "episodes": int(self.counts["completed_episodes"]),
-            "action_rows": int(self.counts["real_action_rows"]),
-            "policy_response_tokens": int(self.counts["real_response_tokens"]),
+            "episodes": (
+                int(resume_budget["invocation_episodes"])
+                if successor_only
+                else int(self.counts["completed_episodes"])
+            ),
+            "action_rows": int(
+                rollout.get("successor_real_rows", 0)
+                if successor_only
+                else self.counts["real_action_rows"]
+            ),
+            "policy_response_tokens": int(
+                rollout.get("successor_real_tokens", 0)
+                if successor_only
+                else self.counts["real_response_tokens"]
+            ),
         }
         for measure in expected_totals:
             self.check(
@@ -3125,7 +3613,7 @@ class _Audit:
         self.check(
             trainer_totals["episodes"]
             == queue_totals["dequeued"]
-            == int(self.expected["episodes"]),
+            == expected_totals["episodes"],
             "FinalStatistics dequeued/optimizer episode total differs from launch budget",
         )
         self.check(
@@ -3136,15 +3624,26 @@ class _Audit:
             queue_routes["dequeued"] == trainer_routes["episodes"],
             "FinalStatistics dequeued/optimizer route accounting differs",
         )
+        expected_stale_total = int(
+            rollout.get("successor_stale_action_rows", 0)
+            if successor_only
+            else self.counts["stale_action_rows"]
+        )
+        expected_stale_routes = _normalized_counter(
+            rollout.get(
+                "successor_stale_action_rows_by_route"
+                if successor_only
+                else "stale_action_rows_by_route",
+                {},
+            ),
+            self.route_ids,
+        )
         self.check(
-            stale_total == int(self.counts["stale_action_rows"]),
+            stale_total == expected_stale_total,
             "FinalStatistics stale-row total differs from rollout evidence",
         )
         self.check(
-            stale_routes
-            == _normalized_counter(
-                rollout.get("stale_action_rows_by_route", {}), self.route_ids
-            ),
+            stale_routes == expected_stale_routes,
             "FinalStatistics stale-row route totals differ from rollout evidence",
         )
         self.check(

@@ -26,6 +26,7 @@ from agentmemorygym_verl.launch import (
     _preserve_legacy_runtime_preflight_fields,
     _require_exact_multitask_outer_commit,
     _validate_accelerator_runtime,
+    _validate_resume_checkpoint,
     build_overrides,
     build_runtime_env,
     main as launch_main,
@@ -848,6 +849,149 @@ class TestAMGMultitaskLauncherContract(unittest.TestCase):
                 _load_launch_identity(inputs, schedule_report=schedule_report),
                 identity,
             )
+
+    def test_multitask_resume_targets_200_without_shrinking_schedule_capacity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inputs, schedule_report, _source_lock = self._identity_fixture(root)
+            prefix_run = root / "prefix"
+            checkpoint = prefix_run / "checkpoints" / "global_step_30"
+            inputs = replace(
+                inputs,
+                resume_from_path=checkpoint,
+                resume_prefix_run_dir=prefix_run,
+                resume_start_update=30,
+                resume_target_update=200,
+                resume_sampler_samples_yielded=2119,
+            )
+
+            identity = _load_multitask_identity(inputs, schedule_report=schedule_report)
+            budget = identity["budget_contract"]
+            values = self._values(
+                build_overrides(
+                    inputs,
+                    effective_schedule=inputs.schedule,
+                    endpoint_client_config=None,
+                    budget_contract=budget,
+                    training_runtime=identity["training_runtime"],
+                )
+            )
+
+            self.assertEqual(budget["optimizer_updates"], 200)
+            self.assertEqual(budget["episodes"], 12_800)
+            self.assertEqual(budget["schedule_capacity_optimizer_updates"], 400)
+            self.assertEqual(budget["schedule_capacity_episodes"], 25_600)
+            self.assertEqual(budget["resume"]["invocation_optimizer_updates"], 170)
+            self.assertEqual(budget["resume"]["invocation_episodes"], 10_880)
+            self.assertEqual(values["trainer.total_training_steps"], "200")
+            self.assertEqual(values["rollout.total_rollout_steps"], "12800")
+            self.assertEqual(values["trainer.resume_mode"], "resume_path")
+            self.assertEqual(values["trainer.resume_from_path"], str(checkpoint))
+
+    def test_multitask_resume_arguments_are_all_or_none_and_capacity_bound(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inputs, schedule_report, _source_lock = self._identity_fixture(root)
+            with self.assertRaisesRegex(ValueError, "provided together"):
+                _load_multitask_identity(
+                    replace(inputs, resume_start_update=30),
+                    schedule_report=schedule_report,
+                )
+
+            prefix_run = root / "prefix"
+            checkpoint = prefix_run / "checkpoints" / "global_step_30"
+            with self.assertRaisesRegex(ValueError, "insufficient rows"):
+                _load_multitask_identity(
+                    replace(
+                        inputs,
+                        resume_from_path=checkpoint,
+                        resume_prefix_run_dir=prefix_run,
+                        resume_start_update=30,
+                        resume_target_update=200,
+                        resume_sampler_samples_yielded=20_000,
+                    ),
+                    schedule_report=schedule_report,
+                )
+
+    def test_resume_checkpoint_requires_complete_shards_and_exact_sampler_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inputs, schedule_report, _source_lock = self._identity_fixture(root)
+            prefix_run = root / "prefix"
+            checkpoint = prefix_run / "checkpoints" / "global_step_30"
+            checkpoint.mkdir(parents=True)
+            (checkpoint / "data.pt").write_bytes(b"sampler")
+            for role in ("actor", "critic"):
+                role_dir = checkpoint / role
+                role_dir.mkdir()
+                for kind in ("model", "optim", "extra_state"):
+                    for rank in range(6):
+                        (role_dir / f"{kind}_world_size_6_rank_{rank}.pt").write_bytes(
+                            b"checkpoint"
+                        )
+            (prefix_run / "launch-receipt.json").write_text(
+                json.dumps(
+                    {
+                        "schedule": {"sha256": schedule_report["sha256"]},
+                        "inputs": {
+                            "route_registry_sha256": inputs.route_registry_sha256
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (prefix_run / "metrics.jsonl").write_text(
+                "".join(
+                    json.dumps({"step": step, "data": {}}) + "\n"
+                    for step in range(1, 31)
+                ),
+                encoding="utf-8",
+            )
+            rollout_dir = prefix_run / "rollout_data"
+            rollout_dir.mkdir()
+            for step in range(1, 31):
+                (rollout_dir / f"{step}.jsonl").write_text("{}\n", encoding="utf-8")
+            inputs = replace(
+                inputs,
+                resume_from_path=checkpoint,
+                resume_prefix_run_dir=prefix_run,
+                resume_start_update=30,
+                resume_target_update=200,
+                resume_sampler_samples_yielded=2119,
+            )
+            runtime = {"python": "/runtime/python"}
+
+            with mock.patch(
+                "agentmemorygym_verl.launch.subprocess.run",
+                return_value=mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps(
+                        {
+                            "_sampler_iter_yielded": 2119,
+                            "_num_yielded": 2119,
+                            "_iterator_finished": False,
+                        }
+                    ),
+                    stderr="",
+                ),
+            ):
+                contract = _validate_resume_checkpoint(
+                    inputs,
+                    training_runtime=runtime,
+                    schedule_report=schedule_report,
+                )
+            self.assertEqual(contract["resume_checkpoint_step"], 30)
+            self.assertEqual(contract["invocation_episodes"], 10_880)
+
+            missing = checkpoint / "critic" / "optim_world_size_6_rank_5.pt"
+            missing.unlink()
+            with self.assertRaisesRegex(FileNotFoundError, "incomplete"):
+                _validate_resume_checkpoint(
+                    inputs,
+                    training_runtime=runtime,
+                    schedule_report=schedule_report,
+                )
 
     def _rewrite_multitask_certificate(
         self, inputs: LaunchInputs, source_lock: dict, certificate: dict

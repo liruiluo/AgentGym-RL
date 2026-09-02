@@ -99,6 +99,29 @@ class LaunchInputs:
     learner_token_budget_profile: str = "default-65536-v1"
     actor_train_token_budget: int = 65_536
     critic_train_token_budget: int = 65_536
+    resume_from_path: Path | None = None
+    resume_prefix_run_dir: Path | None = None
+    resume_start_update: int | None = None
+    resume_target_update: int | None = None
+    resume_sampler_samples_yielded: int | None = None
+
+
+def _resume_requested(inputs: LaunchInputs) -> bool:
+    values = (
+        inputs.resume_from_path,
+        inputs.resume_prefix_run_dir,
+        inputs.resume_start_update,
+        inputs.resume_target_update,
+        inputs.resume_sampler_samples_yielded,
+    )
+    present = tuple(value is not None for value in values)
+    if any(present) and not all(present):
+        raise ValueError(
+            "resume_from_path, resume_prefix_run_dir, resume_start_update, "
+            "resume_target_update, and resume_sampler_samples_yielded must be "
+            "provided together"
+        )
+    return all(present)
 
 
 def _string(value: str | Path) -> str:
@@ -406,8 +429,16 @@ def build_overrides(
         f"trainer.total_training_steps={publication_cycles}",
         "trainer.val_before_train=False",
         "trainer.test_freq=-1",
-        "trainer.resume_mode=disable",
-        "trainer.resume_from_path=null",
+        (
+            "trainer.resume_mode=resume_path"
+            if _resume_requested(inputs)
+            else "trainer.resume_mode=disable"
+        ),
+        (
+            f"trainer.resume_from_path={_string(inputs.resume_from_path)}"
+            if _resume_requested(inputs)
+            else "trainer.resume_from_path=null"
+        ),
         f"trainer.save_freq={save_freq}",
         f"trainer.max_actor_ckpt_to_keep={max_actor_ckpt_to_keep}",
         f"trainer.max_critic_ckpt_to_keep={max_critic_ckpt_to_keep}",
@@ -879,22 +910,69 @@ def _load_multitask_identity(
                 f"multitask route {route.route_id!r} schedule attestation drifted"
             )
 
+    resume = _resume_requested(inputs)
+    target_optimizer_updates = optimizer_updates
+    target_episode_count = scheduled_episode_count
+    resume_budget: dict[str, Any] | None = None
+    if resume:
+        if inputs.mode != "formal":
+            raise ValueError("checkpoint resume is supported only for formal launches")
+        assert inputs.resume_start_update is not None
+        assert inputs.resume_target_update is not None
+        assert inputs.resume_sampler_samples_yielded is not None
+        resume_start_update = _require_positive_int(
+            inputs.resume_start_update, field="resume start update"
+        )
+        target_optimizer_updates = _require_positive_int(
+            inputs.resume_target_update, field="resume target update"
+        )
+        sampler_samples_yielded = _require_positive_int(
+            inputs.resume_sampler_samples_yielded,
+            field="resume sampler samples_yielded",
+        )
+        if not resume_start_update < target_optimizer_updates <= optimizer_updates:
+            raise ValueError(
+                "resume update range must satisfy 0 < start < target <= schedule capacity"
+            )
+        invocation_optimizer_updates = target_optimizer_updates - resume_start_update
+        target_episode_count = target_optimizer_updates * samples_per_update
+        invocation_episodes = invocation_optimizer_updates * samples_per_update
+        remaining_schedule_capacity = scheduled_episode_count - sampler_samples_yielded
+        if remaining_schedule_capacity < invocation_episodes:
+            raise ValueError(
+                "resume schedule has insufficient rows after the saved sampler offset: "
+                f"{remaining_schedule_capacity} < {invocation_episodes}"
+            )
+        resume_budget = {
+            "schema": "amg_verl_resume_budget_v1",
+            "resume_from_path": str(inputs.resume_from_path),
+            "resume_prefix_run_dir": str(inputs.resume_prefix_run_dir),
+            "resume_start_update": resume_start_update,
+            "target_optimizer_updates": target_optimizer_updates,
+            "target_episodes": target_episode_count,
+            "invocation_optimizer_updates": invocation_optimizer_updates,
+            "invocation_episodes": invocation_episodes,
+            "sampler_samples_yielded": sampler_samples_yielded,
+            "schedule_capacity_optimizer_updates": optimizer_updates,
+            "schedule_capacity_episodes": scheduled_episode_count,
+        }
+
     tuning = _ASYNC_TUNING[inputs.mode]
     trigger_parameter_sync_step = tuning["trigger_parameter_sync_step"]
-    if optimizer_updates % trigger_parameter_sync_step:
+    if target_optimizer_updates % trigger_parameter_sync_step:
         raise ValueError(
             "multitask optimizer updates are not divisible by parameter-sync cadence"
         )
-    publication_cycles = optimizer_updates // trigger_parameter_sync_step
+    publication_cycles = target_optimizer_updates // trigger_parameter_sync_step
     budget_contract = {
         "schema": "amg_verl_multitask_budget_contract_v1",
         "mode": inputs.mode,
         "role": role,
         "publication_cycles": publication_cycles,
         "trigger_parameter_sync_step": trigger_parameter_sync_step,
-        "optimizer_updates": optimizer_updates,
+        "optimizer_updates": target_optimizer_updates,
         "samples_per_update": samples_per_update,
-        "episodes": scheduled_episode_count,
+        "episodes": target_episode_count,
         "learner_token_budget_profile": inputs.learner_token_budget_profile,
         "actor_train_token_budget": inputs.actor_train_token_budget,
         "critic_train_token_budget": inputs.critic_train_token_budget,
@@ -907,6 +985,9 @@ def _load_multitask_identity(
         "schedule_sha256": certificate_schedule_sha256,
         "manifest_sha256": expected_report["manifest_digest"],
         "routing_sha256": certificate_schedule_sha256,
+        "schedule_capacity_optimizer_updates": optimizer_updates,
+        "schedule_capacity_episodes": scheduled_episode_count,
+        "resume": resume_budget,
     }
     return {
         "schema": "amg_multitask_source_identity_v1",
@@ -2135,6 +2216,161 @@ def _atomic_json(path: Path, value: Any) -> None:
     os.replace(temporary, path)
 
 
+def _validate_resume_checkpoint(
+    inputs: LaunchInputs,
+    *,
+    training_runtime: Mapping[str, Any],
+    schedule_report: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Bind one native veRL checkpoint without mutating its dataloader state."""
+
+    if not _resume_requested(inputs):
+        return None
+    assert inputs.resume_from_path is not None
+    assert inputs.resume_prefix_run_dir is not None
+    assert inputs.resume_start_update is not None
+    assert inputs.resume_target_update is not None
+    assert inputs.resume_sampler_samples_yielded is not None
+
+    checkpoint = inputs.resume_from_path.resolve()
+    prefix_run = inputs.resume_prefix_run_dir.resolve()
+    start = int(inputs.resume_start_update)
+    target = int(inputs.resume_target_update)
+    expected_checkpoint = prefix_run / "checkpoints" / f"global_step_{start}"
+    if checkpoint != expected_checkpoint.resolve():
+        raise ValueError(
+            f"resume checkpoint must be {expected_checkpoint}, got {checkpoint}"
+        )
+    if checkpoint.is_symlink() or not checkpoint.is_dir():
+        raise FileNotFoundError(f"resume checkpoint is missing or symlinked: {checkpoint}")
+    if prefix_run == inputs.run_dir.resolve():
+        raise ValueError("resume prefix run and successor run must be distinct")
+
+    data_path = checkpoint / "data.pt"
+    if data_path.is_symlink() or not data_path.is_file() or data_path.stat().st_size <= 0:
+        raise FileNotFoundError(f"resume dataloader state is missing: {data_path}")
+    world_size = int(inputs.trainer_gpus)
+    missing: list[str] = []
+    for role in ("actor", "critic"):
+        for kind in ("model", "optim", "extra_state"):
+            for rank in range(world_size):
+                path = checkpoint / role / f"{kind}_world_size_{world_size}_rank_{rank}.pt"
+                if path.is_symlink() or not path.is_file() or path.stat().st_size <= 0:
+                    missing.append(str(path.relative_to(checkpoint)))
+    if missing:
+        raise FileNotFoundError(
+            "resume checkpoint is incomplete: " + ", ".join(missing)
+        )
+
+    runtime_python = str(training_runtime["python"])
+    probe = subprocess.run(
+        [
+            runtime_python,
+            "-B",
+            "-c",
+            (
+                "import json,sys,torch; "
+                "x=torch.load(sys.argv[1],map_location='cpu',weights_only=False); "
+                "print(json.dumps({k:x.get(k) for k in "
+                "('_sampler_iter_yielded','_num_yielded','_iterator_finished')}))"
+            ),
+            str(data_path),
+        ],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    if probe.returncode != 0:
+        raise RuntimeError(
+            "cannot read native resume dataloader state: "
+            + "\n".join(probe.stderr.splitlines()[-20:])
+        )
+    try:
+        sampler_state = json.loads(probe.stdout.strip())
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("resume dataloader probe returned invalid JSON") from exc
+    expected_yielded = int(inputs.resume_sampler_samples_yielded)
+    if (
+        sampler_state.get("_sampler_iter_yielded") != expected_yielded
+        or sampler_state.get("_num_yielded") != expected_yielded
+        or sampler_state.get("_iterator_finished") is not False
+    ):
+        raise RuntimeError(
+            "resume dataloader state differs from the declared sampler offset: "
+            f"{sampler_state!r}"
+        )
+
+    prefix_launch = prefix_run / "launch-receipt.json"
+    prefix_metrics = prefix_run / "metrics.jsonl"
+    prefix_rollout_dir = prefix_run / "rollout_data"
+    for path, label in (
+        (prefix_launch, "prefix launch receipt"),
+        (prefix_metrics, "prefix FileLogger"),
+    ):
+        if path.is_symlink() or not path.is_file():
+            raise FileNotFoundError(f"{label} is missing or symlinked: {path}")
+    prefix_receipt = _load_json_mapping(prefix_launch, label="prefix launch receipt")
+    prefix_schedule = prefix_receipt.get("schedule")
+    prefix_inputs = prefix_receipt.get("inputs")
+    if (
+        not isinstance(prefix_schedule, Mapping)
+        or prefix_schedule.get("sha256") != schedule_report.get("sha256")
+    ):
+        raise RuntimeError("resume prefix and successor schedules differ")
+    if (
+        not isinstance(prefix_inputs, Mapping)
+        or prefix_inputs.get("route_registry_sha256") != inputs.route_registry_sha256
+    ):
+        raise RuntimeError("resume prefix and successor route registries differ")
+
+    metrics_steps: set[int] = set()
+    for line in prefix_metrics.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        step = row.get("step")
+        if isinstance(step, int) and not isinstance(step, bool) and step > 0:
+            metrics_steps.add(step)
+    if not set(range(1, start + 1)).issubset(metrics_steps):
+        raise RuntimeError("resume prefix FileLogger does not cover every prefix update")
+
+    rollout_files: dict[str, str] = {}
+    for step in range(1, start + 1):
+        path = prefix_rollout_dir / f"{step}.jsonl"
+        if path.is_symlink() or not path.is_file() or path.stat().st_size <= 0:
+            raise FileNotFoundError(f"resume prefix rollout is missing: {path}")
+        rollout_files[str(step)] = _sha256(path)
+
+    return {
+        "schema": "amg_verl_resume_contract_v1",
+        "prefix_run_dir": str(prefix_run),
+        "prefix_launch_receipt": {
+            "path": str(prefix_launch),
+            "sha256": _sha256(prefix_launch),
+        },
+        "prefix_file_logger": {
+            "path": str(prefix_metrics),
+            "sha256": _sha256(prefix_metrics),
+        },
+        "prefix_rollout_data": {
+            "path": str(prefix_rollout_dir),
+            "files": rollout_files,
+        },
+        "resume_from_path": str(checkpoint),
+        "resume_checkpoint_step": start,
+        "resume_checkpoint_data": {
+            "path": str(data_path),
+            "sha256": _sha256(data_path),
+        },
+        "sampler_samples_yielded": expected_yielded,
+        "schedule_capacity_episodes": int(schedule_report["count"]),
+        "target_optimizer_updates": target,
+        "target_episodes": target * 64,
+        "invocation_optimizer_updates": target - start,
+        "invocation_episodes": (target - start) * 64,
+    }
+
+
 def prepare_launch(
     inputs: LaunchInputs,
     *,
@@ -2172,6 +2408,11 @@ def prepare_launch(
         raise RuntimeError("publication identity omitted its async budget contract")
     if not isinstance(training_runtime, Mapping):
         raise RuntimeError("publication identity omitted its training runtime")
+    resume_contract = _validate_resume_checkpoint(
+        inputs,
+        training_runtime=training_runtime,
+        schedule_report=schedule_report,
+    )
     orchestrator_preflight = _load_multitask_orchestrator_preflight(
         inputs,
         launch_identity=launch_identity,
@@ -2281,6 +2522,19 @@ def prepare_launch(
             "standalone_rollout_gpus": inputs.standalone_rollout_gpus,
             "actor_use_fused_kernels": inputs.actor_use_fused_kernels,
             "critic_use_fused_kernels": inputs.critic_use_fused_kernels,
+            "resume_from_path": (
+                str(inputs.resume_from_path)
+                if inputs.resume_from_path is not None
+                else None
+            ),
+            "resume_prefix_run_dir": (
+                str(inputs.resume_prefix_run_dir)
+                if inputs.resume_prefix_run_dir is not None
+                else None
+            ),
+            "resume_start_update": inputs.resume_start_update,
+            "resume_target_update": inputs.resume_target_update,
+            "resume_sampler_samples_yielded": inputs.resume_sampler_samples_yielded,
         },
         "source": source_report_runtime,
         "plugin_manifest": _production_manifest(inputs.outer_root),
@@ -2292,6 +2546,7 @@ def prepare_launch(
             else None
         ),
         "budget_contract": dict(budget_contract),
+        "resume_contract": resume_contract,
         "budget": budget,
         "resolved_config": {
             "path": str(resolved_path),
@@ -2348,6 +2603,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--critic-train-token-budget", type=int, default=65_536)
     parser.add_argument("--actor-use-fused-kernels", action="store_true")
     parser.add_argument("--critic-use-fused-kernels", action="store_true")
+    parser.add_argument("--resume-from-path", type=Path)
+    parser.add_argument("--resume-prefix-run-dir", type=Path)
+    parser.add_argument("--resume-start-update", type=int)
+    parser.add_argument("--resume-target-update", type=int)
+    parser.add_argument("--resume-sampler-samples-yielded", type=int)
     parser.add_argument("--resolve-only", action="store_true")
     parser.add_argument(
         "--skip-runtime-preflight",
@@ -2406,6 +2666,19 @@ def main(argv: list[str] | None = None) -> int:
         critic_train_token_budget=args.critic_train_token_budget,
         actor_use_fused_kernels=args.actor_use_fused_kernels,
         critic_use_fused_kernels=args.critic_use_fused_kernels,
+        resume_from_path=(
+            _resolve_cli_directory(args.resume_from_path, label="resume checkpoint")
+            if args.resume_from_path is not None
+            else None
+        ),
+        resume_prefix_run_dir=(
+            _resolve_cli_directory(args.resume_prefix_run_dir, label="resume prefix run")
+            if args.resume_prefix_run_dir is not None
+            else None
+        ),
+        resume_start_update=args.resume_start_update,
+        resume_target_update=args.resume_target_update,
+        resume_sampler_samples_yielded=args.resume_sampler_samples_yielded,
         route_registry=_resolve_cli_regular_file(
             args.route_registry, label="route registry"
         ),

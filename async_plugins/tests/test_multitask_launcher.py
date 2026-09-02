@@ -48,6 +48,7 @@ from agentmemorygym_verl.routes import (
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "async_plugins/config/amg_multitask400.yaml"
 CONFIG_131K = ROOT / "async_plugins/config/amg_multitask400_131k.yaml"
+CONFIG_RESUME = ROOT / "async_plugins/config/amg_multitask200_resume.yaml"
 
 
 def _sha256(path: Path) -> str:
@@ -691,6 +692,46 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
         self.assertFalse(config.critic_use_fused_kernels)
         self.assertFalse(config.require_exact_per_update_route_split)
         self.assertEqual(config.sampling_order, "round_robin")
+
+    def test_reviewed_resume_config_freezes_formal200_successor_budget(self) -> None:
+        config = load_orchestrator_config(CONFIG_RESUME)
+
+        self.assertEqual(config.optimizer_updates, 200)
+        self.assertEqual(config.total_episodes, 12_800)
+        self.assertEqual(config.schedule_capacity_episodes, 25_600)
+        self.assertEqual(config.resume_start_update, 30)
+        self.assertEqual(config.resume_target_update, 200)
+        self.assertEqual(config.resume_sampler_samples_yielded, 2119)
+        self.assertEqual(config.invocation_optimizer_updates, 170)
+        self.assertEqual(config.invocation_episodes, 10_880)
+
+    def test_resume_command_forwards_exact_checkpoint_and_prefix(self) -> None:
+        config = load_orchestrator_config(CONFIG_RESUME)
+        plan = replace(
+            LaunchPlan.for_test(resolve_only=False, config=config),
+            resume_from_path=Path("/prefix/checkpoints/global_step_30"),
+            resume_prefix_run_dir=Path("/prefix"),
+        )
+
+        command = build_generic_launch_command(
+            plan,
+            resolve_only=False,
+            orchestrator_preflight=Path("/run/orchestrator-preflight.json"),
+        )
+        rendered = " ".join(command)
+
+        self.assertIn("--resume-from-path /prefix/checkpoints/global_step_30", rendered)
+        self.assertIn("--resume-prefix-run-dir /prefix", rendered)
+        self.assertIn("--resume-start-update 30", rendered)
+        self.assertIn("--resume-target-update 200", rendered)
+        self.assertIn("--resume-sampler-samples-yielded 2119", rendered)
+
+        with self.assertRaisesRegex(OrchestratorError, "resume launch plan is incomplete"):
+            build_generic_launch_command(
+                replace(plan, resume_prefix_run_dir=None),
+                resolve_only=False,
+                orchestrator_preflight=Path("/run/orchestrator-preflight.json"),
+            )
 
     def test_reviewed_131k_profile_is_explicit_and_forwarded(self) -> None:
         config = load_orchestrator_config(CONFIG_131K)
