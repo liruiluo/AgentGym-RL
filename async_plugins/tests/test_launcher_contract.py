@@ -984,6 +984,56 @@ class TestAMGMultitaskLauncherContract(unittest.TestCase):
             self.assertEqual(contract["resume_checkpoint_step"], 30)
             self.assertEqual(contract["invocation_episodes"], 10_880)
 
+            prefix_schedule = root / "prefix-schedule.jsonl"
+            prefix_registry = root / "prefix-route-registry.json"
+            declaration = root / "resume-provenance.json"
+            prefix_schedule.write_text("{}\n", encoding="utf-8")
+            prefix_registry.write_text('{"routes": []}\n', encoding="utf-8")
+            declaration.write_text("{}\n", encoding="utf-8")
+            prefix_receipt_path = prefix_run / "launch-receipt.json"
+            prefix_receipt = json.loads(
+                prefix_receipt_path.read_text(encoding="utf-8")
+            )
+            prefix_receipt["schedule"].update(
+                path=str(prefix_schedule), sha256="a" * 64
+            )
+            prefix_receipt["inputs"].update(
+                route_registry=str(prefix_registry),
+                route_registry_sha256="b" * 64,
+            )
+            prefix_receipt_path.write_text(
+                json.dumps(prefix_receipt) + "\n", encoding="utf-8"
+            )
+            inputs = replace(inputs, resume_provenance_rebind=declaration)
+            validation = {"schema": "test", "status": "pass"}
+            with (
+                mock.patch(
+                    "agentmemorygym_verl.launch.subprocess.run",
+                    return_value=mock.Mock(
+                        returncode=0,
+                        stdout=json.dumps(
+                            {
+                                "_sampler_iter_yielded": 2119,
+                                "_num_yielded": 2119,
+                                "_iterator_finished": False,
+                            }
+                        ),
+                        stderr="",
+                    ),
+                ),
+                mock.patch(
+                    "agentmemorygym_verl.launch.validate_resume_provenance_rebind",
+                    return_value=validation,
+                ) as validate,
+            ):
+                rebound_contract = _validate_resume_checkpoint(
+                    inputs,
+                    training_runtime=runtime,
+                    schedule_report=schedule_report,
+                )
+            self.assertEqual(rebound_contract["provenance_rebind"], validation)
+            validate.assert_called_once()
+
             missing = checkpoint / "critic" / "optim_world_size_6_rank_5.pt"
             missing.unlink()
             with self.assertRaisesRegex(FileNotFoundError, "incomplete"):

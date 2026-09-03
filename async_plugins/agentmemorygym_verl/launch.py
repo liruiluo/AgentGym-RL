@@ -32,6 +32,7 @@ from .identity import (
 )
 from .orchestrator_lifecycle import process_identity_alive
 from .routes import load_route_registry
+from .resume_provenance import validate_resume_provenance_rebind
 
 _ENDPOINT_SOURCE_LOCK_SCHEMA = "openmle_fast_launcher_source_lock_v1"
 _MULTITASK_SOURCE_LOCK_SCHEMA = "amg_multitask_launcher_source_lock_v1"
@@ -104,6 +105,7 @@ class LaunchInputs:
     resume_start_update: int | None = None
     resume_target_update: int | None = None
     resume_sampler_samples_yielded: int | None = None
+    resume_provenance_rebind: Path | None = None
 
 
 def _resume_requested(inputs: LaunchInputs) -> bool:
@@ -121,6 +123,8 @@ def _resume_requested(inputs: LaunchInputs) -> bool:
             "resume_target_update, and resume_sampler_samples_yielded must be "
             "provided together"
         )
+    if inputs.resume_provenance_rebind is not None and not all(present):
+        raise ValueError("resume_provenance_rebind requires a complete resume request")
     return all(present)
 
 
@@ -2312,16 +2316,40 @@ def _validate_resume_checkpoint(
     prefix_receipt = _load_json_mapping(prefix_launch, label="prefix launch receipt")
     prefix_schedule = prefix_receipt.get("schedule")
     prefix_inputs = prefix_receipt.get("inputs")
-    if (
-        not isinstance(prefix_schedule, Mapping)
-        or prefix_schedule.get("sha256") != schedule_report.get("sha256")
+    if not isinstance(prefix_schedule, Mapping) or not isinstance(
+        prefix_inputs, Mapping
     ):
-        raise RuntimeError("resume prefix and successor schedules differ")
-    if (
-        not isinstance(prefix_inputs, Mapping)
-        or prefix_inputs.get("route_registry_sha256") != inputs.route_registry_sha256
-    ):
-        raise RuntimeError("resume prefix and successor route registries differ")
+        raise RuntimeError("resume prefix launch identity is incomplete")
+    prefix_schedule_sha256 = prefix_schedule.get("sha256")
+    prefix_route_registry_sha256 = prefix_inputs.get("route_registry_sha256")
+    successor_schedule_sha256 = schedule_report.get("sha256")
+    schedule_changed = prefix_schedule_sha256 != successor_schedule_sha256
+    registry_changed = prefix_route_registry_sha256 != inputs.route_registry_sha256
+    provenance_rebind = None
+    if schedule_changed or registry_changed:
+        if inputs.resume_provenance_rebind is None:
+            raise RuntimeError(
+                "resume prefix provenance differs without an explicit rebind receipt"
+            )
+        prefix_schedule_path = Path(str(prefix_schedule.get("path", "")))
+        prefix_registry_path = Path(str(prefix_inputs.get("route_registry", "")))
+        if inputs.route_registry is None:
+            raise RuntimeError("resume provenance rebind requires a route registry")
+        provenance_rebind = validate_resume_provenance_rebind(
+            inputs.resume_provenance_rebind,
+            prefix_schedule_path=prefix_schedule_path,
+            successor_schedule_path=inputs.schedule,
+            prefix_route_registry_path=prefix_registry_path,
+            successor_route_registry_path=inputs.route_registry,
+            prefix_schedule_sha256=str(prefix_schedule_sha256),
+            successor_schedule_sha256=str(successor_schedule_sha256),
+            prefix_route_registry_sha256=str(prefix_route_registry_sha256),
+            successor_route_registry_sha256=str(inputs.route_registry_sha256),
+        )
+    elif inputs.resume_provenance_rebind is not None:
+        raise RuntimeError(
+            "resume provenance rebind was provided but prefix provenance is unchanged"
+        )
 
     metrics_steps: set[int] = set()
     for line in prefix_metrics.read_text(encoding="utf-8").splitlines():
@@ -2368,6 +2396,7 @@ def _validate_resume_checkpoint(
         "target_episodes": target * 64,
         "invocation_optimizer_updates": target - start,
         "invocation_episodes": (target - start) * 64,
+        "provenance_rebind": provenance_rebind,
     }
 
 
@@ -2535,6 +2564,11 @@ def prepare_launch(
             "resume_start_update": inputs.resume_start_update,
             "resume_target_update": inputs.resume_target_update,
             "resume_sampler_samples_yielded": inputs.resume_sampler_samples_yielded,
+            "resume_provenance_rebind": (
+                str(inputs.resume_provenance_rebind)
+                if inputs.resume_provenance_rebind is not None
+                else None
+            ),
         },
         "source": source_report_runtime,
         "plugin_manifest": _production_manifest(inputs.outer_root),
@@ -2608,6 +2642,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--resume-start-update", type=int)
     parser.add_argument("--resume-target-update", type=int)
     parser.add_argument("--resume-sampler-samples-yielded", type=int)
+    parser.add_argument("--resume-provenance-rebind", type=Path)
     parser.add_argument("--resolve-only", action="store_true")
     parser.add_argument(
         "--skip-runtime-preflight",
@@ -2679,6 +2714,10 @@ def main(argv: list[str] | None = None) -> int:
         resume_start_update=args.resume_start_update,
         resume_target_update=args.resume_target_update,
         resume_sampler_samples_yielded=args.resume_sampler_samples_yielded,
+        resume_provenance_rebind=_resolve_cli_regular_file(
+            args.resume_provenance_rebind,
+            label="resume provenance rebind",
+        ),
         route_registry=_resolve_cli_regular_file(
             args.route_registry, label="route registry"
         ),

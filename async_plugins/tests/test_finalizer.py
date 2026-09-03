@@ -6,10 +6,11 @@ import tempfile
 import unittest
 from collections.abc import Callable
 from pathlib import Path
+from unittest import mock
 
 import yaml
 from agentmemorygym_verl.config_contract import verify_resolved_config
-from agentmemorygym_verl.finalizer import finalize_run
+from agentmemorygym_verl.finalizer import _Audit, finalize_run
 from finalizer_fixture import (
     MULTITASK_ROUTES,
     build_valid_multitask_run,
@@ -1441,6 +1442,52 @@ class TestMultitaskFinalizer(FinalizerTestCase):
             )
             self.assertEqual(verdict["counts"]["resume_prefix_yielded_unconsumed"], 0)
 
+    def test_native_resume_rollout_numbering_maps_physical_to_logical_updates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = build_valid_resume_multitask_run(
+                Path(directory) / "run",
+                start_update=30,
+                target_updates=32,
+                schedule_capacity_updates=40,
+                successor_rollout_step_offset=1,
+            )
+
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+
+            self.assertEqual(verdict["status"], "pass", verdict)
+            self.assertEqual(
+                verdict["counts"]["resume_successor_rollout_step_offset"], 1
+            )
+            self.assertEqual(verdict["counts"]["complete_learner_updates"], 32)
+            self.assertEqual(verdict["counts"]["completed_episodes"], 32 * 64)
+            self.assertEqual(
+                sorted(
+                    (path.name for path in fixture["rollout_dir"].glob("*.jsonl")),
+                    key=lambda name: int(Path(name).stem),
+                ),
+                ["32.jsonl", "33.jsonl"],
+            )
+
+    def test_native_resume_rollout_document_step_must_match_physical_filename(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = build_valid_resume_multitask_run(
+                Path(directory) / "run", successor_rollout_step_offset=1
+            )
+            path = fixture["rollout_dir"] / f"{fixture['start_update'] + 2}.jsonl"
+            rows = [
+                json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+            ]
+            rows[0]["step"] = fixture["start_update"] + 1
+            path.write_text(
+                "\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+
+            self.assert_failed(
+                fixture["run_dir"],
+                contains="unexpected physical step(s) for logical optimizer update",
+            )
+
     def test_resume_successor_cumulative_counters_must_reset_at_first_update(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = build_valid_resume_multitask_run(Path(directory) / "run")
@@ -1459,6 +1506,39 @@ class TestMultitaskFinalizer(FinalizerTestCase):
             self.assert_failed(
                 fixture["run_dir"],
                 contains="cumulative optimizer-consumed episodes global total mismatch",
+            )
+
+    def test_native_resume_zero_sample_filelogger_bootstrap_is_ignored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = build_valid_resume_multitask_run(
+                Path(directory) / "run",
+                successor_filelogger_bootstrap=True,
+            )
+
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+
+            self.assertEqual(verdict["status"], "pass", verdict)
+            self.assertEqual(verdict["counts"]["resume_filelogger_bootstrap_rows"], 1)
+
+    def test_native_resume_nonzero_filelogger_bootstrap_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = build_valid_resume_multitask_run(
+                Path(directory) / "run",
+                successor_filelogger_bootstrap=True,
+            )
+            rows = [
+                json.loads(line)
+                for line in fixture["metrics_path"].read_text(encoding="utf-8").splitlines()
+            ]
+            rows[0]["data"]["fully_async/count/total_generated_samples"] = 1
+            fixture["metrics_path"].write_text(
+                "\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+
+            self.assert_failed(
+                fixture["run_dir"],
+                contains="resume successor FileLogger rewrote prefix publication steps",
             )
 
     def test_resume_prefix_schedule_position_must_precede_sampler_offset(self):
@@ -1531,6 +1611,78 @@ class TestMultitaskFinalizer(FinalizerTestCase):
             self.assert_failed(
                 fixture["run_dir"], contains="resume prefix rollout 1 drifted"
             )
+
+    def test_resume_provenance_rebind_is_revalidated_by_finalizer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = build_valid_resume_multitask_run(root / "run")
+            launch = json.loads(fixture["launch_path"].read_text(encoding="utf-8"))
+            prefix_launch_path = fixture["prefix_run"] / "launch-receipt.json"
+            prefix_launch = json.loads(prefix_launch_path.read_text(encoding="utf-8"))
+
+            successor_schedule = Path(launch["schedule"]["path"])
+            successor_registry = Path(launch["inputs"]["route_registry"])
+            prefix_schedule = root / "prefix-schedule.jsonl"
+            prefix_registry = root / "prefix-route-registry.json"
+            prefix_schedule.write_bytes(successor_schedule.read_bytes() + b"\n")
+            prefix_registry.write_bytes(successor_registry.read_bytes() + b"\n")
+            prefix_launch["schedule"].update(
+                path=str(prefix_schedule), sha256=sha256(prefix_schedule)
+            )
+            prefix_launch["inputs"].update(
+                route_registry=str(prefix_registry),
+                route_registry_sha256=sha256(prefix_registry),
+            )
+            prefix_launch_path.write_text(
+                json.dumps(prefix_launch, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+            declaration = root / "resume-provenance.json"
+            declaration.write_text("{}\n", encoding="utf-8")
+            validation = {
+                "schema": "amg_resume_provenance_rebind_validation_v1",
+                "status": "pass",
+                "declaration": {
+                    "path": str(declaration),
+                    "sha256": sha256(declaration),
+                },
+                "prefix": {
+                    "schedule": {
+                        "path": str(prefix_schedule),
+                        "sha256": sha256(prefix_schedule),
+                    },
+                    "route_registry": {
+                        "path": str(prefix_registry),
+                        "sha256": sha256(prefix_registry),
+                    },
+                },
+                "successor": {
+                    "schedule": {
+                        "path": str(successor_schedule),
+                        "sha256": sha256(successor_schedule),
+                    },
+                    "route_registry": {
+                        "path": str(successor_registry),
+                        "sha256": sha256(successor_registry),
+                    },
+                },
+            }
+            launch["inputs"]["resume_provenance_rebind"] = str(declaration)
+            launch["resume_contract"]["provenance_rebind"] = validation
+            launch["resume_contract"]["prefix_launch_receipt"]["sha256"] = sha256(
+                prefix_launch_path
+            )
+
+            audit = _Audit(fixture["run_dir"], trainer_exit_code=0)
+            with mock.patch(
+                "agentmemorygym_verl.finalizer.validate_resume_provenance_rebind",
+                return_value=validation,
+            ) as validate:
+                audit._audit_resume_contract(launch, launch["budget_contract"])
+
+            self.assertEqual(audit.errors, [])
+            validate.assert_called_once()
 
     def test_route_local_max_rounds_horizon_is_a_complete_trajectory(self):
         with tempfile.TemporaryDirectory() as directory:

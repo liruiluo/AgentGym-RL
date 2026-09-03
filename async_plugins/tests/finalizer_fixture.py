@@ -1238,6 +1238,8 @@ def build_valid_resume_multitask_run(
     start_update: int = 2,
     target_updates: int = 8,
     schedule_capacity_updates: int = 10,
+    successor_filelogger_bootstrap: bool = False,
+    successor_rollout_step_offset: int = 0,
 ) -> dict:
     """Convert a compact fresh fixture into one native resume lineage.
 
@@ -1249,6 +1251,8 @@ def build_valid_resume_multitask_run(
 
     if not 0 < start_update < target_updates <= schedule_capacity_updates:
         raise ValueError("invalid resume fixture update range")
+    if successor_rollout_step_offset not in (0, 1):
+        raise ValueError("resume successor rollout step offset must be 0 or 1")
     fixture = build_valid_multitask_run(
         run_dir, updates=schedule_capacity_updates
     )
@@ -1302,6 +1306,29 @@ def build_valid_resume_multitask_run(
         if step <= start_update or step > target_updates:
             path.unlink()
 
+    if successor_rollout_step_offset:
+        for path in sorted(
+            fixture["rollout_dir"].glob("*.jsonl"),
+            key=lambda item: int(item.stem),
+            reverse=True,
+        ):
+            logical_step = int(path.stem)
+            documents = [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+            ]
+            for document in documents:
+                document["step"] = logical_step + successor_rollout_step_offset
+            destination = path.with_name(
+                f"{logical_step + successor_rollout_step_offset}.jsonl"
+            )
+            destination.write_text(
+                "\n".join(json.dumps(row, sort_keys=True) for row in documents)
+                + "\n",
+                encoding="utf-8",
+            )
+            path.unlink()
+
     prefix_cumulative = all_metrics[start_update - 1]["data"]
     successor_metrics: list[dict] = []
     for row in all_metrics[start_update:target_updates]:
@@ -1313,11 +1340,47 @@ def build_valid_resume_multitask_run(
         data["fully_async/count/total_generated_samples"] = (
             int(row["step"]) - start_update
         ) * samples_per_update
+        if successor_rollout_step_offset:
+            data["training/global_step"] = (
+                int(row["step"]) + successor_rollout_step_offset
+            )
         data["fully_async/count/dropped_stale_samples"] = 0
         data["fully_async/count/stale_trajectory_processed"] = 0
         successor_metrics.append(row)
     fixture["metrics_path"].write_text(
-        "\n".join(json.dumps(row, sort_keys=True) for row in successor_metrics)
+        "\n".join(
+            json.dumps(row, sort_keys=True)
+            for row in (
+                [
+                    {
+                        "step": start_update,
+                        "data": {
+                            "dynamic_resource/rollout_resource_utilization": 0.0,
+                            "fully_async/count/dropped_stale_samples": 0,
+                            "fully_async/count/queue_cleared_samples": 0,
+                            "fully_async/count/queue_dequeued_samples": 0,
+                            "fully_async/count/queue_enqueued_samples": 0,
+                            "fully_async/count/queue_overflow_evictions": 0,
+                            "fully_async/count/queue_resident_samples": 0,
+                            "fully_async/count/rollout_cancelled_samples": 0,
+                            "fully_async/count/rollout_completed_samples": 0,
+                            "fully_async/count/rollout_dispatched_samples": 0,
+                            "fully_async/count/rollout_failed_samples": 0,
+                            "fully_async/count/rollout_inflight_samples": 0,
+                            "fully_async/count/staleness_samples": 0,
+                            "fully_async/count/total_generated_samples": 0,
+                            "fully_async/rollouter/active_time": 1.0,
+                            "fully_async/rollouter/idle_ratio": 0.0,
+                            "fully_async/rollouter/step_generated_samples": 0,
+                            "fully_async/rollouter/version_time": 1.0,
+                        },
+                    }
+                ]
+                if successor_filelogger_bootstrap
+                else []
+            )
+            + successor_metrics
+        )
         + "\n",
         encoding="utf-8",
     )
@@ -1502,6 +1565,7 @@ def build_valid_resume_multitask_run(
         target_updates=target_updates,
         schedule_capacity_updates=schedule_capacity_updates,
         successor_episodes=successor_episodes,
+        successor_rollout_step_offset=successor_rollout_step_offset,
     )
     return fixture
 

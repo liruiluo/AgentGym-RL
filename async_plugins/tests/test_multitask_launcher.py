@@ -711,6 +711,7 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
             LaunchPlan.for_test(resolve_only=False, config=config),
             resume_from_path=Path("/prefix/checkpoints/global_step_30"),
             resume_prefix_run_dir=Path("/prefix"),
+            resume_provenance_rebind=Path("/run/resume-provenance.json"),
         )
 
         command = build_generic_launch_command(
@@ -725,6 +726,9 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
         self.assertIn("--resume-start-update 30", rendered)
         self.assertIn("--resume-target-update 200", rendered)
         self.assertIn("--resume-sampler-samples-yielded 2119", rendered)
+        self.assertIn(
+            "--resume-provenance-rebind /run/resume-provenance.json", rendered
+        )
 
         with self.assertRaisesRegex(OrchestratorError, "resume launch plan is incomplete"):
             build_generic_launch_command(

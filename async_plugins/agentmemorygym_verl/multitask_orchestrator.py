@@ -240,6 +240,7 @@ class LaunchPlan:
     holder_lease: HolderLease | None = None
     resume_from_path: Path | None = None
     resume_prefix_run_dir: Path | None = None
+    resume_provenance_rebind: Path | None = None
 
     @classmethod
     def for_test(
@@ -1913,6 +1914,14 @@ def build_generic_launch_command(
                 str(plan.config.resume_sampler_samples_yielded),
             )
         )
+        if plan.resume_provenance_rebind is not None:
+            command.extend(
+                ("--resume-provenance-rebind", str(plan.resume_provenance_rebind))
+            )
+    elif plan.resume_provenance_rebind is not None:
+        raise OrchestratorError(
+            "resume provenance rebind requires a complete resume launch plan"
+        )
     if resolve_only:
         command.extend(("--resolve-only", "--skip-runtime-preflight"))
     else:
@@ -2039,6 +2048,7 @@ def build_launch_plan(args: argparse.Namespace) -> LaunchPlan:
     )
     raw_resume_from_path = getattr(args, "resume_from_path", None)
     raw_resume_prefix_run_dir = getattr(args, "resume_prefix_run_dir", None)
+    raw_resume_provenance_rebind = getattr(args, "resume_provenance_rebind", None)
     resume_fields = (
         raw_resume_from_path,
         raw_resume_prefix_run_dir,
@@ -2060,6 +2070,18 @@ def build_launch_plan(args: argparse.Namespace) -> LaunchPlan:
     resume_prefix_run_dir = (
         _directory(raw_resume_prefix_run_dir, field="resume prefix run")
         if raw_resume_prefix_run_dir is not None
+        else None
+    )
+    if raw_resume_provenance_rebind is not None and resume_from_path is None:
+        raise OrchestratorError(
+            "resume provenance rebind requires a complete resume launch"
+        )
+    resume_provenance_rebind = (
+        _regular_file(
+            raw_resume_provenance_rebind,
+            field="resume provenance rebind",
+        )
+        if raw_resume_provenance_rebind is not None
         else None
     )
     identity_inputs = LaunchInputs(
@@ -2087,6 +2109,7 @@ def build_launch_plan(args: argparse.Namespace) -> LaunchPlan:
         resume_start_update=config.resume_start_update,
         resume_target_update=config.resume_target_update,
         resume_sampler_samples_yielded=config.resume_sampler_samples_yielded,
+        resume_provenance_rebind=resume_provenance_rebind,
     )
     launch_identity = _load_multitask_identity(
         identity_inputs, schedule_report=schedule_report
@@ -2172,6 +2195,7 @@ def build_launch_plan(args: argparse.Namespace) -> LaunchPlan:
         holder_lease=holder_lease,
         resume_from_path=resume_from_path,
         resume_prefix_run_dir=resume_prefix_run_dir,
+        resume_provenance_rebind=resume_provenance_rebind,
     )
 
 
@@ -2675,6 +2699,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--experiment-name", required=True)
     parser.add_argument("--resume-from-path", type=Path)
     parser.add_argument("--resume-prefix-run-dir", type=Path)
+    parser.add_argument("--resume-provenance-rebind", type=Path)
     parser.add_argument("--resolve-only", action="store_true")
     return parser.parse_args(argv)
 

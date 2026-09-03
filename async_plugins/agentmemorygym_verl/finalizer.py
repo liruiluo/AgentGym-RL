@@ -27,6 +27,7 @@ from .identity import (
     validate_training_runtime_lock,
 )
 from .routes import load_route_registry
+from .resume_provenance import validate_resume_provenance_rebind
 
 _LEGACY_RECEIPT_SCHEMA = "amg_verl_fully_async_launch_receipt_v5"
 _MULTITASK_RECEIPT_SCHEMA = "amg_verl_fully_async_multitask_launch_receipt_v1"
@@ -125,6 +126,34 @@ _FILESYSTEM_CHECKPOINT_READ_RECEIPT_SCHEMA = (
 _FILESYSTEM_CHECKPOINT_PATH = ".agent_memory/CONTINUATION.md"
 _FILESYSTEM_CHECKPOINT_MAX_BYTES = 8 * 1024
 _MISSING_RECEIPT = object()
+_RESUME_FILELOGGER_BOOTSTRAP_KEYS = frozenset(
+    {
+        "dynamic_resource/rollout_resource_utilization",
+        "fully_async/count/dropped_stale_samples",
+        "fully_async/count/queue_cleared_samples",
+        "fully_async/count/queue_dequeued_samples",
+        "fully_async/count/queue_enqueued_samples",
+        "fully_async/count/queue_overflow_evictions",
+        "fully_async/count/queue_resident_samples",
+        "fully_async/count/rollout_cancelled_samples",
+        "fully_async/count/rollout_completed_samples",
+        "fully_async/count/rollout_dispatched_samples",
+        "fully_async/count/rollout_failed_samples",
+        "fully_async/count/rollout_inflight_samples",
+        "fully_async/count/staleness_samples",
+        "fully_async/count/total_generated_samples",
+        "fully_async/rollouter/active_time",
+        "fully_async/rollouter/idle_ratio",
+        "fully_async/rollouter/step_generated_samples",
+        "fully_async/rollouter/version_time",
+    }
+)
+_RESUME_FILELOGGER_ZERO_KEYS = frozenset(
+    key
+    for key in _RESUME_FILELOGGER_BOOTSTRAP_KEYS
+    if key.startswith("fully_async/count/")
+    or key == "fully_async/rollouter/step_generated_samples"
+)
 _REQUIRED_RUNTIME_ARTIFACTS = (
     "file_logger",
     "rollout_data",
@@ -255,6 +284,29 @@ def _finite_positive(value: Any) -> bool:
     except (TypeError, ValueError, OverflowError):
         return False
     return math.isfinite(number) and number > 0.0
+
+
+def _resume_filelogger_bootstrap_row(
+    row: Mapping[str, Any], *, start_update: int
+) -> bool:
+    """Recognize veRL's zero-sample rollouter row emitted at resume startup."""
+
+    if row.get("step") != start_update:
+        return False
+    data = row.get("data")
+    if not isinstance(data, Mapping) or set(data) != _RESUME_FILELOGGER_BOOTSTRAP_KEYS:
+        return False
+    for key in _RESUME_FILELOGGER_ZERO_KEYS:
+        value = data.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value != 0:
+            return False
+    for key in _RESUME_FILELOGGER_BOOTSTRAP_KEYS - _RESUME_FILELOGGER_ZERO_KEYS:
+        value = data.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        if not math.isfinite(float(value)) or float(value) < 0.0:
+            return False
+    return True
 
 
 def _finite_number(value: Any) -> bool:
@@ -1497,20 +1549,133 @@ class _Audit:
                 str(prefix_launch_binding.get("path"))
             ).resolve()
             prefix_launch = _load_json(prefix_launch_path, "resume prefix launch receipt")
-            self.check(
-                _at(prefix_launch, "schedule.sha256")
-                == _at(launch, "schedule.sha256"),
-                "resume prefix schedule differs from successor schedule",
-            )
+            provenance_rebind = contract.get("provenance_rebind")
+            launch_rebind_path = _at(launch, "inputs.resume_provenance_rebind")
+            if provenance_rebind is None:
+                self.check(
+                    launch_rebind_path is None,
+                    "resume provenance declaration is present without a validation",
+                )
+                self.check(
+                    _at(prefix_launch, "schedule.sha256")
+                    == _at(launch, "schedule.sha256"),
+                    "resume prefix schedule differs from successor schedule",
+                )
+                self.check(
+                    _at(prefix_launch, "inputs.route_registry_sha256")
+                    == _at(launch, "inputs.route_registry_sha256"),
+                    "resume prefix route registry differs from successor",
+                )
+            else:
+                if not isinstance(provenance_rebind, Mapping):
+                    raise ValueError("resume provenance validation is not a mapping")
+                declaration = provenance_rebind.get("declaration")
+                prefix_provenance = provenance_rebind.get("prefix")
+                successor_provenance = provenance_rebind.get("successor")
+                if not all(
+                    isinstance(value, Mapping)
+                    for value in (
+                        declaration,
+                        prefix_provenance,
+                        successor_provenance,
+                    )
+                ):
+                    raise ValueError("resume provenance validation bindings are incomplete")
+                assert isinstance(declaration, Mapping)
+                assert isinstance(prefix_provenance, Mapping)
+                assert isinstance(successor_provenance, Mapping)
+                prefix_schedule_binding = prefix_provenance.get("schedule")
+                prefix_registry_binding = prefix_provenance.get("route_registry")
+                successor_schedule_binding = successor_provenance.get("schedule")
+                successor_registry_binding = successor_provenance.get("route_registry")
+                if not all(
+                    isinstance(value, Mapping)
+                    for value in (
+                        prefix_schedule_binding,
+                        prefix_registry_binding,
+                        successor_schedule_binding,
+                        successor_registry_binding,
+                    )
+                ):
+                    raise ValueError("resume provenance artifact bindings are incomplete")
+                assert isinstance(prefix_schedule_binding, Mapping)
+                assert isinstance(prefix_registry_binding, Mapping)
+                assert isinstance(successor_schedule_binding, Mapping)
+                assert isinstance(successor_registry_binding, Mapping)
+                declaration_path = Path(str(declaration.get("path"))).resolve()
+                prefix_schedule_path = Path(
+                    str(prefix_schedule_binding.get("path"))
+                ).resolve()
+                prefix_registry_path = Path(
+                    str(prefix_registry_binding.get("path"))
+                ).resolve()
+                successor_schedule_path = Path(
+                    str(successor_schedule_binding.get("path"))
+                ).resolve()
+                successor_registry_path = Path(
+                    str(successor_registry_binding.get("path"))
+                ).resolve()
+                self.check(
+                    _same_path(launch_rebind_path, declaration_path),
+                    "resume provenance declaration differs from launch input",
+                )
+                self.check(
+                    _same_path(_at(prefix_launch, "schedule.path"), prefix_schedule_path)
+                    and _at(prefix_launch, "schedule.sha256")
+                    == prefix_schedule_binding.get("sha256"),
+                    "resume prefix schedule differs from provenance binding",
+                )
+                self.check(
+                    _same_path(
+                        _at(prefix_launch, "inputs.route_registry"),
+                        prefix_registry_path,
+                    )
+                    and _at(prefix_launch, "inputs.route_registry_sha256")
+                    == prefix_registry_binding.get("sha256"),
+                    "resume prefix route registry differs from provenance binding",
+                )
+                self.check(
+                    _same_path(_at(launch, "schedule.path"), successor_schedule_path)
+                    and _at(launch, "schedule.sha256")
+                    == successor_schedule_binding.get("sha256"),
+                    "resume successor schedule differs from provenance binding",
+                )
+                self.check(
+                    _same_path(
+                        _at(launch, "inputs.route_registry"),
+                        successor_registry_path,
+                    )
+                    and _at(launch, "inputs.route_registry_sha256")
+                    == successor_registry_binding.get("sha256"),
+                    "resume successor route registry differs from provenance binding",
+                )
+                observed_provenance = validate_resume_provenance_rebind(
+                    declaration_path,
+                    prefix_schedule_path=prefix_schedule_path,
+                    successor_schedule_path=successor_schedule_path,
+                    prefix_route_registry_path=prefix_registry_path,
+                    successor_route_registry_path=successor_registry_path,
+                    prefix_schedule_sha256=str(
+                        prefix_schedule_binding.get("sha256", "")
+                    ),
+                    successor_schedule_sha256=str(
+                        successor_schedule_binding.get("sha256", "")
+                    ),
+                    prefix_route_registry_sha256=str(
+                        prefix_registry_binding.get("sha256", "")
+                    ),
+                    successor_route_registry_sha256=str(
+                        successor_registry_binding.get("sha256", "")
+                    ),
+                )
+                self.check(
+                    observed_provenance == provenance_rebind,
+                    "resume provenance validation receipt drifted",
+                )
             self.check(
                 _at(prefix_launch, "schedule.count") == capacity_episodes
                 and _at(launch, "schedule.count") == capacity_episodes,
                 "resume prefix/successor schedule capacity differs from contract",
-            )
-            self.check(
-                _at(prefix_launch, "inputs.route_registry_sha256")
-                == _at(launch, "inputs.route_registry_sha256"),
-                "resume prefix route registry differs from successor",
             )
             rollout_dir = Path(str(prefix_rollout_binding.get("path"))).resolve()
             self.check(
@@ -2106,20 +2271,39 @@ class _Audit:
                 and not isinstance(row.get("step"), bool)
                 and 0 < int(row["step"]) <= self.resume_start_update
             ]
-            successor_prefix_steps = sorted(
-                {
-                    int(row["step"])
-                    for row in successor_rows
-                    if isinstance(row.get("step"), int)
-                    and not isinstance(row.get("step"), bool)
-                    and 0 < int(row["step"]) <= self.resume_start_update
-                }
+            successor_prefix_rows = [
+                row
+                for row in successor_rows
+                if isinstance(row.get("step"), int)
+                and not isinstance(row.get("step"), bool)
+                and 0 < int(row["step"]) <= self.resume_start_update
+            ]
+            bootstrap_is_safe = (
+                len(successor_prefix_rows) == 1
+                and _resume_filelogger_bootstrap_row(
+                    successor_prefix_rows[0], start_update=self.resume_start_update
+                )
             )
             self.check(
-                not successor_prefix_steps,
+                not successor_prefix_rows or bootstrap_is_safe,
                 "resume successor FileLogger rewrote prefix publication steps: "
-                + ", ".join(map(str, successor_prefix_steps)),
+                + ", ".join(
+                    map(
+                        str,
+                        sorted(
+                            {
+                                int(row["step"])
+                                for row in successor_prefix_rows
+                            }
+                        ),
+                    )
+                ),
             )
+            if bootstrap_is_safe:
+                successor_rows = [
+                    row for row in successor_rows if row is not successor_prefix_rows[0]
+                ]
+                self.counts["resume_filelogger_bootstrap_rows"] = 1
             rows = [*prefix_rows, *successor_rows]
 
         validation_metrics = 0
@@ -2596,7 +2780,16 @@ class _Audit:
         if not successor_paths:
             self.errors.append(f"required rollout JSONL is missing under: {directory}")
             return
-        path_entries: list[tuple[int, Path, str]] = []
+        # Each entry carries both the logical optimizer update used by the
+        # publication contract and the physical step written by veRL into the
+        # JSONL filename/document.  A fresh run keeps those equal.  On native
+        # resume, FullyAsyncTrainer restores ``global_steps=start+1`` and then
+        # increments it once at the beginning of ``fit()``, while
+        # ``current_param_version`` resumes at ``start``.  The successor's first
+        # logical update ``start+1`` is therefore physically dumped as
+        # ``start+2.jsonl``.  Keep accepting the older logical-numbered fixture,
+        # but require one exact, gap-free convention for the whole successor.
+        path_entries: list[tuple[int, Path, str, int]] = []
         if self.expected is not None:
             target_updates = int(self.expected["optimizer_updates"])
             if self.resume_contract is None:
@@ -2612,7 +2805,8 @@ class _Audit:
                     "rollout JSONL filename is not bound to its optimizer step",
                 )
                 path_entries = [
-                    (int(path.stem), path, "single") for path in successor_paths
+                    (int(path.stem), path, "single", int(path.stem))
+                    for path in successor_paths
                 ]
             else:
                 prefix_binding = self.resume_contract.get("prefix_rollout_data")
@@ -2633,20 +2827,35 @@ class _Audit:
                     prefix_directory / f"{step}.jsonl"
                     for step in range(1, self.resume_start_update + 1)
                 ]
-                expected_successor_names = [
-                    f"{step}.jsonl"
-                    for step in range(self.resume_start_update + 1, target_updates + 1)
+                logical_successor_steps = list(
+                    range(self.resume_start_update + 1, target_updates + 1)
+                )
+                actual_successor_names = [path.name for path in successor_paths]
+                matching_offsets = [
+                    offset
+                    for offset in (0, 1)
+                    if actual_successor_names
+                    == [f"{step + offset}.jsonl" for step in logical_successor_steps]
                 ]
                 self.check(
-                    [path.name for path in successor_paths]
-                    == expected_successor_names,
+                    len(matching_offsets) == 1,
                     "resume successor rollout filenames do not cover exactly the "
-                    "post-checkpoint optimizer steps",
+                    "post-checkpoint optimizer steps under one supported native offset",
+                )
+                if len(matching_offsets) != 1:
+                    return
+                successor_step_offset = matching_offsets[0]
+                self.counts["resume_successor_rollout_step_offset"] = (
+                    successor_step_offset
                 )
                 path_entries = [
-                    (int(path.stem), path, "prefix") for path in prefix_paths
+                    (step, path, "prefix", step)
+                    for step, path in enumerate(prefix_paths, start=1)
                 ] + [
-                    (int(path.stem), path, "successor") for path in successor_paths
+                    (logical_step, path, "successor", logical_step + successor_step_offset)
+                    for logical_step, path in zip(
+                        logical_successor_steps, successor_paths, strict=True
+                    )
                 ]
                 self.check(
                     len(path_entries) == target_updates,
@@ -2654,7 +2863,8 @@ class _Audit:
                 )
         else:
             path_entries = [
-                (int(path.stem), path, "single") for path in successor_paths
+                (int(path.stem), path, "single", int(path.stem))
+                for path in successor_paths
             ]
 
         real_rows = 0
@@ -2705,7 +2915,7 @@ class _Audit:
         )
 
         segment_stale_action_rows = 0
-        for ordinal, path, segment in path_entries:
+        for ordinal, path, segment, physical_step in path_entries:
             if segment == "successor" and ordinal == self.resume_start_update + 1:
                 segment_stale_action_rows = 0
             try:
@@ -2715,8 +2925,9 @@ class _Audit:
                 continue
             file_step_values = {document.get("step") for document in documents}
             self.check(
-                file_step_values == {ordinal},
-                f"rollout JSONL {path.name} has unexpected optimizer step(s)",
+                file_step_values == {physical_step},
+                f"rollout JSONL {path.name} has unexpected physical step(s) for "
+                f"logical optimizer update {ordinal}",
             )
             current_version = current_versions_by_update.get(ordinal)
             if current_version is None:
