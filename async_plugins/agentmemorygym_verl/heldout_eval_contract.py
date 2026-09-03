@@ -43,6 +43,12 @@ FINAL_EVALUATION_CONTRACT_SCHEMA = "camg_final_evaluation_contract_v1"
 FINAL_PANEL_AGGREGATE = (
     "unweighted macro-average of four environment-level success rates"
 )
+FINAL_PANEL_AGGREGATE_VARIANTS = frozenset(
+    {
+        FINAL_PANEL_AGGREGATE,
+        "unweighted macro-average of the four environment-level success rates",
+    }
+)
 FINAL_PANEL_ROUTE_NAMES = {
     "webshop": "shop",
     "swesmith": "coding",
@@ -103,7 +109,7 @@ def verify_final_panel_contract(
         or manifest.get("selection_uses_model_outputs_or_rewards") is not False
         or manifest.get("active_training_inputs_modified") is not False
         or manifest.get("training_input_hashes_before_after_equal") is not True
-        or manifest.get("aggregate_metric") != FINAL_PANEL_AGGREGATE
+        or manifest.get("aggregate_metric") not in FINAL_PANEL_AGGREGATE_VARIANTS
         or type(target_per_environment) is not int
         or target_per_environment <= 0
         or total_denominator != target_per_environment * len(CANONICAL_ROUTES)
@@ -133,7 +139,7 @@ def verify_final_panel_contract(
         or contract.get("same_task_rows_for_every_method") is not True
         or contract.get("per_environment_denominator") != target_per_environment
         or contract.get("total_task_count") != total_denominator
-        or contract.get("primary_aggregate") != FINAL_PANEL_AGGREGATE
+        or contract.get("primary_aggregate") not in FINAL_PANEL_AGGREGATE_VARIANTS
         or not isinstance(routing_files, Mapping)
     ):
         raise ValueError("final held-out evaluation contract drifted")

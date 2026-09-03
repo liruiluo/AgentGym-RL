@@ -532,6 +532,28 @@ class TestHeldoutSchedule(unittest.TestCase):
                     manifest_path=root / "manifest.json",
                 )
 
+    def test_accepts_frozen_contract_aggregate_article_variant(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec_path, _ = _make_spec(root)
+            spec = json.loads(spec_path.read_text())
+            contract_path = root / spec["final_evaluation_contract"]
+            contract = json.loads(contract_path.read_text())
+            contract["primary_aggregate"] = (
+                "unweighted macro-average of the four environment-level success rates"
+            )
+            spec["final_evaluation_contract_sha256"] = _write_json(
+                contract_path, contract
+            )
+            spec_sha256 = _write_json(spec_path, spec)
+            result = compose_heldout_schedule(
+                spec_path,
+                expected_spec_sha256=spec_sha256,
+                output_path=root / "out.jsonl",
+                manifest_path=root / "manifest.json",
+            )
+            self.assertEqual(result["row_count"], 8)
+
     def test_rejects_route_count_not_authorized_by_final_panel(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
