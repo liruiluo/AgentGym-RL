@@ -281,8 +281,16 @@ def verify_swesmith_formal_eval_authority(
     expected_sha256: str,
     expected_routing_sha256: str,
     expected_admitted_task_count: int,
+    selected_rows: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Verify the fixed Coding Eval subset and its complete admitted universe."""
+    """Verify the full Coding Eval authority and an optional final-panel subset.
+
+    ``runtime-manifest.json`` authorizes the complete 933-task formal Eval
+    pool.  Paper tables may use a pre-registered subset of that pool.  In that
+    case, ``selected_rows`` binds every scheduled row back to the full formal
+    routing without pretending that the 128-row panel is a newly repartitioned
+    formal Eval pool.
+    """
 
     path = require_regular_file(
         manifest_path, field="SWE-smith formal Eval runtime manifest"
@@ -360,12 +368,17 @@ def verify_swesmith_formal_eval_authority(
         )
     expected_count = require_positive_int(
         expected_admitted_task_count,
-        field="expected SWE-smith admitted task count",
+        field="expected SWE-smith scheduled task count",
     )
-    if formal != expected_count:
+    is_subset = selected_rows is not None and expected_count < formal
+    if not is_subset and formal != expected_count:
         raise ValueError(
             "SWE-smith formal Eval task count differs from the held-out schedule"
         )
+    if selected_rows is not None and len(selected_rows) != expected_count:
+        raise ValueError("SWE-smith selected-row count differs from the schedule")
+    if expected_count > formal:
+        raise ValueError("SWE-smith held-out schedule exceeds the formal Eval pool")
     if formal + extension != admitted:
         raise ValueError("SWE-smith formal and extension pools do not partition admission")
     if formal_repositories + extension_repositories != admitted_repositories:
@@ -381,9 +394,9 @@ def verify_swesmith_formal_eval_authority(
     routing_digest = sha256_file(routing_path)
     expected_routing_digest = require_sha256(
         expected_routing_sha256,
-        field="expected SWE-smith admitted routing sha256",
+        field="expected SWE-smith scheduled routing sha256",
     )
-    if routing_digest != expected_routing_digest:
+    if not is_subset and routing_digest != expected_routing_digest:
         raise ValueError(
             "SWE-smith full admission does not bind the held-out routing schedule"
         )
@@ -396,6 +409,41 @@ def verify_swesmith_formal_eval_authority(
         (row.get("extra_info") or {}).get("index") for row in routing_rows
     ] != list(range(formal)):
         raise ValueError("SWE-smith formal Eval routing extra_info.index must be dense")
+
+    selected_identity_sha256: str | None = None
+    if is_subset:
+        def identity(row: Mapping[str, Any]) -> tuple[Any, ...]:
+            extra = row.get("extra_info")
+            if not isinstance(extra, Mapping):
+                raise ValueError("SWE-smith routing row extra_info is missing")
+            item_id = str(row.get("item_id", "")).strip()
+            instance_id = str(extra.get("instance_id", "")).strip()
+            repository = str(extra.get("base_repository", "")).strip()
+            if not item_id or not instance_id or not repository:
+                raise ValueError("SWE-smith routing identity is incomplete")
+            return (
+                item_id,
+                require_nonnegative_int(
+                    row.get("data_idx"), field="SWE-smith routing data_idx"
+                ),
+                instance_id,
+                repository,
+            )
+
+        formal_identities = [identity(row) for row in routing_rows]
+        if len(set(formal_identities)) != len(formal_identities):
+            raise ValueError("SWE-smith formal Eval routing identity is not unique")
+        selected_identities = [identity(row) for row in selected_rows]
+        if len(set(selected_identities)) != len(selected_identities):
+            raise ValueError("SWE-smith final-panel routing identity is not unique")
+        missing = sorted(set(selected_identities) - set(formal_identities))
+        if missing:
+            raise ValueError(
+                "SWE-smith final-panel routing is not a subset of formal Eval"
+            )
+        selected_identity_sha256 = sha256_bytes(
+            canonical_json_bytes(sorted(selected_identities))
+        )
 
     selection_path = _resolve_file_reference(
         path.parent,
@@ -536,6 +584,10 @@ def verify_swesmith_formal_eval_authority(
         "extension_pool_repository_count": extension_repositories,
         "rejected_task_count": rejected,
         "formal_eval_routing_sha256": routing_digest,
+        "scheduled_task_count": expected_count,
+        "scheduled_routing_sha256": expected_routing_digest,
+        "scheduled_identity_sha256": selected_identity_sha256,
+        "scheduled_subset_of_formal_eval": is_subset,
         "formal_eval_selection_path": str(selection_path),
         "formal_eval_selection_sha256": sha256_file(selection_path),
         "admission_summary_path": str(summary_path),
@@ -756,6 +808,7 @@ def _load_spec(
                 ),
                 expected_routing_sha256=observed_schedule_digest,
                 expected_admitted_task_count=expected_rows,
+                selected_rows=source_rows,
             )
         elif any(
             raw_route.get(field) is not None

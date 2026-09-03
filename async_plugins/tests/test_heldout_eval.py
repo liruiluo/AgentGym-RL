@@ -572,6 +572,50 @@ class TestHeldoutSchedule(unittest.TestCase):
             self.assertEqual(schedule.read_bytes(), schedule_two.read_bytes())
             self.assertEqual(report, report_two)
 
+    def test_coding_final_panel_may_be_a_frozen_subset_of_formal_eval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec_path, _ = _make_spec(root, counts=(2, 4, 3, 2))
+            spec = json.loads(spec_path.read_text())
+            coding = next(
+                route for route in spec["routes"] if route["route_id"] == "swesmith"
+            )
+            coding_path = root / coding["schedule"]
+            full_rows = [json.loads(line) for line in coding_path.read_text().splitlines()]
+            selected_rows = [full_rows[0], full_rows[2]]
+            selected_path = root / "swesmith-final-panel.jsonl"
+            coding["schedule"] = selected_path.name
+            coding["expected_rows"] = len(selected_rows)
+            coding["schedule_sha256"] = _write_jsonl(selected_path, selected_rows)
+
+            split_path = root / spec["complete_split_contract"]
+            split = json.loads(split_path.read_text())
+            split["environments"]["coding"]["formal_eval_tasks"] = len(selected_rows)
+            spec["complete_split_contract_sha256"] = _write_json(split_path, split)
+            spec_sha256 = _write_json(spec_path, spec)
+
+            report = compose_heldout_schedule(
+                spec_path,
+                expected_spec_sha256=spec_sha256,
+                output_path=root / "out.jsonl",
+                manifest_path=root / "manifest.json",
+            )
+            authority = report["sources"]["swesmith"]["selection_authority"]
+            self.assertEqual(authority["formal_eval_task_count"], 4)
+            self.assertEqual(authority["scheduled_task_count"], 2)
+            self.assertTrue(authority["scheduled_subset_of_formal_eval"])
+
+            selected_rows[0]["extra_info"]["instance_id"] = "not-in-formal-eval"
+            coding["schedule_sha256"] = _write_jsonl(selected_path, selected_rows)
+            spec_sha256 = _write_json(spec_path, spec)
+            with self.assertRaisesRegex(ValueError, "not a subset"):
+                compose_heldout_schedule(
+                    spec_path,
+                    expected_spec_sha256=spec_sha256,
+                    output_path=root / "out-bad.jsonl",
+                    manifest_path=root / "manifest-bad.json",
+                )
+
     def test_rejects_source_hash_drift_and_reserved_eval_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
