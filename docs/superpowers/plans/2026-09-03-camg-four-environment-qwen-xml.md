@@ -11,7 +11,7 @@ LiteResearcher, and OpenMLE policy surfaces all accept exactly one Qwen XML
 `<tool_call>` per turn. Supervise it through update200 and terminal checkpoint
 closure, then run the frozen matched 4x128 held-out evaluation.
 
-## Live execution status (2026-09-03 20:29 CST)
+## Live execution status (2026-09-03 22:21 CST)
 
 - [x] r91c launched on `6.235.112.253` as the frozen pre-deconfliction control.
   It has committed update 40 with all four routes present, nonzero actor/critic
@@ -39,10 +39,31 @@ closure, then run the frozen matched 4x128 held-out evaluation.
   WebShop and OpenMLE. Reviewer8's final narrow review reports Critical/High/
   Important/Medium = 0 and `VERDICT: PASS`; its only Low note about stderr capture
   was closed by a fresh runtime log containing the unittest `OK` footer.
-- [ ] Commit/push inner and outer, build immutable r92 artifacts, run static and
-  resolve-only gates, then stop r91c and launch fresh r92 on the same B300.
-- [ ] Check r92 update 1 truth, updates 1--5 action adoption/throughput, then
-  updates 1--10/20 quality and real file-memory chains while training remains live.
+- [x] Inner `58c52228d356c18cdd0e24546c866df4d56829e8` and outer
+  `a9825c69ecf6a7d21c0d5e45ab78abea7648aff8` are committed and pushed. The
+  immutable r92 source trees are clean, resolve-only PASS recorded zero endpoint
+  or trainer spawn, r91c was retired after serving as the same-B300 control, and
+  fresh r92 is running on `6.235.112.253`.
+- [x] r92 update1 and updates1--5 truth gates PASS: every update consumed 64
+  complete trajectories with all four routes, nonzero actor/critic updates,
+  per-update parameter publication, and zero rollout failure, stale drop, or
+  queue overflow. Qwen XML normalization improved over r91c on all four routes;
+  the repair remains approximately speed-neutral on the same B300.
+- [x] Through update8, same-stage r92 exceeds r91c on Shop PS, SWE success,
+  LiteResearcher success, OpenMLE BBR/VSR, and all four route returns. Within r92,
+  updates6--8 show clear early lift for SWE and LiteResearcher, slight OpenMLE
+  lift, and flat Shop PS with materially lower invalid actions. This is not yet
+  evidence of four-route stable lift or a new historical best.
+- [x] Through update8, all four routes exhibit real executable checkpoint chains.
+  Behavioral write -> replace -> read -> later-action trajectories are Shop
+  105/130, SWE 60/128, LiteResearcher 65/129, and OpenMLE 61/125. These are
+  system-requested checkpoint chains, not evidence of autonomous long-term-note
+  creation.
+- [ ] At update10 verify the complete six-rank checkpoint, exact publication and
+  owned-process health, then produce the same-hardware quality/format/memory/case
+  report while training remains online.
+- [ ] At update20 decide stable four-route training lift from multi-update blocks;
+  do not stop for an isolated weak policy window and do not run held-out eval.
 
 ## Guardrails
 
