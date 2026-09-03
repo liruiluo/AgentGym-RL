@@ -92,7 +92,11 @@ generator_seed = int(provider.get("generator_seed", -1))
 start_orbit = int(provider.get("global_orbit_index_start_inclusive", -1))
 end_orbit = int(provider.get("global_orbit_index_end_exclusive", -1))
 provider_split = str(provider.get("split", ""))
-if provider_task_count <= 0 or provider_task_count != end_orbit * 2:
+if (
+    provider_task_count <= 0
+    or end_orbit <= start_orbit
+    or provider_task_count > (end_orbit - start_orbit) * 2
+):
     raise SystemExit("Shop provider task count/window mismatch")
 if generator_seed != 233 or start_orbit != 0 or provider_split != "dev":
     raise SystemExit("Shop held-out generator contract drifted")
@@ -109,6 +113,8 @@ if routing_idx != episode_idx or len(set(routing_idx)) != task_count:
     raise SystemExit("Shop sparse routing identity mismatch")
 if not routing_idx or min(routing_idx) < 0 or max(routing_idx) >= provider_task_count:
     raise SystemExit("Shop sparse data_idx escapes provider window")
+if max(routing_idx) != provider_task_count - 1:
+    raise SystemExit("Shop sparse routing does not bind the complete provider window")
 receipt = {
     "schema": "camg_shop_heldout_endpoint_launch_contract_v1",
     "status": "pass",

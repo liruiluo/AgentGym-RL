@@ -691,6 +691,11 @@ heldout_assert_asset_env FIXTURE "fixture asset"
         self.assertIn('--procedural-provider-mode "$provider_mode"', source)
         self.assertIn('--procedural-task-count "$provider_task_count"', source)
         self.assertIn('--split "$provider_split"', source)
+        self.assertIn(
+            "provider_task_count > (end_orbit - start_orbit) * 2", source
+        )
+        self.assertIn("max(routing_idx) != provider_task_count - 1", source)
+        self.assertNotIn("provider_task_count != end_orbit * 2", source)
         for stale in ("--procedural-task-count 6400", "reseeded_stream", "--split train"):
             self.assertNotIn(stale, source)
 
