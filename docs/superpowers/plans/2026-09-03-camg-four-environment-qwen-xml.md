@@ -11,6 +11,39 @@ LiteResearcher, and OpenMLE policy surfaces all accept exactly one Qwen XML
 `<tool_call>` per turn. Supervise it through update200 and terminal checkpoint
 closure, then run the frozen matched 4x128 held-out evaluation.
 
+## Live execution status (2026-09-03 20:29 CST)
+
+- [x] r91c launched on `6.235.112.253` as the frozen pre-deconfliction control.
+  It has committed update 40 with all four routes present, nonzero actor/critic
+  updates, per-update publication, and zero rollout failures, stale drops, or
+  queue-overflow evictions. Keep it online until r92 launch assets are fully
+  ready; it is not the candidate to merge.
+- [x] Independent reviewers4--6 exposed and drove closure of the prompt-projection
+  failure family: nested/dynamic legacy action records, non-idempotence, incorrect
+  `search[keywords]` semantics, exact opaque-payload corruption, endpoint-valid
+  WebShop whitespace variants, and identifier-prefixed `my_apply_patch` collisions.
+  The current repair projects policy-visible text only, preserves decoded opaque
+  values byte-for-byte, and leaves reward, PPO/GAE, endpoint audit state, and the
+  shared rollout unchanged.
+- [x] Current isolated B300 inner suite: 87 tests plus 112 subtests pass. Targeted
+  outer wrapper/routing suite: 47 tests plus 56 subtests pass with the dedicated
+  vLLM compatibility test separately passing. Replaying r91c updates 1--45 through
+  the current projector covers 32,180 rows and 28,704 policy-visible user messages;
+  it leaves zero executable-looking legacy forms, zero non-idempotent projections,
+  zero pseudo-XML imbalance, zero protected-fact loss, and does not alter source
+  rollout files. An expanded 1,000-case adversarial exact/idempotence fuzz also
+  passes for both WebShop and OpenMLE.
+- [x] Reviewer7 found one final identifier-prefix plus backticked-`apply_patch`
+  collision. The inert encoder and both final projectors now use indivisible
+  quoted/plain-token boundaries, with exact shell and patch regressions for both
+  WebShop and OpenMLE. Reviewer8's final narrow review reports Critical/High/
+  Important/Medium = 0 and `VERDICT: PASS`; its only Low note about stderr capture
+  was closed by a fresh runtime log containing the unittest `OK` footer.
+- [ ] Commit/push inner and outer, build immutable r92 artifacts, run static and
+  resolve-only gates, then stop r91c and launch fresh r92 on the same B300.
+- [ ] Check r92 update 1 truth, updates 1--5 action adoption/throughput, then
+  updates 1--10/20 quality and real file-memory chains while training remains live.
+
 ## Guardrails
 
 - Never resume r90c, checkpoint140, or any old optimizer/frontier state.
