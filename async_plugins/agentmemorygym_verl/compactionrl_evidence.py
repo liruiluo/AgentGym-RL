@@ -11,6 +11,9 @@ COMPACTIONRL_EVIDENCE_SUMMARY_SCHEMA = "camg_compactionrl_evidence_summary_v1"
 COMPACTIONRL_RECEIPT_SCHEMA = "agentmemory_compactionrl_receipt_v1"
 TASK_NEUTRAL_ACTION_ROW_SCHEMA = "amg_task_neutral_action_row_v1"
 TASK_NEUTRAL_CONTEXT_SCHEMA = "agentmemory_task_neutral_context_transition_v1"
+ALLOWED_INVALID_SUMMARY_REASONS = frozenset(
+    {"empty_summary", "summary_too_large"}
+)
 
 
 def summarize_compactionrl_step_records(
@@ -29,6 +32,9 @@ def summarize_compactionrl_step_records(
     route_rows: Counter[str] = Counter()
     route_trajectories: dict[str, set[str]] = defaultdict(set)
     route_compactions: Counter[str] = Counter()
+    route_invalid_compactions: Counter[str] = Counter()
+    route_invalid_summary_tokens: Counter[str] = Counter()
+    invalid_reasons: Counter[str] = Counter()
     route_summary_tokens: Counter[str] = Counter()
     route_successors: Counter[str] = Counter()
     route_terminal_compactions: Counter[str] = Counter()
@@ -125,7 +131,6 @@ def summarize_compactionrl_step_records(
         )
         if is_compaction:
             trajectories_with_compaction.add(trajectory_key)
-            route_compactions[route] += 1
             if evidence.get("event") != "context_compaction":
                 violate(
                     f"trajectory {trajectory_uid} row {row_order}: "
@@ -136,17 +141,6 @@ def summarize_compactionrl_step_records(
                     f"trajectory {trajectory_uid} row {row_order}: "
                     "invalid context_memory_mode"
                 )
-            if transition_operation != "replace_messages":
-                violate(
-                    f"trajectory {trajectory_uid} row {row_order}: "
-                    "summary lacks replace_messages transition"
-                )
-            for field in ("context_replaced", "summary_valid"):
-                if evidence.get(field) is not True:
-                    violate(
-                        f"trajectory {trajectory_uid} row {row_order}: "
-                        f"{field} is not true"
-                    )
             if evidence.get("summary_sent_to_native_environment") is not False:
                 violate(
                     f"trajectory {trajectory_uid} row {row_order}: "
@@ -164,16 +158,23 @@ def summarize_compactionrl_step_records(
                 )
 
             action = record.get("action")
-            if not isinstance(action, str) or not action:
+            if not isinstance(action, str):
                 violate(
-                    f"trajectory {trajectory_uid} row {row_order}: empty summary action"
+                    f"trajectory {trajectory_uid} row {row_order}: "
+                    "summary action is not text"
                 )
             else:
-                expected_hash = hashlib.sha256(action.encode("utf-8")).hexdigest()
+                encoded_action = action.encode("utf-8")
+                expected_hash = hashlib.sha256(encoded_action).hexdigest()
                 if evidence.get("summary_sha256") != expected_hash:
                     violate(
                         f"trajectory {trajectory_uid} row {row_order}: "
                         "summary hash mismatch"
+                    )
+                if evidence.get("summary_byte_count") != len(encoded_action):
+                    violate(
+                        f"trajectory {trajectory_uid} row {row_order}: "
+                        "summary byte count mismatch"
                     )
             submission = record.get("action_submission")
             if not isinstance(submission, Mapping):
@@ -202,11 +203,102 @@ def summarize_compactionrl_step_records(
                     f"trajectory {trajectory_uid} row {row_order}: "
                     f"invalid response_token_count {response_tokens!r}"
                 )
-            else:
+                response_tokens = 0
+
+            summary_valid = evidence.get("summary_valid")
+            if summary_valid is True:
+                route_compactions[route] += 1
                 route_summary_tokens[route] += response_tokens
+                if transition_operation != "replace_messages":
+                    violate(
+                        f"trajectory {trajectory_uid} row {row_order}: "
+                        "valid summary lacks replace_messages transition"
+                    )
+                if evidence.get("context_replaced") is not True:
+                    violate(
+                        f"trajectory {trajectory_uid} row {row_order}: "
+                        "valid summary did not replace context"
+                    )
+                if evidence.get("summary_failure_reason") is not None:
+                    violate(
+                        f"trajectory {trajectory_uid} row {row_order}: "
+                        "valid summary has a failure reason"
+                    )
+                if evidence.get("retry_pending") is not False:
+                    violate(
+                        f"trajectory {trajectory_uid} row {row_order}: "
+                        "valid summary left retry pending"
+                    )
+            elif summary_valid is False:
+                route_invalid_compactions[route] += 1
+                route_invalid_summary_tokens[route] += response_tokens
+                reason = evidence.get("summary_failure_reason")
+                if reason not in ALLOWED_INVALID_SUMMARY_REASONS:
+                    violate(
+                        f"trajectory {trajectory_uid} row {row_order}: "
+                        f"unknown invalid-summary reason {reason!r}"
+                    )
+                else:
+                    invalid_reasons[str(reason)] += 1
+                if transition_operation != "preserve":
+                    violate(
+                        f"trajectory {trajectory_uid} row {row_order}: "
+                        "invalid summary changed context"
+                    )
+                if evidence.get("context_replaced") is not False:
+                    violate(
+                        f"trajectory {trajectory_uid} row {row_order}: "
+                        "invalid summary claims context replacement"
+                    )
+                if evidence.get("retry_pending") is not True:
+                    violate(
+                        f"trajectory {trajectory_uid} row {row_order}: "
+                        "invalid summary did not request retry"
+                    )
+                if evidence.get("pre_context_message_count") != evidence.get(
+                    "post_context_message_count"
+                ):
+                    violate(
+                        f"trajectory {trajectory_uid} row {row_order}: "
+                        "invalid summary changed message count"
+                    )
+                if evidence.get("pre_context_sha256") != evidence.get(
+                    "post_context_sha256"
+                ):
+                    violate(
+                        f"trajectory {trajectory_uid} row {row_order}: "
+                        "invalid summary changed context bytes"
+                    )
+                if evidence.get("retained_recent_steps") != 0:
+                    violate(
+                        f"trajectory {trajectory_uid} row {row_order}: "
+                        "invalid summary retained a context tail"
+                    )
+                if isinstance(action, str) and reason == "empty_summary" and action.strip():
+                    violate(
+                        f"trajectory {trajectory_uid} row {row_order}: "
+                        "empty-summary receipt contains non-whitespace text"
+                    )
+                if isinstance(action, str) and reason == "summary_too_large":
+                    byte_count = evidence.get("summary_byte_count")
+                    max_bytes = evidence.get("summary_max_bytes")
+                    if (
+                        type(byte_count) is not int
+                        or type(max_bytes) is not int
+                        or byte_count <= max_bytes
+                    ):
+                        violate(
+                            f"trajectory {trajectory_uid} row {row_order}: "
+                            "oversize receipt is within byte cap"
+                        )
+            else:
+                violate(
+                    f"trajectory {trajectory_uid} row {row_order}: "
+                    "summary_valid is not boolean"
+                )
 
             terminal = record.get("trajectory_terminal") is True
-            if terminal:
+            if terminal and summary_valid is True:
                 route_terminal_compactions[route] += 1
             reward = record.get("immediate_reward", 0.0)
             try:
@@ -246,7 +338,7 @@ def summarize_compactionrl_step_records(
             ):
                 continue
             route = state["route"]
-            if index + 1 < len(rows):
+            if evidence.get("summary_valid") is True and index + 1 < len(rows):
                 route_successors[route] += 1
 
     expected = sorted(set(str(route) for route in expected_routes))
@@ -262,7 +354,9 @@ def summarize_compactionrl_step_records(
             "rows": route_rows[route],
             "trajectories": len(route_trajectories[route]),
             "valid_compactions": route_compactions[route],
+            "invalid_compactions": route_invalid_compactions[route],
             "summary_response_tokens": route_summary_tokens[route],
+            "invalid_summary_response_tokens": route_invalid_summary_tokens[route],
             "compactions_with_successor_policy_row": route_successors[route],
             "terminal_compaction_rows": route_terminal_compactions[route],
             "horizon_reward_overlay_rows": route_horizon_overlays[route],
@@ -281,7 +375,11 @@ def summarize_compactionrl_step_records(
             "rows": sum(route_rows.values()),
             "trajectories": len(trajectories),
             "valid_compactions": sum(route_compactions.values()),
+            "invalid_compactions": sum(route_invalid_compactions.values()),
             "summary_response_tokens": sum(route_summary_tokens.values()),
+            "invalid_summary_response_tokens": sum(
+                route_invalid_summary_tokens.values()
+            ),
             "trajectories_with_compaction": len(trajectories_with_compaction),
             "compactions_with_successor_policy_row": sum(route_successors.values()),
             "terminal_compaction_rows": sum(route_terminal_compactions.values()),
@@ -289,6 +387,7 @@ def summarize_compactionrl_step_records(
         },
         "routes": routes,
         "terminal_outcomes": dict(sorted(terminal_outcomes.items())),
+        "invalid_summary_reasons": dict(sorted(invalid_reasons.items())),
         "violation_count": violation_count,
         "violations": violations,
     }

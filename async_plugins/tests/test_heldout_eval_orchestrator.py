@@ -1,0 +1,288 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+from agentmemorygym_verl.heldout_eval_orchestrator import (
+    ATTEMPT_SCHEMA,
+    EvalAttempt,
+    _attempt_owner_id,
+    _verify_endpoint_source_counts,
+    classify_inference_argv,
+    execute_eval_orchestrator,
+)
+from agentmemorygym_verl.multitask_orchestrator import OrchestratorError
+
+
+class _Backend:
+    def __init__(self, root: Path, *, stage: str | None = None) -> None:
+        self.root = root
+        self.stage = stage
+        self.events: list[str] = []
+        self.evaluator = None
+        self.endpoint_leases = ()
+        self.holder_handle = None
+        self.watch_parent = None
+
+    def resolve(self, _plan):
+        self.events.append("resolve")
+        directory = self.root / "attempt-000000"
+        directory.mkdir()
+        return EvalAttempt(
+            index=0,
+            directory=directory,
+            runtime_plan=object(),
+            already_complete=False,
+            owner_id="eval-run.attempt-000000",
+        )
+
+    def prepare_runtime(self, _plan, _attempt):
+        self.events.append("prepare")
+        if self.stage == "prepare":
+            raise RuntimeError("prepare failed")
+
+    def acquire_holders(self, _plan, _attempt):
+        self.events.append("holder")
+        self.holder_handle = object()
+        if self.stage == "holder":
+            raise RuntimeError("holder failed")
+        return self.holder_handle
+
+    def start_endpoints(self, _plan, _attempt):
+        self.events.append("endpoints")
+        self.endpoint_leases = (object(),)
+        if self.stage == "endpoints":
+            raise RuntimeError("endpoints failed")
+        return self.endpoint_leases
+
+    def start_watch_parent(self, _plan, _attempt):
+        self.events.append("watch-parent")
+        self.watch_parent = object()
+        if self.stage == "watch-parent":
+            raise RuntimeError("watch-parent failed")
+        return self.watch_parent
+
+    def start_evaluator(self, _plan, _attempt):
+        self.events.append("evaluator")
+        self.evaluator = object()
+        if self.stage == "evaluator":
+            raise RuntimeError("evaluator failed")
+        return self.evaluator
+
+    def wait_evaluator(self, _plan, _attempt, _evaluator, _endpoints, _holder):
+        self.events.append("wait")
+        if self.stage == "wait":
+            raise RuntimeError("wait failed")
+        return 0
+
+    def stop_evaluator(self, _plan, _evaluator):
+        self.events.append("stop-evaluator")
+        self.evaluator = None
+
+    def stop_watch_parent(self, _plan, _attempt, _watch_parent):
+        self.events.append("stop-watch-parent")
+        self.watch_parent = None
+
+    def stop_endpoints(self, _plan, _attempt, _endpoints):
+        self.events.append("stop-endpoints")
+        self.endpoint_leases = ()
+
+    def restore_holders(self, _plan, _attempt, _holder):
+        self.events.append("restore-holder")
+        self.holder_handle = None
+
+    def cleanup_audit(self, _plan, _attempt):
+        self.events.append("cleanup-audit")
+        return {"status": "pass"}
+
+
+def _plan(root: Path, *, resolve_only: bool = False, episode_count: int = 512):
+    return SimpleNamespace(
+        resolve_only=resolve_only,
+        evaluation=SimpleNamespace(
+            run_dir=root / "evaluation",
+            episode_count=episode_count,
+        ),
+    )
+
+
+class HeldoutEvalOrchestratorTests(unittest.TestCase):
+    def test_attempt_owner_is_namespaced_by_eval_run(self):
+        self.assertEqual(
+            _attempt_owner_id("compactionrl-native-heldout", 0),
+            "compactionrl-native-heldout.attempt-000000",
+        )
+
+    def test_endpoint_counts_must_match_final_panel_source_pools(self):
+        source_counts = {
+            "webshop": 1746,
+            "swesmith": 933,
+            "literesearcher": 5319,
+            "openmle_fast": 169,
+        }
+        evaluation = SimpleNamespace(
+            route_counts={route_id: 128 for route_id in source_counts},
+            final_panel_authority={"source_counts": source_counts},
+        )
+        endpoints = tuple(
+            SimpleNamespace(route_id=route_id, task_count=count)
+            for route_id, count in source_counts.items()
+        )
+        self.assertEqual(
+            _verify_endpoint_source_counts(evaluation, endpoints), source_counts
+        )
+        drifted = endpoints[:-1] + (
+            SimpleNamespace(route_id="openmle_fast", task_count=168),
+        )
+        with self.assertRaisesRegex(OrchestratorError, "source-pool counts differ"):
+            _verify_endpoint_source_counts(evaluation, drifted)
+        self.assertEqual(
+            _attempt_owner_id("compactionrl-native-heldout", 17),
+            "compactionrl-native-heldout.attempt-000017",
+        )
+
+    def test_process_classifier_ignores_ray_or_vllm_in_file_arguments(self):
+        self.assertEqual(
+            classify_inference_argv(
+                ["/usr/bin/python3", "/tmp/analyze.py", "/tmp/ray/vllm-report.json"]
+            ),
+            (),
+        )
+        self.assertEqual(
+            classify_inference_argv(
+                ["/usr/bin/python3", "-m", "sglang.launch_server", "--port", "1"]
+            ),
+            ("python_module:sglang.launch_server",),
+        )
+        self.assertEqual(classify_inference_argv(["raylet", "--node-ip-address=x"]), ("executable:raylet",))
+
+    def test_resolve_only_never_mutates_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = _Backend(root)
+            self.assertEqual(
+                execute_eval_orchestrator(
+                    _plan(root, resolve_only=True), backend=backend
+                ),
+                0,
+            )
+            self.assertEqual(backend.events, ["resolve"])
+
+    def test_runtime_failures_unwind_only_acquired_layers_in_reverse_order(self):
+        expected = {
+            "prepare": ["resolve", "prepare", "cleanup-audit"],
+            "holder": [
+                "resolve",
+                "prepare",
+                "holder",
+                "restore-holder",
+                "cleanup-audit",
+            ],
+            "watch-parent": [
+                "resolve",
+                "prepare",
+                "holder",
+                "watch-parent",
+                "stop-watch-parent",
+                "restore-holder",
+                "cleanup-audit",
+            ],
+            "endpoints": [
+                "resolve",
+                "prepare",
+                "holder",
+                "watch-parent",
+                "endpoints",
+                "stop-endpoints",
+                "stop-watch-parent",
+                "restore-holder",
+                "cleanup-audit",
+            ],
+            "evaluator": [
+                "resolve",
+                "prepare",
+                "holder",
+                "watch-parent",
+                "endpoints",
+                "evaluator",
+                "stop-evaluator",
+                "stop-endpoints",
+                "stop-watch-parent",
+                "restore-holder",
+                "cleanup-audit",
+            ],
+            "wait": [
+                "resolve",
+                "prepare",
+                "holder",
+                "watch-parent",
+                "endpoints",
+                "evaluator",
+                "wait",
+                "stop-evaluator",
+                "stop-endpoints",
+                "stop-watch-parent",
+                "restore-holder",
+                "cleanup-audit",
+            ],
+        }
+        for stage, events in expected.items():
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                backend = _Backend(root, stage=stage)
+                with self.assertRaisesRegex(RuntimeError, f"{stage} failed"):
+                    execute_eval_orchestrator(_plan(root), backend=backend)
+                self.assertEqual(backend.events, events)
+                receipt = json.loads(
+                    (root / "attempt-000000/orchestrator-receipt.json").read_text()
+                )
+                self.assertEqual(receipt["schema"], ATTEMPT_SCHEMA)
+                self.assertEqual(receipt["status"], "fail")
+
+    def test_success_waits_then_cleans_and_reverifies_final_metrics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = _Backend(root)
+            with mock.patch(
+                "agentmemorygym_verl.heldout_eval_orchestrator.finalize_run_metrics",
+                return_value={"status": "pass"},
+            ) as finalize:
+                self.assertEqual(
+                    execute_eval_orchestrator(
+                        _plan(root, episode_count=7_777), backend=backend
+                    ),
+                    0,
+                )
+            self.assertEqual(
+                backend.events,
+                [
+                    "resolve",
+                    "prepare",
+                    "holder",
+                    "watch-parent",
+                    "endpoints",
+                    "evaluator",
+                    "wait",
+                    "stop-evaluator",
+                    "stop-endpoints",
+                    "stop-watch-parent",
+                    "restore-holder",
+                    "cleanup-audit",
+                ],
+            )
+            finalize.assert_called_once_with(
+                root / "evaluation", expected_episode_count=7_777
+            )
+            receipt = json.loads(
+                (root / "attempt-000000/orchestrator-receipt.json").read_text()
+            )
+            self.assertEqual(receipt["status"], "pass")
+            self.assertEqual(receipt["evaluator_exit_code"], 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

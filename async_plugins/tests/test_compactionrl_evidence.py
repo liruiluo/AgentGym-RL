@@ -59,6 +59,9 @@ def _summary_row(*, uid: str, route: str, order: int, terminal: bool = False):
             "native_environment_call_count": 0,
             "summary_specific_reward": False,
             "summary_sha256": hashlib.sha256(action.encode()).hexdigest(),
+            "summary_byte_count": len(action.encode()),
+            "summary_failure_reason": None,
+            "retry_pending": False,
         },
     }
     if terminal:
@@ -101,6 +104,33 @@ class CompactionRLEvidenceTest(unittest.TestCase):
         )
         self.assertEqual(summary["status"], "PASS")
         self.assertEqual(summary["routes_without_valid_compaction"], ["swesmith"])
+
+    def test_recoverable_oversize_summary_is_behavior_not_infrastructure_failure(self):
+        row = _summary_row(uid="research-1", route="openmle_fast", order=0)
+        row["context_transition"]["operation"] = "preserve"
+        row["wrapper_evidence"].update(
+            {
+                "summary_valid": False,
+                "context_replaced": False,
+                "summary_failure_reason": "summary_too_large",
+                "retry_pending": True,
+                "summary_max_bytes": 8,
+                "pre_context_message_count": 9,
+                "post_context_message_count": 9,
+                "pre_context_sha256": "a" * 64,
+                "post_context_sha256": "a" * 64,
+                "retained_recent_steps": 0,
+            }
+        )
+
+        summary = summarize_compactionrl_step_records(
+            [row], expected_routes=("openmle_fast",)
+        )
+
+        self.assertEqual(summary["status"], "PASS")
+        self.assertEqual(summary["totals"]["valid_compactions"], 0)
+        self.assertEqual(summary["totals"]["invalid_compactions"], 1)
+        self.assertEqual(summary["invalid_summary_reasons"], {"summary_too_large": 1})
 
     def test_fails_closed_on_summary_contract_drift(self):
         base = _summary_row(uid="shop-1", route="webshop", order=0)
