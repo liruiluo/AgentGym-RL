@@ -52,8 +52,11 @@ heldout_assert_file() {
 
 heldout_assert_executable() {
   local path=$1 label=$2
-  [[ "$path" = /* && -f "$path" && ! -L "$path" && -x "$path" ]] \
-    || heldout_die "$label is not an absolute executable regular file: $path"
+  # Virtual-environment Python entrypoints are normally symlinks.  Bash's
+  # -f/-x checks follow the link and still reject missing, broken, directory,
+  # and non-executable targets.
+  [[ "$path" = /* && -f "$path" && -x "$path" ]] \
+    || heldout_die "$label is not an absolute executable file: $path"
 }
 
 heldout_assert_source() {

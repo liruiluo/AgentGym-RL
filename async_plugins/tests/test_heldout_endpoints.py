@@ -626,6 +626,32 @@ heldout_assert_asset_env FIXTURE "fixture asset"
             )
             self.assertEqual(completed.returncode, 0, completed.stdout)
 
+    def test_executable_check_accepts_venv_style_symlink(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "python3.12"
+            target.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            target.chmod(0o700)
+            entrypoint = root / "python3"
+            entrypoint.symlink_to(target.name)
+            completed = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'set -euo pipefail; source "$1"; '
+                    'heldout_assert_executable "$2" "fixture Python"',
+                    "bash",
+                    str(LAUNCHER_ROOT / "common.sh"),
+                    str(entrypoint),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout)
+
     def test_launchers_use_registry_git_roots_without_double_outer_component(self):
         common = (LAUNCHER_ROOT / "common.sh").read_text()
         self.assertIn('basename -- "$CAMG_HELDOUT_SOURCE_OUTER_ROOT"', common)
