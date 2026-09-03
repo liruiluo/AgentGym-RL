@@ -146,28 +146,46 @@ def _verify_existing_publication(
     training_run_id: str,
     source_commits: dict[str, str],
 ) -> dict[str, Any]:
-    sys.path.insert(0, str(ASYNC_PLUGINS))
-    from agentmemorygym_verl.heldout_eval import verify_model_manifest
-
+    if (
+        not manifest_path.is_absolute()
+        or manifest_path.is_symlink()
+        or not manifest_path.is_file()
+    ):
+        raise PublicationError("model manifest must be an absolute regular file")
     manifest_sha256 = sha256_file(manifest_path)
-    verified = verify_model_manifest(
-        manifest_path,
-        expected_manifest_sha256=manifest_sha256,
-        expected_checkpoint_step=checkpoint_step,
-        expected_training_run_id=training_run_id,
-        expected_source_commits=source_commits,
-    )
-    if verified.path != model_path.resolve():
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise PublicationError(f"invalid model manifest: {exc}") from exc
+    if not isinstance(payload, dict) or payload.get("schema") != MODEL_MANIFEST_SCHEMA:
+        raise PublicationError("model manifest schema mismatch")
+    if payload.get("checkpoint_step") != checkpoint_step:
+        raise PublicationError("model manifest checkpoint step mismatch")
+    if payload.get("training_run_id") != training_run_id:
+        raise PublicationError("model manifest training run mismatch")
+    if payload.get("source_commits") != source_commits:
+        raise PublicationError("model manifest source commits mismatch")
+    try:
+        declared_model_path = Path(payload["model_path"])
+    except (KeyError, TypeError) as exc:
+        raise PublicationError("model manifest lacks a valid model path") from exc
+    if not declared_model_path.is_absolute() or declared_model_path.resolve() != model_path.resolve():
         raise PublicationError("existing model manifest points at another model path")
+    declared_files = payload.get("files")
+    if not isinstance(declared_files, list) or not declared_files:
+        raise PublicationError("model manifest files must be a non-empty list")
+    observed_files = inventory_model(model_path)
+    if declared_files != observed_files:
+        raise PublicationError("model manifest does not match the exact model payload")
     return {
         "schema": "camg_merged_hf_checkpoint_publication_result_v1",
         "status": "pass",
         "publication": "reused_verified",
-        "model_path": str(verified.path),
-        "model_manifest": str(verified.manifest_path),
+        "model_path": str(model_path.resolve()),
+        "model_manifest": str(manifest_path.resolve()),
         "model_manifest_sha256": manifest_sha256,
-        "file_count": verified.file_count,
-        "checkpoint_step": verified.checkpoint_step,
+        "file_count": len(observed_files),
+        "checkpoint_step": checkpoint_step,
     }
 
 
