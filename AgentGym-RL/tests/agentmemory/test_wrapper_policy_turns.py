@@ -29,7 +29,10 @@ from agentenv.controller.types import (  # noqa: E402
     ActionFormat,
     build_task_neutral_transition_info,
 )
-from agentenv.envs.agentmemory import AgentMemoryEnvClient  # noqa: E402
+from agentenv.envs.agentmemory import (  # noqa: E402
+    AgentMemoryEnvClient,
+    FilesystemAgentMemoryAdapter,
+)
 from agentenv.envs.filesystem_checkpoint import (  # noqa: E402
     FILESYSTEM_CHECKPOINT_PATH,
     FILESYSTEM_CHECKPOINT_READ_RECEIPT_SCHEMA,
@@ -55,13 +58,16 @@ from agentenv.envs.webshop_handoff import (  # noqa: E402
     WEBSHOP_POST_CHECKPOINT_READ_MARKER,
     WEBSHOP_SESSION_HANDOFF_REQUEST,
 )
+from agentenv.envs.verl_qwen_tool_parser import (  # noqa: E402
+    QWEN_INVALID_ACTION_SENTINEL,
+)
 
 
 def count_prompt_tokens(messages) -> int:
     return sum(len(message["content"].split()) + 2 for message in messages)
 
 
-def prepare(client, messages, *, capacity: int = 4096):
+def prepare(client, messages, *, capacity: int = 8192):
     response_budget = 32
     return prepare_policy_turn(
         client,
@@ -73,6 +79,49 @@ def prepare(client, messages, *, capacity: int = 4096):
         max_observation_tokens=64,
         action_observation_envelope_tokens=4,
     )
+
+
+def qwen_call(name: str, **parameters: object) -> str:
+    """Encode one policy-facing action with Qwen3.5's native XML envelope."""
+
+    body = ["<tool_call>", f"<function={name}>"]
+    for key, value in parameters.items():
+        body.extend((f"<parameter={key}>", str(value), "</parameter>"))
+    body.extend(("</function>", "</tool_call>"))
+    return "\n".join(body)
+
+
+def endpoint_action_signature(endpoint_action: str) -> object:
+    """Compare endpoint actions semantically across harmless JSON spacing."""
+
+    if endpoint_action.startswith("shell_command "):
+        payload = json.loads(endpoint_action.removeprefix("shell_command "))
+        if not isinstance(payload, dict):
+            raise ValueError("shell_command fixture payload must be an object")
+        return ("shell_command", payload)
+    return endpoint_action
+
+
+def qwen_policy_action(endpoint_action: str) -> str:
+    """Translate a test fixture's frozen endpoint syntax into policy XML."""
+
+    if endpoint_action.startswith("search[") and endpoint_action.endswith("]"):
+        return qwen_call("search", keywords=endpoint_action[7:-1])
+    if endpoint_action.startswith("click[") and endpoint_action.endswith("]"):
+        return qwen_call("click", item=endpoint_action[6:-1])
+    if endpoint_action.startswith("shell_command "):
+        payload = json.loads(endpoint_action.removeprefix("shell_command "))
+        if not isinstance(payload, dict):
+            raise ValueError("shell_command fixture payload must be an object")
+        return qwen_call("shell_command", **payload)
+    if endpoint_action.startswith("apply_patch\n"):
+        return qwen_call(
+            "apply_patch",
+            patch=endpoint_action.removeprefix("apply_patch\n"),
+        )
+    if endpoint_action in {"submit", "finish"}:
+        return qwen_call(endpoint_action)
+    raise ValueError(f"unsupported endpoint fixture action: {endpoint_action!r}")
 
 
 def filesystem_checkpoint_receipt(
@@ -102,6 +151,7 @@ class FakeWebShopClient(AgentMemoryEnvClient):
         BaseEnvClient.__init__(self, action_format=ActionFormat.REACT)
         self.is_v3 = True
         self.is_filesystem = True
+        self.adapter_cls = FilesystemAgentMemoryAdapter
         self.metadata = {"surface": "fake_filesystem_webshop"}
         self.env_id = 101
         self.data_len = 1
@@ -186,6 +236,7 @@ class FakeSwesmithClient(SwesmithEnvClient):
             raise ValueError("SWE-smith invalid_action_reward must be zero")
         BaseEnvClient.__init__(self, action_format=ActionFormat.REACT)
         self.invalid_action_reward = float(invalid_action_reward)
+        self.checkpoint_contract_penalty = 0.0
         self.env_id = 202
         self.data_len = 1
         self.metadata = {
@@ -210,7 +261,7 @@ class FakeSwesmithClient(SwesmithEnvClient):
         action = str(kwargs["json"]["action"])
         self.native_calls.append(action)
         step = len(self.native_calls)
-        if action == "malformed policy output":
+        if action == QWEN_INVALID_ACTION_SENTINEL:
             return {
                 "observation": "Invalid action: expected one bare tool action.",
                 "reward": -0.01,
@@ -478,10 +529,10 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         )
         messages = self.bind_webshop(client)
         _, messages = complete_policy_turn(
-            client, prepare(client, messages), "search[black mug]"
+            client, prepare(client, messages), qwen_policy_action("search[black mug]")
         )
 
-        pressure_turn = prepare(client, messages, capacity=1800)
+        pressure_turn = prepare(client, messages, capacity=4200)
         self.assertEqual(
             pressure_turn.control_request, WEBSHOP_CONTEXT_COMPACTION_REQUEST
         )
@@ -491,7 +542,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             + ' > .agent_memory/CONTINUATION.md","workdir":"."}'
         )
         output, messages = complete_policy_turn(
-            client, pressure_turn, checkpoint_action
+            client, pressure_turn, qwen_policy_action(checkpoint_action)
         )
 
         evidence = output.info["wrapper_evidence"]
@@ -508,13 +559,13 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertNotIn("session-0 search result", str(messages))
         self.assertNotIn(checkpoint_body, str(messages))
 
-        read = prepare(client, messages, capacity=1800)
+        read = prepare(client, messages, capacity=4200)
         self.assertIsNone(read.control_request)
         read_action = (
             'shell_command {"command":"cat .agent_memory/CONTINUATION.md",'
             '"workdir":"."}'
         )
-        read_output, messages = complete_policy_turn(client, read, read_action)
+        read_output, messages = complete_policy_turn(client, read, qwen_policy_action(read_action))
         self.assertTrue(
             read_output.info["wrapper_evidence"]["checkpoint_read_satisfied"]
         )
@@ -533,11 +584,11 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         )
         messages = self.bind_webshop(client)
         _, messages = complete_policy_turn(
-            client, prepare(client, messages), "search[black mug]"
+            client, prepare(client, messages), qwen_policy_action("search[black mug]")
         )
         before = deepcopy(messages)
 
-        selected = prepare(client, messages, capacity=1800)
+        selected = prepare(client, messages, capacity=4200)
         output, retry_messages = complete_policy_turn(
             client, selected, "malformed checkpoint output"
         )
@@ -551,7 +602,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             retry_messages[-1]["content"].startswith(before[-1]["content"])
         )
         self.assertNotIn("failed checkpoint", str(retry_messages))
-        retry = prepare(client, retry_messages, capacity=1800)
+        retry = prepare(client, retry_messages, capacity=4200)
         self.assertEqual(retry.control_request, WEBSHOP_CONTEXT_COMPACTION_REQUEST)
 
     def test_webshop_pressure_native_buy_promotes_only_session_handoff(self) -> None:
@@ -568,15 +619,15 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         )
         messages = self.bind_webshop(client)
         _, messages = complete_policy_turn(
-            client, prepare(client, messages), "search[black mug]"
+            client, prepare(client, messages), qwen_policy_action("search[black mug]")
         )
 
-        pressure_turn = prepare(client, messages, capacity=1800)
+        pressure_turn = prepare(client, messages, capacity=4200)
         self.assertEqual(
             pressure_turn.control_request, WEBSHOP_CONTEXT_COMPACTION_REQUEST
         )
         failed_output, messages = complete_policy_turn(
-            client, pressure_turn, "click[Buy Now]"
+            client, pressure_turn, qwen_policy_action("click[Buy Now]")
         )
         self.assertEqual(
             failed_output.info["wrapper_evidence"]["checkpoint_failure_reason"],
@@ -585,7 +636,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertIsNone(client._pending_context_checkpoint)
         self.assertIsNotNone(client._pending_session_handoff)
 
-        handoff_turn = prepare(client, messages, capacity=1800)
+        handoff_turn = prepare(client, messages, capacity=4200)
         self.assertEqual(
             handoff_turn.control_request, WEBSHOP_SESSION_HANDOFF_REQUEST
         )
@@ -594,7 +645,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             + FILESYSTEM_CHECKPOINT_PATH
             + "\n+preserve the completed purchase and continue\n*** End Patch"
         )
-        output, _ = complete_policy_turn(client, handoff_turn, checkpoint_action)
+        output, _ = complete_policy_turn(client, handoff_turn, qwen_policy_action(checkpoint_action))
         self.assertTrue(output.info["wrapper_evidence"]["continuation_persisted"])
         self.assertIsNone(client._pending_session_handoff)
         self.assertIsNone(client._pending_context_checkpoint)
@@ -614,7 +665,8 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
                     observation=(
                         checkpoint_body
                         + "\n\nsession-1 fresh observation\n"
-                        + "As the first action, issue exactly shell_command to read "
+                        + "The required checkpoint read must happen before any "
+                        + "dependent task action. Use one Qwen XML shell_command to read "
                         + FILESYSTEM_CHECKPOINT_PATH
                     ),
                     checkpoint_payload=checkpoint_payload,
@@ -638,7 +690,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         search = prepare(client, messages)
         self.assertIsNone(search.control_request)
         search_output, messages = complete_policy_turn(
-            client, search, "search[black mug]"
+            client, search, qwen_policy_action("search[black mug]")
         )
         self.assertEqual(client.native_calls, ["search[black mug]"])
         self.assertEqual(
@@ -658,11 +710,11 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
 
         buy = prepare(client, messages)
         self.assertIsNone(buy.control_request)
-        buy_output, messages = complete_policy_turn(client, buy, "click[Buy Now]")
+        buy_output, messages = complete_policy_turn(client, buy, qwen_policy_action("click[Buy Now]"))
         self.assertEqual(
             buy_output.info["context_transition"]["operation"], "preserve"
         )
-        self.assertIn("click[Buy Now]", str(messages))
+        self.assertEqual(messages[-1]["content"], qwen_policy_action("click[Buy Now]"))
         self.assertNotIn("session-1 fresh observation", str(messages))
 
         handoff = prepare(client, messages)
@@ -673,12 +725,13 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             + ' > .agent_memory/CONTINUATION.md","workdir":"."}'
         )
         handoff_output, messages = complete_policy_turn(
-            client, handoff, checkpoint_action
+            client, handoff, qwen_policy_action(checkpoint_action)
         )
 
+        self.assertEqual(client.native_calls[:2], ["search[black mug]", "click[Buy Now]"])
         self.assertEqual(
-            client.native_calls,
-            ["search[black mug]", "click[Buy Now]", checkpoint_action],
+            endpoint_action_signature(client.native_calls[2]),
+            endpoint_action_signature(checkpoint_action),
         )
         self.assertEqual(
             (handoff_output.info["native_call_count_before"],
@@ -716,8 +769,11 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             'shell_command {"command":"cat .agent_memory/CONTINUATION.md",'
             '"workdir":"."}'
         )
-        read_output, messages = complete_policy_turn(client, read, read_action)
-        self.assertEqual(client.native_calls[-1], read_action)
+        read_output, messages = complete_policy_turn(client, read, qwen_policy_action(read_action))
+        self.assertEqual(
+            endpoint_action_signature(client.native_calls[-1]),
+            endpoint_action_signature(read_action),
+        )
         self.assertEqual(read_output.info["context_epoch_after"], 1)
         self.assertTrue(
             read_output.info["wrapper_evidence"]["checkpoint_read_satisfied"]
@@ -735,7 +791,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             str(messages),
         )
         self.assertIn(
-            "continue shopping now with one bare search[...] or click[...] action",
+            "continue shopping now with one Qwen XML search or click function call",
             str(messages),
         )
         self.assertIn(
@@ -747,7 +803,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
                 "The required continuation checkpoint read succeeded"
             ),
             read_output.state.rindex(
-                "As the first action, issue exactly shell_command"
+                "The required checkpoint read must happen"
             ),
         )
         self.assertTrue(
@@ -761,7 +817,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         next_turn = prepare(client, messages)
         self.assertIsNone(next_turn.control_request)
         next_action = "search[blue mug]"
-        next_output, messages = complete_policy_turn(client, next_turn, next_action)
+        next_output, messages = complete_policy_turn(client, next_turn, qwen_policy_action(next_action))
         self.assertEqual(client.native_calls[-1], next_action)
         self.assertEqual(next_output.info["context_transition"]["operation"], "replace_messages")
         self.assertIsNone(client._pending_checkpoint_read)
@@ -820,7 +876,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         )
         messages = self.bind_webshop(client)
         _, messages = complete_policy_turn(
-            client, prepare(client, messages), "click[Buy Now]"
+            client, prepare(client, messages), qwen_policy_action("click[Buy Now]")
         )
         checkpoint_action = (
             'shell_command {"command":"mkdir -p .agent_memory && printf %s '
@@ -828,14 +884,14 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             + ' > .agent_memory/CONTINUATION.md","workdir":"."}'
         )
         _, messages = complete_policy_turn(
-            client, prepare(client, messages), checkpoint_action
+            client, prepare(client, messages), qwen_policy_action(checkpoint_action)
         )
         read_action = (
             'shell_command {"command":"cat .agent_memory/CONTINUATION.md",'
             '"workdir":"."}'
         )
         first_read, messages = complete_policy_turn(
-            client, prepare(client, messages), read_action
+            client, prepare(client, messages), qwen_policy_action(read_action)
         )
         self.assertTrue(
             first_read.info["wrapper_evidence"]["checkpoint_read_satisfied"]
@@ -846,7 +902,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             'shell_command {"command":"cat notes.md","workdir":"."}'
         )
         other_read, messages = complete_policy_turn(
-            client, prepare(client, messages), other_read_action
+            client, prepare(client, messages), qwen_policy_action(other_read_action)
         )
         self.assertNotIn(
             "checkpoint_read_already_consumed",
@@ -856,7 +912,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertIsNotNone(client._consumed_checkpoint_read)
 
         repeated_read, messages = complete_policy_turn(
-            client, prepare(client, messages), read_action
+            client, prepare(client, messages), qwen_policy_action(read_action)
         )
         repeated_evidence = repeated_read.info["wrapper_evidence"]
         self.assertTrue(repeated_evidence["checkpoint_read_already_consumed"])
@@ -877,13 +933,13 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertIsNotNone(client._consumed_checkpoint_read)
 
         browser_output, messages = complete_policy_turn(
-            client, prepare(client, messages), "search[blue mug]"
+            client, prepare(client, messages), qwen_policy_action("search[blue mug]")
         )
         self.assertEqual(browser_output.state, "session-1 search result")
         self.assertIsNone(client._consumed_checkpoint_read)
 
         ordinary_reread, messages = complete_policy_turn(
-            client, prepare(client, messages), read_action
+            client, prepare(client, messages), qwen_policy_action(read_action)
         )
         self.assertEqual(ordinary_reread.state, checkpoint_body)
         self.assertNotIn(
@@ -893,7 +949,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertNotIn(progress_cue, ordinary_reread.state)
 
         _, messages = complete_policy_turn(
-            client, prepare(client, messages), "click[Buy Now]"
+            client, prepare(client, messages), qwen_policy_action("click[Buy Now]")
         )
         second_handoff = prepare(client, messages)
         self.assertEqual(
@@ -904,12 +960,12 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             '.agent_memory/CONTINUATION.md"}'
         )
         _, messages = complete_policy_turn(
-            client, second_handoff, second_checkpoint_action
+            client, second_handoff, qwen_policy_action(second_checkpoint_action)
         )
         self.assertIsNotNone(client._pending_checkpoint_read)
         self.assertIsNone(client._consumed_checkpoint_read)
         second_first_read, _ = complete_policy_turn(
-            client, prepare(client, messages), read_action
+            client, prepare(client, messages), qwen_policy_action(read_action)
         )
         self.assertTrue(
             second_first_read.info["wrapper_evidence"]["checkpoint_read_satisfied"]
@@ -930,7 +986,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         )
         messages = self.bind_webshop(client)
         buy_output, messages = complete_policy_turn(
-            client, prepare(client, messages), "click[Buy Now]"
+            client, prepare(client, messages), qwen_policy_action("click[Buy Now]")
         )
         self.assertEqual(buy_output.info["session_epoch_after"], 1)
         preboundary_messages = deepcopy(messages)
@@ -963,7 +1019,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             first_retry_messages[-1]["content"],
             "Filesystem checkpoint was not accepted (missing_receipt). "
             "The earlier context is still present. Retry now with exactly one "
-            "shell_command or apply_patch that overwrites "
+            "Qwen XML shell_command or apply_patch function call that overwrites "
             "`.agent_memory/CONTINUATION.md` with 1 to 8192 bytes.",
         )
         self.assertEqual(
@@ -984,7 +1040,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             ]
         )
 
-        retry = prepare(client, first_retry_messages, capacity=4096)
+        retry = prepare(client, first_retry_messages, capacity=8192)
         self.assertEqual(retry.control_request, WEBSHOP_SESSION_HANDOFF_REQUEST)
         second_invalid = "second invalid checkpoint action"
         second_output, second_retry_messages = complete_policy_turn(
@@ -998,7 +1054,11 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertNotIn(second_invalid, str(second_retry_messages))
         self.assertEqual(
             client.native_calls,
-            ["click[Buy Now]", invalid, second_invalid],
+            [
+                "click[Buy Now]",
+                QWEN_INVALID_ACTION_SENTINEL,
+                QWEN_INVALID_ACTION_SENTINEL,
+            ],
         )
 
     def test_failed_webshop_shell_cannot_authorize_context_replacement(self) -> None:
@@ -1010,7 +1070,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         )
         messages = self.bind_webshop(client)
         _, messages = complete_policy_turn(
-            client, prepare(client, messages), "click[Buy Now]"
+            client, prepare(client, messages), qwen_policy_action("click[Buy Now]")
         )
         failed_action = (
             'shell_command {"command":"false > .agent_memory/CONTINUATION.md"}'
@@ -1019,7 +1079,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         output, messages = complete_policy_turn(
             client,
             prepare(client, messages),
-            failed_action,
+            qwen_policy_action(failed_action),
         )
 
         self.assertEqual(
@@ -1054,7 +1114,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         client = FakeWebShopClient([webshop_buy_response(), stale])
         messages = self.bind_webshop(client)
         _, messages = complete_policy_turn(
-            client, prepare(client, messages), "click[Buy Now]"
+            client, prepare(client, messages), qwen_policy_action("click[Buy Now]")
         )
         failed_action = (
             'shell_command {"command":"printf checkpoint > '
@@ -1064,7 +1124,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         output, messages = complete_policy_turn(
             client,
             prepare(client, messages),
-            failed_action,
+            qwen_policy_action(failed_action),
         )
 
         self.assertEqual(
@@ -1095,7 +1155,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         client = FakeWebShopClient([webshop_buy_response(), stale])
         messages = self.bind_webshop(client)
         _, messages = complete_policy_turn(
-            client, prepare(client, messages), "click[Buy Now]"
+            client, prepare(client, messages), qwen_policy_action("click[Buy Now]")
         )
         failed_action = (
             'shell_command {"command":"printf new > '
@@ -1105,7 +1165,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         output, messages = complete_policy_turn(
             client,
             prepare(client, messages),
-            failed_action,
+            qwen_policy_action(failed_action),
         )
 
         self.assertEqual(
@@ -1159,18 +1219,18 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         )
         messages = self.bind_webshop(client)
         _, messages = complete_policy_turn(
-            client, prepare(client, messages), "click[Buy Now]"
+            client, prepare(client, messages), qwen_policy_action("click[Buy Now]")
         )
         write_action = (
             'shell_command {"command":"printf checkpoint > '
             '.agent_memory/CONTINUATION.md"}'
         )
         _, messages = complete_policy_turn(
-            client, prepare(client, messages), write_action
+            client, prepare(client, messages), qwen_policy_action(write_action)
         )
 
         wrong_output, messages = complete_policy_turn(
-            client, prepare(client, messages), "search[blue mug]"
+            client, prepare(client, messages), qwen_policy_action("search[blue mug]")
         )
         wrong_evidence = wrong_output.info["wrapper_evidence"]
         self.assertTrue(wrong_evidence["checkpoint_read_required"])
@@ -1187,12 +1247,16 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertEqual(wrong_output.info["context_epoch_after"], 1)
         self.assertEqual(
             wrong_output.info["action_submission"]["raw_policy_output"],
+            qwen_policy_action("search[blue mug]"),
+        )
+        self.assertEqual(
+            wrong_output.info["action_submission"]["submitted_action"],
             "search[blue mug]",
         )
 
         first_retry_messages = deepcopy(messages)
         second_wrong_output, messages = complete_policy_turn(
-            client, prepare(client, messages), "search[red mug]"
+            client, prepare(client, messages), qwen_policy_action("search[red mug]")
         )
         self.assertEqual(
             second_wrong_output.info["context_transition"]["operation"],
@@ -1207,7 +1271,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             'shell_command {"command":"cat .agent_memory/CONTINUATION.md"}'
         )
         read_output, _ = complete_policy_turn(
-            client, prepare(client, messages), read_action
+            client, prepare(client, messages), qwen_policy_action(read_action)
         )
         read_evidence = read_output.info["wrapper_evidence"]
         self.assertTrue(read_evidence["checkpoint_read_required"])
@@ -1219,7 +1283,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         client = FakeWebShopClient([webshop_buy_response()])
         messages = self.bind_webshop(client)
         _, messages = complete_policy_turn(
-            client, prepare(client, messages), "click[Buy Now]"
+            client, prepare(client, messages), qwen_policy_action("click[Buy Now]")
         )
         candidate_messages = messages + [
             {"role": "user", "content": WEBSHOP_SESSION_HANDOFF_REQUEST}
@@ -1298,7 +1362,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             "_validate_step_response",
             return_value=("action_status=completed", 0.0, False, env_info),
         ):
-            output, replacement = complete_policy_turn(client, prepared, action)
+            output, replacement = complete_policy_turn(client, prepared, qwen_policy_action(action))
 
         self.assertEqual(client.native_calls, [action])
         self.assertEqual(client.metadata["max_policy_actions"], 30)
@@ -1352,7 +1416,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             wrong_output, replacement = complete_policy_turn(
                 client,
                 prepare(client, replacement),
-                wrong_action,
+                qwen_policy_action(wrong_action),
             )
         self.assertIn("Checkpoint read failed", wrong_output.state)
         self.assertTrue(
@@ -1379,7 +1443,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             second_wrong_output, replacement = complete_policy_turn(
                 client,
                 prepare(client, replacement),
-                second_wrong_action,
+                qwen_policy_action(second_wrong_action),
             )
         self.assertEqual(
             second_wrong_output.info["context_transition"]["operation"],
@@ -1422,7 +1486,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             read_output, replacement = complete_policy_turn(
                 client,
                 prepare(client, replacement),
-                read_action,
+                qwen_policy_action(read_action),
             )
         self.assertTrue(
             read_output.info["wrapper_evidence"]["checkpoint_read_satisfied"]
@@ -1475,7 +1539,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
                 prepared,
                 malformed,
             )
-            retry = prepare(client, retry_messages, capacity=4096)
+            retry = prepare(client, retry_messages, capacity=8192)
             second_malformed = "second malformed checkpoint action"
             second_output, second_retry_messages = complete_policy_turn(
                 client,
@@ -1483,7 +1547,10 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
                 second_malformed,
             )
 
-        self.assertEqual(client.native_calls, [malformed, second_malformed])
+        self.assertEqual(
+            client.native_calls,
+            [QWEN_INVALID_ACTION_SENTINEL, QWEN_INVALID_ACTION_SENTINEL],
+        )
         self.assertEqual(
             output.info["context_transition"]["operation"],
             "replace_messages",
@@ -1590,7 +1657,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
                     "_validate_step_response",
                     return_value=("result", 0.0, False, env_info),
                 ):
-                    output = client.step(action)
+                    output = client.step(qwen_policy_action(action))
                 self.assertEqual(
                     output.info["wrapper_evidence"]["memory_event"],
                     expected_event,
@@ -1619,14 +1686,14 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             "_validate_step_response",
             return_value=("failed", -0.01, False, env_info),
         ):
-            output = client.step(action)
+            output = client.step(qwen_policy_action(action))
         self.assertNotIn("memory_event", output.info["wrapper_evidence"])
 
     def test_swesmith_compaction_executes_checkpoint_then_real_read(self) -> None:
         client = FakeSwesmithClient()
         self.assertEqual(
             SWE_MEMORY_CONTRACT,
-            "policy_filesystem_checkpoint_then_client_replace_v2",
+            "policy_filesystem_checkpoint_then_client_replace_v3",
         )
         self.assertIn("# Durable debugging notes", SWE_POLICY_SYSTEM_PROMPT)
         self.assertIn(
@@ -1640,12 +1707,12 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         ]
         messages = bind_initial_policy_context(client, initial)
 
-        action = prepare(client, messages, capacity=4096)
+        action = prepare(client, messages, capacity=8192)
         self.assertIsNone(action.control_request)
         action_output, messages = complete_policy_turn(
             client,
             action,
-            'shell_command {"command":"rg -n parser .","workdir":"."}',
+            qwen_policy_action('shell_command {"command":"rg -n parser .","workdir":"."}'),
         )
         self.assertEqual(len(client.native_calls), 1)
         self.assertEqual(
@@ -1671,11 +1738,14 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             + ' > .agent_memory/CONTINUATION.md","workdir":"."}'
         )
         compaction_output, messages = complete_policy_turn(
-            client, compaction, checkpoint_action
+            client, compaction, qwen_policy_action(checkpoint_action)
         )
 
         self.assertEqual(len(client.native_calls), 2)
-        self.assertEqual(client.native_calls[-1], checkpoint_action)
+        self.assertEqual(
+            endpoint_action_signature(client.native_calls[-1]),
+            endpoint_action_signature(checkpoint_action),
+        )
         evidence = compaction_output.info["wrapper_evidence"]
         self.assertEqual(evidence["workspace_continuity_id"], client.env_id)
         self.assertTrue(evidence["continuation_persisted"])
@@ -1709,8 +1779,8 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         )
         wrong_output, messages = complete_policy_turn(
             client,
-            prepare(client, messages, capacity=4096),
-            wrong_action,
+            prepare(client, messages, capacity=8192),
+            qwen_policy_action(wrong_action),
         )
         self.assertEqual(
             wrong_output.info["context_transition"]["operation"],
@@ -1728,7 +1798,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertNotIn(wrong_action, str(messages))
         self.assertNotIn("native tool output 3", str(messages))
 
-        reread = prepare(client, messages, capacity=4096)
+        reread = prepare(client, messages, capacity=8192)
         self.assertIsNone(reread.control_request)
         reread_action = (
             'shell_command {"command":"cat .agent_memory/CONTINUATION.md",'
@@ -1737,9 +1807,12 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         reread_output, messages = complete_policy_turn(
             client,
             reread,
-            reread_action,
+            qwen_policy_action(reread_action),
         )
-        self.assertEqual(client.native_calls[-1], reread_action)
+        self.assertEqual(
+            endpoint_action_signature(client.native_calls[-1]),
+            endpoint_action_signature(reread_action),
+        )
         self.assertEqual(len(client.native_calls), 4)
         self.assertEqual(
             reread_output.info["wrapper_evidence"]["workspace_continuity_id"],
@@ -1765,7 +1838,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
     def test_swesmith_endpoint_attested_modify_and_execute_events(self) -> None:
         client = FakeSwesmithClient()
         modify = client.step(
-            'shell_command {"command":"printf changed > notes.md","workdir":"."}'
+            qwen_policy_action('shell_command {"command":"printf changed > notes.md","workdir":"."}')
         )
         self.assertEqual(modify.info["wrapper_evidence"]["memory_event"], "modify")
         self.assertEqual(
@@ -1773,7 +1846,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             ["notes.md"],
         )
         execute = client.step(
-            'shell_command {"command":"python train.py","workdir":"."}'
+            qwen_policy_action('shell_command {"command":"python train.py","workdir":"."}')
         )
         self.assertEqual(execute.info["wrapper_evidence"]["memory_event"], "execute")
 
@@ -1798,7 +1871,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             },
         }
         with mock.patch.object(client, "_request", return_value=response):
-            output = client.step(action)
+            output = client.step(qwen_policy_action(action))
         self.assertNotIn("memory_event", output.info["wrapper_evidence"])
 
     def test_swesmith_failed_checkpoint_rebuilds_stable_context_and_retries(self) -> None:
@@ -1815,7 +1888,7 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         compaction = prepare(client, messages, capacity=candidate_count + 1)
         failed_action = 'shell_command {"command":"true"}'
         output, first_retry_messages = complete_policy_turn(
-            client, compaction, failed_action
+            client, compaction, qwen_policy_action(failed_action)
         )
         self.assertEqual(output.reward, 0.0)
         self.assertEqual(output.info["context_epoch_after"], 0)
@@ -1832,10 +1905,10 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertNotIn(failed_action, str(first_retry_messages))
         self.assertNotIn("native tool output", str(first_retry_messages))
 
-        retry = prepare(client, first_retry_messages, capacity=4096)
+        retry = prepare(client, first_retry_messages, capacity=8192)
         self.assertEqual(retry.control_request, SWE_CONTEXT_COMPACTION_REQUEST)
         second_output, second_retry_messages = complete_policy_turn(
-            client, retry, failed_action
+            client, retry, qwen_policy_action(failed_action)
         )
         self.assertEqual(
             second_output.info["context_transition"]["operation"],
@@ -1887,8 +1960,8 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         client = FakeSwesmithClient()
 
         output = client.step(
-            'shell_command {"command":"echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT",'
-            '"workdir":"."}'
+            qwen_policy_action('shell_command {"command":"echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT",'
+            '"workdir":"."}')
         )
 
         evidence = output.info["wrapper_evidence"]
@@ -1911,12 +1984,12 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         client = FakeSwesmithClient()
         inspect = 'shell_command {"command":"find . -maxdepth 2 -type f"}'
 
-        first = client.step(inspect)
-        repeated = client.step(inspect)
+        first = client.step(qwen_policy_action(inspect))
+        repeated = client.step(qwen_policy_action(inspect))
         mutation = client.step(
-            'shell_command {"command":"printf changed > notes.txt"}'
+            qwen_policy_action('shell_command {"command":"printf changed > notes.txt"}')
         )
-        after_mutation = client.step(inspect)
+        after_mutation = client.step(qwen_policy_action(inspect))
 
         self.assertTrue(
             first.info["wrapper_evidence"]["actor_credit"]["positive_eligible"]
@@ -1945,8 +2018,8 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         inspect = 'shell_command {"command":"find . -maxdepth 2 -type f"}'
 
         invalid = client.step("malformed policy output")
-        first = client.step(inspect)
-        repeated = client.step(inspect)
+        first = client.step(qwen_policy_action(inspect))
+        repeated = client.step(qwen_policy_action(inspect))
 
         self.assertEqual(invalid.reward, -0.01)
         self.assertNotIn("reward_overlay", invalid.info["wrapper_evidence"])
@@ -1967,9 +2040,9 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         )
         inspect = 'shell_command {"command":"find . -maxdepth 2 -type f"}'
 
-        first, messages = complete_policy_turn(client, prepare(client, messages), inspect)
+        first, messages = complete_policy_turn(client, prepare(client, messages), qwen_policy_action(inspect))
         repeated, messages = complete_policy_turn(
-            client, prepare(client, messages), inspect
+            client, prepare(client, messages), qwen_policy_action(inspect)
         )
         self.assertTrue(
             first.info["wrapper_evidence"]["actor_credit"]["positive_eligible"]
@@ -1990,14 +2063,14 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
             '.agent_memory/CONTINUATION.md","workdir":"."}'
         )
         checkpoint_output, messages = complete_policy_turn(
-            client, compaction, checkpoint_action
+            client, compaction, qwen_policy_action(checkpoint_action)
         )
         self.assertTrue(
             checkpoint_output.info["wrapper_evidence"]["continuation_persisted"]
         )
 
         after_compaction, _ = complete_policy_turn(
-            client, prepare(client, messages), inspect
+            client, prepare(client, messages), qwen_policy_action(inspect)
         )
         self.assertTrue(
             after_compaction.info["wrapper_evidence"]["actor_credit"][
@@ -2025,13 +2098,12 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertNotIn("Understood.", str(messages))
         system_prompt = messages[0]["content"]
         self.assertIn("Start at byte zero", system_prompt)
-        self.assertIn(
-            'shell_command {"command":"find . -maxdepth 2 -type f | head -80",'
-            '"workdir":".","timeout_ms":120000}',
-            system_prompt,
-        )
-        self.assertIn("Start at byte zero with shell_command or apply_patch", system_prompt)
-        self.assertIn("no XML tags", system_prompt)
+        self.assertIn("<function=shell_command>", system_prompt)
+        self.assertIn("<parameter=command>", system_prompt)
+        self.assertIn("find . -maxdepth 2 -type f | head -80", system_prompt)
+        self.assertIn("Start at byte zero with <tool_call>", system_prompt)
+        self.assertIn("one Qwen XML tool call", system_prompt)
+        self.assertIn("Do not use the bare shell_command JSON form", system_prompt)
         self.assertIn("*** Update File: relative/path.py", system_prompt)
         self.assertIn("apply_patch is optional", system_prompt)
         self.assertIn("use shell_command when an exact patch is uncertain", system_prompt)
@@ -2040,11 +2112,11 @@ class SharedWrapperPolicyTurnTest(unittest.TestCase):
         self.assertIn("Do not use cat > or a here-document", system_prompt)
         self.assertIn("re-inspect the small target region", system_prompt)
         self.assertIn("<think> tag", system_prompt)
-        self.assertIn("Think privately", system_prompt)
+        self.assertIn("Reason silently", system_prompt)
         self.assertIn("A shell command can edit", system_prompt)
         self.assertIn("workspace intentionally has no .git directory", system_prompt)
-        self.assertIn("Do not submit plain text until", system_prompt)
-        self.assertIn("Prose before or after a tool action is a parser error", system_prompt)
+        self.assertIn("Never submit a plain-text final response", system_prompt)
+        self.assertIn("Prose before or after a tool call is a parser error", system_prompt)
 
 
 class RolloutFakeWebShopClient(FakeWebShopClient):
@@ -2089,23 +2161,25 @@ class RolloutFakeSwesmithClient(FakeSwesmithClient):
         return None
 
 
-WEBSHOP_CHECKPOINT_ACTION = (
+WEBSHOP_CHECKPOINT_ENDPOINT_ACTION = (
     'shell_command {"command":"mkdir -p .agent_memory && printf webshop-state > '
     '.agent_memory/CONTINUATION.md","workdir":"."}'
 )
-SWE_CHECKPOINT_ACTION = (
+SWE_CHECKPOINT_ENDPOINT_ACTION = (
     'shell_command {"command":"mkdir -p .agent_memory && printf swe-state > '
     '.agent_memory/CONTINUATION.md","workdir":"."}'
 )
+WEBSHOP_CHECKPOINT_ACTION = qwen_policy_action(WEBSHOP_CHECKPOINT_ENDPOINT_ACTION)
+SWE_CHECKPOINT_ACTION = qwen_policy_action(SWE_CHECKPOINT_ENDPOINT_ACTION)
 
 
 class FakeRolloutTokenizer:
     pad_token_id = 0
 
     _responses = {
-        (101, 999): "click[Buy Now]",
+        (101, 999): qwen_policy_action("click[Buy Now]"),
         (103, 999): WEBSHOP_CHECKPOINT_ACTION,
-        (201, 202, 999): (
+        (201, 202, 999): qwen_policy_action(
             'shell_command {"command":"rg -n parser .","workdir":"."}'
         ),
         (204, 205, 999): SWE_CHECKPOINT_ACTION,
@@ -2142,16 +2216,89 @@ class FakeRolloutTokenizer:
 
 class SharedRolloutRuntimeTest(unittest.TestCase):
     def test_two_wrappers_share_exact_sampled_and_packed_policy_rows(self) -> None:
-        import torch
+        import importlib.util
 
+        import torch
+        import verl.utils as verl_utils
+        import verl.utils.torch_functional as verl_torch_functional
+        import verl.workers.rollout as verl_rollout
+
+        # This compatibility test exercises the historical task-neutral wrapper
+        # against the pinned latest-veRL parser. Extend only the two package paths
+        # that own the local compatibility modules; keep top-level veRL and its
+        # parser/runtime imports on the exact upstream checkout.
+        legacy_verl = ROOT / "verl"
+        verl_utils.__path__.append(str(legacy_verl / "utils"))
+        verl_rollout.__path__.append(str(legacy_verl / "workers" / "rollout"))
+
+        from verl.experimental.agent_loop.tool_parser import ToolParser
         from verl.utils.agentgym.rollout_context import (
             AGENTMEMORY_STEP_RECORD_JSON,
             normalize_generation_record,
         )
-        from verl.workers.rollout.agent_vllm_rollout.vllm_rollout import (
-            vLLMRollout,
+
+        # Load the exact upstream parser before temporarily exposing legacy
+        # rollout-only modules below. This keeps parser imports on one coherent
+        # latest-veRL dependency graph instead of re-entering it after vLLM has
+        # initialized its older compatibility stack.
+        self.assertEqual(
+            ToolParser.get_tool_parser("qwen3_coder", tokenizer=None).__class__.__name__,
+            "Qwen3XMLToolParser",
         )
-        from verl.workers.rollout.schemas import Message, RolloutHandler
+
+        def load_legacy_module(name: str, relative_path: str):
+            spec = importlib.util.spec_from_file_location(
+                name,
+                legacy_verl / relative_path,
+            )
+            self.assertIsNotNone(spec)
+            self.assertIsNotNone(spec.loader)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+
+        legacy_base = load_legacy_module(
+            "_amg_legacy_rollout_base",
+            "workers/rollout/base.py",
+        )
+        legacy_schemas = load_legacy_module(
+            "_amg_legacy_rollout_schemas",
+            "workers/rollout/schemas.py",
+        )
+
+        # Latest veRL renamed get_eos_mask to the equivalent get_response_mask,
+        # and replaced the old rollout base/schema contracts. The formal
+        # fully-async SGLang path imports none of these historical objects.
+        # Expose only those exact compatibility objects while importing the
+        # immutable legacy vLLM module;
+        # all other imports, including the Qwen parser used by the wrappers, stay
+        # on the pinned upstream checkout.
+        eos_mask = (
+            verl_torch_functional.get_eos_mask
+            if hasattr(verl_torch_functional, "get_eos_mask")
+            else verl_torch_functional.get_response_mask
+        )
+        with (
+            mock.patch.object(
+                verl_torch_functional,
+                "get_eos_mask",
+                eos_mask,
+                create=True,
+            ),
+            mock.patch.dict(
+                sys.modules,
+                {
+                    "verl.workers.rollout.base": legacy_base,
+                    "verl.workers.rollout.schemas": legacy_schemas,
+                },
+            ),
+        ):
+            from verl.workers.rollout.agent_vllm_rollout.vllm_rollout import (
+                vLLMRollout,
+            )
+
+        Message = legacy_schemas.Message
+        RolloutHandler = legacy_schemas.RolloutHandler
 
         tokenizer = FakeRolloutTokenizer()
         rollout = vLLMRollout.__new__(vLLMRollout)
@@ -2180,9 +2327,10 @@ class SharedRolloutRuntimeTest(unittest.TestCase):
                 prompt_loss_mask=[],
                 response_loss_mask=[],
                 max_response_len=8,
-                # Leave realistic headroom for one failed checkpoint write and
-                # its bounded retry request. The synthetic token IDs remain tiny.
-                max_model_len=2048,
+                # Leave realistic headroom for the longer Qwen XML checkpoint
+                # request plus one failed write and bounded retry. The synthetic
+                # token IDs remain tiny.
+                max_model_len=8192,
             )
             handler.parent_index = item_id
             handler.rollout_replica_index = 0
@@ -2235,16 +2383,18 @@ class SharedRolloutRuntimeTest(unittest.TestCase):
         rollout._output_generation_records = output_generation_records
 
         expected_actions = [
-            "click[Buy Now]",
+            qwen_policy_action("click[Buy Now]"),
             WEBSHOP_CHECKPOINT_ACTION,
-            'shell_command {"command":"rg -n parser .","workdir":"."}',
+            qwen_policy_action(
+                'shell_command {"command":"rg -n parser .","workdir":"."}'
+            ),
             SWE_CHECKPOINT_ACTION,
         ]
         with tempfile.TemporaryDirectory() as tmpdir:
             rollout.config = SimpleNamespace(
-                prompt_length=2040,
+                prompt_length=8184,
                 response_length=8,
-                max_model_len=2048,
+                max_model_len=8192,
                 n=1,
                 send_interval=0,
                 rollout_log_dir=tmpdir,
@@ -2328,7 +2478,11 @@ class SharedRolloutRuntimeTest(unittest.TestCase):
         self.assertEqual(compaction["outcome"], "success")
         self.assertEqual(compaction["horizon_finalization"]["reward"], 0.5)
         self.assertEqual(
-            webshop.native_calls, ["click[Buy Now]", WEBSHOP_CHECKPOINT_ACTION]
+            [endpoint_action_signature(action) for action in webshop.native_calls],
+            [
+                endpoint_action_signature("click[Buy Now]"),
+                endpoint_action_signature(WEBSHOP_CHECKPOINT_ENDPOINT_ACTION),
+            ],
         )
         self.assertEqual(len(swesmith.native_calls), 2)
 

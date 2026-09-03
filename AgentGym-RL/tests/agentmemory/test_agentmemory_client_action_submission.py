@@ -687,8 +687,8 @@ class ProceduralAgentMemoryClientContractTest(unittest.TestCase):
         prompt = client.conversation_start[0]["value"]
         for fragment in (
             "private persistent workspace",
-            "Use shell_command",
-            "Use apply_patch",
+            "<function=shell_command>",
+            "<function=apply_patch>",
             "networkless and resource-bounded",
             "zero task reward",
             "no host-path access or dedicated memory API",
@@ -769,25 +769,23 @@ mkdir -p .agent_memory && printf '%s\n' 'next: search[red mug]' > .agent_memory/
                     "",
                 )
 
-    def test_filesystem_prompt_defaults_to_canonical_bare_workspace_actions(self) -> None:
+    def test_filesystem_prompt_defaults_to_canonical_qwen_xml_actions(self) -> None:
         client = self.create_client(filesystem_metadata())
         prompt = client.conversation_start[0]["value"]
-        self.assertIn("Use shell_command with one JSON object", prompt)
-        self.assertIn('shell_command {"command"', prompt)
-        self.assertIn("apply_patch followed by a multiline", prompt)
-        self.assertNotIn("Qwen XML", prompt)
-        self.assertNotIn("<tool_call>", prompt)
-        self.assertIn(
-            "system prompt's canonical bare shell_command JSON form",
-            WEBSHOP_SESSION_HANDOFF_REQUEST,
-        )
+        self.assertIn("Qwen XML", prompt)
+        self.assertIn("<tool_call>", prompt)
+        self.assertIn("<function=shell_command>", prompt)
+        self.assertIn("<parameter=command>", prompt)
+        self.assertIn("<function=apply_patch>", prompt)
+        self.assertNotIn('<tool_call>\n{"name":', prompt)
+        self.assertIn("Qwen XML", WEBSHOP_SESSION_HANDOFF_REQUEST)
+        self.assertIn("<function=shell_command>", WEBSHOP_SESSION_HANDOFF_REQUEST)
         self.assertIn("mkdir -p .agent_memory", WEBSHOP_SESSION_HANDOFF_REQUEST)
         self.assertIn(
             ".agent_memory/CONTINUATION.md", WEBSHOP_SESSION_HANDOFF_REQUEST
         )
-        self.assertNotIn("Qwen XML", WEBSHOP_SESSION_HANDOFF_REQUEST)
         self.assertLessEqual(
-            len(WEBSHOP_SESSION_HANDOFF_REQUEST.encode("utf-8")), 1242
+            len(WEBSHOP_SESSION_HANDOFF_REQUEST.encode("utf-8")), 2048
         )
 
     def test_filesystem_function_schema_has_no_legacy_memory_api(self) -> None:
@@ -797,7 +795,7 @@ mkdir -p .agent_memory && printf '%s\n' 'next: search[red mug]' > .agent_memory/
         )
         prompt = client.conversation_start[0]["value"]
         for function_name in ("search", "click", "shell_command", "apply_patch"):
-            self.assertIn(f'"name": "{function_name}"', prompt)
+            self.assertIn(f'"name":"{function_name}"', prompt)
         for function_name in (
             "read",
             "write",
@@ -809,7 +807,7 @@ mkdir -p .agent_memory && printf '%s\n' 'next: search[red mug]' > .agent_memory/
             "summary",
             "filter",
         ):
-            self.assertNotIn(f'"name": "{function_name}"', prompt)
+            self.assertNotIn(f'"name":"{function_name}"', prompt)
 
     def test_filesystem_code_action_uses_literal_call_parser(self) -> None:
         client = self.create_client(
@@ -1208,7 +1206,7 @@ mkdir -p .agent_memory && printf '%s\n' 'next: search[red mug]' > .agent_memory/
                     'ASK {"field": "color"}',
                 )
                 prompt = client.conversation_start[0]["value"]
-                self.assertIn('ASK {"field":"..."}', prompt)
+                self.assertIn('<function=ask><parameter=field>FIELD</parameter>', prompt)
                 self.assertNotIn("ltm_inventory_mode", client.metadata)
 
     def test_regular_filesystem_surface_rejects_ask(self) -> None:
