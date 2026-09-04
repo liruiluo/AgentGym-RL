@@ -322,7 +322,10 @@ PY_CONTRACT
 )
 IFS=$'\t' read -r DATASET_REVISION SOURCE_REVISION <<< "$contract_values"
 
-mapfile -d '' -t image_binding_args < <(
+image_binding_args=()
+while IFS= read -r -d '' binding_arg; do
+  image_binding_args+=("$binding_arg")
+done < <(
   "$PYBIN" -B - "$CAMG_HELDOUT_ASSET_IMAGE_BINDINGS_PATH" <<'PY_BINDINGS'
 import json
 import sys

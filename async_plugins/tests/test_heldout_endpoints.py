@@ -735,6 +735,8 @@ heldout_assert_asset_env FIXTURE "fixture asset"
             "PREPARE_ROOTFS=$SOURCE_ROOT/scripts/agentmemory/prepare_swesmith_oci_rootfs.py",
             source,
         )
+        self.assertNotIn("mapfile -d", source)
+        self.assertIn("while IFS= read -r -d '' binding_arg; do", source)
         project_root = LAUNCHER_ROOT.parents[2]
         self.assertTrue(
             (
