@@ -89,6 +89,40 @@ class PrepareSwesmithOciRootfsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must not be empty"):
             MODULE._transport_prefixes("docker.1ms.run", ("  ",))
 
+    def test_materializes_a_subset_without_narrowing_the_frozen_manifest(self):
+        first = MODULE.parse_binding(
+            "jyangballin/image-a=swebench/image-a@sha256:" + "a" * 64
+        )
+        second = MODULE.parse_binding(
+            "jyangballin/image-b=swebench/image-b@sha256:" + "b" * 64
+        )
+        bindings = (first, second)
+        selected = MODULE.select_materialization_bindings(
+            bindings, (second.profile_image,)
+        )
+        self.assertEqual(selected, (second,))
+        self.assertEqual(
+            len(
+                MODULE.build_image_manifest(
+                    bindings,
+                    dataset_revision="c" * 40,
+                    source_revision="d" * 40,
+                )["images"]
+            ),
+            2,
+        )
+
+    def test_rejects_unknown_or_duplicate_materialization_profiles(self):
+        binding = MODULE.parse_binding(
+            "jyangballin/image-a=swebench/image-a@sha256:" + "a" * 64
+        )
+        with self.assertRaisesRegex(ValueError, "absent from the frozen bindings"):
+            MODULE.select_materialization_bindings((binding,), ("swebench/missing",))
+        with self.assertRaisesRegex(ValueError, "must be unique"):
+            MODULE.select_materialization_bindings(
+                (binding,), (binding.profile_image, binding.profile_image)
+            )
+
     def test_purges_corrupt_crane_layer_cache_entries(self):
         with tempfile.TemporaryDirectory() as raw:
             cache = Path(raw)

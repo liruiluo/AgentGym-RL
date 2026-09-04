@@ -746,6 +746,20 @@ heldout_assert_asset_env FIXTURE 'fixture asset'
         self.assertIn("SWESMITH_DETAIL_TOKEN", source)
         self.assertNotIn("full-pool-formal100", source)
         self.assertNotIn("-eq 110", source)
+        self.assertIn(
+            "ROOTFS_RUN_ROOT=/tmp/agentmemorygym-swesmith-heldout-$RUN_KEY",
+            source,
+        )
+        self.assertNotIn(
+            "ROOTFS_RUN_ROOT=/dev/shm/agentmemorygym-swesmith-heldout-$RUN_KEY",
+            source,
+        )
+        self.assertIn("--materialize-profile-image", source)
+        self.assertIn("selected_repository_task_counts", source)
+        self.assertIn("bamboo-proxy.jd.com:80", source)
+        self.assertIn("--fallback-transport-prefix dockerproxy.net", source)
+        self.assertIn("--fallback-transport-prefix docker.1panel.live", source)
+        self.assertNotIn("--fallback-transport-prefix docker.io", source)
 
     def test_literesearcher_uses_all_heldout_rows_and_identity_source(self):
         source = (LAUNCHER_ROOT / "literesearcher.sh").read_text()

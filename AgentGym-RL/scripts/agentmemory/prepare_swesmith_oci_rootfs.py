@@ -84,14 +84,19 @@ def _json_bytes(value: Any) -> bytes:
     return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
-def _run_bytes(argv: list[str], *, environment: dict[str, str]) -> bytes:
+def _run_bytes(
+    argv: list[str],
+    *,
+    environment: dict[str, str],
+    timeout_seconds: int = 180,
+) -> bytes:
     completed = subprocess.run(
         argv,
         check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=environment,
-        timeout=900,
+        timeout=timeout_seconds,
     )
     if completed.returncode != 0:
         error = completed.stderr.decode("utf-8", errors="replace")[-2000:]
@@ -445,9 +450,41 @@ def build_image_manifest(
     }
 
 
+def select_materialization_bindings(
+    bindings: tuple[ImageBinding, ...],
+    requested_profile_images: Iterable[str],
+) -> tuple[ImageBinding, ...]:
+    """Select the root filesystems needed by one frozen evaluation panel.
+
+    The complete binding tuple still defines the generated image manifest.  This
+    selector only limits which digest-pinned root filesystems are materialized,
+    so a formal subset does not silently rewrite the frozen image identity.
+    """
+
+    requested = tuple(value.strip() for value in requested_profile_images)
+    if not requested:
+        return bindings
+    if any(not value for value in requested):
+        raise ValueError("materialized profile image names must not be empty")
+    if len(set(requested)) != len(requested):
+        raise ValueError("materialized profile image names must be unique")
+    available = {binding.profile_image for binding in bindings}
+    unknown = sorted(set(requested) - available)
+    if unknown:
+        raise ValueError(
+            "materialized profile images are absent from the frozen bindings: "
+            + ", ".join(unknown)
+        )
+    selected = set(requested)
+    return tuple(
+        binding for binding in bindings if binding.profile_image in selected
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binding", action="append", type=parse_binding, required=True)
+    parser.add_argument("--materialize-profile-image", action="append", default=[])
     parser.add_argument("--cache-root", type=Path, required=True)
     parser.add_argument("--crane", type=Path, required=True)
     parser.add_argument("--transport-prefix", required=True)
@@ -477,6 +514,12 @@ def main() -> int:
     bindings = tuple(args.binding)
     if len({binding.source_image for binding in bindings}) != len(bindings):
         parser.error("source image bindings must be unique")
+    try:
+        materialization_bindings = select_materialization_bindings(
+            bindings, args.materialize_profile_image
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     args.cache_root.mkdir(parents=True, exist_ok=True, mode=0o755)
     crane = args.crane.expanduser().resolve()
     if not crane.is_file() or not os.access(crane, os.X_OK):
@@ -504,7 +547,7 @@ def main() -> int:
                 transport_fallbacks=transport_prefixes[1:],
                 download_attempts=args.download_attempts,
             ): binding
-            for binding in bindings
+            for binding in materialization_bindings
         }
         for future in as_completed(futures):
             binding = futures[future]
@@ -534,6 +577,10 @@ def main() -> int:
             {
                 "status": "pass",
                 "image_count": len(bindings),
+                "materialized_image_count": len(materialization_bindings),
+                "materialized_profile_images": sorted(
+                    binding.profile_image for binding in materialization_bindings
+                ),
                 "image_manifest": str(args.image_manifest_output.expanduser().resolve()),
                 "image_manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
                 "cache_results": sorted(results, key=lambda result: result["profile_image"]),
