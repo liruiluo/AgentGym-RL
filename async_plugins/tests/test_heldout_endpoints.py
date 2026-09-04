@@ -598,6 +598,29 @@ class HeldoutEndpointLauncherTests(unittest.TestCase):
                     f"{path} contains leaked patch markers",
                 )
 
+    def test_executable_helper_accepts_a_symlink_to_a_regular_binary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / "python-real"
+            target.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            target.chmod(0o700)
+            link = root / "python"
+            link.symlink_to(target)
+            command = f"""
+set -Eeuo pipefail
+source {LAUNCHER_ROOT / 'common.sh'}
+heldout_assert_executable {link} 'fixture executable'
+"""
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout)
+
     def test_asset_helper_executes_under_nounset(self):
         with tempfile.TemporaryDirectory() as temp:
             asset = Path(temp) / "asset.json"

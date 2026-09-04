@@ -51,9 +51,13 @@ heldout_assert_file() {
 }
 
 heldout_assert_executable() {
-  local path=$1 label=$2
-  [[ "$path" = /* && -f "$path" && ! -L "$path" && -x "$path" ]] \
-    || heldout_die "$label is not an absolute executable regular file: $path"
+  local path=$1 label=$2 resolved
+  [[ "$path" = /* && -x "$path" ]] \
+    || heldout_die "$label is not an absolute executable path: $path"
+  resolved=$(readlink -f -- "$path") \
+    || heldout_die "$label executable path cannot be resolved: $path"
+  [[ "$resolved" = /* && -f "$resolved" && ! -L "$resolved" && -x "$resolved" ]] \
+    || heldout_die "$label does not resolve to an executable regular file: $path"
 }
 
 heldout_assert_source() {
