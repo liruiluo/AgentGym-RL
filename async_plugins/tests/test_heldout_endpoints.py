@@ -581,6 +581,15 @@ class HeldoutEndpointRegistryTests(unittest.TestCase):
 
 
 class HeldoutEndpointLauncherTests(unittest.TestCase):
+    def test_literesearcher_cold_start_has_one_bounded_c64_retry(self):
+        launcher = (LAUNCHER_ROOT / "literesearcher.sh").read_text()
+        self.assertIn("for diverse_visit_attempt in 1 2; do", launcher)
+        self.assertIn(
+            "diverse-bounded-c64-visit-attempt-${diverse_visit_attempt}.json",
+            launcher,
+        )
+        self.assertIn('[[ "$diverse_visit_passed" == 1 ]]', launcher)
+
     def test_launchers_are_executable_and_parse_as_bash(self):
         for name in ("common", *ROUTES):
             with self.subTest(name=name):
