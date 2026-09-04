@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import unittest
 
 from agentmemorygym_verl.compactionrl_evidence import (
@@ -107,7 +108,19 @@ class CompactionRLEvidenceTest(unittest.TestCase):
 
     def test_recoverable_oversize_summary_is_behavior_not_infrastructure_failure(self):
         row = _summary_row(uid="research-1", route="openmle_fast", order=0)
-        row["context_transition"]["operation"] = "preserve"
+        restored_messages = [
+            {"role": "system", "content": "frozen framing"},
+            {"role": "user", "content": "task state before compaction"},
+        ]
+        restored_digest = hashlib.sha256(
+            json.dumps(
+                restored_messages,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        row["context_transition"]["messages"] = restored_messages
         row["wrapper_evidence"].update(
             {
                 "summary_valid": False,
@@ -115,10 +128,10 @@ class CompactionRLEvidenceTest(unittest.TestCase):
                 "summary_failure_reason": "summary_too_large",
                 "retry_pending": True,
                 "summary_max_bytes": 8,
-                "pre_context_message_count": 9,
-                "post_context_message_count": 9,
-                "pre_context_sha256": "a" * 64,
-                "post_context_sha256": "a" * 64,
+                "pre_context_message_count": len(restored_messages),
+                "post_context_message_count": len(restored_messages),
+                "pre_context_sha256": restored_digest,
+                "post_context_sha256": restored_digest,
                 "retained_recent_steps": 0,
             }
         )
@@ -131,6 +144,61 @@ class CompactionRLEvidenceTest(unittest.TestCase):
         self.assertEqual(summary["totals"]["valid_compactions"], 0)
         self.assertEqual(summary["totals"]["invalid_compactions"], 1)
         self.assertEqual(summary["invalid_summary_reasons"], {"summary_too_large": 1})
+
+    def test_prompt_overflow_restores_exact_pre_request_context(self):
+        row = _summary_row(uid="research-2", route="openmle_fast", order=0)
+        restored_messages = [
+            {"role": "system", "content": "frozen framing"},
+            {"role": "user", "content": "task state before compaction"},
+        ]
+        restored_digest = hashlib.sha256(
+            json.dumps(
+                restored_messages,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        row["context_transition"]["messages"] = restored_messages
+        row["wrapper_evidence"].update(
+            {
+                "summary_valid": False,
+                "context_replaced": False,
+                "summary_failure_reason": "summary_prompt_overflow",
+                "retry_pending": True,
+                "summary_max_bytes": 8192,
+                "pre_context_message_count": len(restored_messages),
+                "post_context_message_count": len(restored_messages),
+                "pre_context_sha256": restored_digest,
+                "post_context_sha256": restored_digest,
+                "retained_recent_steps": 0,
+            }
+        )
+
+        summary = summarize_compactionrl_step_records(
+            [row], expected_routes=("openmle_fast",)
+        )
+        self.assertEqual(summary["status"], "PASS")
+        self.assertEqual(
+            summary["invalid_summary_reasons"], {"summary_prompt_overflow": 1}
+        )
+
+        wrong_operation = copy.deepcopy(row)
+        wrong_operation["context_transition"] = {
+            "schema": "agentmemory_task_neutral_context_transition_v1",
+            "operation": "preserve",
+        }
+        self.assertEqual(
+            summarize_compactionrl_step_records([wrong_operation])["status"], "FAIL"
+        )
+
+        wrong_bytes = copy.deepcopy(row)
+        wrong_bytes["context_transition"]["messages"][1]["content"] += " drift"
+        failed = summarize_compactionrl_step_records([wrong_bytes])
+        self.assertEqual(failed["status"], "FAIL")
+        self.assertTrue(
+            any("wrong context bytes" in item for item in failed["violations"])
+        )
 
     def test_fails_closed_on_summary_contract_drift(self):
         base = _summary_row(uid="shop-1", route="webshop", order=0)

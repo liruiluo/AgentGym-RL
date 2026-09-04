@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
@@ -12,8 +13,28 @@ COMPACTIONRL_RECEIPT_SCHEMA = "agentmemory_compactionrl_receipt_v1"
 TASK_NEUTRAL_ACTION_ROW_SCHEMA = "amg_task_neutral_action_row_v1"
 TASK_NEUTRAL_CONTEXT_SCHEMA = "agentmemory_task_neutral_context_transition_v1"
 ALLOWED_INVALID_SUMMARY_REASONS = frozenset(
-    {"empty_summary", "summary_too_large"}
+    {"empty_summary", "summary_prompt_overflow", "summary_too_large"}
 )
+
+
+def _context_message_digest(messages: Any) -> str | None:
+    if isinstance(messages, (str, bytes)) or not isinstance(messages, Sequence):
+        return None
+    normalized: list[dict[str, str]] = []
+    for message in messages:
+        if not isinstance(message, Mapping):
+            return None
+        role = message.get("role")
+        content = message.get("content")
+        if role not in {"system", "user", "assistant"} or not isinstance(
+            content, str
+        ):
+            return None
+        normalized.append({"role": str(role), "content": content})
+    payload = json.dumps(
+        normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def summarize_compactionrl_step_records(
@@ -240,11 +261,34 @@ def summarize_compactionrl_step_records(
                     )
                 else:
                     invalid_reasons[str(reason)] += 1
-                if transition_operation != "preserve":
+                if transition_operation != "replace_messages":
                     violate(
                         f"trajectory {trajectory_uid} row {row_order}: "
-                        "invalid summary changed context"
+                        "invalid summary did not restore the pre-request context"
                     )
+                elif isinstance(transition, Mapping):
+                    restored_messages = transition.get("messages")
+                    restored_digest = _context_message_digest(restored_messages)
+                    if restored_digest is None:
+                        violate(
+                            f"trajectory {trajectory_uid} row {row_order}: "
+                            "invalid summary has malformed restored context"
+                        )
+                    if (
+                        not isinstance(restored_messages, Sequence)
+                        or isinstance(restored_messages, (str, bytes))
+                        or len(restored_messages)
+                        != evidence.get("pre_context_message_count")
+                    ):
+                        violate(
+                            f"trajectory {trajectory_uid} row {row_order}: "
+                            "invalid summary restored the wrong message count"
+                        )
+                    if restored_digest != evidence.get("pre_context_sha256"):
+                        violate(
+                            f"trajectory {trajectory_uid} row {row_order}: "
+                            "invalid summary restored the wrong context bytes"
+                        )
                 if evidence.get("context_replaced") is not False:
                     violate(
                         f"trajectory {trajectory_uid} row {row_order}: "
