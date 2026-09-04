@@ -1600,6 +1600,20 @@ trainer:
             self.assertEqual(contract["route_registry"]["max_rounds"], ROUTE_MAX_ROUNDS)
             self.assertFalse(contract["runner"]["generic_action_outcome_used"])
 
+    def test_plan_accepts_low_concurrency_infrastructure_batch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            kwargs, _, _ = self._plan_fixture(Path(directory))
+            plan = load_eval_plan(**{**kwargs, "batch_size": 8})
+            self.assertEqual(plan.batch_size, 8)
+            config = derive_eval_config(plan)
+            self.assertEqual(
+                config["actor_rollout_ref"]["rollout"]["agent"]["num_workers"],
+                8,
+            )
+            self.assertEqual(config["data"]["gen_batch_size"], 8)
+            with self.assertRaisesRegex(ValueError, "must be one of: 8, 64"):
+                load_eval_plan(**{**kwargs, "batch_size": 7})
+
     def test_plan_accepts_pre_registered_coding_subset_of_formal_pool(self):
         with tempfile.TemporaryDirectory() as directory:
             kwargs, _, _ = self._plan_fixture(

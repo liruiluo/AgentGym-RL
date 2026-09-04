@@ -49,6 +49,7 @@ SUPPORTED_MODEL_KINDS = ("merged_checkpoint", "frozen_hf")
 SCHEDULE_MANIFEST_SCHEMA = SCHEDULE_SCHEMA
 EXPECTED_CHECKPOINT_STEP = 200
 EXPECTED_BATCH_SIZE = 64
+SUPPORTED_BATCH_SIZES = frozenset({8, EXPECTED_BATCH_SIZE})
 EXPECTED_NUM_GPUS = 8
 PADDING_INDEX_BASE = 1_000_000_000
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
@@ -476,8 +477,9 @@ def load_eval_plan(
         raise ValueError(
             f"held-out {model_kind} evaluation requires checkpoint_step={expected_step}"
         )
-    if batch_size != EXPECTED_BATCH_SIZE:
-        raise ValueError(f"held-out batch_size must remain {EXPECTED_BATCH_SIZE}")
+    if batch_size not in SUPPORTED_BATCH_SIZES:
+        supported = ", ".join(str(value) for value in sorted(SUPPORTED_BATCH_SIZES))
+        raise ValueError(f"held-out batch_size must be one of: {supported}")
     if num_gpus != EXPECTED_NUM_GPUS:
         raise ValueError(f"held-out evaluation requires exactly {EXPECTED_NUM_GPUS} GPUs")
     if not isinstance(gpu_memory_utilization, (int, float)) or not 0 < float(
