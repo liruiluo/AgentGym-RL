@@ -598,6 +598,28 @@ class HeldoutEndpointLauncherTests(unittest.TestCase):
                     f"{path} contains leaked patch markers",
                 )
 
+    def test_asset_helper_executes_under_nounset(self):
+        with tempfile.TemporaryDirectory() as temp:
+            asset = Path(temp) / "asset.json"
+            digest = _write(asset, b"verified\n")
+            command = f"""
+set -Eeuo pipefail
+source {LAUNCHER_ROOT / 'common.sh'}
+export HELDOUT_RUNTIME_PYTHON={sys.executable}
+export CAMG_HELDOUT_ASSET_FIXTURE_PATH={asset}
+export CAMG_HELDOUT_ASSET_FIXTURE_SHA256={digest}
+heldout_assert_asset_env FIXTURE 'fixture asset'
+"""
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout)
+
     def test_launchers_use_registry_git_roots_without_double_outer_component(self):
         common = (LAUNCHER_ROOT / "common.sh").read_text()
         self.assertIn('basename -- "$CAMG_HELDOUT_SOURCE_OUTER_ROOT"', common)

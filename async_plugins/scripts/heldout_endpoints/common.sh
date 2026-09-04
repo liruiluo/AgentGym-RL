@@ -110,7 +110,9 @@ heldout_assert_base_contract() {
 }
 
 heldout_assert_asset_env() {
-  local stem=$1 label=$2 path_name="CAMG_HELDOUT_ASSET_${stem}_PATH" sha_name="CAMG_HELDOUT_ASSET_${stem}_SHA256"
+  local stem=$1 label=$2
+  local path_name="CAMG_HELDOUT_ASSET_${stem}_PATH"
+  local sha_name="CAMG_HELDOUT_ASSET_${stem}_SHA256"
   heldout_require_env "$path_name"
   heldout_require_env "$sha_name"
   heldout_assert_file "${!path_name}" "${!sha_name}" "$label"
