@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -765,6 +766,17 @@ heldout_assert_asset_env FIXTURE "fixture asset"
 
 
 class OpenMleHeldoutValidatorTests(unittest.TestCase):
+    def test_child_environment_drops_heldout_control_plane_bindings(self):
+        inherited = {
+            "PATH": "/usr/bin",
+            "CAMG_HELDOUT_ASSET_PRIVATE_GRADER_BINDINGS_PATH": "/private.jsonl",
+            "CAMG_HELDOUT_SOURCE_OUTER_ROOT": "/source",
+            "OPENMLE_FAST_PRIVATE_RUNNER": "/runner.py",
+        }
+        with mock.patch.dict(os.environ, inherited, clear=True):
+            sanitized = openmle_supervisor.runtime.sanitized_environment()
+        self.assertEqual(sanitized, {"PATH": "/usr/bin"})
+
     def _fixture(self, root: Path):
         outer = root / "AgentGym-RL"
         inner = outer / "AgentGym"
