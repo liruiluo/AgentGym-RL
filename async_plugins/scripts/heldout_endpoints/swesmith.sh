@@ -15,6 +15,7 @@ heldout_assert_asset_env HELDOUT_MANIFEST "SWE-smith held-out manifest"
 heldout_assert_asset_env IMAGE_BINDINGS "SWE-smith image bindings"
 heldout_assert_asset_env IMAGE_MANIFEST "SWE-smith image manifest"
 heldout_assert_asset_env MIRROR_BUNDLES_MANIFEST "SWE-smith mirror-bundles-manifest"
+heldout_assert_asset_env OFFLINE_IMAGE_ASSETS "SWE-smith offline image assets"
 heldout_assert_asset_env ROUTING "SWE-smith held-out routing"
 heldout_assert_asset_env RUNTIME_MANIFEST "SWE-smith runtime manifest"
 heldout_require_env SWESMITH_DETAIL_TOKEN
@@ -45,7 +46,6 @@ UID_LEASE_ROOT=$LOCAL_ROOT/uid-leases
 MIRRORS_ROOT=$LOCAL_ROOT/mirrors
 AUDIT_ROOT=$SERVICE_ROOT/audits
 ROOTFS_CACHE_ROOT=$ROOTFS_RUN_ROOT/oci-rootfs
-LAYER_CACHE_ROOT=$ROOTFS_RUN_ROOT/layers
 GENERATED_IMAGE_MANIFEST=$SERVICE_ROOT/image-manifest.generated.json
 LAUNCH_RECEIPT=$SERVICE_ROOT/heldout-launch-contract.json
 
@@ -62,7 +62,7 @@ for path in "$LOCAL_ROOT" "$ROOTFS_RUN_ROOT"; do
 done
 install -d -m 0700 \
   "$SERVICE_ROOT" "$AUDIT_ROOT" "$LOCAL_ROOT" "$EPISODES_ROOT" \
-  "$UID_LEASE_ROOT" "$MIRRORS_ROOT" "$ROOTFS_CACHE_ROOT" "$LAYER_CACHE_ROOT"
+  "$UID_LEASE_ROOT" "$MIRRORS_ROOT" "$ROOTFS_CACHE_ROOT"
 
 cleanup_local_roots() {
   local rc=$?
@@ -389,22 +389,12 @@ for item in payload["records"]:
         sys.stdout.buffer.write(b"--materialize-profile-image\0" + profile + b"\0")
 PY_BINDINGS
 )
-env \
-  HTTP_PROXY=http://bamboo-proxy.jd.com:80 \
-  HTTPS_PROXY=http://bamboo-proxy.jd.com:80 \
-  http_proxy=http://bamboo-proxy.jd.com:80 \
-  https_proxy=http://bamboo-proxy.jd.com:80 \
-  NO_PROXY=127.0.0.1,localhost \
-  no_proxy=127.0.0.1,localhost \
+env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
   "$PYBIN" -B "$PREPARE_ROOTFS" \
   "${image_binding_args[@]}" \
   --cache-root "$ROOTFS_CACHE_ROOT" \
-  --layer-cache-root "$LAYER_CACHE_ROOT" \
   --crane "$CRANE" \
-  --transport-prefix docker.1ms.run \
-  --fallback-transport-prefix dockerproxy.net \
-  --fallback-transport-prefix docker.1panel.live \
-  --download-attempts 6 \
+  --offline-image-asset-manifest "$CAMG_HELDOUT_ASSET_OFFLINE_IMAGE_ASSETS_PATH" \
   --dataset-revision "$DATASET_REVISION" \
   --source-revision "$SOURCE_REVISION" \
   --image-manifest-output "$GENERATED_IMAGE_MANIFEST" \

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import http.client
 import json
 import os
 import signal
@@ -1208,6 +1209,25 @@ def assert_ports_available(specs: Sequence[EndpointLaunchSpec]) -> None:
             reservation.close()
 
 
+def wait_for_ports_available(
+    specs: Sequence[EndpointLaunchSpec],
+    *,
+    timeout_seconds: float = 5.0,
+    poll_seconds: float = 0.05,
+) -> None:
+    """Wait briefly for a terminated listener to release its bind."""
+
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            assert_ports_available(specs)
+            return
+        except OrchestratorError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(poll_seconds)
+
+
 def _replace_tokens(value: str, replacements: Mapping[str, str]) -> str:
     rendered = value
     for token, replacement in replacements.items():
@@ -1733,7 +1753,12 @@ def wait_for_endpoints(
                 )
             try:
                 body, payload = _readiness_probe(spec)
-            except (OSError, urllib.error.URLError, TimeoutError):
+            except (
+                OSError,
+                http.client.HTTPException,
+                urllib.error.URLError,
+                TimeoutError,
+            ):
                 if time.monotonic() - started >= spec.ready_timeout_seconds:
                     raise OrchestratorError(f"{route_id} endpoint readiness timed out")
                 continue
@@ -2549,7 +2574,7 @@ class LocalBackend:
         self.endpoint_leases = ()
         for spec in plan.endpoints:
             try:
-                assert_ports_available((spec,))
+                wait_for_ports_available((spec,))
             except Exception as exc:
                 errors.append(f"{spec.route_id} listener cleanup: {exc}")
         if errors:

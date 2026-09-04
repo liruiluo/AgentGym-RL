@@ -58,6 +58,7 @@ _REQUIRED_ASSETS = {
             "image_bindings",
             "image_manifest",
             "mirror_bundles_manifest",
+            "offline_image_assets",
             "routing",
             "runtime_manifest",
         }
