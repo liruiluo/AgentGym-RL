@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import http.client
 import json
 import os
 import shutil
@@ -39,6 +40,8 @@ from agentmemorygym_verl.multitask_orchestrator import (
     load_orchestrator_config,
     process_start_ticks,
     start_endpoint_processes,
+    wait_for_endpoints,
+    wait_for_ports_available,
 )
 from agentmemorygym_verl.routes import (
     canonical_policy_framing_sha256,
@@ -1108,6 +1111,52 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
             route_id="webshop", endpoint=f"http://127.0.0.1:{port}"
         )
         assert_ports_available((spec,))
+
+    def test_port_release_wait_retries_a_transient_collision(self) -> None:
+        spec = EndpointLaunchSpec.for_test(
+            route_id="webshop", endpoint="http://127.0.0.1:49200"
+        )
+        with (
+            mock.patch(
+                "agentmemorygym_verl.multitask_orchestrator.assert_ports_available",
+                side_effect=[OrchestratorError("transient collision"), None],
+            ) as probe,
+            mock.patch("agentmemorygym_verl.multitask_orchestrator.time.sleep"),
+        ):
+            wait_for_ports_available((spec,), timeout_seconds=1.0, poll_seconds=0.01)
+        self.assertEqual(probe.call_count, 2)
+
+    def test_readiness_retries_transient_bad_status_line(self) -> None:
+        spec = EndpointLaunchSpec.for_test(
+            route_id="webshop", endpoint="http://127.0.0.1:49200"
+        )
+        lease = ProcessLease(
+            name="webshop",
+            pid=101,
+            start_ticks="1",
+            process=object(),
+            log_handle=None,
+        )
+
+        class AliveSupervisor:
+            @staticmethod
+            def alive(_lease: ProcessLease) -> bool:
+                return True
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+            "agentmemorygym_verl.multitask_orchestrator._readiness_probe",
+            side_effect=[
+                http.client.BadStatusLine("GET /metadata HTTP/1.1"),
+                (b"{}", {}),
+            ],
+        ), mock.patch("agentmemorygym_verl.multitask_orchestrator.time.sleep"):
+            report = wait_for_endpoints(
+                (spec,),
+                (lease,),
+                run_dir=Path(directory),
+                supervisor=AliveSupervisor(),
+            )
+        self.assertEqual(report["webshop"]["metadata"], {})
 
     def test_partial_endpoint_startup_rolls_back_exact_started_leases(self) -> None:
         specs = tuple(

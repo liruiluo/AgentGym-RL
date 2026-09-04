@@ -49,6 +49,7 @@ ASSET_NAMES = {
         "image_bindings",
         "image_manifest",
         "mirror_bundles_manifest",
+        "offline_image_assets",
         "routing",
         "runtime_manifest",
     },
@@ -723,6 +724,12 @@ heldout_assert_asset_env FIXTURE "fixture asset"
         self.assertIn("CAMG_HELDOUT_ASSET_ADMITTED_POOL_MANIFEST_PATH", source)
         self.assertIn("CAMG_HELDOUT_ASSET_EXTENSION_POOL_MANIFEST_PATH", source)
         self.assertIn("prepare_swesmith_oci_rootfs.py", source)
+        self.assertIn("heldout_assert_asset_env OFFLINE_IMAGE_ASSETS", source)
+        self.assertIn("--offline-image-asset-manifest", source)
+        self.assertNotIn("--transport-prefix", source)
+        self.assertNotIn("--fallback-transport-prefix", source)
+        self.assertNotIn("--layer-cache-root", source)
+        self.assertNotIn("HTTP_PROXY=http", source)
         self.assertIn(
             "PREPARE_ROOTFS=$SOURCE_OUTER/AgentGym-RL/scripts/agentmemory/prepare_swesmith_oci_rootfs.py",
             source,
@@ -758,10 +765,8 @@ heldout_assert_asset_env FIXTURE "fixture asset"
         )
         self.assertIn("--materialize-profile-image", source)
         self.assertIn("selected_repository_task_counts", source)
-        self.assertIn("bamboo-proxy.jd.com:80", source)
-        self.assertIn("--fallback-transport-prefix dockerproxy.net", source)
-        self.assertIn("--fallback-transport-prefix docker.1panel.live", source)
-        self.assertNotIn("--fallback-transport-prefix docker.io", source)
+        self.assertNotIn("bamboo-proxy.jd.com:80", source)
+        self.assertIn("env -u HTTP_PROXY -u HTTPS_PROXY", source)
 
     def test_literesearcher_uses_all_heldout_rows_and_identity_source(self):
         source = (LAUNCHER_ROOT / "literesearcher.sh").read_text()

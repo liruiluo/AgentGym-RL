@@ -10,6 +10,7 @@ import json
 import os
 import re
 import subprocess
+import tarfile
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,6 +24,8 @@ _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 _CACHE_SCHEMA = "swesmith_oci_rootfs_cache_v1"
 _MANIFEST_SCHEMA = "swesmith_oci_image_manifest_v1"
+_OFFLINE_ASSET_SCHEMA = "camg_swesmith_offline_image_assets_v1"
+_OFFLINE_PRESTAGE_SCHEMA = "camg_swesmith_final128_oci_metadata_prestage_v1"
 _VERIFIED_LAYER_CACHE_FILES: set[tuple[str, int, int, int]] = set()
 
 
@@ -35,6 +38,15 @@ class ImageBinding:
     @property
     def cache_name(self) -> str:
         return self.digest.replace(":", "-")
+
+
+@dataclass(frozen=True)
+class OfflineImageAsset:
+    image_tarball: Path
+    image_tarball_sha256: str
+    image_tarball_bytes: int
+    manifest_raw: bytes
+    config_raw: bytes
 
 
 def parse_binding(raw: str) -> ImageBinding:
@@ -113,6 +125,197 @@ def _transport_prefixes(primary: str, fallbacks: Iterable[str]) -> tuple[str, ..
         if prefix not in prefixes:
             prefixes.append(prefix)
     return tuple(prefixes)
+
+
+def _bound_regular_file(
+    path: Path,
+    *,
+    root: Path,
+    expected_sha256: str,
+    expected_bytes: int | None = None,
+    label: str,
+) -> Path:
+    expanded = path.expanduser()
+    if expanded.is_symlink():
+        raise RuntimeError(f"{label} must not be a symlink: {expanded}")
+    resolved = (expanded if expanded.is_absolute() else root / expanded).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise RuntimeError(f"{label} escapes the offline asset package: {resolved}") from exc
+    if not resolved.is_file():
+        raise RuntimeError(f"{label} is not an immutable regular file: {resolved}")
+    if expected_bytes is not None and resolved.stat().st_size != expected_bytes:
+        raise RuntimeError(f"{label} byte count drifted: {resolved}")
+    if _sha256_file(resolved) != expected_sha256:
+        raise RuntimeError(f"{label} digest drifted: {resolved}")
+    return resolved
+
+
+def load_offline_image_assets(
+    path: Path,
+    bindings: tuple[ImageBinding, ...],
+) -> dict[str, OfflineImageAsset]:
+    """Load a complete, hash-bound offline image set for this materialization."""
+
+    expanded_manifest_path = path.expanduser()
+    if expanded_manifest_path.is_symlink():
+        raise RuntimeError(
+            f"offline image asset manifest must not be a symlink: {expanded_manifest_path}"
+        )
+    manifest_path = expanded_manifest_path.resolve()
+    if not manifest_path.is_file():
+        raise RuntimeError(f"offline image asset manifest is invalid: {manifest_path}")
+    package_root = manifest_path.parent.resolve()
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    records = payload.get("images")
+    if (
+        payload.get("schema") != _OFFLINE_ASSET_SCHEMA
+        or payload.get("status") != "pass"
+        or payload.get("network_required_at_launch") is not False
+        or not isinstance(records, list)
+        or int(payload.get("image_count", -1)) != len(records)
+    ):
+        raise RuntimeError("offline image asset manifest is not launch-ready")
+
+    prestage_record = payload.get("source_metadata_prestage")
+    if not isinstance(prestage_record, dict):
+        raise RuntimeError("offline image asset manifest lacks metadata provenance")
+    prestage_path = _bound_regular_file(
+        Path(str(prestage_record.get("path", ""))),
+        root=package_root,
+        expected_sha256=str(prestage_record.get("sha256", "")),
+        label="offline metadata prestage",
+    )
+    prestage = json.loads(prestage_path.read_text(encoding="utf-8"))
+    prestage_images = prestage.get("images")
+    if (
+        prestage.get("schema") != _OFFLINE_PRESTAGE_SCHEMA
+        or prestage.get("status") != "pass"
+        or int(prestage.get("missing_layer_count", -1)) != 0
+        or prestage.get("bad_layers") != []
+        or not isinstance(prestage_images, list)
+    ):
+        raise RuntimeError("offline metadata prestage is not complete")
+    provenance_by_profile = {
+        str(record.get("profile_image", "")): record for record in prestage_images
+    }
+
+    records_by_profile: dict[str, dict[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            raise RuntimeError("offline image asset entry is not an object")
+        profile_image = str(record.get("profile_image", ""))
+        if not profile_image or profile_image in records_by_profile:
+            raise RuntimeError("offline image asset profiles must be nonempty and unique")
+        records_by_profile[profile_image] = record
+
+    expected_profiles = {binding.profile_image for binding in bindings}
+    if set(records_by_profile) != expected_profiles:
+        missing = sorted(expected_profiles - set(records_by_profile))
+        extra = sorted(set(records_by_profile) - expected_profiles)
+        raise RuntimeError(
+            f"offline image assets differ from selected bindings: missing={missing}, extra={extra}"
+        )
+
+    assets: dict[str, OfflineImageAsset] = {}
+    for binding in bindings:
+        record = records_by_profile[binding.profile_image]
+        provenance = provenance_by_profile.get(binding.profile_image)
+        if not isinstance(provenance, dict):
+            raise RuntimeError(
+                f"offline image metadata is missing for {binding.profile_image}"
+            )
+        if (
+            record.get("source_image") != binding.source_image
+            or record.get("digest") != binding.digest
+            or provenance.get("source_image") != binding.source_image
+            or provenance.get("digest") != binding.digest
+        ):
+            raise RuntimeError(
+                f"offline image identity drifted for {binding.profile_image}"
+            )
+        image_tar = record.get("image_tar")
+        if not isinstance(image_tar, dict):
+            raise RuntimeError(f"offline image tar is missing for {binding.profile_image}")
+        tarball = _bound_regular_file(
+            Path(str(image_tar.get("path", ""))),
+            root=package_root,
+            expected_sha256=str(image_tar.get("sha256", "")),
+            expected_bytes=int(image_tar.get("bytes", -1)),
+            label=f"offline image tar for {binding.profile_image}",
+        )
+        manifest_path_for_image = _bound_regular_file(
+            Path(str(provenance.get("manifest", ""))),
+            root=package_root,
+            expected_sha256=binding.digest.removeprefix("sha256:"),
+            label=f"OCI manifest for {binding.profile_image}",
+        )
+        config_path = _bound_regular_file(
+            Path(str(provenance.get("config", ""))),
+            root=package_root,
+            expected_sha256=str(record.get("config_sha256", "")),
+            label=f"OCI config for {binding.profile_image}",
+        )
+        manifest_raw = manifest_path_for_image.read_bytes()
+        config_raw = config_path.read_bytes()
+        manifest = json.loads(manifest_raw)
+        config_sha256 = hashlib.sha256(config_raw).hexdigest()
+        if (
+            record.get("manifest_sha256") != binding.digest.removeprefix("sha256:")
+            or manifest.get("config", {}).get("digest") != f"sha256:{config_sha256}"
+        ):
+            raise RuntimeError(
+                f"offline OCI metadata drifted for {binding.profile_image}"
+            )
+        expected_members = {
+            "manifest.json",
+            f"sha256:{config_sha256}",
+            *{
+                f"{layer['digest'].removeprefix('sha256:')}.tar.gz"
+                for layer in provenance.get("layers", [])
+            },
+        }
+        with tarfile.open(tarball, "r:") as archive:
+            members = archive.getmembers()
+            if any(not member.isfile() for member in members):
+                raise RuntimeError(
+                    f"offline image tar contains non-regular entries: {binding.profile_image}"
+                )
+            if {member.name for member in members} != expected_members:
+                raise RuntimeError(
+                    f"offline image tar member set drifted: {binding.profile_image}"
+                )
+            docker_manifest_handle = archive.extractfile("manifest.json")
+            config_handle = archive.extractfile(f"sha256:{config_sha256}")
+            if docker_manifest_handle is None or config_handle is None:
+                raise RuntimeError(
+                    f"offline image tar metadata is missing: {binding.profile_image}"
+                )
+            docker_manifest = json.load(docker_manifest_handle)
+            archived_config = config_handle.read()
+        expected_layers = [
+            f"{layer['digest'].removeprefix('sha256:')}.tar.gz"
+            for layer in provenance.get("layers", [])
+        ]
+        if (
+            archived_config != config_raw
+            or not isinstance(docker_manifest, list)
+            or len(docker_manifest) != 1
+            or docker_manifest[0].get("Config") != f"sha256:{config_sha256}"
+            or docker_manifest[0].get("Layers") != expected_layers
+        ):
+            raise RuntimeError(
+                f"offline Docker archive contract drifted: {binding.profile_image}"
+            )
+        assets[binding.profile_image] = OfflineImageAsset(
+            image_tarball=tarball,
+            image_tarball_sha256=str(image_tar.get("sha256")),
+            image_tarball_bytes=int(image_tar.get("bytes")),
+            manifest_raw=manifest_raw,
+            config_raw=config_raw,
+        )
+    return assets
 
 
 def _purge_invalid_cached_layers(layer_cache_root: Path) -> tuple[str, ...]:
@@ -284,13 +487,14 @@ def _materialize_one(
     *,
     cache_root: Path,
     crane: Path,
-    transport_prefix: str,
+    transport_prefix: str | None,
     environment: dict[str, str],
     dataset_revision: str,
     source_revision: str,
     layer_cache_root: Path | None = None,
     transport_fallbacks: tuple[str, ...] = (),
     download_attempts: int = 1,
+    offline_image_asset: OfflineImageAsset | None = None,
 ) -> dict[str, Any]:
     target = cache_root / binding.cache_name
     if target.is_dir() and (target / ".complete").is_file():
@@ -305,11 +509,22 @@ def _materialize_one(
         raise RuntimeError(f"partial cache path already exists: {partial}")
     rootfs = partial / "rootfs"
     rootfs.mkdir(parents=True, mode=0o755)
-    prefixes = _transport_prefixes(transport_prefix, transport_fallbacks)
-    reference = f"{prefixes[0]}/{binding.source_image}@{binding.digest}"
-    selected_transport = prefixes[0]
-    pull_attempts = 1
-    if layer_cache_root is None:
+    if offline_image_asset is not None:
+        prefixes: tuple[str, ...] = ()
+        reference = f"{binding.source_image}@{binding.digest}"
+        selected_transport = "offline-image-asset"
+        pull_attempts = 0
+        manifest_raw = offline_image_asset.manifest_raw
+        config_raw = offline_image_asset.config_raw
+        manifest = json.loads(manifest_raw)
+    else:
+        if transport_prefix is None:
+            raise RuntimeError("online OCI materialization requires a transport prefix")
+        prefixes = _transport_prefixes(transport_prefix, transport_fallbacks)
+        reference = f"{prefixes[0]}/{binding.source_image}@{binding.digest}"
+        selected_transport = prefixes[0]
+        pull_attempts = 1
+    if offline_image_asset is None and layer_cache_root is None:
         manifest_raw = _run_bytes(
             [str(crane), "manifest", reference], environment=environment
         )
@@ -319,7 +534,7 @@ def _materialize_one(
         config_raw = _run_bytes(
             [str(crane), "config", reference], environment=environment
         )
-    else:
+    elif offline_image_asset is None:
         (
             reference,
             selected_transport,
@@ -349,9 +564,17 @@ def _materialize_one(
 
     export_stderr = partial / "crane-export.stderr.log"
     tar_stderr = partial / "tar-extract.stderr.log"
-    image_tarball = partial / "image.tar"
+    image_tarball = (
+        offline_image_asset.image_tarball
+        if offline_image_asset is not None
+        else partial / "image.tar"
+    )
     with export_stderr.open("wb") as export_error, tar_stderr.open("wb") as tar_error:
-        image_input = image_tarball.open("rb") if layer_cache_root is not None else None
+        image_input = (
+            image_tarball.open("rb")
+            if offline_image_asset is not None or layer_cache_root is not None
+            else None
+        )
         exporter = subprocess.Popen(
             [str(crane), "export", "-" if image_input is not None else reference, "-"],
             stdin=image_input,
@@ -384,7 +607,8 @@ def _materialize_one(
             f"OCI export failed: crane={export_returncode} tar={tar_returncode}; "
             f"partial={partial}"
         )
-    image_tarball.unlink(missing_ok=True)
+    if offline_image_asset is None:
+        image_tarball.unlink(missing_ok=True)
 
     bash = _require_rootfs_contract(rootfs)
     rootfs_bytes, regular_files = _measure_rootfs(rootfs)
@@ -400,6 +624,15 @@ def _materialize_one(
         "transport_mirror": selected_transport,
         "transport_attempts": pull_attempts,
         "layer_cache_enabled": layer_cache_root is not None,
+        "offline_image_asset": (
+            {
+                "path": str(offline_image_asset.image_tarball),
+                "bytes": offline_image_asset.image_tarball_bytes,
+                "sha256": offline_image_asset.image_tarball_sha256,
+            }
+            if offline_image_asset is not None
+            else None
+        ),
         "resolved_digest": binding.digest,
         "manifest_sha256": binding.digest.removeprefix("sha256:"),
         "config_sha256": config_sha,
@@ -487,7 +720,8 @@ def main() -> int:
     parser.add_argument("--materialize-profile-image", action="append", default=[])
     parser.add_argument("--cache-root", type=Path, required=True)
     parser.add_argument("--crane", type=Path, required=True)
-    parser.add_argument("--transport-prefix", required=True)
+    parser.add_argument("--offline-image-asset-manifest", type=Path)
+    parser.add_argument("--transport-prefix")
     parser.add_argument("--fallback-transport-prefix", action="append", default=[])
     parser.add_argument("--layer-cache-root", type=Path)
     parser.add_argument("--download-attempts", type=int, default=6)
@@ -505,12 +739,6 @@ def main() -> int:
             parser.error(f"{label} revision must be a full lowercase Git commit")
     if args.max_workers <= 0 or args.download_attempts <= 0:
         parser.error("--max-workers and --download-attempts must be positive")
-    try:
-        transport_prefixes = _transport_prefixes(
-            args.transport_prefix, args.fallback_transport_prefix
-        )
-    except ValueError as exc:
-        parser.error(str(exc))
     bindings = tuple(args.binding)
     if len({binding.source_image for binding in bindings}) != len(bindings):
         parser.error("source image bindings must be unique")
@@ -520,6 +748,32 @@ def main() -> int:
         )
     except ValueError as exc:
         parser.error(str(exc))
+    if args.offline_image_asset_manifest is not None:
+        if (
+            args.transport_prefix is not None
+            or args.fallback_transport_prefix
+            or args.layer_cache_root is not None
+        ):
+            parser.error(
+                "offline image assets cannot be combined with registry transports "
+                "or a download cache"
+            )
+        offline_assets = load_offline_image_assets(
+            args.offline_image_asset_manifest, materialization_bindings
+        )
+        transport_prefixes: tuple[str, ...] = ()
+    else:
+        if args.transport_prefix is None:
+            parser.error(
+                "either --offline-image-asset-manifest or --transport-prefix is required"
+            )
+        try:
+            transport_prefixes = _transport_prefixes(
+                args.transport_prefix, args.fallback_transport_prefix
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        offline_assets = {}
     args.cache_root.mkdir(parents=True, exist_ok=True, mode=0o755)
     crane = args.crane.expanduser().resolve()
     if not crane.is_file() or not os.access(crane, os.X_OK):
@@ -546,6 +800,7 @@ def main() -> int:
                 layer_cache_root=layer_cache_root,
                 transport_fallbacks=transport_prefixes[1:],
                 download_attempts=args.download_attempts,
+                offline_image_asset=offline_assets.get(binding.profile_image),
             ): binding
             for binding in materialization_bindings
         }
@@ -581,6 +836,7 @@ def main() -> int:
                 "materialized_profile_images": sorted(
                     binding.profile_image for binding in materialization_bindings
                 ),
+                "offline_image_assets": args.offline_image_asset_manifest is not None,
                 "image_manifest": str(args.image_manifest_output.expanduser().resolve()),
                 "image_manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
                 "cache_results": sorted(results, key=lambda result: result["profile_image"]),
