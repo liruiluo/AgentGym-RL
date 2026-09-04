@@ -117,26 +117,35 @@ class HeldoutEvalOrchestratorTests(unittest.TestCase):
             "agemem-native-heldout.attempt-000000",
         )
 
-    def test_endpoint_counts_must_match_complete_split_schedule(self):
+    def test_endpoint_task_pools_must_cover_the_eval_schedule(self):
         route_counts = {
+            "webshop": 128,
+            "swesmith": 128,
+            "literesearcher": 128,
+            "openmle_fast": 128,
+        }
+        evaluation = SimpleNamespace(route_counts=route_counts)
+        endpoint_counts = {
             "webshop": 1746,
-            "swesmith": 23,
+            "swesmith": 933,
             "literesearcher": 5319,
             "openmle_fast": 169,
         }
-        evaluation = SimpleNamespace(route_counts=route_counts)
         endpoints = tuple(
             SimpleNamespace(route_id=route_id, task_count=count)
-            for route_id, count in route_counts.items()
+            for route_id, count in endpoint_counts.items()
         )
         self.assertEqual(
-            _verify_endpoint_task_counts(evaluation, endpoints), route_counts
+            _verify_endpoint_task_counts(evaluation, endpoints), endpoint_counts
         )
-        drifted = endpoints[:-1] + (
-            SimpleNamespace(route_id="openmle_fast", task_count=168),
+        undersized = endpoints[:-1] + (
+            SimpleNamespace(route_id="openmle_fast", task_count=127),
         )
-        with self.assertRaisesRegex(OrchestratorError, "differ from the complete split"):
-            _verify_endpoint_task_counts(evaluation, drifted)
+        with self.assertRaisesRegex(OrchestratorError, "cannot cover"):
+            _verify_endpoint_task_counts(evaluation, undersized)
+        missing = endpoints[:-1]
+        with self.assertRaisesRegex(OrchestratorError, "route set differs"):
+            _verify_endpoint_task_counts(evaluation, missing)
         self.assertEqual(
             _attempt_owner_id("agemem-native-heldout", 17),
             "agemem-native-heldout.attempt-000017",

@@ -158,10 +158,23 @@ def _verify_endpoint_task_counts(
     endpoints: Sequence[HeldoutEndpointSpec],
 ) -> dict[str, int]:
     endpoint_counts = {endpoint.route_id: endpoint.task_count for endpoint in endpoints}
-    if endpoint_counts != evaluation.route_counts:
+    if set(endpoint_counts) != set(evaluation.route_counts):
         raise OrchestratorError(
-            "held-out endpoint task counts differ from the complete split/eval "
-            f"schedule: endpoints={endpoint_counts!r}, schedule={evaluation.route_counts!r}"
+            "held-out endpoint route set differs from the eval schedule: "
+            f"endpoints={endpoint_counts!r}, schedule={evaluation.route_counts!r}"
+        )
+    undersized = {
+        route_id: {
+            "endpoint": endpoint_counts[route_id],
+            "scheduled": scheduled_count,
+        }
+        for route_id, scheduled_count in evaluation.route_counts.items()
+        if endpoint_counts[route_id] < scheduled_count
+    }
+    if undersized:
+        raise OrchestratorError(
+            "held-out endpoint task pools cannot cover the eval schedule: "
+            f"{undersized!r}"
         )
     return endpoint_counts
 
