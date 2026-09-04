@@ -655,9 +655,13 @@ heldout_assert_asset_env FIXTURE 'fixture asset'
                 for stale in (
                     "$CAMG_HELDOUT_SOURCE_OUTER_ROOT/AgentGym-RL",
                     "$OUTER_SOURCE_ROOT/AgentGym-RL",
-                    "$SOURCE_OUTER/AgentGym-RL",
                 ):
                     self.assertNotIn(stale, source)
+                expected_nested_helper_refs = 1 if route_id == "swesmith" else 0
+                self.assertEqual(
+                    source.count("$SOURCE_OUTER/AgentGym-RL"),
+                    expected_nested_helper_refs,
+                )
 
     def test_each_route_uses_verified_heldout_contract(self):
         for route_id in ROUTES:
@@ -712,6 +716,21 @@ heldout_assert_asset_env FIXTURE 'fixture asset'
             os.environ.clear()
             os.environ.update(original)
         self.assertEqual(environment, {"PATH": "/usr/bin"})
+
+    def test_swesmith_rootfs_preparer_matches_superproject_layout(self):
+        source = (LAUNCHER_ROOT / "swesmith.sh").read_text()
+        relative_helper = Path(
+            "AgentGym-RL/scripts/agentmemory/prepare_swesmith_oci_rootfs.py"
+        )
+        self.assertTrue((LAUNCHER_ROOT.parents[2] / relative_helper).is_file())
+        self.assertIn(
+            f"PREPARE_ROOTFS=$SOURCE_OUTER/{relative_helper.as_posix()}", source
+        )
+        self.assertIn(
+            '[[ -r "$PREPARE_ROOTFS" ]] || heldout_die '
+            '"missing SWE-smith OCI rootfs preparer: $PREPARE_ROOTFS"',
+            source,
+        )
 
     def test_swesmith_uses_formal_eval_subset_and_run_scoped_rootfs(self):
         source = (LAUNCHER_ROOT / "swesmith.sh").read_text()

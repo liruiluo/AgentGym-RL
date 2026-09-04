@@ -1194,6 +1194,7 @@ def assert_ports_available(specs: Sequence[EndpointLaunchSpec]) -> None:
             )
             family = socket.AF_INET6 if host == "::1" else socket.AF_INET
             probe = socket.socket(family, socket.SOCK_STREAM)
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 probe.bind((_bindable_host(host), port))
             except OSError as exc:

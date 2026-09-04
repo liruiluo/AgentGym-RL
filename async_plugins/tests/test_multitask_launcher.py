@@ -1110,6 +1110,31 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
         finally:
             listener.close()
 
+    def test_port_availability_allows_time_wait_without_listener(self) -> None:
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        client = socket.create_connection(("127.0.0.1", port))
+        accepted, _ = listener.accept()
+        accepted.close()
+        self.assertEqual(client.recv(1), b"")
+        client.close()
+        listener.close()
+
+        raw_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            with self.assertRaises(OSError):
+                raw_probe.bind(("127.0.0.1", port))
+        finally:
+            raw_probe.close()
+
+        spec = EndpointLaunchSpec.for_test(
+            route_id="openmle_fast", endpoint=f"http://127.0.0.1:{port}"
+        )
+        assert_ports_available((spec,))
+
     def test_partial_endpoint_startup_rolls_back_exact_started_leases(self) -> None:
         specs = tuple(
             EndpointLaunchSpec.for_test(
