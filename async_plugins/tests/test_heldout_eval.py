@@ -1129,6 +1129,89 @@ class TestHeldoutMaterialization(unittest.TestCase):
                 "webshop", {"current_subtask_index": 5, "subtask_count": 5}
             )
 
+    def test_autoresearch_ungraded_policy_terminals_are_native_failures(self):
+        for terminal_reason, grading_count in (
+            ("action_budget_exhausted", 0),
+            ("managed_runtime_limit", 0),
+            ("wall_timeout", 0),
+            ("episode_wall_limit", 0),
+            ("episode_wall_limit", 1),
+            ("workspace_invariant_violation", 0),
+        ):
+            with self.subTest(
+                terminal_reason=terminal_reason,
+                grading_count=grading_count,
+            ):
+                metric = native_success_metric(
+                    "openmle_fast",
+                    {
+                        "grade": None,
+                        "terminal": True,
+                        "truncated": False,
+                        "terminal_reason": terminal_reason,
+                        "episode_success": False,
+                        "runtime_success": False,
+                        "counters": {"grading_count": grading_count},
+                    },
+                )
+                self.assertEqual(metric["value"], 0.0)
+                self.assertFalse(metric["submission_valid"])
+                self.assertFalse(metric["grade_present"])
+                self.assertEqual(metric["terminal_reason"], terminal_reason)
+
+    def test_autoresearch_ungraded_terminal_evidence_fails_closed(self):
+        valid = {
+            "grade": None,
+            "terminal": True,
+            "truncated": False,
+            "terminal_reason": "action_budget_exhausted",
+            "episode_success": False,
+            "runtime_success": False,
+            "counters": {"grading_count": 0},
+        }
+        malformed = (
+            {key: value for key, value in valid.items() if key != "grade"},
+            {**valid, "terminal": False},
+            {**valid, "truncated": True},
+            {**valid, "episode_success": True},
+            {**valid, "runtime_success": True},
+            {**valid, "terminal_reason": None},
+            {**valid, "counters": {}},
+        )
+        for receipt in malformed:
+            with self.subTest(receipt=receipt):
+                with self.assertRaisesRegex(
+                    ValueError, "missing grade|ungraded terminal"
+                ):
+                    native_success_metric("openmle_fast", receipt)
+
+    def test_materializes_autoresearch_horizon_without_synthesized_grade(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rows, _, _, _ = _compose(Path(directory), counts=(1, 1, 1, 1))
+            source = rows[3]
+            record = _action_row(
+                source, order=0, length=1, success=False, horizon=True
+            )
+            horizon_env = record["horizon_finalization"]["env_info"]
+            horizon_env.update(
+                {
+                    "grade": None,
+                    "terminal": True,
+                    "truncated": False,
+                    "terminal_reason": "action_budget_exhausted",
+                    "episode_success": False,
+                    "runtime_success": False,
+                    "counters": {"grading_count": 0},
+                }
+            )
+            episode = _materialize_records(source, [record])["episodes"][0]
+            self.assertEqual(episode["native_metric"]["value"], 0.0)
+            self.assertFalse(episode["native_metric"]["grade_present"])
+            self.assertEqual(
+                episode["native_metric_evidence"]["source"],
+                "horizon_finalization.env_info",
+            )
+
 
 class TestHeldoutAtomicResume(unittest.TestCase):
     def test_atomic_batches_resume_and_finalize(self):

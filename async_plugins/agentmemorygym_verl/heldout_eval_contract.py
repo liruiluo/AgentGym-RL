@@ -1368,6 +1368,47 @@ def native_success_metric(
         }
     if route_id == "openmle_fast":
         grade = final_env_info.get("grade")
+        if grade is None and "grade" in final_env_info:
+            # AutoResearch intentionally does not synthesize a private grade
+            # when the policy reaches a non-infrastructure terminal before a
+            # valid submit (for example, the action or wall-time budget).  It
+            # is still a registered native failure, not missing evidence.
+            # Keep this fail-closed: only the exact public terminal receipt is
+            # accepted; truncated/infrastructure or malformed receipts remain
+            # evaluator errors and must be rescheduled upstream.
+            counters = final_env_info.get("counters")
+            terminal_reason = final_env_info.get("terminal_reason")
+            if (
+                final_env_info.get("terminal") is not True
+                or final_env_info.get("truncated") is not False
+                or final_env_info.get("episode_success") is not False
+                or final_env_info.get("runtime_success") is not False
+                or not isinstance(terminal_reason, str)
+                or not terminal_reason
+                or not isinstance(counters, Mapping)
+            ):
+                raise ValueError(
+                    "AutoResearch ungraded terminal evidence is malformed"
+                )
+            grading_count = counters.get("grading_count")
+            if (
+                isinstance(grading_count, bool)
+                or not isinstance(grading_count, int)
+                or grading_count < 0
+            ):
+                raise ValueError(
+                    "AutoResearch ungraded terminal lacks a valid grading_count"
+                )
+            return {
+                "name": "autoresearch_beats_baseline_rate",
+                "numerator": 0,
+                "denominator": 1,
+                "value": 0.0,
+                "submission_valid": False,
+                "improved_over_baseline": None,
+                "grade_present": False,
+                "terminal_reason": terminal_reason,
+            }
         if not isinstance(grade, Mapping):
             raise ValueError("AutoResearch terminal evidence is missing grade")
         submission_valid = grade.get("submission_valid")
@@ -1386,6 +1427,8 @@ def native_success_metric(
             "value": float(success),
             "submission_valid": submission_valid,
             "improved_over_baseline": improved if isinstance(improved, bool) else None,
+            "grade_present": True,
+            "terminal_reason": final_env_info.get("terminal_reason"),
         }
     raise ValueError(f"unknown CAMG held-out route {route_id!r}")
 
