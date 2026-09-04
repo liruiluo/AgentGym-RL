@@ -1101,7 +1101,6 @@ class HeldoutEndpointProbeTests(unittest.TestCase):
                         "task_id": "competition@5",
                         "source_family": "KAGGLE_DATASET:a/b",
                         "role": "heldout",
-                        "manifest_sha256": "a" * 64,
                     },
                 },
             },
@@ -1118,6 +1117,12 @@ class HeldoutEndpointProbeTests(unittest.TestCase):
                     "data_idx": rows[spec.route_id]["data_idx"],
                     **rows[spec.route_id]["extra_info"]["source_extra_info"],
                 }
+                if spec.route_id == "openmle_fast":
+                    expected["manifest_sha256"] = next(
+                        asset.sha256
+                        for asset in spec.assets
+                        if asset.name == "heldout_manifest"
+                    )
                 fake = _FakeEndpoint(spec.route_id, expected)
                 receipt = probe_heldout_reset_identity(
                     spec,

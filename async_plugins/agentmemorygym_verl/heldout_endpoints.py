@@ -926,6 +926,11 @@ def probe_heldout_reset_identity(
                 "source_pool_index": extra.get("source_pool_index"),
             }
         elif spec.route_id == "openmle_fast":
+            heldout_manifest_sha256 = next(
+                asset.sha256
+                for asset in spec.assets
+                if asset.name == "heldout_manifest"
+            )
             actual = {
                 "data_idx": info.get("data_idx"),
                 "task_id": info.get("task_id"),
@@ -938,7 +943,7 @@ def probe_heldout_reset_identity(
                 "task_id": extra.get("task_id"),
                 "source_family": extra.get("source_family"),
                 "manifest_role": extra.get("role"),
-                "manifest_sha256": extra.get("manifest_sha256"),
+                "manifest_sha256": heldout_manifest_sha256,
             }
         else:  # pragma: no cover - the dataclass is created by the strict loader.
             raise OrchestratorError(f"unsupported held-out route: {spec.route_id}")
