@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from .agemem_evidence import summarize_agemem_step_records
+from .heldout_method_evidence import summarize_method_step_records
 
 CANONICAL_ROUTES = (
     "webshop",
@@ -162,13 +163,14 @@ def verify_complete_split_contract(
             raise ValueError(
                 "held-out schedule counts differ from the complete split contract"
             )
-    return {
+    result = {
         "schema": COMPLETE_SPLIT_SCHEMA,
         "path": str(path),
         "sha256": observed_digest,
         "package_id": str(payload.get("package_id", "")),
         "route_counts": route_counts,
     }
+    return result
 
 
 def canonical_json_bytes(value: Any) -> bytes:
@@ -229,12 +231,13 @@ def normalize_route_max_rounds(value: Any) -> dict[str, int]:
         raise TypeError("route_max_rounds must be an object")
     if set(value) != set(CANONICAL_ROUTES):
         raise ValueError("route_max_rounds must cover exactly the canonical routes")
-    return {
+    result = {
         route_id: require_positive_int(
             value[route_id], field=f"route {route_id!r} max_rounds"
         )
         for route_id in CANONICAL_ROUTES
     }
+    return result
 
 
 def require_regular_file(path: str | os.PathLike[str], *, field: str) -> Path:
@@ -1290,6 +1293,8 @@ def _verify_action_native_source_identity(
 def _native_metric_evidence(
     route_id: str,
     action_rows: Sequence[Mapping[str, Any]],
+    *,
+    method_id: str = "agemem",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Locate native metric evidence without treating memory-only rows as task steps."""
 
@@ -1301,12 +1306,11 @@ def _native_metric_evidence(
             "action_row_uid": final_row.get("trajectory_row_uid"),
         }
 
-    # The bundled-shopping wrapper has no horizon finalizer.  An AgeMem tool
-    # action does not call the native environment, so its env_info_after is
-    # intentionally empty.  Walk back to the latest native progress receipt.
+    # The bundled-shopping wrapper has no horizon finalizer.  A method-owned
+    # memory action may not call the native environment, so walk back to the
+    # latest row carrying the native progress receipt.  This is intentionally
+    # independent of any adapter-specific event name.
     for row in reversed(action_rows):
-        if _adapter_event(row) != "native_action_passthrough":
-            continue
         env_info = row.get("env_info_after")
         if not isinstance(env_info, Mapping):
             continue
@@ -1316,8 +1320,29 @@ def _native_metric_evidence(
                 "action_row_uid": row.get("trajectory_row_uid"),
             }
 
-    events = [_adapter_event(row) for row in action_rows]
-    if events and all(event == "memory_tool_action" for event in events):
+    adapter_key = {
+        "agemem": "agemem_adapter",
+        "mem0": "mem0_adapter",
+        "letta_code": "letta_code_adapter",
+        "qwen35_4b": None,
+    }.get(method_id)
+    events = []
+    for row in action_rows:
+        evidence = row.get("wrapper_evidence")
+        adapter = (
+            evidence.get(adapter_key)
+            if adapter_key is not None and isinstance(evidence, Mapping)
+            else None
+        )
+        events.append(adapter.get("event") if isinstance(adapter, Mapping) else None)
+    method_only_events = (
+        {"memory_tool_action"}
+        if method_id == "agemem"
+        else {"memory_tool_action", "memory_filesystem_read"}
+    )
+    if method_id in {"agemem", "letta_code"} and events and all(
+        event in method_only_events for event in events
+    ):
         return {
             "current_subtask_index": 0,
             "subtask_count": 6,
@@ -1439,6 +1464,7 @@ def _episode_record(
     *,
     expected_global_step: int,
     route_max_rounds: Mapping[str, int],
+    method_id: str = "agemem",
 ) -> dict[str, Any]:
     uid = str(input_row["uid"])
     route_id = str(input_row["route_id"])
@@ -1522,14 +1548,15 @@ def _episode_record(
             f"episode {uid} was not sampled entirely from checkpoint step "
             f"{expected_global_step}: observed {sorted(policy_steps)!r}"
         )
-    agemem_evidence = summarize_agemem_step_records(
+    method_evidence = summarize_method_step_records(
         action_rows,
-        expected_routes=[route_id],
+        method_id=method_id,
     )
-    if agemem_evidence.get("status") != "PASS":
-        violations = agemem_evidence.get("violations")
+    if method_evidence.get("status") != "PASS":
+        violations = method_evidence.get("violations")
         detail = violations[0] if isinstance(violations, list) and violations else "unknown"
-        raise ValueError(f"episode {uid} AgeMem evidence failed: {detail}")
+        label = "AgeMem" if method_id == "agemem" else method_id
+        raise ValueError(f"episode {uid} {label} evidence failed: {detail}")
 
     final_row = action_rows[-1]
     done = final_row.get("rollout_done_flag")
@@ -1543,7 +1570,9 @@ def _episode_record(
         )
         if not valid_shop_budget_terminal:
             raise ValueError(f"episode {uid} lacks a terminal wrapper transition")
-    final_env_info, metric_evidence = _native_metric_evidence(route_id, action_rows)
+    final_env_info, metric_evidence = _native_metric_evidence(
+        route_id, action_rows, method_id=method_id
+    )
     metric = native_success_metric(route_id, final_env_info)
     return {
         "schema": EPISODE_SCHEMA,
@@ -1562,15 +1591,8 @@ def _episode_record(
         "native_metric": metric,
         "native_metric_evidence": metric_evidence,
         "final_env_info": final_env_info,
-        "agemem_evidence": {
-            "schema": agemem_evidence["schema"],
-            "status": agemem_evidence["status"],
-            "totals": agemem_evidence["totals"],
-            "operation_counts": agemem_evidence["operation_counts"],
-            "context_operation_counts": agemem_evidence[
-                "context_operation_counts"
-            ],
-        },
+        "method_id": method_id,
+        "method_evidence": method_evidence,
         "final_action_row_uid": final_row["trajectory_row_uid"],
     }
 
@@ -1581,6 +1603,7 @@ def materialize_generated_batch(
     *,
     expected_global_step: int,
     route_max_rounds: Mapping[str, int],
+    method_id: str = "agemem",
 ) -> dict[str, Any]:
     """Validate and partition expanded AgentLoop outputs by UID and padding flag."""
 
@@ -1644,6 +1667,7 @@ def materialize_generated_batch(
                 action_rows,
                 expected_global_step=expected_step,
                 route_max_rounds=normalized_max_rounds,
+                method_id=method_id,
             )
             padding_action_rows.extend(action_rows)
         else:
@@ -1654,11 +1678,14 @@ def materialize_generated_batch(
                     action_rows,
                     expected_global_step=expected_step,
                     route_max_rounds=normalized_max_rounds,
+                    method_id=method_id,
                 )
             )
-    real_evidence = summarize_agemem_step_records(real_action_rows)
+    real_evidence = summarize_method_step_records(
+        real_action_rows, method_id=method_id
+    )
     padding_evidence = (
-        summarize_agemem_step_records(padding_action_rows)
+        summarize_method_step_records(padding_action_rows, method_id=method_id)
         if padding_action_rows
         else None
     )
@@ -1666,8 +1693,8 @@ def materialize_generated_batch(
         if summary is not None and summary.get("status") != "PASS":
             violations = summary.get("violations")
             detail = violations[0] if isinstance(violations, list) and violations else "unknown"
-            raise ValueError(f"{label} AgeMem batch evidence failed: {detail}")
-    return {
+            raise ValueError(f"{label} {method_id} batch evidence failed: {detail}")
+    result = {
         "action_rows": real_action_rows,
         "episodes": episodes,
         "padding_action_rows": padding_action_rows,
@@ -1678,12 +1705,23 @@ def materialize_generated_batch(
         "padding_uids": [
             str(row["uid"]) for row in input_rows if row["eval_padding"] is True
         ],
-        "agemem_evidence": {
+        "method_id": method_id,
+        "method_evidence": {
             "real": real_evidence,
             "padding": padding_evidence,
         },
         "route_max_rounds": normalized_max_rounds,
     }
+    if method_id == "agemem":
+        result["agemem_evidence"] = {
+            key: (
+                value.get("legacy_agemem_summary")
+                if isinstance(value, Mapping)
+                else None
+            )
+            for key, value in result["method_evidence"].items()
+        }
+    return result
 
 
 def aggregate_episode_metrics(
@@ -1781,7 +1819,8 @@ def commit_batch(
     input_uids = [str(uid) for uid in materialized["input_uids"]]
     real_uids = [str(uid) for uid in materialized["real_uids"]]
     padding_uids = [str(uid) for uid in materialized["padding_uids"]]
-    agemem_evidence = deepcopy(dict(materialized["agemem_evidence"]))
+    method_id = str(materialized.get("method_id") or "agemem")
+    method_evidence = deepcopy(dict(materialized["method_evidence"]))
     route_max_rounds = normalize_route_max_rounds(
         materialized.get("route_max_rounds")
     )
@@ -1843,10 +1882,15 @@ def commit_batch(
             "batch_metrics": aggregate_episode_metrics(
                 episodes, require_all_routes=False
             ),
-            "agemem_evidence": agemem_evidence,
+            "method_id": method_id,
+            "method_evidence": method_evidence,
             "route_max_rounds": route_max_rounds,
             "files": files,
         }
+        if method_id == "agemem":
+            receipt["agemem_evidence"] = deepcopy(
+                dict(materialized["agemem_evidence"])
+            )
         _write_file_and_entry(
             temporary, "receipt.json", canonical_json_bytes(receipt)
         )
@@ -1881,6 +1925,7 @@ def verify_batch_directory(
     expected_global_step = require_nonnegative_int(
         run_contract.get("checkpoint_step"), field="run checkpoint_step"
     )
+    method_id = str(run_contract.get("method_id") or "agemem")
     contract_registry = run_contract.get("route_registry")
     route_max_rounds = normalize_route_max_rounds(
         contract_registry.get("max_rounds")
@@ -1999,22 +2044,63 @@ def verify_batch_directory(
             action_rows_by_uid[uid],
             expected_global_step=expected_global_step,
             route_max_rounds=route_max_rounds,
+            method_id=method_id,
         )
         if reconstructed != episode:
             raise ValueError(f"episode {uid} differs from its action-row evidence")
-    recomputed_agemem_evidence = {
-        "real": summarize_agemem_step_records(action_rows),
+    recomputed_method_evidence = {
+        "real": summarize_method_step_records(action_rows, method_id=method_id),
         "padding": (
-            summarize_agemem_step_records(padding_rows) if padding_rows else None
+            summarize_method_step_records(padding_rows, method_id=method_id)
+            if padding_rows
+            else None
         ),
     }
     if any(
         summary is not None and summary.get("status") != "PASS"
-        for summary in recomputed_agemem_evidence.values()
+        for summary in recomputed_method_evidence.values()
     ):
-        raise ValueError("batch AgeMem adapter evidence failed validation")
-    if receipt.get("agemem_evidence") != recomputed_agemem_evidence:
-        raise ValueError("batch AgeMem evidence differs from the action-row ledger")
+        raise ValueError(f"batch {method_id} adapter evidence failed validation")
+    stored_evidence = receipt.get("method_evidence")
+    if stored_evidence is None and method_id == "agemem":
+        # Read-only compatibility with the immutable AgeMem v1 receipts.
+        stored_evidence = receipt.get("agemem_evidence")
+        recomputed_method_evidence = {
+            key: (
+                value.get("legacy_agemem_summary")
+                if isinstance(value, Mapping)
+                else None
+            )
+            for key, value in recomputed_method_evidence.items()
+        }
+    if stored_evidence != recomputed_method_evidence:
+        raise ValueError(
+            f"batch {method_id} evidence differs from the action-row ledger"
+        )
+    if method_id == "agemem" and "agemem_evidence" in receipt:
+        expected_legacy = {
+            key: (
+                value.get("legacy_agemem_summary")
+                if isinstance(value, Mapping)
+                else None
+            )
+            for key, value in {
+                "real": summarize_method_step_records(
+                    action_rows, method_id="agemem"
+                ),
+                "padding": (
+                    summarize_method_step_records(
+                        padding_rows, method_id="agemem"
+                    )
+                    if padding_rows
+                    else None
+                ),
+            }.items()
+        }
+        if receipt.get("agemem_evidence") != expected_legacy:
+            raise ValueError(
+                "batch AgeMem evidence differs from the action-row ledger"
+            )
     recomputed_metrics = aggregate_episode_metrics(
         episodes, require_all_routes=False
     )

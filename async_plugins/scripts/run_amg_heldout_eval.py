@@ -11,11 +11,13 @@ from agentmemorygym_verl.heldout_eval import (
     EXPECTED_BATCH_SIZE,
     EXPECTED_CHECKPOINT_STEP,
     EXPECTED_NUM_GPUS,
+    SUPPORTED_MODEL_KINDS,
     derive_eval_config,
     load_eval_plan,
     run_contract,
     run_evaluation,
 )
+from agentmemorygym_verl.heldout_method_evidence import SUPPORTED_METHOD_IDS
 from agentmemorygym_verl.heldout_eval_contract import (
     canonical_json_bytes,
     compose_heldout_schedule,
@@ -38,10 +40,14 @@ def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--agent-loop-config-sha256", required=True)
     parser.add_argument("--model-manifest", type=Path, required=True)
     parser.add_argument("--model-manifest-sha256", required=True)
+    parser.add_argument("--method-id", choices=SUPPORTED_METHOD_IDS, default="agemem")
+    parser.add_argument(
+        "--model-kind", choices=SUPPORTED_MODEL_KINDS, default="merged_checkpoint"
+    )
     parser.add_argument("--training-run-id", required=True)
-    parser.add_argument("--training-outer-commit", required=True)
-    parser.add_argument("--training-inner-commit", required=True)
-    parser.add_argument("--training-verl-commit", required=True)
+    parser.add_argument("--training-outer-commit", default="")
+    parser.add_argument("--training-inner-commit", default="")
+    parser.add_argument("--training-verl-commit", default="")
     parser.add_argument("--evaluator-outer-commit", required=True)
     parser.add_argument("--evaluator-inner-commit", required=True)
     parser.add_argument("--evaluator-verl-commit", required=True)
@@ -69,6 +75,8 @@ def _plan(args: argparse.Namespace):
         expected_agent_loop_config_sha256=args.agent_loop_config_sha256,
         model_manifest_path=args.model_manifest,
         expected_model_manifest_sha256=args.model_manifest_sha256,
+        method_id=args.method_id,
+        model_kind=args.model_kind,
         training_run_id=args.training_run_id,
         training_outer_commit=args.training_outer_commit,
         training_inner_commit=args.training_inner_commit,

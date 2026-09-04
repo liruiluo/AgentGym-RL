@@ -41,8 +41,11 @@ from .heldout_eval_contract import (
     verify_swesmith_formal_eval_authority,
 )
 from .routes import load_route_registry
+from .heldout_method_evidence import SUPPORTED_METHOD_IDS
 
 MODEL_MANIFEST_SCHEMA = "camg_merged_hf_checkpoint_manifest_v1"
+FROZEN_MODEL_MANIFEST_SCHEMA = "camg_frozen_hf_model_manifest_v1"
+SUPPORTED_MODEL_KINDS = ("merged_checkpoint", "frozen_hf")
 SCHEDULE_MANIFEST_SCHEMA = SCHEDULE_SCHEMA
 EXPECTED_CHECKPOINT_STEP = 200
 EXPECTED_BATCH_SIZE = 64
@@ -69,6 +72,9 @@ class VerifiedModel:
     training_run_id: str
     source_commits: dict[str, str]
     file_count: int
+    model_kind: str = "merged_checkpoint"
+    model_id: str = ""
+    source_revision: str = ""
 
 
 @dataclass(frozen=True)
@@ -95,6 +101,8 @@ class HeldoutEvalPlan:
     evaluator_outer_commit: str
     evaluator_inner_commit: str
     evaluator_verl_commit: str
+    method_id: str = "agemem"
+    model_kind: str = "merged_checkpoint"
     batch_size: int = EXPECTED_BATCH_SIZE
     num_gpus: int = EXPECTED_NUM_GPUS
     gpu_memory_utilization: float = 0.8
@@ -293,6 +301,7 @@ def verify_model_manifest(
     expected_checkpoint_step: int,
     expected_training_run_id: str,
     expected_source_commits: dict[str, str],
+    model_kind: str = "merged_checkpoint",
 ) -> VerifiedModel:
     """Verify every byte in one immutable merged-HF checkpoint publication."""
 
@@ -307,11 +316,19 @@ def verify_model_manifest(
             f"got {observed_digest}"
         )
     payload = _mapping(read_json(path), field="model manifest")
-    if payload.get("schema") != MODEL_MANIFEST_SCHEMA:
-        raise ValueError(f"model manifest schema must be {MODEL_MANIFEST_SCHEMA!r}")
-    step = require_positive_int(
-        payload.get("checkpoint_step"), field="model checkpoint_step"
+    if model_kind not in SUPPORTED_MODEL_KINDS:
+        raise ValueError(f"unsupported held-out model_kind {model_kind!r}")
+    expected_schema = (
+        MODEL_MANIFEST_SCHEMA
+        if model_kind == "merged_checkpoint"
+        else FROZEN_MODEL_MANIFEST_SCHEMA
     )
+    if payload.get("schema") != expected_schema:
+        raise ValueError(f"model manifest schema must be {expected_schema!r}")
+    raw_step = payload.get("checkpoint_step")
+    if isinstance(raw_step, bool) or not isinstance(raw_step, int) or raw_step < 0:
+        raise ValueError("model checkpoint_step must be a non-negative integer")
+    step = raw_step
     if step != expected_checkpoint_step:
         raise ValueError(
             f"model checkpoint step mismatch: expected {expected_checkpoint_step}, got {step}"
@@ -319,17 +336,33 @@ def verify_model_manifest(
     training_run_id = str(payload.get("training_run_id", ""))
     if training_run_id != expected_training_run_id:
         raise ValueError("model manifest training_run_id mismatch")
-    source = _mapping(payload.get("source_commits"), field="model source_commits")
-    normalized_source = {
-        key: _commit(source.get(key), field=f"model source commit {key}")
-        for key in ("outer", "inner", "verl")
-    }
-    normalized_expected = {
-        key: _commit(expected_source_commits.get(key), field=f"expected source commit {key}")
-        for key in ("outer", "inner", "verl")
-    }
-    if normalized_source != normalized_expected:
-        raise ValueError("model manifest source commits differ from the eval contract")
+    normalized_source: dict[str, str] = {}
+    model_id = ""
+    source_revision = ""
+    if model_kind == "merged_checkpoint":
+        source = _mapping(payload.get("source_commits"), field="model source_commits")
+        normalized_source = {
+            key: _commit(source.get(key), field=f"model source commit {key}")
+            for key in ("outer", "inner", "verl")
+        }
+        normalized_expected = {
+            key: _commit(
+                expected_source_commits.get(key),
+                field=f"expected source commit {key}",
+            )
+            for key in ("outer", "inner", "verl")
+        }
+        if normalized_source != normalized_expected:
+            raise ValueError("model manifest source commits differ from the eval contract")
+    else:
+        if step != 0:
+            raise ValueError("frozen HF model manifest checkpoint_step must be zero")
+        model_id = str(payload.get("model_id") or "").strip()
+        source_revision = str(payload.get("source_revision") or "").strip().lower()
+        if not model_id:
+            raise ValueError("frozen HF model manifest requires model_id")
+        if not _COMMIT.fullmatch(source_revision):
+            raise ValueError("frozen HF model manifest requires a full source_revision")
 
     model_path = _absolute_directory(payload.get("model_path"), field="model path")
     if path == model_path or model_path in path.parents:
@@ -385,6 +418,9 @@ def verify_model_manifest(
         training_run_id=training_run_id,
         source_commits=normalized_source,
         file_count=len(observed),
+        model_kind=model_kind,
+        model_id=model_id,
+        source_revision=source_revision,
     )
 
 
@@ -411,6 +447,8 @@ def load_eval_plan(
     evaluator_outer_commit: str,
     evaluator_inner_commit: str,
     evaluator_verl_commit: str,
+    method_id: str = "agemem",
+    model_kind: str = "merged_checkpoint",
     checkpoint_step: int = EXPECTED_CHECKPOINT_STEP,
     batch_size: int = EXPECTED_BATCH_SIZE,
     num_gpus: int = EXPECTED_NUM_GPUS,
@@ -420,8 +458,24 @@ def load_eval_plan(
 
     if not _RUN_ID.fullmatch(run_id):
         raise ValueError("run_id contains unsupported characters or length")
-    if checkpoint_step != EXPECTED_CHECKPOINT_STEP:
-        raise ValueError("native held-out evaluation is permitted only at update200")
+    method_id = str(method_id or "").strip().lower()
+    model_kind = str(model_kind or "").strip().lower()
+    if method_id not in SUPPORTED_METHOD_IDS:
+        raise ValueError(f"unsupported held-out method_id {method_id!r}")
+    if model_kind not in SUPPORTED_MODEL_KINDS:
+        raise ValueError(f"unsupported held-out model_kind {model_kind!r}")
+    expected_kind = "merged_checkpoint" if method_id == "agemem" else "frozen_hf"
+    if model_kind != expected_kind:
+        raise ValueError(
+            f"held-out method {method_id!r} requires model_kind {expected_kind!r}"
+        )
+    expected_step = EXPECTED_CHECKPOINT_STEP if model_kind == "merged_checkpoint" else 0
+    if checkpoint_step != expected_step:
+        if model_kind == "merged_checkpoint":
+            raise ValueError("native held-out evaluation is permitted only at update200")
+        raise ValueError(
+            f"held-out {model_kind} evaluation requires checkpoint_step={expected_step}"
+        )
     if batch_size != EXPECTED_BATCH_SIZE:
         raise ValueError(f"held-out batch_size must remain {EXPECTED_BATCH_SIZE}")
     if num_gpus != EXPECTED_NUM_GPUS:
@@ -524,6 +578,7 @@ def load_eval_plan(
         expected_checkpoint_step=checkpoint_step,
         expected_training_run_id=training_run_id,
         expected_source_commits=source_commits,
+        model_kind=model_kind,
     )
     return HeldoutEvalPlan(
         run_id=run_id,
@@ -554,6 +609,8 @@ def load_eval_plan(
         evaluator_verl_commit=_commit(
             evaluator_verl_commit, field="evaluator veRL commit"
         ),
+        method_id=method_id,
+        model_kind=model_kind,
         batch_size=batch_size,
         num_gpus=num_gpus,
         gpu_memory_utilization=float(gpu_memory_utilization),
@@ -668,6 +725,8 @@ def run_contract(plan: HeldoutEvalPlan, eval_config_sha256: str) -> dict[str, An
     return {
         "schema": RUN_SCHEMA,
         "run_id": plan.run_id,
+        "method_id": plan.method_id,
+        "model_kind": plan.model_kind,
         "checkpoint_step": plan.model.checkpoint_step,
         "training_run_id": plan.model.training_run_id,
         "training_source_commits": plan.model.source_commits,
@@ -681,6 +740,8 @@ def run_contract(plan: HeldoutEvalPlan, eval_config_sha256: str) -> dict[str, An
             "manifest_path": str(plan.model.manifest_path),
             "manifest_sha256": plan.model.manifest_sha256,
             "file_count": plan.model.file_count,
+            "model_id": plan.model.model_id or None,
+            "source_revision": plan.model.source_revision or None,
         },
         "schedule": {
             "path": str(plan.schedule_path),
@@ -728,7 +789,9 @@ def run_contract(plan: HeldoutEvalPlan, eval_config_sha256: str) -> dict[str, An
             "dataset": "AMGTrajectoryDataset",
             "server_manager": "LLMServerManager.standalone",
             "agent_loop_manager": "AgentLoopManager",
-            "policy_version_enforcement": "every_action_row_min_max_equal_200",
+            "policy_version_enforcement": (
+                "every_action_row_min_max_equal_checkpoint_step"
+            ),
             "generic_action_outcome_used": False,
         },
     }
@@ -904,6 +967,7 @@ def run_evaluation(plan: HeldoutEvalPlan) -> dict[str, Any]:
                 padded_rows,
                 expected_global_step=plan.model.checkpoint_step,
                 route_max_rounds=plan.route_max_rounds,
+                method_id=plan.method_id,
             )
             receipt = commit_batch(
                 plan.run_dir,

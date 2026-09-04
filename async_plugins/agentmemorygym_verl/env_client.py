@@ -22,6 +22,10 @@ _CLIENT_CLASS_NAMES = {
 _AGENTMEMORY_POLICY_PROMPT_FIELD = "policy_system_prompt"
 _AGEMEM_ROUTE_SCHEMA = "camg_agemem_style_route_v1"
 _AGEMEM_ADAPTER_NAME = "agemem_style"
+_MEM0_ROUTE_SCHEMA = "camg_mem0_route_v1"
+_MEM0_ADAPTER_NAME = "mem0"
+_LETTA_CODE_ROUTE_SCHEMA = "camg_letta_code_route_v1"
+_LETTA_CODE_ADAPTER_NAME = "letta_code"
 
 _OPENMLE_IDENTITY_FIELDS = (
     "expected_manifest_sha256",
@@ -208,26 +212,42 @@ def _wrap_memory_adapter(client: Any, raw_adapter: Any):
         raise ValueError(
             "unknown AMG memory_adapter fields: " + ", ".join(unknown)
         )
-    if adapter.get("schema") != _AGEMEM_ROUTE_SCHEMA:
+    identity = (adapter.get("schema"), adapter.get("name"))
+    supported = {
+        (_AGEMEM_ROUTE_SCHEMA, _AGEMEM_ADAPTER_NAME),
+        (_MEM0_ROUTE_SCHEMA, _MEM0_ADAPTER_NAME),
+        (_LETTA_CODE_ROUTE_SCHEMA, _LETTA_CODE_ADAPTER_NAME),
+    }
+    if identity not in supported:
         _close_quietly(client)
         raise ValueError(
-            f"AMG memory_adapter.schema must be {_AGEMEM_ROUTE_SCHEMA!r}"
-        )
-    if adapter.get("name") != _AGEMEM_ADAPTER_NAME:
-        _close_quietly(client)
-        raise ValueError(
-            f"AMG memory_adapter.name must be {_AGEMEM_ADAPTER_NAME!r}"
+            "AMG memory_adapter schema/name pair is unsupported: "
+            f"{identity!r}"
         )
     config = adapter.get("config", {})
     if not isinstance(config, Mapping):
         _close_quietly(client)
         raise TypeError("AMG memory_adapter.config must be a mapping")
     try:
-        from agentenv.envs import AgeMemAdapterConfig, AgeMemEnvClientAdapter
+        if identity == (_AGEMEM_ROUTE_SCHEMA, _AGEMEM_ADAPTER_NAME):
+            from agentenv.envs import AgeMemAdapterConfig, AgeMemEnvClientAdapter
 
-        return AgeMemEnvClientAdapter(
+            return AgeMemEnvClientAdapter(
+                client,
+                AgeMemAdapterConfig.from_mapping(config),
+            )
+        if identity == (_MEM0_ROUTE_SCHEMA, _MEM0_ADAPTER_NAME):
+            from agentenv.envs import Mem0AdapterConfig, Mem0EnvClientAdapter
+
+            return Mem0EnvClientAdapter(
+                client,
+                Mem0AdapterConfig.from_mapping(config),
+            )
+        from agentenv.envs import LettaCodeAdapterConfig, LettaCodeEnvClientAdapter
+
+        return LettaCodeEnvClientAdapter(
             client,
-            AgeMemAdapterConfig.from_mapping(config),
+            LettaCodeAdapterConfig.from_mapping(config),
         )
     except Exception:
         _close_quietly(client)

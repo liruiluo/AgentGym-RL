@@ -7,6 +7,8 @@ from unittest.mock import patch
 from agentenv.controller.env import BaseEnvClient
 from agentenv.controller.types import StepOutput
 from agentenv.envs.agemem import AGEMEM_PROMPT_MARKER, AgeMemEnvClientAdapter
+from agentenv.envs.letta_code import LettaCodeEnvClientAdapter
+from agentenv.envs.mem0 import Mem0EnvClientAdapter
 from agentmemorygym_verl import env_client
 
 
@@ -99,6 +101,57 @@ class AgeMemEnvClientConstructionTests(unittest.TestCase):
             client = env_client.create_env_client(config("webshop", adapter=None))
         self.assertIsInstance(client, FakeClient)
         self.assertNotIsInstance(client, AgeMemEnvClientAdapter)
+
+    def test_mem0_and_letta_routes_use_their_task_neutral_adapters(self) -> None:
+        adapters = (
+            (
+                {
+                    "schema": "camg_mem0_route_v1",
+                    "name": "mem0",
+                    "config": {
+                        "runtime_root": "/tmp/camg-mem0-test",
+                        "llm_base_url": "http://127.0.0.1:65201/v1",
+                        "embedding_base_url": "http://127.0.0.1:65202/v1",
+                    },
+                },
+                Mem0EnvClientAdapter,
+            ),
+            (
+                {
+                    "schema": "camg_letta_code_route_v1",
+                    "name": "letta_code",
+                    "config": {"runtime_root": "/tmp/camg-letta-test"},
+                },
+                LettaCodeEnvClientAdapter,
+            ),
+        )
+        with patch.object(
+            env_client, "_client_classes", return_value={"webshop": FakeClient}
+        ):
+            for adapter, expected_type in adapters:
+                with self.subTest(expected_type=expected_type.__name__):
+                    client = env_client.create_env_client(
+                        config("webshop", adapter=adapter)
+                    )
+                    self.assertIsInstance(client, expected_type)
+                    client.close()
+
+    def test_mismatched_schema_name_pair_fails_closed(self) -> None:
+        with patch.object(
+            env_client, "_client_classes", return_value={"webshop": FakeClient}
+        ):
+            with self.assertRaisesRegex(ValueError, "schema/name pair"):
+                env_client.create_env_client(
+                    config(
+                        "webshop",
+                        adapter={
+                            "schema": "camg_mem0_route_v1",
+                            "name": "letta_code",
+                            "config": {},
+                        },
+                    )
+                )
+        self.assertTrue(FakeClient.instances[-1].closed)
 
     def test_swesmith_private_detail_token_binding_is_forwarded(self) -> None:
         value = config("swesmith", adapter=None)

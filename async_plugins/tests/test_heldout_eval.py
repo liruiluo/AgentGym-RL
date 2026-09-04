@@ -33,6 +33,7 @@ from agentmemorygym_verl.heldout_eval_contract import (
     verify_swesmith_formal_eval_authority,
 )
 from agentmemorygym_verl.heldout_eval import (
+    FROZEN_MODEL_MANIFEST_SCHEMA,
     MODEL_MANIFEST_SCHEMA,
     derive_eval_config,
     load_eval_plan,
@@ -1619,6 +1620,70 @@ trainer:
             (model_dir / "config.json").write_text('{"tampered":true}\n')
             with self.assertRaisesRegex(ValueError, "byte count mismatch|sha256 mismatch"):
                 load_eval_plan(**kwargs)
+
+    def test_frozen_qwen_mem0_and_letta_share_one_exact_model_publication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            kwargs, model_dir, model_manifest = self._plan_fixture(Path(directory))
+            frozen_revision = "9" * 40
+            files = [
+                {
+                    "path": path.name,
+                    "bytes": path.stat().st_size,
+                    "sha256": sha256_file(path),
+                }
+                for path in sorted(model_dir.iterdir())
+            ]
+            manifest_hash = _write_json(
+                model_manifest,
+                {
+                    "schema": FROZEN_MODEL_MANIFEST_SCHEMA,
+                    "checkpoint_step": 0,
+                    "training_run_id": "frozen-qwen35-4b",
+                    "model_id": "Qwen/Qwen3.5-4B",
+                    "source_revision": frozen_revision,
+                    "model_path": str(model_dir),
+                    "files": files,
+                },
+            )
+            frozen = {
+                **kwargs,
+                "expected_model_manifest_sha256": manifest_hash,
+                "training_run_id": "frozen-qwen35-4b",
+                "training_outer_commit": "",
+                "training_inner_commit": "",
+                "training_verl_commit": "",
+                "model_kind": "frozen_hf",
+                "checkpoint_step": 0,
+            }
+            identities = set()
+            for method_id in ("qwen35_4b", "mem0", "letta_code"):
+                with self.subTest(method_id=method_id):
+                    plan = load_eval_plan(**{**frozen, "method_id": method_id})
+                    contract = run_contract(plan, "a" * 64)
+                    self.assertEqual(contract["checkpoint_step"], 0)
+                    self.assertEqual(contract["model_kind"], "frozen_hf")
+                    self.assertEqual(contract["method_id"], method_id)
+                    self.assertEqual(contract["training_source_commits"], {})
+                    identities.add(
+                        (
+                            contract["model"]["manifest_sha256"],
+                            contract["model"]["source_revision"],
+                        )
+                    )
+            self.assertEqual(len(identities), 1)
+
+            with self.assertRaisesRegex(ValueError, "requires model_kind"):
+                load_eval_plan(
+                    **{
+                        **frozen,
+                        "method_id": "mem0",
+                        "model_kind": "merged_checkpoint",
+                        "checkpoint_step": 200,
+                    }
+                )
+            (model_dir / "config.json").write_text('{"tampered":true}\n')
+            with self.assertRaisesRegex(ValueError, "byte count mismatch|sha256 mismatch"):
+                load_eval_plan(**{**frozen, "method_id": "qwen35_4b"})
 
     def test_commit_interval_and_receipt_metric_tampering_fail_closed(self):
         with tempfile.TemporaryDirectory() as directory:
