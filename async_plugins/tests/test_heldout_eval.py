@@ -685,7 +685,7 @@ class TestHeldoutMaterialization(unittest.TestCase):
                 "initial_state_all_actions_are_compactions",
             )
 
-    def test_every_action_row_requires_exact_native_source_identity(self):
+    def test_every_action_row_binds_missing_and_rejects_drifted_source_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             rows, _, _, _ = _compose(Path(directory), counts=(1, 1, 1, 1))
             for source in rows:
@@ -702,10 +702,13 @@ class TestHeldoutMaterialization(unittest.TestCase):
 
                     missing = deepcopy(records)
                     missing[0]["env_info_after"].pop("episode_source_identity")
-                    with self.assertRaisesRegex(
-                        ValueError, "native source identity"
-                    ):
-                        _materialize_records(source, missing)
+                    normalized = _materialize_records(source, missing)
+                    self.assertEqual(
+                        normalized["action_rows"][0]["env_info_after"][
+                            "episode_source_identity"
+                        ],
+                        _episode_source_identity(source),
+                    )
 
                     drifted = deepcopy(records)
                     drifted[1]["env_info_after"]["episode_source_identity"][
@@ -715,6 +718,15 @@ class TestHeldoutMaterialization(unittest.TestCase):
                         ValueError, "native source identity drift"
                     ):
                         _materialize_records(source, drifted)
+
+                    raw_drifted = deepcopy(records)
+                    raw_drifted[0]["env_info_after"]["data_idx"] = (
+                        source["data_idx"] + 1
+                    )
+                    with self.assertRaisesRegex(
+                        ValueError, "native source identity hint drift"
+                    ):
+                        _materialize_records(source, raw_drifted)
 
     def test_horizon_native_source_identity_must_match_action_rows(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -728,6 +740,20 @@ class TestHeldoutMaterialization(unittest.TestCase):
             ]["instance_id"] = "wrong.issue"
             with self.assertRaisesRegex(ValueError, "native source identity drift"):
                 _materialize_records(source, [record])
+
+            missing = _action_row(
+                source, order=0, length=1, success=True, horizon=True
+            )
+            missing["horizon_finalization"]["env_info"].pop(
+                "episode_source_identity"
+            )
+            normalized = _materialize_records(source, [missing])
+            self.assertEqual(
+                normalized["action_rows"][0]["horizon_finalization"]["env_info"][
+                    "episode_source_identity"
+                ],
+                _episode_source_identity(source),
+            )
 
     def test_budget_terminal_requires_exact_shop_horizon(self):
         with tempfile.TemporaryDirectory() as directory:

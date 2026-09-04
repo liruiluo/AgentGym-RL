@@ -953,8 +953,90 @@ def _expected_native_source_identity(
     return identity
 
 
-def _verify_action_native_source_identity(
-    row: Mapping[str, Any],
+_RAW_NATIVE_IDENTITY_ALIASES = {
+    "webshop": {
+        "data_idx": ("data_idx",),
+        "scenario_id": ("scenario_id",),
+        "orbit_index": ("orbit_index",),
+    },
+    "swesmith": {
+        "data_idx": ("data_idx",),
+        "instance_id": ("instance_id",),
+        "base_repository": ("base_repository",),
+    },
+    "literesearcher": {
+        "data_idx": ("data_idx",),
+        "row_identity": ("row_identity",),
+        "source_pool_index": ("source_pool_index",),
+    },
+    "openmle_fast": {
+        "data_idx": ("data_idx",),
+        "task_id": ("task_id",),
+        "source_family": ("source_family",),
+        "manifest_role": ("manifest_role",),
+        "manifest_sha256": ("manifest_sha256", "task_manifest_sha256"),
+    },
+}
+_RAW_NATIVE_IDENTITY_NESTED_SCOPES = (
+    "source_identity",
+    "source_extra_info",
+    "build_info",
+    "execution",
+    "wrapper_evidence",
+)
+
+
+def _bind_env_info_native_source_identity(
+    env_info: Mapping[str, Any],
+    *,
+    expected: Mapping[str, Any],
+    episode_uid: str,
+    row_position: int,
+    location: str,
+) -> dict[str, Any]:
+    """Attach schedule identity after rejecting any conflicting native hints."""
+
+    normalized = deepcopy(dict(env_info))
+    route_id = str(expected["route_id"])
+    scopes: list[tuple[str, Mapping[str, Any]]] = [("", normalized)]
+    for scope_name in _RAW_NATIVE_IDENTITY_NESTED_SCOPES:
+        scope = normalized.get(scope_name)
+        if isinstance(scope, Mapping):
+            scopes.append((f"{scope_name}.", scope))
+    for expected_name, observed_names in _RAW_NATIVE_IDENTITY_ALIASES[route_id].items():
+        expected_value = expected[expected_name]
+        for prefix, scope in scopes:
+            for observed_name in observed_names:
+                if observed_name not in scope:
+                    continue
+                observed_value = scope[observed_name]
+                if (
+                    type(observed_value) is not type(expected_value)
+                    or observed_value != expected_value
+                ):
+                    raise ValueError(
+                        f"episode {episode_uid} row {row_position} {location} native "
+                        f"source identity hint drift at {prefix}{observed_name}"
+                    )
+
+    if "episode_source_identity" in normalized:
+        observed = normalized["episode_source_identity"]
+        if not isinstance(observed, Mapping):
+            raise ValueError(
+                f"episode {episode_uid} row {row_position} {location} has malformed "
+                "native source identity"
+            )
+        if dict(observed) != dict(expected):
+            raise ValueError(
+                f"episode {episode_uid} row {row_position} native source identity drift"
+            )
+    else:
+        normalized["episode_source_identity"] = deepcopy(dict(expected))
+    return normalized
+
+
+def _bind_action_native_source_identity(
+    row: dict[str, Any],
     *,
     expected: Mapping[str, Any],
     episode_uid: str,
@@ -965,15 +1047,13 @@ def _verify_action_native_source_identity(
         raise ValueError(
             f"episode {episode_uid} row {row_position} lacks native env_info"
         )
-    observed = env_info.get("episode_source_identity")
-    if not isinstance(observed, Mapping):
-        raise ValueError(
-            f"episode {episode_uid} row {row_position} lacks native source identity"
-        )
-    if dict(observed) != dict(expected):
-        raise ValueError(
-            f"episode {episode_uid} row {row_position} native source identity drift"
-        )
+    row["env_info_after"] = _bind_env_info_native_source_identity(
+        env_info,
+        expected=expected,
+        episode_uid=episode_uid,
+        row_position=row_position,
+        location="env_info_after",
+    )
     horizon = row.get("horizon_finalization")
     if isinstance(horizon, Mapping):
         horizon_env = horizon.get("env_info")
@@ -981,15 +1061,15 @@ def _verify_action_native_source_identity(
             raise ValueError(
                 f"episode {episode_uid} row {row_position} horizon lacks native env_info"
             )
-        horizon_identity = horizon_env.get("episode_source_identity")
-        if not isinstance(horizon_identity, Mapping):
-            raise ValueError(
-                f"episode {episode_uid} row {row_position} horizon lacks native source identity"
-            )
-        if dict(horizon_identity) != dict(expected):
-            raise ValueError(
-                f"episode {episode_uid} row {row_position} native source identity drift"
-            )
+        normalized_horizon = deepcopy(dict(horizon))
+        normalized_horizon["env_info"] = _bind_env_info_native_source_identity(
+            horizon_env,
+            expected=expected,
+            episode_uid=episode_uid,
+            row_position=row_position,
+            location="horizon_finalization.env_info",
+        )
+        row["horizon_finalization"] = normalized_horizon
 
 
 def _native_metric_evidence(
@@ -1144,7 +1224,7 @@ def _episode_record(
             raise ValueError(f"episode {uid} action-row identity drift")
         if row.get("trajectory_row_uid") != f"{uid}-row-{position}":
             raise ValueError(f"episode {uid} action-row UID drift at {position}")
-        _verify_action_native_source_identity(
+        _bind_action_native_source_identity(
             row,
             expected=verified_native_source_identity,
             episode_uid=uid,
