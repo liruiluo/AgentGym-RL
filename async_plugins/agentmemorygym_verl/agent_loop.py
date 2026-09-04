@@ -66,6 +66,51 @@ def _messages(value: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
     return normalized
 
 
+def _policy_tool_schemas(client: Any) -> list[dict[str, Any]] | None:
+    provider = getattr(client, "policy_tool_schemas", None)
+    if not callable(provider):
+        return None
+    raw_schemas = provider()
+    if raw_schemas is None:
+        return None
+    if isinstance(raw_schemas, (str, bytes)) or not isinstance(
+        raw_schemas, Sequence
+    ):
+        raise TypeError("AMG policy tool schemas must be a sequence of mappings")
+
+    schemas: list[dict[str, Any]] = []
+    names: set[str] = set()
+    for index, raw_schema in enumerate(raw_schemas):
+        if not isinstance(raw_schema, Mapping):
+            raise TypeError(f"AMG policy tool schema {index} is not a mapping")
+        schema = deepcopy(dict(raw_schema))
+        function = schema.get("function")
+        if schema.get("type") != "function" or not isinstance(function, Mapping):
+            raise ValueError(
+                f"AMG policy tool schema {index} is not an OpenAI function schema"
+            )
+        name = function.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"AMG policy tool schema {index} has no function name")
+        if name in names:
+            raise ValueError(f"AMG policy tool schema repeats function {name!r}")
+        names.add(name)
+        schemas.append(schema)
+    if not schemas:
+        raise ValueError("AMG policy tool schemas must not be empty")
+    return schemas
+
+
+def _tool_schema_digest(tools: Sequence[Mapping[str, Any]] | None) -> str:
+    payload = json.dumps(
+        list(tools or []),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _is_prefix(
     prefix: Sequence[Mapping[str, str]], values: Sequence[Mapping[str, str]]
 ) -> bool:
@@ -174,14 +219,18 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
         self._route_registry = route_registry_from_agentgym_config(
             self.agentgym_config
         )
-        self._envelope_tokens: int | None = None
+        self._envelope_tokens_by_tool_schema: dict[str, int] = {}
 
-    def _render_prompt_sync(self, messages: list[dict[str, str]]) -> list[int]:
+    def _render_prompt_sync(
+        self,
+        messages: list[dict[str, str]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> list[int]:
         # Latest veRL always routes AgentLoop tokenization through its native
         # Continuous Token builder. Qwen3.5 selection is inferred from the
         # root Hugging Face model_type by AgentLoopWorker.
         return normalize_token_ids(
-            self.continuous_token_builder.build_initial_tokens(messages)
+            self.continuous_token_builder.build_initial_tokens(messages, tools=tools)
         )
 
     def _prompt_for_candidate(
@@ -189,6 +238,7 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
         current_messages: list[dict[str, str]],
         current_prompt_ids: list[int],
         candidate_messages: Sequence[Mapping[str, str]],
+        tools: list[dict[str, Any]] | None = None,
     ) -> list[int]:
         candidate = [dict(message) for message in candidate_messages]
         if candidate == current_messages:
@@ -198,7 +248,7 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
         # generation, so it is not an append to the runtime token stream.  Render
         # that candidate as a fresh prompt; Continuous Token remains responsible
         # for the ordinary sampled-assistant -> observation append below.
-        return self._render_prompt_sync(candidate)
+        return self._render_prompt_sync(candidate, tools=tools)
 
     def _next_prompt_ids(
         self,
@@ -208,6 +258,7 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
         action: str,
         action_token_ids: list[int],
         next_messages: list[dict[str, str]],
+        tools: list[dict[str, Any]] | None = None,
     ) -> list[int]:
         assistant_messages = prepared_messages + [
             {"role": "assistant", "content": action}
@@ -227,30 +278,37 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                         assistant_messages,
                         next_messages,
                         assistant_runtime,
+                        tools=tools,
                     ).token_ids
                 )
                 return next_prompt
 
         # replace_messages and preserve-without-observation deliberately rebuild
         # through upstream Continuous Token rather than inventing a second merge API.
-        return self._render_prompt_sync(next_messages)
+        return self._render_prompt_sync(next_messages, tools=tools)
 
     def _action_observation_envelope_tokens(
-        self, messages: list[dict[str, str]], prompt_ids: list[int]
+        self,
+        messages: list[dict[str, str]],
+        prompt_ids: list[int],
+        tools: list[dict[str, Any]] | None = None,
     ) -> int:
-        if self._envelope_tokens is None:
+        schema_digest = _tool_schema_digest(tools)
+        envelope_tokens = self._envelope_tokens_by_tool_schema.get(schema_digest)
+        if envelope_tokens is None:
             empty_transition = messages + [
                 {"role": "assistant", "content": ""},
                 {"role": "user", "content": ""},
             ]
-            self._envelope_tokens = len(
-                self._render_prompt_sync(empty_transition)
+            envelope_tokens = len(
+                self._render_prompt_sync(empty_transition, tools=tools)
             ) - len(prompt_ids)
-            if self._envelope_tokens < 0:
+            if envelope_tokens < 0:
                 raise RuntimeError(
                     "AMG chat template shortened across an empty action/observation turn"
                 )
-        return self._envelope_tokens
+            self._envelope_tokens_by_tool_schema[schema_digest] = envelope_tokens
+        return envelope_tokens
 
     @staticmethod
     def _resolve_data_idx(kwargs: Mapping[str, Any]) -> int:
@@ -377,11 +435,14 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
         rows: list[dict[str, Any]] = []
         try:
             client.reset(data_idx)
+            policy_tools = _policy_tool_schemas(client)
             initial_messages = raw_prompt + [
                 {"role": "user", "content": str(client.observe())}
             ]
             current_messages = bind_initial_policy_context(client, initial_messages)
-            current_prompt_ids = self._render_prompt_sync(current_messages)
+            current_prompt_ids = self._render_prompt_sync(
+                current_messages, tools=policy_tools
+            )
 
             for row_order in range(route.max_rounds):
                 if len(current_prompt_ids) > max_prompt_tokens:
@@ -395,19 +456,31 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                     client,
                     current_messages,
                     count_prompt_tokens=lambda candidate, messages=current_messages, prompt_ids=current_prompt_ids: (
-                        len(self._prompt_for_candidate(messages, prompt_ids, candidate))
+                        len(
+                            self._prompt_for_candidate(
+                                messages,
+                                prompt_ids,
+                                candidate,
+                                tools=policy_tools,
+                            )
+                        )
                     ),
                     max_prompt_tokens=max_prompt_tokens,
                     max_model_tokens=max_model_tokens,
                     max_response_tokens=response_budget,
                     max_observation_tokens=route.max_observation_tokens,
                     action_observation_envelope_tokens=self._action_observation_envelope_tokens(
-                        current_messages, current_prompt_ids
+                        current_messages,
+                        current_prompt_ids,
+                        tools=policy_tools,
                     ),
                 )
                 prepared_messages = [dict(message) for message in prepared.messages]
                 prompt_ids = self._prompt_for_candidate(
-                    current_messages, current_prompt_ids, prepared_messages
+                    current_messages,
+                    current_prompt_ids,
+                    prepared_messages,
+                    tools=policy_tools,
                 )
                 if len(prompt_ids) != prepared.prompt_token_count:
                     raise RuntimeError(
@@ -569,6 +642,7 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                     action=action,
                     action_token_ids=response_ids,
                     next_messages=next_messages,
+                    tools=policy_tools,
                 )
                 current_messages = next_messages
 

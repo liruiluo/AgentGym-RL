@@ -4,6 +4,7 @@ import ast
 import inspect
 import json
 import unittest
+from copy import deepcopy
 from dataclasses import dataclass
 from types import MappingProxyType, SimpleNamespace
 from unittest import IsolatedAsyncioTestCase, mock
@@ -27,7 +28,9 @@ class _MergeResult:
 class _RecordingContinuousBuilder:
     def __init__(self):
         self.initial_calls = []
+        self.initial_tool_calls = []
         self.non_assistant_calls = []
+        self.non_assistant_tool_calls = []
         self.assistant_calls = []
 
     @staticmethod
@@ -37,12 +40,14 @@ class _RecordingContinuousBuilder:
         )
         return [ord(char) for char in payload] + [999]
 
-    def build_initial_tokens(self, messages):
+    def build_initial_tokens(self, messages, *, tools=None):
         self.initial_calls.append([dict(message) for message in messages])
+        self.initial_tool_calls.append(deepcopy(tools))
         return self._render(messages)
 
-    def merge_non_assistant_tokens(self, previous, updated, runtime):
+    def merge_non_assistant_tokens(self, previous, updated, runtime, *, tools=None):
         self.non_assistant_calls.append((previous, updated, runtime))
+        self.non_assistant_tool_calls.append(deepcopy(tools))
         return _MergeResult(self._render(updated))
 
     def merge_assistant_tokens(self, runtime, assistant):
@@ -53,8 +58,9 @@ class _RecordingContinuousBuilder:
 class _HistoryNormalizingContinuousBuilder(_RecordingContinuousBuilder):
     """Mimic Qwen3.5 dropping generation-only thinking markers on rerender."""
 
-    def build_initial_tokens(self, messages):
+    def build_initial_tokens(self, messages, *, tools=None):
         self.initial_calls.append([dict(message) for message in messages])
+        self.initial_tool_calls.append(deepcopy(tools))
         if any(message["role"] == "assistant" for message in messages):
             return [700, 701]
         return [700, 702]
@@ -63,8 +69,9 @@ class _HistoryNormalizingContinuousBuilder(_RecordingContinuousBuilder):
         self.assistant_calls.append((list(runtime), list(assistant)))
         return _MergeResult(list(runtime) + list(assistant))
 
-    def merge_non_assistant_tokens(self, previous, updated, runtime):
+    def merge_non_assistant_tokens(self, previous, updated, runtime, *, tools=None):
         self.non_assistant_calls.append((previous, updated, runtime))
+        self.non_assistant_tool_calls.append(deepcopy(tools))
         return _MergeResult(list(runtime) + [703])
 
 
@@ -113,6 +120,21 @@ class _MemoryChainClient:
 
     def reset(self, data_idx):
         self.data_idx = data_idx
+
+    def policy_tool_schemas(self):
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "task_action",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                        "required": ["value"],
+                    },
+                },
+            }
+        ]
 
     def observe(self):
         return "Task: persist a value across compaction, revise it, and execute it."
@@ -341,24 +363,30 @@ class TestPromptRendering(unittest.TestCase):
         loop.continuous_token_builder = _RecordingContinuousBuilder()
         loop.tokenizer = object()
         loop.apply_chat_template_kwargs = {}
+        loop._envelope_tokens_by_tool_schema = {}
         return loop
 
     def test_control_candidate_is_full_rendered_before_any_assistant_generation(self):
         loop = self._loop()
+        tools = [{"type": "function", "function": {"name": "act"}}]
         current = [{"role": "user", "content": "task"}]
-        current_ids = loop._render_prompt_sync(current)
+        current_ids = loop._render_prompt_sync(current, tools=tools)
         candidate = current + [{"role": "user", "content": "compact now"}]
 
-        actual = loop._prompt_for_candidate(current, current_ids, candidate)
+        actual = loop._prompt_for_candidate(
+            current, current_ids, candidate, tools=tools
+        )
 
         self.assertEqual(actual, loop.continuous_token_builder._render(candidate))
         self.assertEqual(loop.continuous_token_builder.non_assistant_calls, [])
         self.assertEqual(loop.continuous_token_builder.initial_calls[-1], candidate)
+        self.assertEqual(loop.continuous_token_builder.initial_tool_calls, [tools, tools])
 
     def test_append_after_sampled_assistant_uses_upstream_continuous_token_merge(self):
         loop = self._loop()
+        tools = [{"type": "function", "function": {"name": "act"}}]
         prepared = [{"role": "user", "content": "task"}]
-        prompt_ids = loop._render_prompt_sync(prepared)
+        prompt_ids = loop._render_prompt_sync(prepared, tools=tools)
         action_ids = [11, 12]
         next_messages = prepared + [
             {"role": "assistant", "content": "act"},
@@ -371,17 +399,20 @@ class TestPromptRendering(unittest.TestCase):
             action="act",
             action_token_ids=action_ids,
             next_messages=next_messages,
+            tools=tools,
         )
 
         self.assertEqual(actual, loop.continuous_token_builder._render(next_messages))
         self.assertEqual(len(loop.continuous_token_builder.assistant_calls), 1)
         self.assertEqual(len(loop.continuous_token_builder.non_assistant_calls), 1)
+        self.assertEqual(loop.continuous_token_builder.non_assistant_tool_calls, [tools])
 
     def test_append_keeps_continuous_runtime_for_history_normalizing_template(self):
         loop = self._loop()
         loop.continuous_token_builder = _HistoryNormalizingContinuousBuilder()
+        tools = [{"type": "function", "function": {"name": "act"}}]
         prepared = [{"role": "user", "content": "task"}]
-        prompt_ids = loop._render_prompt_sync(prepared)
+        prompt_ids = loop._render_prompt_sync(prepared, tools=tools)
         next_messages = prepared + [
             {"role": "assistant", "content": "act"},
             {"role": "user", "content": "observation"},
@@ -393,16 +424,20 @@ class TestPromptRendering(unittest.TestCase):
             action="act",
             action_token_ids=[11, 12],
             next_messages=next_messages,
+            tools=tools,
         )
 
         self.assertEqual(actual, prompt_ids + [11, 12, 703])
         self.assertNotEqual(actual, [700, 701])
         self.assertEqual(loop.continuous_token_builder.initial_calls, [prepared])
+        self.assertEqual(loop.continuous_token_builder.initial_tool_calls, [tools])
+        self.assertEqual(loop.continuous_token_builder.non_assistant_tool_calls, [tools])
 
     def test_replace_messages_forces_full_rebuild(self):
         loop = self._loop()
+        tools = [{"type": "function", "function": {"name": "act"}}]
         prepared = [{"role": "user", "content": "long context"}]
-        prompt_ids = loop._render_prompt_sync(prepared)
+        prompt_ids = loop._render_prompt_sync(prepared, tools=tools)
         replacement = [
             {"role": "system", "content": "system"},
             {"role": "user", "content": "compacted"},
@@ -414,11 +449,30 @@ class TestPromptRendering(unittest.TestCase):
             action="compact summary",
             action_token_ids=[15],
             next_messages=replacement,
+            tools=tools,
         )
 
         self.assertEqual(actual, loop.continuous_token_builder._render(replacement))
         self.assertEqual(loop.continuous_token_builder.assistant_calls, [])
         self.assertEqual(loop.continuous_token_builder.non_assistant_calls, [])
+        self.assertEqual(loop.continuous_token_builder.initial_tool_calls, [tools, tools])
+
+    def test_envelope_cache_is_isolated_by_tool_schema(self):
+        loop = self._loop()
+        messages = [{"role": "user", "content": "task"}]
+        first = [{"type": "function", "function": {"name": "first"}}]
+        second = [{"type": "function", "function": {"name": "second"}}]
+        first_ids = loop._render_prompt_sync(messages, tools=first)
+        second_ids = loop._render_prompt_sync(messages, tools=second)
+
+        loop._action_observation_envelope_tokens(messages, first_ids, tools=first)
+        loop._action_observation_envelope_tokens(messages, second_ids, tools=second)
+
+        self.assertEqual(len(loop._envelope_tokens_by_tool_schema), 2)
+        self.assertEqual(
+            loop.continuous_token_builder.initial_tool_calls,
+            [first, second, first, second],
+        )
 
 
 class TestAMGAgentLoop(IsolatedAsyncioTestCase):
@@ -462,11 +516,11 @@ class TestAMGAgentLoop(IsolatedAsyncioTestCase):
                 ),
             )
         )
-        loop._envelope_tokens = 1
+        loop._envelope_tokens_by_tool_schema = {}
         loop.rollout_config = SimpleNamespace(
             response_length=8,
-            prompt_length=512,
-            max_model_len=520,
+            prompt_length=4096,
+            max_model_len=4104,
             calculate_log_probs=True,
         )
         loop.server_manager = _Server(actions)
@@ -474,8 +528,11 @@ class TestAMGAgentLoop(IsolatedAsyncioTestCase):
             {(100 + index,): action for index, action in enumerate(actions)}
         )
         loop.continuous_token_builder = _RecordingContinuousBuilder()
-        loop._render_prompt_sync = lambda messages: [
-            1 + index for index, _ in enumerate(json.dumps(messages, sort_keys=True))
+        loop._render_prompt_sync = lambda messages, tools=None: [
+            1 + index
+            for index, _ in enumerate(
+                json.dumps({"messages": messages, "tools": tools}, sort_keys=True)
+            )
         ]
         return loop
 
