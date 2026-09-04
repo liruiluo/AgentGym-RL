@@ -731,6 +731,9 @@ heldout_assert_asset_env FIXTURE 'fixture asset'
             '"missing SWE-smith OCI rootfs preparer: $PREPARE_ROOTFS"',
             source,
         )
+        self.assertNotIn("mapfile -d", source)
+        self.assertIn("while IFS= read -r -d '' image_binding_arg; do", source)
+        self.assertIn('image_binding_args+=("$image_binding_arg")', source)
 
     def test_swesmith_uses_formal_eval_subset_and_run_scoped_rootfs(self):
         source = (LAUNCHER_ROOT / "swesmith.sh").read_text()
