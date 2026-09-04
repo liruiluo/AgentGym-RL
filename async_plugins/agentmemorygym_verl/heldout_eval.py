@@ -32,6 +32,7 @@ from .heldout_eval_contract import (
     materialize_generated_batch,
     pad_batch_rows,
     read_json,
+    read_jsonl,
     require_positive_int,
     require_regular_file,
     require_sha256,
@@ -187,11 +188,24 @@ def _schedule_counts_and_coding_authority(
         coding_source.get("selection_authority"),
         field="SWE-smith formal Eval authority",
     )
+    coding_schedule = _absolute_regular(
+        coding_source.get("path"), field="held-out SWE-smith source schedule"
+    )
+    coding_schedule_hash = require_sha256(
+        coding_source.get("schedule_sha256"),
+        field="held-out SWE-smith source schedule expected sha256",
+    )
+    if sha256_file(coding_schedule) != coding_schedule_hash:
+        raise ValueError("held-out SWE-smith source schedule sha256 mismatch")
+    selected_coding_rows = tuple(read_jsonl(coding_schedule))
+    if len(selected_coding_rows) != route_counts["swesmith"]:
+        raise ValueError("held-out SWE-smith source schedule row count drift")
     verified = verify_swesmith_formal_eval_authority(
         authority.get("path"),
         expected_sha256=authority.get("sha256"),
-        expected_routing_sha256=coding_source.get("schedule_sha256"),
+        expected_routing_sha256=coding_schedule_hash,
         expected_admitted_task_count=route_counts["swesmith"],
+        selected_rows=selected_coding_rows,
     )
     if authority != verified:
         raise ValueError("SWE-smith formal Eval authority summary drift")

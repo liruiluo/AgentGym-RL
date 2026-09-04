@@ -1280,7 +1280,9 @@ class TestHeldoutRunnerPlan(unittest.TestCase):
                 schedule_position=7,
             )
 
-    def _plan_fixture(self, root: Path):
+    def _plan_fixture(
+        self, root: Path, *, coding_panel_count: int | None = None
+    ):
         registry = root / "route-registry.json"
         registry_hash = _write_json(
             registry,
@@ -1310,6 +1312,36 @@ class TestHeldoutRunnerPlan(unittest.TestCase):
             counts=tuple(TEST_ROUTE_COUNTS[route] for route in CANONICAL_ROUTES),
             route_registry_sha256=registry_hash,
         )
+        expected_route_counts = dict(TEST_ROUTE_COUNTS)
+        if coding_panel_count is not None:
+            if not 0 < coding_panel_count < TEST_ROUTE_COUNTS["swesmith"]:
+                raise ValueError("coding_panel_count must define a strict subset")
+            spec_payload = json.loads(spec.read_text())
+            coding = next(
+                route
+                for route in spec_payload["routes"]
+                if route["route_id"] == "swesmith"
+            )
+            full_path = spec.parent / coding["schedule"]
+            full_rows = [
+                json.loads(line) for line in full_path.read_text().splitlines()
+            ]
+            selected_path = spec.parent / "swesmith-final-panel.jsonl"
+            coding["schedule"] = selected_path.name
+            coding["expected_rows"] = coding_panel_count
+            coding["schedule_sha256"] = _write_jsonl(
+                selected_path, full_rows[:coding_panel_count]
+            )
+            split_path = spec.parent / spec_payload["complete_split_contract"]
+            split_payload = json.loads(split_path.read_text())
+            split_payload["environments"]["coding"][
+                "formal_eval_tasks"
+            ] = coding_panel_count
+            spec_payload["complete_split_contract_sha256"] = _write_json(
+                split_path, split_payload
+            )
+            spec_hash = _write_json(spec, spec_payload)
+            expected_route_counts["swesmith"] = coding_panel_count
         schedule = root / "heldout.jsonl"
         schedule_manifest = root / "heldout-manifest.json"
         schedule_report = compose_heldout_schedule(
@@ -1318,7 +1350,9 @@ class TestHeldoutRunnerPlan(unittest.TestCase):
             output_path=schedule,
             manifest_path=schedule_manifest,
         )
-        self.assertEqual(schedule_report["row_count"], TEST_EPISODE_COUNT)
+        self.assertEqual(
+            schedule_report["row_count"], sum(expected_route_counts.values())
+        )
 
         loop_config = root / "agent-loop.yaml"
         loop_config.write_text("- name: amg_task_neutral_async\n", encoding="utf-8")
@@ -1481,6 +1515,18 @@ trainer:
             self.assertEqual(contract["evaluator_source_commits"]["inner"], "5" * 40)
             self.assertEqual(contract["route_registry"]["max_rounds"], ROUTE_MAX_ROUNDS)
             self.assertFalse(contract["runner"]["generic_action_outcome_used"])
+
+    def test_plan_accepts_pre_registered_coding_subset_of_formal_pool(self):
+        with tempfile.TemporaryDirectory() as directory:
+            kwargs, _, _ = self._plan_fixture(
+                Path(directory), coding_panel_count=7
+            )
+            plan = load_eval_plan(**kwargs)
+            self.assertEqual(plan.route_counts["swesmith"], 7)
+            authority = plan.swesmith_formal_eval_authority
+            self.assertEqual(authority["formal_eval_task_count"], 23)
+            self.assertEqual(authority["scheduled_task_count"], 7)
+            self.assertTrue(authority["scheduled_subset_of_formal_eval"])
 
     def test_plan_rejects_early_checkpoint_and_model_payload_tamper(self):
         with tempfile.TemporaryDirectory() as directory:
