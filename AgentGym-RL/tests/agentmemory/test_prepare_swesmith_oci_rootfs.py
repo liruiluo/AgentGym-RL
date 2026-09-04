@@ -2,6 +2,8 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import os
+import stat
 import sys
 import tarfile
 import tempfile
@@ -31,6 +33,7 @@ class PrepareSwesmithOciRootfsTest(unittest.TestCase):
     def test_rootfs_contract_does_not_require_one_python_layout(self):
         with tempfile.TemporaryDirectory() as raw:
             rootfs = Path(raw)
+            rootfs.chmod(0o755)
             for relative in ("testbed", "tmp", "var/tmp", "dev", "proc", "run"):
                 (rootfs / relative).mkdir(parents=True, exist_ok=True)
             for relative in (
@@ -46,6 +49,19 @@ class PrepareSwesmithOciRootfsTest(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b"executable")
             self.assertEqual(MODULE._require_rootfs_contract(rootfs), rootfs / "bin/bash")
+
+    def test_normalizes_rootfs_top_mode_after_restrictive_umask(self):
+        with tempfile.TemporaryDirectory() as raw:
+            old_umask = os.umask(0o077)
+            try:
+                rootfs = Path(raw) / "rootfs"
+                rootfs.mkdir(mode=0o755)
+            finally:
+                os.umask(old_umask)
+
+            self.assertEqual(stat.S_IMODE(rootfs.stat().st_mode), 0o700)
+            MODULE._make_rootfs_traversable(rootfs)
+            self.assertEqual(stat.S_IMODE(rootfs.stat().st_mode), 0o755)
 
     def test_parses_binding_and_builds_profile_manifest(self):
         first = MODULE.parse_binding(

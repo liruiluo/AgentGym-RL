@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import tarfile
 import tempfile
@@ -435,7 +436,26 @@ def _measure_rootfs(rootfs: Path) -> tuple[int, int]:
     return total_bytes, regular_files
 
 
+def _require_rootfs_traversable(rootfs: Path) -> None:
+    if not rootfs.is_dir() or rootfs.is_symlink():
+        raise RuntimeError(f"OCI rootfs is not a secure directory: {rootfs}")
+    if stat.S_IMODE(rootfs.stat().st_mode) & 0o555 != 0o555:
+        raise RuntimeError(
+            "OCI rootfs top directory must be traversable by the unprivileged policy"
+        )
+
+
+def _make_rootfs_traversable(rootfs: Path) -> None:
+    # The sealed eval launcher intentionally runs with umask 077.  mkdir(0755)
+    # is therefore insufficient, and OCI extraction may also restore a root
+    # directory mode from the image.  Normalize only the chroot top directory;
+    # the containing cache remains private and image-internal modes stay intact.
+    os.chmod(rootfs, 0o755)
+    _require_rootfs_traversable(rootfs)
+
+
 def _require_rootfs_contract(rootfs: Path) -> Path:
+    _require_rootfs_traversable(rootfs)
     for relative in (
         "testbed",
         "tmp",
@@ -610,6 +630,7 @@ def _materialize_one(
     if offline_image_asset is None:
         image_tarball.unlink(missing_ok=True)
 
+    _make_rootfs_traversable(rootfs)
     bash = _require_rootfs_contract(rootfs)
     rootfs_bytes, regular_files = _measure_rootfs(rootfs)
     crane_version = _run_bytes([str(crane), "version"], environment=environment).decode(
