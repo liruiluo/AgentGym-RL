@@ -1090,6 +1090,25 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
         finally:
             listener.close()
 
+    def test_port_probe_allows_recently_closed_endpoint_connections(self) -> None:
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        client = socket.create_connection(("127.0.0.1", port))
+        accepted, _ = listener.accept()
+        listener.close()
+        accepted.shutdown(socket.SHUT_WR)
+        self.assertEqual(client.recv(1), b"")
+        client.close()
+        accepted.close()
+
+        spec = EndpointLaunchSpec.for_test(
+            route_id="webshop", endpoint=f"http://127.0.0.1:{port}"
+        )
+        assert_ports_available((spec,))
+
     def test_partial_endpoint_startup_rolls_back_exact_started_leases(self) -> None:
         specs = tuple(
             EndpointLaunchSpec.for_test(

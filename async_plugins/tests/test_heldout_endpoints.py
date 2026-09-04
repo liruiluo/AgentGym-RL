@@ -720,6 +720,14 @@ heldout_assert_asset_env FIXTURE "fixture asset"
         self.assertIn("CAMG_HELDOUT_ASSET_ADMITTED_POOL_MANIFEST_PATH", source)
         self.assertIn("CAMG_HELDOUT_ASSET_EXTENSION_POOL_MANIFEST_PATH", source)
         self.assertIn("prepare_swesmith_oci_rootfs.py", source)
+        self.assertIn(
+            "PREPARE_ROOTFS=$SOURCE_ROOT/scripts/agentmemory/prepare_swesmith_oci_rootfs.py",
+            source,
+        )
+        self.assertNotIn(
+            "PREPARE_ROOTFS=$SOURCE_OUTER/scripts/agentmemory/prepare_swesmith_oci_rootfs.py",
+            source,
+        )
         self.assertIn("mirror-bundles-manifest", source)
         self.assertIn("SWESMITH_DETAIL_TOKEN", source)
         self.assertNotIn("full-pool-formal100", source)

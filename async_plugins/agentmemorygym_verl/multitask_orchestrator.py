@@ -1122,6 +1122,12 @@ def assert_ports_available(specs: Sequence[EndpointLaunchSpec]) -> None:
             family = socket.AF_INET6 if host == "::1" else socket.AF_INET
             probe = socket.socket(family, socket.SOCK_STREAM)
             try:
+                # Endpoint health checks create short-lived TCP connections.
+                # Reusing an endpoint immediately after exact process cleanup
+                # must not be rejected solely because the old connection is in
+                # TIME_WAIT; an active listener still fails this bind unless it
+                # also opted into SO_REUSEPORT.
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 probe.bind((_bindable_host(host), port))
             except OSError as exc:
                 probe.close()
