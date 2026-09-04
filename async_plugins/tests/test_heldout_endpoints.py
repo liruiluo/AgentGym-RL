@@ -665,9 +665,12 @@ heldout_assert_asset_env FIXTURE "fixture asset"
                 for stale in (
                     "$CAMG_HELDOUT_SOURCE_OUTER_ROOT/AgentGym-RL",
                     "$OUTER_SOURCE_ROOT/AgentGym-RL",
-                    "$SOURCE_OUTER/AgentGym-RL",
                 ):
                     self.assertNotIn(stale, source)
+                self.assertNotIn(
+                    "SOURCE_OUTER=$CAMG_HELDOUT_SOURCE_OUTER_ROOT/AgentGym-RL",
+                    source,
+                )
 
     def test_each_route_uses_verified_heldout_contract(self):
         for route_id in ROUTES:
@@ -721,12 +724,23 @@ heldout_assert_asset_env FIXTURE "fixture asset"
         self.assertIn("CAMG_HELDOUT_ASSET_EXTENSION_POOL_MANIFEST_PATH", source)
         self.assertIn("prepare_swesmith_oci_rootfs.py", source)
         self.assertIn(
-            "PREPARE_ROOTFS=$SOURCE_ROOT/scripts/agentmemory/prepare_swesmith_oci_rootfs.py",
+            "PREPARE_ROOTFS=$SOURCE_OUTER/AgentGym-RL/scripts/agentmemory/prepare_swesmith_oci_rootfs.py",
             source,
         )
         self.assertNotIn(
             "PREPARE_ROOTFS=$SOURCE_OUTER/scripts/agentmemory/prepare_swesmith_oci_rootfs.py",
             source,
+        )
+        self.assertNotIn(
+            "PREPARE_ROOTFS=$SOURCE_ROOT/scripts/agentmemory/prepare_swesmith_oci_rootfs.py",
+            source,
+        )
+        project_root = LAUNCHER_ROOT.parents[2]
+        self.assertTrue(
+            (
+                project_root
+                / "AgentGym-RL/scripts/agentmemory/prepare_swesmith_oci_rootfs.py"
+            ).is_file()
         )
         self.assertIn("mirror-bundles-manifest", source)
         self.assertIn("SWESMITH_DETAIL_TOKEN", source)
