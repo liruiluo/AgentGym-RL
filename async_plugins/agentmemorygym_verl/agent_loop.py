@@ -138,6 +138,29 @@ def _receipt_parts(
     )
 
 
+def _bind_episode_source_identity(
+    client: Any,
+    env_info: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Carry reset-attested source identity on every task-neutral action row."""
+
+    canonical = deepcopy(dict(env_info))
+    source_identity = getattr(client, "episode_source_identity", None)
+    if source_identity is None:
+        return canonical
+    if not isinstance(source_identity, Mapping):
+        raise TypeError("AMG client episode_source_identity must be a mapping")
+    expected = deepcopy(dict(source_identity))
+    observed = canonical.get("episode_source_identity")
+    if observed is not None:
+        if not isinstance(observed, Mapping) or dict(observed) != expected:
+            raise RuntimeError(
+                "AMG action receipt episode_source_identity drifted from reset"
+            )
+    canonical["episode_source_identity"] = expected
+    return canonical
+
+
 def _outcome(
     *,
     done: bool,
@@ -464,6 +487,7 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                 env_info, action_submission, receipt = _receipt_parts(
                     step_output, action
                 )
+                env_info = _bind_episode_source_identity(client, env_info)
                 context_transition = receipt["context_transition"]
                 wrapper_evidence = receipt["wrapper_evidence"]
 
@@ -594,6 +618,9 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                     horizon_reward = float(horizon_output.reward)
                     horizon_env_info, horizon_action_submission, horizon_receipt = (
                         _receipt_parts(horizon_output, "")
+                    )
+                    horizon_env_info = _bind_episode_source_identity(
+                        client, horizon_env_info
                     )
                     horizon_context_transition = horizon_receipt["context_transition"]
                     horizon_wrapper_evidence = horizon_receipt["wrapper_evidence"]

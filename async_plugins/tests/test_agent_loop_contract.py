@@ -270,6 +270,30 @@ class _SuccessfulClient(_MemoryChainClient):
         )
 
 
+class _MissingIdentityReceiptClient(_MemoryChainClient):
+    """Model an invalid native action whose endpoint receipt omits reset identity."""
+
+    def reset(self, data_idx):
+        super().reset(data_idx)
+        self.episode_source_identity = {
+            "schema": "camg_native_episode_source_identity_v1",
+            "route_id": "fixture",
+            "data_idx": data_idx,
+            "source_key": f"heldout-{data_idx}",
+        }
+
+    def step(self, action):
+        self.actions.append(action)
+        return StepOutput(
+            state="Invalid Action.",
+            reward=0.0,
+            done=False,
+            info=build_task_neutral_transition_info(
+                env_info={"parser_status": "invalid"}
+            ),
+        )
+
+
 class _HorizonClient(_MemoryChainClient):
     def step(self, action):
         self.actions.append(action)
@@ -552,6 +576,76 @@ class TestAMGAgentLoop(IsolatedAsyncioTestCase):
                 record = json.loads(outputs[0].extra_fields["step_record_json"])
                 self.assertEqual(record["route_id"], route.route_id)
                 self.assertEqual(record["data_source"], route.route_id)
+
+    async def test_invalid_native_action_keeps_reset_source_identity_on_every_route(
+        self,
+    ):
+        route_specs = tuple(
+            RouteSpec(
+                route_id=route_id,
+                max_rounds=1,
+                max_observation_tokens=32,
+                policy_framing_sha256=None,
+                route_attestation_sha256=None,
+                client_config=MappingProxyType(
+                    {
+                        "task_name": "agentmemory",
+                        "env_addr": f"http://127.0.0.1:{65420 + index}",
+                        "max_retries": 0,
+                    }
+                ),
+            )
+            for index, route_id in enumerate(("fixture-a", "fixture-b"))
+        )
+        registry = self._registry(*route_specs)
+
+        for index, route in enumerate(route_specs):
+            with self.subTest(route_id=route.route_id):
+                client = _MissingIdentityReceiptClient()
+                loop = self._loop(
+                    [f"INVALID {route.route_id}"],
+                    max_turns=1,
+                    registry=registry,
+                )
+                with mock.patch.object(
+                    agent_loop_module,
+                    "create_env_client",
+                    return_value=client,
+                ):
+                    outputs = await loop.run(
+                        {"max_tokens": 8},
+                        item_id=f"task-{route.route_id}",
+                        data_idx=index + 7,
+                        uid=f"trajectory-{route.route_id}",
+                        route_id=route.route_id,
+                        raw_prompt=[{"role": "system", "content": "system"}],
+                    )
+
+                record = json.loads(outputs[0].extra_fields["step_record_json"])
+                self.assertEqual(
+                    record["env_info_after"]["episode_source_identity"],
+                    client.episode_source_identity,
+                )
+
+    def test_source_identity_drift_fails_closed(self):
+        client = SimpleNamespace(
+            episode_source_identity={
+                "schema": "camg_native_episode_source_identity_v1",
+                "route_id": "fixture",
+                "data_idx": 3,
+            }
+        )
+        with self.assertRaisesRegex(RuntimeError, "drifted from reset"):
+            agent_loop_module._bind_episode_source_identity(
+                client,
+                {
+                    "episode_source_identity": {
+                        "schema": "camg_native_episode_source_identity_v1",
+                        "route_id": "fixture",
+                        "data_idx": 4,
+                    }
+                },
+            )
 
     async def test_route_local_horizon_and_observation_budget_are_used(self):
         route = RouteSpec(
