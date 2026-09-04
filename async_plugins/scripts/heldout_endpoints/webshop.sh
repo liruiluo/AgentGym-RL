@@ -92,7 +92,12 @@ generator_seed = int(provider.get("generator_seed", -1))
 start_orbit = int(provider.get("global_orbit_index_start_inclusive", -1))
 end_orbit = int(provider.get("global_orbit_index_end_exclusive", -1))
 provider_split = str(provider.get("split", ""))
-if provider_task_count <= 0 or provider_task_count != end_orbit * 2:
+provider_capacity = (end_orbit - start_orbit) * 2
+if (
+    provider_task_count <= 0
+    or end_orbit <= start_orbit
+    or provider_task_count > provider_capacity
+):
     raise SystemExit("Shop provider task count/window mismatch")
 if generator_seed != 233 or start_orbit != 0 or provider_split != "dev":
     raise SystemExit("Shop held-out generator contract drifted")

@@ -685,6 +685,34 @@ heldout_assert_asset_env FIXTURE 'fixture asset'
         for stale in ("--procedural-task-count 6400", "reseeded_stream", "--split train"):
             self.assertNotIn(stale, source)
 
+    def test_shop_allows_sparse_provider_rows_within_fixed_orbit_window(self):
+        source = (LAUNCHER_ROOT / "webshop.sh").read_text()
+        self.assertIn(
+            "provider_task_count > provider_capacity", source
+        )
+        self.assertNotIn(
+            "provider_task_count != end_orbit * 2", source
+        )
+
+    def test_openmle_child_environment_drops_ambient_private_variables(self):
+        runtime = openmle_supervisor.runtime
+        original = dict(os.environ)
+        try:
+            os.environ.clear()
+            os.environ.update(
+                {
+                    "PATH": "/usr/bin",
+                    "CAMG_HELDOUT_ASSET_PRIVATE_GRADER_BINDINGS_PATH": "/secret",
+                    "CAMG_HELDOUT_ASSET_PRIVATE_GRADER_BINDINGS_SHA256": "deadbeef",
+                    "OPENMLE_FAST_PRIVATE_TASK_MANIFEST": "/private/manifest",
+                }
+            )
+            environment = runtime.sanitized_environment()
+        finally:
+            os.environ.clear()
+            os.environ.update(original)
+        self.assertEqual(environment, {"PATH": "/usr/bin"})
+
     def test_swesmith_uses_formal_eval_subset_and_run_scoped_rootfs(self):
         source = (LAUNCHER_ROOT / "swesmith.sh").read_text()
         self.assertIn("camg_swesmith_formal_eval_runtime_manifest_v5", source)

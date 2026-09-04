@@ -72,7 +72,7 @@ def sanitized_environment() -> Dict[str, str]:
     return {
         key: value
         for key, value in os.environ.items()
-        if not key.startswith("OPENMLE_FAST_")
+        if not key.startswith("OPENMLE_FAST_") and "PRIVATE" not in key
     }
 
 
