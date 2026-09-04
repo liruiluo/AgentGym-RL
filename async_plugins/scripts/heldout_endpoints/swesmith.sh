@@ -39,7 +39,7 @@ RUN_DIR=${AMG_MULTITASK_ENDPOINT_RUN_DIR:?missing endpoint run dir}
 SERVICE_ROOT=$RUN_DIR/service
 RUN_KEY=$(printf '%s' "$RUN_ID" | sha256sum | awk '{print substr($1, 1, 16)}')
 LOCAL_ROOT=/tmp/agentmemorygym-swesmith-$RUN_KEY
-ROOTFS_RUN_ROOT=/dev/shm/agentmemorygym-swesmith-heldout-$RUN_KEY
+ROOTFS_RUN_ROOT=/tmp/agentmemorygym-swesmith-heldout-$RUN_KEY
 EPISODES_ROOT=$LOCAL_ROOT/episodes
 UID_LEASE_ROOT=$LOCAL_ROOT/uid-leases
 MIRRORS_ROOT=$LOCAL_ROOT/mirrors
@@ -54,7 +54,7 @@ case "$LOCAL_ROOT" in
   *) heldout_die "unsafe SWE-smith local root: $LOCAL_ROOT" ;;
 esac
 case "$ROOTFS_RUN_ROOT" in
-  /dev/shm/agentmemorygym-swesmith-heldout-[0-9a-f][0-9a-f]*) ;;
+  /tmp/agentmemorygym-swesmith-heldout-[0-9a-f][0-9a-f]*) ;;
   *) heldout_die "unsafe SWE-smith rootfs root: $ROOTFS_RUN_ROOT" ;;
 esac
 for path in "$LOCAL_ROOT" "$ROOTFS_RUN_ROOT"; do
@@ -75,7 +75,7 @@ import sys
 paths = [Path(value) for value in sys.argv[1:]]
 expected = (
     (Path("/tmp"), "agentmemorygym-swesmith-"),
-    (Path("/dev/shm"), "agentmemorygym-swesmith-heldout-"),
+    (Path("/tmp"), "agentmemorygym-swesmith-heldout-"),
 )
 for path, (parent, prefix) in zip(paths, expected):
     if path.parent != parent or not path.name.startswith(prefix) or path.is_symlink():
@@ -223,6 +223,22 @@ if (
     or extension_pool.get("training_role") is not False
 ):
     raise RuntimeError("SWE-smith formal Eval selection/pool contract drifted")
+selected_repositories = formal_selection.get("selected_repositories")
+selected_counts = formal_selection.get("selected_repository_task_counts")
+dataset_repositories = selection.get("repositories")
+if (
+    not isinstance(selected_repositories, list)
+    or not selected_repositories
+    or len(set(selected_repositories)) != len(selected_repositories)
+    or selected_repositories != sorted(selected_repositories)
+    or dataset_repositories != selected_repositories
+    or int(formal_selection.get("formal_eval_repository_count", -1))
+    != len(selected_repositories)
+    or not isinstance(selected_counts, dict)
+    or set(selected_counts) != set(selected_repositories)
+    or sum(int(value) for value in selected_counts.values()) != expected_count
+):
+    raise RuntimeError("SWE-smith selected-repository contract drifted")
 
 bindings = load(bindings_path)
 records = bindings.get("records")
@@ -230,6 +246,18 @@ if bindings.get("schema") != "camg_swe_heldout_image_bindings_v1" or not isinsta
     raise RuntimeError("SWE-smith image binding schema drifted")
 if not records or any(item.get("status") != "pass" for item in records):
     raise RuntimeError("SWE-smith image bindings are incomplete")
+binding_repositories = [str(item.get("base_repository", "")) for item in records]
+if (
+    any(not repository for repository in binding_repositories)
+    or len(set(binding_repositories)) != len(binding_repositories)
+    or not set(selected_repositories).issubset(binding_repositories)
+):
+    raise RuntimeError("SWE-smith image bindings do not cover the formal repositories")
+materialized_records = [
+    item for item in records if item["base_repository"] in selected_repositories
+]
+if len(materialized_records) != len(selected_repositories):
+    raise RuntimeError("SWE-smith formal repositories do not map one-to-one to images")
 images = load(image_path)
 expected_images = sorted(
     (str(item["profile_image"]), str(item["digest"])) for item in records
@@ -249,13 +277,26 @@ if (
     raise RuntimeError("SWE-smith admission certificate drifted")
 
 routing_count = 0
+routing_repository_counts = {}
 with routing_path.open(encoding="utf-8") as handle:
     for routing_count, line in enumerate(handle, start=1):
         row = json.loads(line)
         if row.get("data_idx") != routing_count - 1:
             raise RuntimeError("SWE-smith held-out routing is not contiguous")
+        repository = str(row.get("extra_info", {}).get("base_repository", ""))
+        if repository not in selected_repositories:
+            raise RuntimeError(
+                f"SWE-smith held-out routing escaped the formal repositories: {repository}"
+            )
+        routing_repository_counts[repository] = (
+            routing_repository_counts.get(repository, 0) + 1
+        )
 if routing_count != expected_count:
     raise RuntimeError("SWE-smith held-out routing count drifted")
+if routing_repository_counts != {
+    key: int(value) for key, value in selected_counts.items()
+}:
+    raise RuntimeError("SWE-smith held-out repository counts drifted")
 
 bundles = load(bundles_path)
 bundle_records = bundles.get("records")
@@ -309,7 +350,12 @@ receipt = {
     "extension_pool_task_count": extension_count,
     "dataset_revision": dataset_revision,
     "source_revision": source_revision,
-    "image_count": len(records),
+    "frozen_image_count": len(records),
+    "materialized_image_count": len(materialized_records),
+    "materialized_repositories": selected_repositories,
+    "materialized_profile_images": sorted(
+        item["profile_image"] for item in materialized_records
+    ),
     "mirror_count": len(restored),
     "restored_mirrors": restored,
     "created_at_unix_ns": time.time_ns(),
@@ -326,23 +372,38 @@ image_binding_args=()
 while IFS= read -r -d '' binding_arg; do
   image_binding_args+=("$binding_arg")
 done < <(
-  "$PYBIN" -B - "$CAMG_HELDOUT_ASSET_IMAGE_BINDINGS_PATH" <<'PY_BINDINGS'
+  "$PYBIN" -B - \
+    "$CAMG_HELDOUT_ASSET_IMAGE_BINDINGS_PATH" \
+    "$CAMG_HELDOUT_ASSET_FORMAL_EVAL_SELECTION_PATH" <<'PY_BINDINGS'
 import json
 import sys
 
 payload = json.load(open(sys.argv[1], encoding="utf-8"))
+selection = json.load(open(sys.argv[2], encoding="utf-8"))
+selected = set(selection["selected_repositories"])
 for item in payload["records"]:
     value = f'{item["source_image"]}={item["profile_image"]}@{item["digest"]}'
     sys.stdout.buffer.write(b"--binding\0" + value.encode("utf-8") + b"\0")
+    if item["base_repository"] in selected:
+        profile = item["profile_image"].encode("utf-8")
+        sys.stdout.buffer.write(b"--materialize-profile-image\0" + profile + b"\0")
 PY_BINDINGS
 )
-"$PYBIN" -B "$PREPARE_ROOTFS" \
+env \
+  HTTP_PROXY=http://bamboo-proxy.jd.com:80 \
+  HTTPS_PROXY=http://bamboo-proxy.jd.com:80 \
+  http_proxy=http://bamboo-proxy.jd.com:80 \
+  https_proxy=http://bamboo-proxy.jd.com:80 \
+  NO_PROXY=127.0.0.1,localhost \
+  no_proxy=127.0.0.1,localhost \
+  "$PYBIN" -B "$PREPARE_ROOTFS" \
   "${image_binding_args[@]}" \
   --cache-root "$ROOTFS_CACHE_ROOT" \
   --layer-cache-root "$LAYER_CACHE_ROOT" \
   --crane "$CRANE" \
   --transport-prefix docker.1ms.run \
-  --fallback-transport-prefix docker.io \
+  --fallback-transport-prefix dockerproxy.net \
+  --fallback-transport-prefix docker.1panel.live \
   --download-attempts 6 \
   --dataset-revision "$DATASET_REVISION" \
   --source-revision "$SOURCE_REVISION" \
@@ -351,10 +412,17 @@ PY_BINDINGS
   > "$SERVICE_ROOT/rootfs-prepare.log"
 [[ "$(heldout_sha256 "$GENERATED_IMAGE_MANIFEST")" == "$CAMG_HELDOUT_ASSET_IMAGE_MANIFEST_SHA256" ]] \
   || heldout_die "generated SWE-smith image manifest differs from frozen manifest"
-image_count=$("$PYBIN" -B -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["records"]))' "$CAMG_HELDOUT_ASSET_IMAGE_BINDINGS_PATH")
 complete_count=$(find "$ROOTFS_CACHE_ROOT" -mindepth 2 -maxdepth 2 -type f -name .complete | wc -l | tr -d '[:space:]')
-[[ "$complete_count" == "$image_count" ]] \
-  || heldout_die "SWE-smith OCI rootfs count drifted: $complete_count != $image_count"
+materialized_image_count=$("$PYBIN" -B - "$CAMG_HELDOUT_ASSET_IMAGE_BINDINGS_PATH" "$CAMG_HELDOUT_ASSET_FORMAL_EVAL_SELECTION_PATH" <<'PY_COUNT'
+import json
+import sys
+bindings = json.load(open(sys.argv[1], encoding="utf-8"))["records"]
+selected = set(json.load(open(sys.argv[2], encoding="utf-8"))["selected_repositories"])
+print(sum(item["base_repository"] in selected for item in bindings))
+PY_COUNT
+)
+[[ "$complete_count" == "$materialized_image_count" ]] \
+  || heldout_die "SWE-smith OCI rootfs count drifted: $complete_count != $materialized_image_count"
 
 export PYTHONPATH="$SOURCE_OUTER:$SOURCE_ROOT/agentenv-swesmith:$SOURCE_ROOT/agentenv-agentmemory:$SOURCE_ROOT/agentenv:$GRADER_SHIM:$GRADER_PYDEPS"
 export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
