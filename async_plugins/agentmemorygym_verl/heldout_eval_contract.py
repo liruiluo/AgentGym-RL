@@ -1151,6 +1151,37 @@ def native_success_metric(
         }
     if route_id == "openmle_fast":
         grade = final_env_info.get("grade")
+        if grade is None and "grade" in final_env_info:
+            # AutoResearch intentionally does not invoke the private grader when
+            # the policy reaches a native resource limit without submitting.
+            # Count that audited policy failure as a zero, but fail closed on a
+            # missing grade everywhere else.
+            counters = final_env_info.get("counters")
+            no_submission_terminal = (
+                final_env_info.get("terminal") is True
+                and final_env_info.get("truncated") is False
+                and final_env_info.get("episode_success") is False
+                and final_env_info.get("runtime_success") is False
+                and final_env_info.get("terminal_reason")
+                in {
+                    "action_budget_exhausted",
+                    "managed_runtime_limit",
+                    "episode_wall_limit",
+                    "wall_timeout",
+                }
+                and isinstance(counters, Mapping)
+                and type(counters.get("grading_count")) is int
+                and counters.get("grading_count") == 0
+            )
+            if no_submission_terminal:
+                return {
+                    "name": "autoresearch_beats_baseline_rate",
+                    "numerator": 0,
+                    "denominator": 1,
+                    "value": 0.0,
+                    "submission_valid": False,
+                    "improved_over_baseline": None,
+                }
         if not isinstance(grade, Mapping):
             raise ValueError("AutoResearch terminal evidence is missing grade")
         submission_valid = grade.get("submission_valid")

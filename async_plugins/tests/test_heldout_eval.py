@@ -874,6 +874,51 @@ class TestHeldoutMaterialization(unittest.TestCase):
                     route_max_rounds=ROUTE_MAX_ROUNDS,
                 )
 
+    def test_autoresearch_unsubmitted_native_limit_is_zero_not_missing_grade(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rows, _, _, _ = _compose(Path(directory), counts=(1, 1, 1, 1))
+            source = rows[3]
+            record = _action_row(
+                source, order=0, length=1, success=False, horizon=True
+            )
+            terminal = record["horizon_finalization"]["env_info"]
+            terminal.update(
+                grade=None,
+                terminal=True,
+                truncated=False,
+                terminal_reason="episode_wall_limit",
+                runtime_success=False,
+                episode_success=False,
+                counters={"grading_count": 0},
+            )
+            episode = _materialize_records(source, [record])["episodes"][0]
+            self.assertEqual(
+                episode["native_metric"],
+                {
+                    "name": "autoresearch_beats_baseline_rate",
+                    "numerator": 0,
+                    "denominator": 1,
+                    "value": 0.0,
+                    "submission_valid": False,
+                    "improved_over_baseline": None,
+                },
+            )
+
+            for field, value in (
+                ("terminal", False),
+                ("truncated", True),
+                ("terminal_reason", "sandbox_freeze_fault"),
+                ("runtime_success", True),
+                ("episode_success", True),
+                ("counters", {"grading_count": 1}),
+            ):
+                malformed = deepcopy(record)
+                malformed["horizon_finalization"]["env_info"][field] = value
+                with self.subTest(field=field), self.assertRaisesRegex(
+                    ValueError, "missing grade"
+                ):
+                    _materialize_records(source, [malformed])
+
     def test_native_metrics_require_registered_fields(self):
         self.assertEqual(
             native_success_metric(
