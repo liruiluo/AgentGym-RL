@@ -1195,6 +1195,10 @@ trainer:
             self.assertEqual(
                 config["actor_rollout_ref"]["model"]["path"], str(model_dir.resolve())
             )
+            self.assertEqual(
+                config["actor_rollout_ref"]["model"]["tokenizer_path"],
+                "/old/model",
+            )
             rollout = config["actor_rollout_ref"]["rollout"]
             self.assertEqual(rollout["load_format"], "auto")
             self.assertEqual(rollout["nnodes"], 1)

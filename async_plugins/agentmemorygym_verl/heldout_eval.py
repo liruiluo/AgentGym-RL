@@ -594,9 +594,27 @@ def derive_eval_config(plan: HeldoutEvalPlan) -> dict[str, Any]:
                 f"{observed!r} != {expected!r}"
             )
 
+    # The merged policy checkpoint can be published by a newer Transformers
+    # runtime than the evaluator.  Tokenization is unchanged by PPO, so retain
+    # the exact tokenizer selected by the formal training configuration instead
+    # of reloading tokenizer metadata emitted beside the merged weights.
+    formal_model_path = _nested_get(config, "actor_rollout_ref.model.path")
+    formal_tokenizer_path = _nested_get(
+        config, "actor_rollout_ref.model.tokenizer_path"
+    )
+    if formal_tokenizer_path in (None, ""):
+        formal_tokenizer_path = formal_model_path
+    if (
+        not isinstance(formal_tokenizer_path, str)
+        or not Path(formal_tokenizer_path).is_absolute()
+    ):
+        raise ValueError(
+            "formal resolved config must select an absolute tokenizer path"
+        )
+
     overrides = {
         "actor_rollout_ref.model.path": str(plan.model.path),
-        "actor_rollout_ref.model.tokenizer_path": str(plan.model.path),
+        "actor_rollout_ref.model.tokenizer_path": formal_tokenizer_path,
         "actor_rollout_ref.model.use_shm": False,
         "actor_rollout_ref.rollout.nnodes": 1,
         "actor_rollout_ref.rollout.n_gpus_per_node": plan.num_gpus,
