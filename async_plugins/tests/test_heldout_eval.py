@@ -84,7 +84,6 @@ def _source_extra(route_id: str, position: int, data_idx: int) -> dict:
             "task_id": f"competition@{position}",
             "source_family": f"KAGGLE_DATASET:owner/dataset-{position}",
             "role": "heldout",
-            "manifest_sha256": "c" * 64,
         }
     raise AssertionError(route_id)
 
@@ -116,7 +115,6 @@ def _episode_source_identity(input_row: dict) -> dict:
             task_id=source["task_id"],
             source_family=source["source_family"],
             manifest_role=source["role"],
-            manifest_sha256=source["manifest_sha256"],
         )
     else:
         raise AssertionError(route_id)

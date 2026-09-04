@@ -943,13 +943,12 @@ def _expected_native_source_identity(
             manifest_role=_required_identity_text(
                 source.get("role"), field="AutoResearch manifest_role"
             ),
-            manifest_sha256=require_sha256(
-                source.get("manifest_sha256"),
-                field="AutoResearch manifest_sha256",
-            ),
         )
         if identity["manifest_role"] != "heldout":
             raise ValueError("AutoResearch native source manifest_role must be heldout")
+        # The task-manifest digest is verified once at endpoint startup and by
+        # the reset-identity probe.  It is intentionally not duplicated in
+        # each row of the frozen paper schedule.
     return identity
 
 
@@ -974,7 +973,6 @@ _RAW_NATIVE_IDENTITY_ALIASES = {
         "task_id": ("task_id",),
         "source_family": ("source_family",),
         "manifest_role": ("manifest_role",),
-        "manifest_sha256": ("manifest_sha256", "task_manifest_sha256"),
     },
 }
 _RAW_NATIVE_IDENTITY_NESTED_SCOPES = (
