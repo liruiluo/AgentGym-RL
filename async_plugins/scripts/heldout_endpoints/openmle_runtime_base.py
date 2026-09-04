@@ -326,7 +326,7 @@ def build_service_environments(
             "OPENMLE_FAST_RUNTIME_ARTIFACT_LOCK_SHA256": exact["artifact_lock"][
                 "expected_sha256"
             ],
-            "OPENMLE_FAST_GRADER_CLIENT_TIMEOUT_SECONDS": "10",
+            "OPENMLE_FAST_GRADER_CLIENT_TIMEOUT_SECONDS": "15",
             "OPENMLE_FAST_GRADER_TIMEOUT_MARGIN_SECONDS": "2",
             "OPENMLE_FAST_CLIENT_TIMEOUT_SECONDS": "200",
             "OPENMLE_FAST_CLIENT_TIMEOUT_MARGIN_SECONDS": "5",

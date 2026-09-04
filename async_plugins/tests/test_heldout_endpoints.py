@@ -789,6 +789,10 @@ heldout_assert_asset_env FIXTURE 'fixture asset'
         self.assertNotIn("def parse_args", runtime_source)
         self.assertNotIn("def main", runtime_source)
         self.assertNotIn('choices=("gate1", "formal100")', runtime_source)
+        self.assertIn(
+            '"OPENMLE_FAST_GRADER_CLIENT_TIMEOUT_SECONDS": "15"',
+            runtime_source,
+        )
 
     def test_missing_verified_environment_fails_before_route_start(self):
         for route_id in ROUTES:
