@@ -316,9 +316,17 @@ class _NativeLifecycleClient(_MemoryChainClient):
 
 
 class _DirectNativeParser:
+    def __init__(self, *, content="", calls=None):
+        self.content = content
+        self.calls = (
+            [SimpleNamespace(name="task_action", arguments="{}")]
+            if calls is None
+            else list(calls)
+        )
+
     async def extract_tool_calls(self, response_ids, tools):
         del response_ids, tools
-        return "", [SimpleNamespace(name="task_action", arguments="{}")]
+        return self.content, self.calls
 
 
 class _HorizonClient(_MemoryChainClient):
@@ -737,6 +745,62 @@ class TestAMGAgentLoop(IsolatedAsyncioTestCase):
         record = json.loads(outputs[0].extra_fields["step_record_json"])
         self.assertEqual(record["generation_stop_reason"], "stop")
         self.assertEqual(outputs[0].extra_fields["generation_stop_reason"], "stop")
+
+    async def _validate_native_action(self, action, *, content="", calls=None):
+        loop = self._loop([action], max_turns=1)
+        loop._native_tool_parser = _DirectNativeParser(
+            content=content,
+            calls=calls,
+        )
+        loop._typed_tool_schemas = lambda tools: ()
+        return await loop._validated_native_tool_call(
+            response_ids=[100],
+            action=action,
+            tools=_MemoryChainClient().policy_tool_schemas(),
+            action_submission={"tool_parser_normalized": True},
+        )
+
+    async def test_native_call_accepts_surrounding_non_think_content(self):
+        call = (
+            "<tool_call>\n<function=task_action>\n<parameter=value>\nx\n"
+            "</parameter>\n</function>\n</tool_call>"
+        )
+        prefixed = await self._validate_native_action(
+            "I will inspect the files.\n" + call,
+            content="I will inspect the files.\n",
+        )
+        suffixed = await self._validate_native_action(
+            call + "\nDone.",
+            content="\nDone.",
+        )
+        self.assertEqual(prefixed.name, "task_action")
+        self.assertEqual(suffixed.name, "task_action")
+
+    async def test_native_call_rejects_multiple_calls_or_think_content(self):
+        call = (
+            "<tool_call>\n<function=task_action>\n<parameter=value>\nx\n"
+            "</parameter>\n</function>\n</tool_call>"
+        )
+        with self.assertRaisesRegex(RuntimeError, "single native tool-call"):
+            await self._validate_native_action(call + "\n" + call)
+        with self.assertRaisesRegex(RuntimeError, "single native tool-call"):
+            await self._validate_native_action("<think>reasoning</think>\n" + call)
+
+    async def test_native_call_fails_closed_when_verl_parser_returns_wrong_count(self):
+        call = (
+            "<tool_call>\n<function=task_action>\n<parameter=value>\nx\n"
+            "</parameter>\n</function>\n</tool_call>"
+        )
+        with self.assertRaisesRegex(RuntimeError, "parser disagreement"):
+            await self._validate_native_action(call, calls=[])
+        with self.assertRaisesRegex(RuntimeError, "parser disagreement"):
+            await self._validate_native_action(
+                call,
+                calls=[
+                    SimpleNamespace(name="task_action", arguments="{}"),
+                    SimpleNamespace(name="task_action", arguments="{}"),
+                ],
+            )
 
     async def test_valid_native_call_appends_tool_result_before_next_generation(self):
         action = (

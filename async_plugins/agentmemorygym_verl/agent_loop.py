@@ -359,20 +359,23 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
             raise RuntimeError(
                 "AMG wrapper accepted a native tool call without tool schemas"
             )
-        stripped = action.strip()
+        opening = "<tool_call>"
+        closing = "</tool_call>"
+        lowered = action.lower()
         if (
-            not stripped.startswith("<tool_call>")
-            or not stripped.endswith("</tool_call>")
-            or stripped.count("<tool_call>") != 1
-            or stripped.count("</tool_call>") != 1
+            action.count(opening) != 1
+            or action.count(closing) != 1
+            or action.find(opening) > action.find(closing)
+            or "<think" in lowered
+            or "</think" in lowered
         ):
             raise RuntimeError(
-                "AMG wrapper accepted output outside the strict native tool envelope"
+                "AMG wrapper accepted output outside the single native tool-call contract"
             )
-        content, calls = await self._native_tool_parser.extract_tool_calls(
+        _content, calls = await self._native_tool_parser.extract_tool_calls(
             response_ids, list(self._typed_tool_schemas(tools))
         )
-        if content.strip() or len(calls) != 1:
+        if len(calls) != 1:
             raise RuntimeError(
                 "AMG wrapper/native veRL parser disagreement for an accepted action"
             )
