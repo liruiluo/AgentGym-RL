@@ -22,6 +22,20 @@ from finalizer_fixture import (
 
 JsonMutation = Callable[[dict], None]
 
+ROLLOUT_CORRECTION_SUFFIXES = (
+    "kl",
+    "k3_kl",
+    "log_ppl_abs_diff",
+    "rollout_is_oob_ratio",
+    "rollout_is_ratio_fraction_high",
+    "rollout_is_ratio_fraction_low",
+    "rollout_is_mean",
+    "rollout_is_min",
+    "rollout_is_max",
+    "rollout_is_std",
+    "rollout_is_eff_sample_size",
+)
+
 
 def rewrite_first_rollout(fixture: dict, mutation: JsonMutation) -> None:
     path = sorted(fixture["rollout_dir"].glob("*.jsonl"))[0]
@@ -213,9 +227,10 @@ class TestFinalizerSuccess(FinalizerTestCase):
                     verdict["counts"]["real_action_rows"]
                     + verdict["counts"]["derived_padding_action_rows"]
                 )
-                % 512,
+                % 4,
                 0,
             )
+            self.assertLess(verdict["counts"]["derived_padding_action_rows"], 4)
             self.assertEqual(verdict["trainer_exit_code"], 0)
 
     def test_real_rich_v8_formal_fixture_passes_exact_6400_episode_contract(self):
@@ -326,6 +341,9 @@ class TestFinalizerMissingArtifacts(FinalizerTestCase):
             "FileLogger": lambda fixture: fixture["metrics_path"].unlink(),
             "resolved config": lambda fixture: fixture["resolved_path"].unlink(),
             "Hydra config": lambda fixture: fixture["hydra_path"].unlink(),
+            "critic parameter freeze manifest": lambda fixture: fixture[
+                "freeze_path"
+            ].unlink(),
             "rollout JSONL": lambda fixture: next(
                 fixture["rollout_dir"].glob("*.jsonl")
             ).unlink(),
@@ -346,7 +364,364 @@ class TestFinalizerMissingArtifacts(FinalizerTestCase):
                 self.assert_failed(fixture["run_dir"], contains=expected)
 
 
+class TestFinalizerCriticParameterFreeze(FinalizerTestCase):
+    def test_valid_manifest_is_reported_in_terminal_verdict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+
+            self.assertEqual(verdict["status"], "pass", verdict)
+            summary = verdict["critic_parameter_freeze"]
+            self.assertEqual(summary["status"], "pass")
+            self.assertEqual(summary["completed_step"], 1)
+            self.assertEqual(
+                [len(values) for values in summary["optimizer_step_learning_rates"]],
+                [1, 1],
+            )
+            self.assertAlmostEqual(
+                summary["optimizer_step_learning_rates"][0][0], 5e-7
+            )
+            self.assertAlmostEqual(
+                summary["optimizer_step_learning_rates"][1][0], 1e-6
+            )
+            self.assertEqual(summary["probe_elements_per_rank"], 4096)
+            self.assertGreater(summary["frozen_parameter_count"], 0)
+            self.assertGreater(summary["trainable_parameter_count"], 0)
+            self.assertRegex(summary["loader_artifact_manifest_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_loader_provenance_fail_closed(self):
+        cases = (
+            (
+                "entrypoint",
+                lambda value: value["loader_provenance"].update(
+                    loader_entrypoint="unreviewed.loader"
+                ),
+                "loader entrypoint",
+            ),
+            (
+                "loader_path",
+                lambda value: value["loader_provenance"].update(
+                    loader_realpath="/models/other"
+                ),
+                "did not read the configured model directory",
+            ),
+            (
+                "config_digest",
+                lambda value: value["loader_provenance"].update(
+                    resolved_config_sha256="0" * 64
+                ),
+                "resolved config digest",
+            ),
+            (
+                "artifact_hash",
+                lambda value: value["loader_provenance"]["artifact_files"][0].update(
+                    sha256="0" * 64
+                ),
+                "artifact hashes differ",
+            ),
+            (
+                "artifact_digest",
+                lambda value: value["loader_provenance"].update(
+                    artifact_manifest_sha256="0" * 64
+                ),
+                "artifact manifest digest/order mismatch",
+            ),
+            (
+                "readback",
+                lambda value: value["loader_provenance"]["readback"].update(
+                    status="fail"
+                ),
+                "post-load readback evidence",
+            ),
+        )
+        for label, mutation, expected in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                fixture = self.build(Path(directory))
+                mutate_json(fixture["freeze_path"], mutation)
+                self.assert_failed(fixture["run_dir"], contains=expected)
+
+    def test_manifest_identity_and_parameter_taxonomy_fail_closed(self):
+        cases = (
+            (
+                "schema",
+                lambda value: value.update(schema="unknown"),
+                "schema mismatch",
+            ),
+            (
+                "model_type",
+                lambda value: value["model"].update(model_type="qwen3_5_moe"),
+                "not dense qwen3_5",
+            ),
+            (
+                "wrapper_class",
+                lambda value: value["model"].update(
+                    **{"class": "Qwen3_5ForSequenceClassification"}
+                ),
+                "not the exact TRL value-head wrapper",
+            ),
+            (
+                "pretrained_model_class",
+                lambda value: value["model"].update(
+                    pretrained_model_class="Qwen3_5ForCausalLM"
+                ),
+                "pretrained model is not exact Qwen3.5 conditional generation",
+            ),
+            (
+                "config_hash",
+                lambda value: value["model"].update(config_sha256="not-a-hash"),
+                "config hash is invalid",
+            ),
+            (
+                "duplicate_name",
+                lambda value: value["parameters"][1].update(
+                    name=value["parameters"][0]["name"]
+                ),
+                "invalid or duplicate name",
+            ),
+            (
+                "category_drift",
+                lambda value: value["parameters"][0].update(
+                    category="unclassified"
+                ),
+                "unknown category",
+            ),
+            (
+                "requires_grad_drift",
+                lambda value: value["parameters"][1].update(requires_grad=True),
+                "requires_grad drift",
+            ),
+            (
+                "optimizer_member_drift",
+                lambda value: value["parameters"][0].update(
+                    optimizer_member=False
+                ),
+                "optimizer membership drift",
+            ),
+            (
+                "tied_lm_head_alias_missing",
+                lambda value: value.update(parameter_aliases=[]),
+                "category lm_head_auxiliary is empty",
+            ),
+            (
+                "tied_lm_head_alias_drift",
+                lambda value: value["parameter_aliases"][0].update(
+                    alias_name="pretrained_model.other.weight"
+                ),
+                "parameter alias record",
+            ),
+        )
+        for label, mutation, expected in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                fixture = self.build(Path(directory))
+                mutate_json(fixture["freeze_path"], mutation)
+                self.assert_failed(fixture["run_dir"], contains=expected)
+
+    def test_manifest_summaries_and_optimizer_membership_fail_closed(self):
+        cases = (
+            (
+                "category_summary",
+                lambda value: value["categories"]["mlp"].update(numel=1),
+                "category mlp summary mismatch",
+            ),
+            (
+                "frozen_summary",
+                lambda value: value.update(frozen_parameter_count=999),
+                "frozen summary mismatch",
+            ),
+            (
+                "trainable_summary",
+                lambda value: value.update(trainable_parameter_numel=1),
+                "trainable summary mismatch",
+            ),
+            (
+                "optimizer_membership",
+                lambda value: value["optimizer"].update(membership_exact=False),
+                "optimizer membership does not exactly match",
+            ),
+        )
+        for label, mutation, expected in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                fixture = self.build(Path(directory))
+                mutate_json(fixture["freeze_path"], mutation)
+                self.assert_failed(fixture["run_dir"], contains=expected)
+
+    def test_first_real_optimizer_step_probe_fail_closed(self):
+        cases = (
+            (
+                "not_step_one",
+                lambda value: value["first_optimizer_step"].update(
+                    completed_step=2
+                ),
+                "completed optimizer step 1",
+            ),
+            (
+                "probe_budget",
+                lambda value: value["first_optimizer_step"].update(
+                    probe_elements_per_rank=8192
+                ),
+                "probe budget differs",
+            ),
+            (
+                "frozen_changed",
+                lambda value: value["first_optimizer_step"]["frozen"].update(
+                    changed_count=1, l2=0.1, max_abs=0.1
+                ),
+                "frozen parameter probe changed",
+            ),
+            (
+                "trainable_unchanged",
+                lambda value: value["first_optimizer_step"]["trainable"].update(
+                    changed_count=0, l2=0.0, max_abs=0.0
+                ),
+                "trainable parameter probe did not change",
+            ),
+            (
+                "first_step_full_lr",
+                lambda value: value["first_optimizer_step"].update(
+                    learning_rates=[5e-6]
+                ),
+                "first-step probe learning rates differ",
+            ),
+        )
+        for label, mutation, expected in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                fixture = self.build(Path(directory))
+                mutate_json(fixture["freeze_path"], mutation)
+                self.assert_failed(fixture["run_dir"], contains=expected)
+
+    def test_two_step_critic_lr_warmup_trace_fails_closed(self):
+        cases = (
+            (
+                "missing_second_step",
+                lambda value: value["optimizer_step_learning_rates"].update(
+                    steps=value["optimizer_step_learning_rates"]["steps"][:1]
+                ),
+                "does not attest exactly two steps",
+            ),
+            (
+                "pending_trace",
+                lambda value: value["optimizer_step_learning_rates"].update(
+                    status="pending"
+                ),
+                "does not attest exactly two steps",
+            ),
+            (
+                "step_one_low",
+                lambda value: value["optimizer_step_learning_rates"]["steps"][0].update(
+                    learning_rates=[4e-7]
+                ),
+                "step 1 learning rates differ",
+            ),
+            (
+                "step_one_full",
+                lambda value: value["optimizer_step_learning_rates"]["steps"][0].update(
+                    learning_rates=[5e-6]
+                ),
+                "step 1 learning rates differ",
+            ),
+            (
+                "step_one_high",
+                lambda value: value["optimizer_step_learning_rates"]["steps"][0].update(
+                    learning_rates=[6e-7]
+                ),
+                "step 1 learning rates differ",
+            ),
+            (
+                "step_two_low",
+                lambda value: value["optimizer_step_learning_rates"]["steps"][1].update(
+                    learning_rates=[9e-7]
+                ),
+                "step 2 learning rates differ",
+            ),
+            (
+                "step_two_full",
+                lambda value: value["optimizer_step_learning_rates"]["steps"][1].update(
+                    learning_rates=[5e-6]
+                ),
+                "step 2 learning rates differ",
+            ),
+            (
+                "step_two_high",
+                lambda value: value["optimizer_step_learning_rates"]["steps"][1].update(
+                    learning_rates=[1.1e-6]
+                ),
+                "step 2 learning rates differ",
+            ),
+            (
+                "step_two_non_numeric",
+                lambda value: value["optimizer_step_learning_rates"]["steps"][1].update(
+                    learning_rates=["not-a-number"]
+                ),
+                "step 2 learning rates differ",
+            ),
+        )
+        for label, mutation, expected in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                fixture = self.build(Path(directory))
+                mutate_json(fixture["freeze_path"], mutation)
+                self.assert_failed(fixture["run_dir"], contains=expected)
+
+
 class TestFinalizerFileLogger(FinalizerTestCase):
+    def test_actual_actor_k1_critic_k2_execution_is_required(self):
+        cases = (
+            (
+                "missing_actor_counter",
+                lambda data: data.pop("actor/optimizer_steps_delta"),
+            ),
+            (
+                "actor_epoch_drift",
+                lambda data: data.update(
+                    **{"actor/ppo_epoch_passes_delta": 2.0}
+                ),
+            ),
+            (
+                "critic_epoch_drift",
+                lambda data: data.update(
+                    **{"critic/ppo_epoch_passes_delta": 1.0}
+                ),
+            ),
+            (
+                "role_minibatch_mismatch",
+                lambda data: data.update(
+                    **{"critic/mini_batches_per_epoch": 2.0}
+                ),
+            ),
+            (
+                "critic_step_mismatch",
+                lambda data: data.update(
+                    **{"critic/optimizer_steps_delta": 1.0}
+                ),
+            ),
+            (
+                "fractional_counter",
+                lambda data: data.update(
+                    **{"critic/optimizer_steps_delta": 1.5}
+                ),
+            ),
+        )
+        for label, mutation in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                fixture = self.build(Path(directory))
+                rows = [
+                    json.loads(line)
+                    for line in fixture["metrics_path"]
+                    .read_text(encoding="utf-8")
+                    .splitlines()
+                ]
+                mutation(rows[0]["data"])
+                fixture["metrics_path"].write_text(
+                    "\n".join(json.dumps(row, sort_keys=True) for row in rows)
+                    + "\n",
+                    encoding="utf-8",
+                )
+
+                self.assert_failed(
+                    fixture["run_dir"],
+                    contains="actor-K1/critic-K2",
+                )
+
     def test_step_zero_rollouter_bootstrap_and_split_publication_rows_pass(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = self.build(Path(directory))
@@ -357,9 +732,8 @@ class TestFinalizerFileLogger(FinalizerTestCase):
             correction = {
                 key: learner.pop(key)
                 for key in (
-                    "rollout_corr/kl",
-                    "rollout_corr/k3_kl",
-                    "rollout_corr/log_ppl_abs_diff",
+                    f"rollout_corr/{suffix}"
+                    for suffix in ROLLOUT_CORRECTION_SUFFIXES
                 )
             }
             rows = [
@@ -390,7 +764,7 @@ class TestFinalizerFileLogger(FinalizerTestCase):
                 fixture["metrics_path"].read_text(encoding="utf-8").splitlines()[0]
             )["data"]
             learner = dict(original)
-            for suffix in ("kl", "k3_kl", "log_ppl_abs_diff"):
+            for suffix in ROLLOUT_CORRECTION_SUFFIXES:
                 learner[f"actor/rollout_corr/{suffix}"] = learner.pop(
                     f"rollout_corr/{suffix}"
                 )
@@ -457,6 +831,36 @@ class TestFinalizerFileLogger(FinalizerTestCase):
                     **{"actor/rollout_corr/k3_kl": float("nan")}
                 ),
             ),
+            (
+                "out_of_range_fraction",
+                lambda data: data.update(
+                    **{"actor/rollout_corr/rollout_is_oob_ratio": 1.01}
+                ),
+            ),
+            (
+                "zero_ess",
+                lambda data: data.update(
+                    **{"actor/rollout_corr/rollout_is_eff_sample_size": 0.0}
+                ),
+            ),
+            (
+                "invalid_applied_weight_order",
+                lambda data: data.update(
+                    **{"actor/rollout_corr/rollout_is_min": 1.1}
+                ),
+            ),
+            (
+                "negative_applied_weight_std",
+                lambda data: data.update(
+                    **{"actor/rollout_corr/rollout_is_std": -0.01}
+                ),
+            ),
+            (
+                "inconsistent_icepop_fractions",
+                lambda data: data.update(
+                    **{"actor/rollout_corr/rollout_is_oob_ratio": 0.16}
+                ),
+            ),
         )
         for label, mutation in cases:
             with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
@@ -467,7 +871,7 @@ class TestFinalizerFileLogger(FinalizerTestCase):
                     .splitlines()[0]
                 )["data"]
                 learner = dict(original)
-                for suffix in ("kl", "k3_kl", "log_ppl_abs_diff"):
+                for suffix in ROLLOUT_CORRECTION_SUFFIXES:
                     learner[f"actor/rollout_corr/{suffix}"] = learner.pop(
                         f"rollout_corr/{suffix}"
                     )
@@ -499,7 +903,7 @@ class TestFinalizerFileLogger(FinalizerTestCase):
                 fixture["metrics_path"].read_text(encoding="utf-8").splitlines()[0]
             )
             combined = row["data"]
-            for suffix in ("kl", "k3_kl", "log_ppl_abs_diff"):
+            for suffix in ROLLOUT_CORRECTION_SUFFIXES:
                 combined[f"actor/rollout_corr/{suffix}"] = combined.pop(
                     f"rollout_corr/{suffix}"
                 )
@@ -522,9 +926,8 @@ class TestFinalizerFileLogger(FinalizerTestCase):
             corrections = {
                 key: learner.pop(key)
                 for key in (
-                    "rollout_corr/kl",
-                    "rollout_corr/k3_kl",
-                    "rollout_corr/log_ppl_abs_diff",
+                    f"rollout_corr/{suffix}"
+                    for suffix in ROLLOUT_CORRECTION_SUFFIXES
                 )
             }
             rollouter = {
@@ -1505,6 +1908,39 @@ class TestMultitaskFinalizer(FinalizerTestCase):
                     break
             else:
                 self.fail("fixture omitted the route-local horizon terminal row")
+            path.write_text(
+                "\n".join(
+                    json.dumps(document, sort_keys=True) for document in documents
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            self.assert_failed(
+                fixture["run_dir"],
+                contains="terminal row is not done or a valid max_rounds horizon",
+            )
+
+    def test_early_horizon_finalized_receipt_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build_multitask(Path(directory))
+            path = fixture["rollout_dir"] / "1.jsonl"
+            documents = [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+            ]
+            for document in documents:
+                record = json.loads(document["step_record_json"])
+                if record.get("trajectory_terminal") is True:
+                    record["rollout_done_flag"] = True
+                    record["termination_kind"] = "horizon_finalized"
+                    record["horizon_finalizer_receipt"] = (
+                        "terminal_transition_applied"
+                    )
+                    document["step_record_json"] = json.dumps(record, sort_keys=True)
+                    break
+            else:
+                self.fail("fixture omitted a terminal trajectory row")
             path.write_text(
                 "\n".join(
                     json.dumps(document, sort_keys=True) for document in documents

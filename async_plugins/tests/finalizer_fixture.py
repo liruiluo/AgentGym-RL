@@ -25,7 +25,7 @@ RICH_V8_FIXTURES = next(
     Path("/tmp/openmle-v8-launch-fixtures-20260818"),
 )
 
-FINAL_STATISTICS_VERL_COMMIT = "f3ac28fe54c945e092b9630030f44d236a106a11"
+FINAL_STATISTICS_VERL_COMMIT = "6cd387cd2ebf413f93082eabf4ef5ad52bda37b5"
 MULTITASK_ROUTES = ("webshop", "swesmith", "literesearcher", "openmle_fast")
 
 
@@ -41,6 +41,276 @@ def messages_sha256(messages: list[dict[str, str]]) -> str:
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
+
+
+def parameter_name_sha256(names: list[str]) -> str:
+    canonical = json.dumps(
+        sorted(names),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def canonical_json_sha256(value: object) -> str:
+    canonical = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def write_critic_parameter_freeze_manifest(
+    run_dir: Path,
+    config: dict,
+) -> Path:
+    """Emit a compact fixture matching veRL's rank-zero runtime manifest."""
+
+    records = [
+        {
+            "name": "model.embed_tokens.weight",
+            "shape": [32, 8],
+            "numel": 256,
+            "dtype": "float32",
+            "module_class": "Embedding",
+            "category": "embedding",
+            "requires_grad": True,
+            "optimizer_member": True,
+        },
+        {
+            "name": "model.layers.0.self_attn.q_proj.weight",
+            "shape": [8, 8],
+            "numel": 64,
+            "dtype": "float32",
+            "module_class": "Linear",
+            "category": "self_attention",
+            "requires_grad": False,
+            "optimizer_member": False,
+        },
+        {
+            "name": "model.layers.0.linear_attn.in_proj.weight",
+            "shape": [8, 8],
+            "numel": 64,
+            "dtype": "float32",
+            "module_class": "Linear",
+            "category": "linear_attention",
+            "requires_grad": False,
+            "optimizer_member": False,
+        },
+        {
+            "name": "pretrained_model.model.visual.blocks.0.mlp.weight",
+            "shape": [8, 8],
+            "numel": 64,
+            "dtype": "float32",
+            "module_class": "Linear",
+            "category": "visual_auxiliary",
+            "requires_grad": False,
+            "optimizer_member": False,
+        },
+        {
+            "name": "model.layers.0.mlp.gate_proj.weight",
+            "shape": [16, 8],
+            "numel": 128,
+            "dtype": "float32",
+            "module_class": "Linear",
+            "category": "mlp",
+            "requires_grad": True,
+            "optimizer_member": True,
+        },
+        {
+            "name": "model.layers.0.input_layernorm.weight",
+            "shape": [8],
+            "numel": 8,
+            "dtype": "float32",
+            "module_class": "RMSNorm",
+            "category": "norm",
+            "requires_grad": True,
+            "optimizer_member": True,
+        },
+        {
+            "name": "score.weight",
+            "shape": [1, 8],
+            "numel": 8,
+            "dtype": "float32",
+            "module_class": "Linear",
+            "category": "value_head",
+            "requires_grad": True,
+            "optimizer_member": True,
+        },
+    ]
+    frozen_categories = (
+        "self_attention",
+        "linear_attention",
+        "visual_auxiliary",
+        "lm_head_auxiliary",
+    )
+    trainable_categories = ("value_head", "mlp", "norm", "embedding")
+    records_by_name = {record["name"]: record for record in records}
+
+    def summary(names: list[str]) -> dict:
+        names = sorted(names)
+        return {
+            "parameter_count": len(names),
+            "numel": sum(records_by_name[name]["numel"] for name in names),
+            "name_sha256": parameter_name_sha256(names),
+        }
+
+    categories = {}
+    for category in frozen_categories + trainable_categories:
+        names = [
+            record["name"] for record in records if record["category"] == category
+        ]
+        categories[category] = {
+            **summary(names),
+            "requires_grad": category in trainable_categories,
+        }
+    frozen_names = [
+        record["name"]
+        for record in records
+        if record["category"] in frozen_categories
+    ]
+    trainable_names = [
+        record["name"]
+        for record in records
+        if record["category"] in trainable_categories
+    ]
+    frozen_summary = summary(frozen_names)
+    trainable_summary = summary(trainable_names)
+    critic_model = config["critic"]["model"]
+    probe_elements_per_rank = critic_model[
+        "parameter_freeze_probe_elements_per_rank"
+    ]
+    world_size = config["trainer"]["n_gpus_per_node"]
+    group_sampled_elements = world_size * (probe_elements_per_rank // 2)
+    artifact_roles = {
+        "config.json": "config",
+        "model.safetensors.index.json": "weight_index",
+        "model.safetensors-00001-of-00002.safetensors": "weight_shard",
+        "model.safetensors-00002-of-00002.safetensors": "weight_shard",
+    }
+    artifact_files = sorted(
+        (
+            {
+                "relative_path": relative_path,
+                "role": artifact_roles[relative_path],
+                "size_bytes": 100 + index,
+                "sha256": LOCKED_MODEL_FILE_SHA256[relative_path],
+            }
+            for index, relative_path in enumerate(artifact_roles)
+        ),
+        key=lambda record: record["relative_path"],
+    )
+    weight_files = [
+        record for record in artifact_files if record["role"] == "weight_shard"
+    ]
+    config_sha256 = hashlib.sha256(b"fixture-qwen3.5-config").hexdigest()
+    artifact_manifest_sha256 = canonical_json_sha256(artifact_files)
+    manifest = {
+        "schema": "verl_critic_parameter_freeze_v3",
+        "name_sha256_encoding": (
+            "sha256(canonical-json(sorted(parameter_names)))"
+        ),
+        "status": "pass",
+        "policy": critic_model["parameter_freeze_policy"],
+        "model": {
+            "class": "AutoModelForCausalLMWithValueHead",
+            "pretrained_model_class": "Qwen3_5ForConditionalGeneration",
+            "model_type": "qwen3_5",
+            "role": "value_model",
+            "config_sha256": config_sha256,
+            "path": critic_model["path"],
+            "revision": "fixture-revision",
+        },
+        "loader_provenance": {
+            "schema": "verl_model_loader_provenance_v1",
+            "loader_entrypoint": "verl.utils.model.load_valuehead_model",
+            "configured_path": critic_model["path"],
+            "configured_realpath": critic_model["path"],
+            "loader_path": critic_model["path"],
+            "loader_realpath": critic_model["path"],
+            "configured_path_samefile": True,
+            "resolved_config_sha256": config_sha256,
+            "source_revision": "fixture-revision",
+            "resolved_revision": "huggingface:fixture-revision",
+            "artifact_files": artifact_files,
+            "artifact_manifest_sha256": artifact_manifest_sha256,
+            "weight_manifest_sha256": canonical_json_sha256(weight_files),
+            "weight_file_count": len(weight_files),
+            "weight_total_bytes": sum(record["size_bytes"] for record in weight_files),
+            "readback": {
+                "status": "pass",
+                "phase": "post_from_pretrained",
+                "file_count": len(artifact_files),
+                "total_bytes": sum(record["size_bytes"] for record in artifact_files),
+                "all_regular": True,
+                "symlink_count": 0,
+            },
+        },
+        "parameter_aliases": [
+            {
+                "canonical_name": "model.embed_tokens.weight",
+                "canonical_category": "embedding",
+                "alias_name": "pretrained_model.lm_head.weight",
+                "alias_role": "tied_lm_head",
+                "requires_grad": True,
+            }
+        ],
+        "parameters": records,
+        "categories": categories,
+        "frozen_parameter_count": frozen_summary["parameter_count"],
+        "frozen_parameter_numel": frozen_summary["numel"],
+        "frozen_parameter_name_sha256": frozen_summary["name_sha256"],
+        "trainable_parameter_count": trainable_summary["parameter_count"],
+        "trainable_parameter_numel": trainable_summary["numel"],
+        "trainable_parameter_name_sha256": trainable_summary["name_sha256"],
+        "optimizer": {
+            "membership_exact": True,
+            "parameter_count": trainable_summary["parameter_count"],
+            "numel": trainable_summary["numel"],
+            "name_sha256": trainable_summary["name_sha256"],
+        },
+        "first_optimizer_step": {
+            "status": "pass",
+            "completed_step": 1,
+            "frozen": {
+                "changed_count": 0,
+                "l2": 0.0,
+                "max_abs": 0.0,
+                "sampled_elements": group_sampled_elements,
+            },
+            "trainable": {
+                "changed_count": world_size,
+                "l2": 0.1,
+                "max_abs": 0.01,
+                "sampled_elements": group_sampled_elements,
+            },
+            "probe_elements_per_rank": probe_elements_per_rank,
+            "learning_rates": [config["critic"]["optim"]["lr"] / 10.0],
+        },
+        "optimizer_step_learning_rates": {
+            "required_steps": 2,
+            "status": "pass",
+            "steps": [
+                {
+                    "completed_step": 1,
+                    "learning_rates": [config["critic"]["optim"]["lr"] / 10.0],
+                },
+                {
+                    "completed_step": 2,
+                    "learning_rates": [config["critic"]["optim"]["lr"] / 5.0],
+                },
+            ],
+        },
+    }
+    path = run_dir / "critic-parameter-freeze.json"
+    path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return path
 
 
 def _publication_fixture_identity() -> tuple[dict, dict, dict, dict[str, str]]:
@@ -196,7 +466,7 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
             "ppo_micro_batch_size_per_gpu": 8,
             "ppo_max_token_len_per_gpu": 65536,
             "ppo_infer_max_token_len_per_gpu": 32768,
-            "ppo_epochs": 1,
+            "ppo_epochs": 2,
             "shuffle": False,
             "use_dynamic_bsz": True,
             "loss_agg_mode": "token-mean",
@@ -206,21 +476,45 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
                 "optimizer_offload": False,
                 "reshard_after_forward": True,
             },
-            "optim": {"lr": 1e-5},
+            "optim": {
+                "lr": 5e-6,
+                "lr_warmup_steps": 10,
+                "lr_scheduler_type": "constant",
+                "zero_indexed_step": False,
+                "lr_scheduler_step_per_optimizer_step": True,
+            },
             "model": {
                 "path": PUBLICATION_TRAINING_RUNTIME["base_model"],
                 "enable_gradient_checkpointing": True,
                 "use_fused_kernels": False,
                 "fused_kernel_options": {"impl_backend": "torch"},
+                "parameter_freeze_policy": "qwen35_dense_token_mixers_v1",
+                "parameter_freeze_manifest_path": str(
+                    run_dir / "critic-parameter-freeze.json"
+                ),
+                "parameter_freeze_probe_elements_per_rank": 4_096,
             },
         },
         "algorithm": {
-            "adv_estimator": "amg_action_axis_gae",
+            "adv_estimator": "amg_sao_token_gae",
+            "amg_policy_lambda_mode": "length_adaptive",
+            "amg_policy_lambda_scale": 1.5,
+            "amg_critic_lambda": 1.0,
+            "amg_reward_tolerance": 1e-6,
             "amg_advantage_normalization": "upstream_masked_whiten",
+            "full_learner_batch_updates": True,
             "gamma": 1.0,
             "lam": 1.0,
             "use_kl_in_reward": False,
-            "rollout_correction": {"bypass_mode": True, "loss_type": "ppo_clip"},
+            "rollout_correction": {
+                "bypass_mode": True,
+                "loss_type": "reinforce",
+                "rollout_is": "token",
+                "rollout_is_threshold": "0.2_4.0",
+                "rollout_is_batch_normalize": False,
+                "rollout_rs": None,
+                "rollout_rs_threshold": None,
+            },
         },
         "data": {
             "train_files": [str(schedule)],
@@ -254,6 +548,7 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
         "trainer": {
             "nnodes": 1,
             "n_gpus_per_node": trainer_gpus,
+            "critic_warmup": 0,
             "total_training_steps": 100 if formal else 1,
             "total_epochs": 1,
             "val_before_train": False,
@@ -485,6 +780,21 @@ def _action_rows(
                 "trajectory_row_order": order,
                 "trajectory_terminal": terminal,
                 "rollout_done_flag": terminal and not horizon_terminal,
+                "declared_max_rounds": horizon_rounds or 30,
+                "termination_kind": (
+                    "max_rounds"
+                    if horizon_terminal
+                    else ("environment_done" if terminal else "in_progress")
+                ),
+                "horizon_finalizer_receipt": (
+                    "no_terminal_transition:no_hook"
+                    if horizon_terminal
+                    else (
+                        "not_invoked:environment_done"
+                        if terminal
+                        else "not_applicable:nonterminal"
+                    )
+                ),
                 "immediate_reward": 1.0 if terminal and not horizon_terminal else 0.0,
                 "trajectory_return": 0.0 if horizon_rounds is not None else 1.0,
                 "task_round": order + 1,
@@ -543,7 +853,7 @@ def build_valid_run(run_dir: Path, mode: str = "gate") -> dict:
     collections_per_publication = 1
 
     config = resolved_config(mode, run_dir, schedule_path)
-    ppo_mini_batch_size = config["actor_rollout_ref"]["actor"]["ppo_mini_batch_size"]
+    padding_multiple = 6 if formal else 4
     resolved_path = run_dir / "resolved-config.yaml"
     resolved_path.write_text(yaml.safe_dump(config, sort_keys=True), encoding="utf-8")
     hydra_dir = run_dir / "hydra" / ".hydra"
@@ -551,6 +861,7 @@ def build_valid_run(run_dir: Path, mode: str = "gate") -> dict:
     (hydra_dir / "config.yaml").write_text(
         yaml.safe_dump(config, sort_keys=True), encoding="utf-8"
     )
+    freeze_path = write_critic_parameter_freeze_manifest(run_dir, config)
 
     rollout_dir = run_dir / "rollout_data"
     rollout_dir.mkdir()
@@ -600,7 +911,7 @@ def build_valid_run(run_dir: Path, mode: str = "gate") -> dict:
             "\n".join(jsonl_lines) + "\n", encoding="utf-8"
         )
         collection_real_rows.append(len(collection_records))
-        padding_rows += (-len(collection_records)) % ppo_mini_batch_size
+        padding_rows += (-len(collection_records)) % padding_multiple
 
     metrics_path = run_dir / "metrics.jsonl"
     metric_lines = []
@@ -612,6 +923,12 @@ def build_valid_run(run_dir: Path, mode: str = "gate") -> dict:
                     "data": {
                         "actor/grad_norm": 1.0,
                         "critic/grad_norm": 1.0,
+                        "actor/ppo_epoch_passes_delta": 1.0,
+                        "actor/mini_batches_per_epoch": 1.0,
+                        "actor/optimizer_steps_delta": 1.0,
+                        "critic/ppo_epoch_passes_delta": 2.0,
+                        "critic/mini_batches_per_epoch": 1.0,
+                        "critic/optimizer_steps_delta": 2.0,
                         "fully_async/count/current_param_version": publication,
                         "fully_async/count/stale_trajectory_processed": 0,
                         "fully_async/count/total_generated_samples": min(
@@ -623,6 +940,14 @@ def build_valid_run(run_dir: Path, mode: str = "gate") -> dict:
                         "rollout_corr/kl": 0.01,
                         "rollout_corr/k3_kl": 0.001,
                         "rollout_corr/log_ppl_abs_diff": 0.01,
+                        "rollout_corr/rollout_is_oob_ratio": 0.15,
+                        "rollout_corr/rollout_is_ratio_fraction_high": 0.10,
+                        "rollout_corr/rollout_is_ratio_fraction_low": 0.05,
+                        "rollout_corr/rollout_is_mean": 0.90,
+                        "rollout_corr/rollout_is_min": 0.0,
+                        "rollout_corr/rollout_is_max": 2.0,
+                        "rollout_corr/rollout_is_std": 0.40,
+                        "rollout_corr/rollout_is_eff_sample_size": 0.80,
                     },
                 },
                 sort_keys=True,
@@ -729,6 +1054,7 @@ def build_valid_run(run_dir: Path, mode: str = "gate") -> dict:
             "rollout_data": str(rollout_dir),
             "hydra_config": str(hydra_dir / "config.yaml"),
             "checkpoints": str(run_dir / "checkpoints"),
+            "critic_parameter_freeze": str(freeze_path),
             "finalization": str(run_dir / "finalization.json"),
         },
         "validation_enabled": False,
@@ -749,6 +1075,7 @@ def build_valid_run(run_dir: Path, mode: str = "gate") -> dict:
         "hydra_path": hydra_dir / "config.yaml",
         "rollout_dir": rollout_dir,
         "checkpoint_root": run_dir / "checkpoints",
+        "freeze_path": freeze_path,
         "launch_path": launch_path,
     }
 
@@ -940,6 +1267,7 @@ def build_valid_multitask_run(
     hydra_dir.mkdir(parents=True)
     hydra_path = hydra_dir / "config.yaml"
     hydra_path.write_text(yaml.safe_dump(config, sort_keys=True), encoding="utf-8")
+    freeze_path = write_critic_parameter_freeze_manifest(run_dir, config)
 
     budget_contract = {
         "schema": "amg_verl_multitask_budget_contract_v1",
@@ -1020,15 +1348,19 @@ def build_valid_multitask_run(
             "\n".join(json.dumps(row, sort_keys=True) for row in documents) + "\n",
             encoding="utf-8",
         )
-        padding_rows += (-len(documents)) % config["actor_rollout_ref"]["actor"][
-            "ppo_mini_batch_size"
-        ]
+        padding_rows += (-len(documents)) % 6
         cumulative_episodes.update(update_episodes)
         cumulative_actions.update(update_actions)
         cumulative_tokens.update(update_tokens)
         data = {
             "actor/grad_norm": 1.0,
             "critic/grad_norm": 1.0,
+            "actor/ppo_epoch_passes_delta": 1.0,
+            "actor/mini_batches_per_epoch": 1.0,
+            "actor/optimizer_steps_delta": 1.0,
+            "critic/ppo_epoch_passes_delta": 2.0,
+            "critic/mini_batches_per_epoch": 1.0,
+            "critic/optimizer_steps_delta": 2.0,
             "fully_async/count/current_param_version": update - 1,
             "fully_async/count/stale_trajectory_processed": 0,
             "fully_async/count/total_generated_samples": update * samples_per_update,
@@ -1038,6 +1370,14 @@ def build_valid_multitask_run(
             "rollout_corr/kl": 0.01,
             "rollout_corr/k3_kl": 0.001,
             "rollout_corr/log_ppl_abs_diff": 0.01,
+            "rollout_corr/rollout_is_oob_ratio": 0.15,
+            "rollout_corr/rollout_is_ratio_fraction_high": 0.10,
+            "rollout_corr/rollout_is_ratio_fraction_low": 0.05,
+            "rollout_corr/rollout_is_mean": 0.90,
+            "rollout_corr/rollout_is_min": 0.0,
+            "rollout_corr/rollout_is_max": 2.0,
+            "rollout_corr/rollout_is_std": 0.40,
+            "rollout_corr/rollout_is_eff_sample_size": 0.80,
         }
         for measure, current, cumulative in (
             ("episodes", update_episodes, cumulative_episodes),
@@ -1205,6 +1545,7 @@ def build_valid_multitask_run(
             "rollout_data": str(rollout_dir),
             "hydra_config": str(hydra_path),
             "checkpoints": str(run_dir / "checkpoints"),
+            "critic_parameter_freeze": str(freeze_path),
             "finalization": str(run_dir / "finalization.json"),
             "trainer_log": str(trainer_log),
         },
@@ -1226,6 +1567,7 @@ def build_valid_multitask_run(
         "hydra_path": hydra_path,
         "rollout_dir": rollout_dir,
         "checkpoint_root": run_dir / "checkpoints",
+        "freeze_path": freeze_path,
         "launch_path": launch_path,
         "trainer_log": trainer_log,
     }

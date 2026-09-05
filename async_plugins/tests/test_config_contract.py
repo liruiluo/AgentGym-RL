@@ -136,7 +136,7 @@ def _config(*, mode: str = "formal") -> dict:
             "ppo_infer_max_token_len_per_gpu": 32768,
             "ppo_mini_batch_size": ppo_mini_batch_size,
             "ppo_micro_batch_size_per_gpu": 8,
-            "ppo_epochs": 1,
+            "ppo_epochs": 2,
             "shuffle": False,
             "use_dynamic_bsz": True,
             "loss_agg_mode": "token-mean",
@@ -146,23 +146,41 @@ def _config(*, mode: str = "formal") -> dict:
                 "optimizer_offload": False,
                 "reshard_after_forward": True,
             },
-            "optim": {"lr": 1e-5},
+            "optim": {
+                "lr": 5e-6,
+                "lr_warmup_steps": 10,
+                "zero_indexed_step": False,
+                "lr_scheduler_step_per_optimizer_step": True,
+            },
             "model": {
                 "path": "/models/Qwen3.5-4B",
                 "enable_gradient_checkpointing": True,
                 "use_fused_kernels": False,
                 "fused_kernel_options": {"impl_backend": "torch"},
+                "parameter_freeze_policy": "qwen35_dense_token_mixers_v1",
+                "parameter_freeze_manifest_path": "/run/critic-parameter-freeze.json",
+                "parameter_freeze_probe_elements_per_rank": 4_096,
             },
         },
         "algorithm": {
-            "adv_estimator": "amg_action_axis_gae",
+            "adv_estimator": "amg_sao_token_gae",
+            "amg_policy_lambda_mode": "length_adaptive",
+            "amg_policy_lambda_scale": 1.5,
+            "amg_critic_lambda": 1.0,
+            "amg_reward_tolerance": 1e-6,
             "amg_advantage_normalization": "upstream_masked_whiten",
+            "full_learner_batch_updates": True,
             "gamma": 1.0,
             "lam": 1.0,
             "use_kl_in_reward": False,
             "rollout_correction": {
                 "bypass_mode": True,
-                "loss_type": "ppo_clip",
+                "loss_type": "reinforce",
+                "rollout_is": "token",
+                "rollout_is_threshold": "0.2_4.0",
+                "rollout_is_batch_normalize": False,
+                "rollout_rs": None,
+                "rollout_rs_threshold": None,
             },
         },
         "data": {
@@ -205,6 +223,7 @@ def _config(*, mode: str = "formal") -> dict:
         "trainer": {
             "nnodes": 1,
             "n_gpus_per_node": trainer_gpus,
+            "critic_warmup": 0,
             "total_training_steps": 100 if formal else 1,
             "total_epochs": 1,
             "val_before_train": False,
@@ -322,18 +341,55 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         self.assertEqual(report["optimizer_updates"], 1)
         self.assertEqual(report["episodes"], 64)
 
-    def test_rejects_grpo_or_missing_critic(self):
+    def test_rejects_non_token_estimator_or_missing_critic(self):
         config = _config()
         config["algorithm"]["adv_estimator"] = "grpo"
         config["critic"]["enable"] = False
-        with self.assertRaisesRegex(ValueError, "action-axis GAE"):
+        with self.assertRaisesRegex(ValueError, "token-axis GAE"):
             _verify(config, mode="formal")
 
-    def test_rejects_unwhitened_action_axis_advantages(self):
+    def test_rejects_unwhitened_token_axis_advantages(self):
         config = _config()
         config["algorithm"]["amg_advantage_normalization"] = "none"
         with self.assertRaisesRegex(ValueError, "amg_advantage_normalization"):
             _verify(config, mode="formal")
+
+    def test_rejects_sao_or_compactionrl_contract_drift(self):
+        mutations = (
+            (("algorithm",), "amg_policy_lambda_mode", "fixed"),
+            (("algorithm",), "amg_policy_lambda_scale", 2.0),
+            (("algorithm",), "amg_critic_lambda", 0.95),
+            (("algorithm",), "amg_reward_tolerance", 1e-4),
+            (("algorithm",), "full_learner_batch_updates", False),
+            (("algorithm", "rollout_correction"), "loss_type", "ppo_clip"),
+            (("algorithm", "rollout_correction"), "rollout_is", "sequence"),
+            (
+                ("algorithm", "rollout_correction"),
+                "rollout_is_threshold",
+                "0.1_5.0",
+            ),
+            (
+                ("algorithm", "rollout_correction"),
+                "rollout_is_batch_normalize",
+                True,
+            ),
+            (("critic",), "ppo_epochs", 1),
+            (("critic", "optim"), "zero_indexed_step", True),
+            (
+                ("critic", "optim"),
+                "lr_scheduler_step_per_optimizer_step",
+                False,
+            ),
+        )
+        for path, key, wrong in mutations:
+            with self.subTest(path=path, key=key):
+                config = _config()
+                target = config
+                for component in path:
+                    target = target[component]
+                target[key] = wrong
+                with self.assertRaisesRegex(ValueError, key):
+                    _verify(config, mode="formal")
 
     def test_rejects_half_async_or_validation(self):
         config = _config()

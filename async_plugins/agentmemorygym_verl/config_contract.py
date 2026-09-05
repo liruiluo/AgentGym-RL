@@ -130,11 +130,11 @@ def verify_resolved_config(
     expected = dict(expected_budget)
 
     if (
-        _at(config, "algorithm.adv_estimator") != "amg_action_axis_gae"
+        _at(config, "algorithm.adv_estimator") != "amg_sao_token_gae"
         or _at(config, "critic.enable") is not True
     ):
         raise ValueError(
-            "AMG PPO requires registered action-axis GAE and an enabled critic"
+            "AMG SAO PPO requires registered token-axis GAE and an enabled critic"
         )
 
     _require_equal(config, "actor_rollout_ref.rollout.n", 1)
@@ -142,7 +142,16 @@ def verify_resolved_config(
     _require_equal(config, "actor_rollout_ref.rollout.calculate_log_probs", True)
     _require_equal(config, "actor_rollout_ref.actor.use_rollout_log_probs", True)
     _require_equal(config, "algorithm.rollout_correction.bypass_mode", True)
-    _require_equal(config, "algorithm.rollout_correction.loss_type", "ppo_clip")
+    _require_equal(config, "algorithm.rollout_correction.loss_type", "reinforce")
+    _require_equal(config, "algorithm.rollout_correction.rollout_is", "token")
+    _require_equal(
+        config, "algorithm.rollout_correction.rollout_is_threshold", "0.2_4.0"
+    )
+    _require_equal(
+        config, "algorithm.rollout_correction.rollout_is_batch_normalize", False
+    )
+    _require_equal(config, "algorithm.rollout_correction.rollout_rs", None)
+    _require_equal(config, "algorithm.rollout_correction.rollout_rs_threshold", None)
     _require_equal(
         config, "actor_rollout_ref.actor.policy_loss.loss_mode", "bypass_mode"
     )
@@ -403,6 +412,8 @@ def verify_resolved_config(
         "data.return_raw_chat": True,
         "actor_rollout_ref.model.enable_gradient_checkpointing": True,
         "critic.model.enable_gradient_checkpointing": True,
+        "critic.model.parameter_freeze_policy": "qwen35_dense_token_mixers_v1",
+        "critic.model.parameter_freeze_probe_elements_per_rank": 4_096,
         "actor_rollout_ref.actor.ppo_mini_batch_size": ppo_mini_batch_size,
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu": 8,
         "actor_rollout_ref.actor.ppo_epochs": 1,
@@ -421,7 +432,7 @@ def verify_resolved_config(
         "critic.fsdp.reshard_after_forward": True,
         "critic.ppo_mini_batch_size": ppo_mini_batch_size,
         "critic.ppo_micro_batch_size_per_gpu": 8,
-        "critic.ppo_epochs": 1,
+        "critic.ppo_epochs": 2,
         "critic.shuffle": False,
         "critic.use_dynamic_bsz": True,
         "critic.loss_agg_mode": "token-mean",
@@ -430,8 +441,14 @@ def verify_resolved_config(
         "critic.strategy": "fsdp2",
         "algorithm.gamma": 1.0,
         "algorithm.lam": 1.0,
+        "algorithm.amg_policy_lambda_mode": "length_adaptive",
+        "algorithm.amg_policy_lambda_scale": 1.5,
+        "algorithm.amg_critic_lambda": 1.0,
+        "algorithm.amg_reward_tolerance": 1e-6,
         "algorithm.amg_advantage_normalization": "upstream_masked_whiten",
+        "algorithm.full_learner_batch_updates": True,
         "algorithm.use_kl_in_reward": False,
+        "trainer.critic_warmup": 0,
         "trainer.total_epochs": 1,
         "trainer.val_before_train": False,
         "trainer.test_freq": -1,
@@ -487,9 +504,27 @@ def verify_resolved_config(
         raise ValueError(
             f"actor lr must match synchronous comparator 1e-6, got {actor_lr}"
         )
-    if not math.isclose(critic_lr, 1e-5, rel_tol=0.0, abs_tol=1e-15):
+    if not math.isclose(critic_lr, 5e-6, rel_tol=0.0, abs_tol=1e-15):
         raise ValueError(
-            f"critic lr must match synchronous comparator 1e-5, got {critic_lr}"
+            f"critic lr must match the registered SAO recipe 5e-6, got {critic_lr}"
+        )
+    _require_equal(config, "critic.optim.lr_warmup_steps", 10)
+    _require_equal(config, "critic.optim.zero_indexed_step", False)
+    _require_equal(
+        config,
+        "critic.optim.lr_scheduler_step_per_optimizer_step",
+        True,
+    )
+    freeze_manifest_path = _at(
+        config, "critic.model.parameter_freeze_manifest_path"
+    )
+    if (
+        not isinstance(freeze_manifest_path, str)
+        or not freeze_manifest_path.strip()
+        or not Path(freeze_manifest_path).is_absolute()
+    ):
+        raise ValueError(
+            "critic parameter_freeze_manifest_path must be a non-empty absolute path"
         )
 
     mini_batch = _positive_int(
@@ -602,8 +637,52 @@ def verify_resolved_config(
             "impl_backend": "torch",
         },
         "rollout_n": 1,
-        "adv_estimator": "amg_action_axis_gae",
+        "adv_estimator": "amg_sao_token_gae",
+        "policy_lambda": {
+            "mode": "length_adaptive",
+            "scale": 1.5,
+        },
+        "critic_lambda": 1.0,
+        "critic_parameter_freeze": {
+            "policy": "qwen35_dense_token_mixers_v1",
+            "probe_elements_per_rank": 4_096,
+            "manifest_path": freeze_manifest_path,
+            "trainable_categories": [
+                "embedding",
+                "norm",
+                "mlp",
+                "value_head",
+            ],
+            "frozen_categories": [
+                "self_attention",
+                "linear_attention",
+                "visual_auxiliary",
+                "lm_head_auxiliary",
+            ],
+        },
+        "critic_recipe": {
+            "learning_rate": 5e-6,
+            "lr_warmup_steps": 10,
+            "zero_indexed_step": False,
+            "lr_scheduler_step_per_optimizer_step": True,
+            "trainer_critic_warmup": 0,
+        },
+        "actor_ppo_epochs": 1,
+        "critic_ppo_epochs": 2,
+        "optimizer_update_boundary": {
+            "scope": "complete_aligned_learner_batch",
+            "actor_steps_per_publication": 1,
+            "critic_steps_per_publication": 2,
+            "dynamic_micro_batching_only": True,
+        },
         "advantage_normalization": "upstream_masked_whiten",
+        "rollout_correction": {
+            "bypass_mode": True,
+            "loss_type": "reinforce",
+            "rollout_is": "token",
+            "rollout_is_threshold": "0.2_4.0",
+            "rollout_is_batch_normalize": False,
+        },
         "model_path": actor_model,
         "env_addr": env_addr,
         "route_ids": route_ids,

@@ -290,6 +290,18 @@ def build_overrides(
         f"critic.model.use_fused_kernels={inputs.critic_use_fused_kernels}",
         "critic.model.fused_kernel_options.impl_backend=torch",
         "critic.model.enable_gradient_checkpointing=True",
+        # SAO freezes the critic's token-mixing modules. Qwen3.5-4B is a dense
+        # hybrid model rather than the paper's MoE target, so the registered
+        # adaptation freezes both full self-attention and GatedDeltaNet/linear
+        # attention while leaving embeddings, norms, dense MLPs, and the scalar
+        # value head trainable. The exact TRL Qwen3.5 wrapper also retains an
+        # unused visual tower, which is explicitly frozen. Its LM head is tied
+        # to the trainable token embedding, so the runtime records that exact
+        # alias instead of claiming an impossible independent freeze. veRL writes a run-owned
+        # parameter/optimizer/first-step proof that the finalizer audits.
+        "critic.model.parameter_freeze_policy=qwen35_dense_token_mixers_v1",
+        f"critic.model.parameter_freeze_manifest_path={run_dir}/critic-parameter-freeze.json",
+        "critic.model.parameter_freeze_probe_elements_per_rank=4096",
         "actor_rollout_ref.actor.strategy=fsdp2",
         "actor_rollout_ref.actor.fsdp_config.strategy=fsdp2",
         "actor_rollout_ref.actor.fsdp_config.param_offload=False",
@@ -333,7 +345,9 @@ def build_overrides(
         "critic.fsdp.reshard_after_forward=True",
         f"critic.ppo_mini_batch_size={ppo_mini_batch_size}",
         "critic.ppo_micro_batch_size_per_gpu=8",
-        "critic.ppo_epochs=1",
+        # The public SAO recipe uses two value updates for each actor update.
+        # The critic remains veRL-native; only its epoch count changes.
+        "critic.ppo_epochs=2",
         "critic.shuffle=False",
         "critic.use_dynamic_bsz=True",
         "critic.loss_agg_mode=token-mean",
@@ -343,10 +357,18 @@ def build_overrides(
         f"critic.ppo_max_token_len_per_gpu={critic_train_token_budget}",
         "+critic.ppo_infer_max_token_len_per_gpu=32768",
         "critic.forward_max_token_len_per_gpu=262144",
-        "critic.optim.lr=1e-5",
+        # The public SAO recipe states a 5e-6 value-model learning rate and a
+        # ten-step value-model warmup. Map the latter to the critic LR
+        # scheduler, not trainer.critic_warmup (which suppresses actor updates).
+        "critic.optim.lr=5e-6",
         "critic.optim.weight_decay=0.01",
-        "critic.optim.lr_warmup_steps=0",
+        "critic.optim.lr_warmup_steps=10",
         "critic.optim.lr_scheduler_type=constant",
+        # SAO's two critic optimizer updates are both real schedule steps.  A
+        # one-indexed warmup gives them 0.1x and 0.2x LR instead of performing
+        # a zero-LR first step, and the scheduler advances after each update.
+        "critic.optim.zero_indexed_step=False",
+        "++critic.optim.lr_scheduler_step_per_optimizer_step=True",
         "actor_rollout_ref.rollout.n=1",
         "actor_rollout_ref.rollout.name=sglang",
         "actor_rollout_ref.rollout.mode=async",
@@ -383,16 +405,29 @@ def build_overrides(
         "actor_rollout_ref.rollout.agent.default_agent_loop=amg_task_neutral_async",
         f"actor_rollout_ref.rollout.agent.agent_loop_config_path={loop_config}",
         "actor_rollout_ref.hybrid_engine=False",
-        "algorithm.adv_estimator=amg_action_axis_gae",
+        "algorithm.adv_estimator=amg_sao_token_gae",
+        "++algorithm.amg_policy_lambda_mode=length_adaptive",
+        "++algorithm.amg_policy_lambda_scale=1.5",
+        "++algorithm.amg_critic_lambda=1.0",
+        "++algorithm.amg_reward_tolerance=1.0e-6",
         "++algorithm.amg_advantage_normalization=upstream_masked_whiten",
+        # One complete aligned learner batch defines one actor update and one
+        # token denominator.  The critic makes two full-batch passes; FSDP may
+        # still split either pass into dynamic micro-batches for memory.
+        "++algorithm.full_learner_batch_updates=True",
         "algorithm.gamma=1.0",
         "algorithm.lam=1.0",
         "algorithm.use_kl_in_reward=False",
         "algorithm.kl_ctrl.kl_coef=0.0",
         "algorithm.rollout_correction.bypass_mode=True",
-        "algorithm.rollout_correction.loss_type=ppo_clip",
-        "algorithm.rollout_correction.rollout_is=null",
+        # SAO/IcePop keeps the fully asynchronous actor on the native bypass
+        # loss, with per-token importance weights and a two-sided trust band.
+        "algorithm.rollout_correction.loss_type=reinforce",
+        "algorithm.rollout_correction.rollout_is=token",
+        "algorithm.rollout_correction.rollout_is_threshold=0.2_4.0",
+        "algorithm.rollout_correction.rollout_is_batch_normalize=False",
         "algorithm.rollout_correction.rollout_rs=null",
+        "algorithm.rollout_correction.rollout_rs_threshold=null",
         # Ray otherwise reserves roughly 30% of the node's currently available
         # memory in tmpfs. AMG batches use far less object-store space, while
         # the colocated retrieval index needs that headroom to stay resident.
@@ -497,7 +532,7 @@ def build_runtime_env(
     env["CUDA_HOME"] = cuda_home
     env["CUDA_PATH"] = cuda_home
     env["LD_LIBRARY_PATH"] = os.pathsep.join(cuda_library_entries)
-    env["VERL_USE_EXTERNAL_MODULES"] = "agentmemorygym_verl.action_gae"
+    env["VERL_USE_EXTERNAL_MODULES"] = "agentmemorygym_verl.token_gae"
     env["VERL_USE_EXTERNAL_PLUGINS"] = "none"
     env["VERL_FILE_LOGGER_PATH"] = str(inputs.run_dir / "metrics.jsonl")
     env.pop("VERL_FULLY_ASYNC_RUNTIME_RECEIPT_PATH", None)
@@ -1906,7 +1941,7 @@ from trl import AutoModelForCausalLMWithValueHead
 from agentmemorygym_verl.active_source_audit import audit_resolved_active_sources
 # Match veRL's real entrypoint: external estimator registration must occur
 # before the runtime probe asks the upstream registry for the AMG estimator.
-from agentmemorygym_verl import action_gae as _amg_action_gae
+from agentmemorygym_verl import token_gae as _amg_token_gae
 from agentmemorygym_verl.agent_loop import AMGTaskNeutralAgentLoop
 from agentmemorygym_verl.dataset import AMGTrajectoryDataset
 from agentmemorygym_verl.env_client import create_env_client
@@ -1920,7 +1955,7 @@ from verl.utils.tokenizer.continuous_token_wiring import (
     infer_continuous_token_model_family,
 )
 
-fn = get_adv_estimator_fn("amg_action_axis_gae")
+fn = get_adv_estimator_fn("amg_sao_token_gae")
 model_path = sys.argv[1]
 registry_path = sys.argv[2]
 registry_sha256 = sys.argv[3]
@@ -2305,6 +2340,9 @@ def prepare_launch(
             "rollout_data": str(inputs.run_dir / "rollout_data"),
             "hydra_config": str(inputs.run_dir / "hydra" / ".hydra" / "config.yaml"),
             "checkpoints": str(inputs.run_dir / "checkpoints"),
+            "critic_parameter_freeze": str(
+                inputs.run_dir / "critic-parameter-freeze.json"
+            ),
             "finalization": str(inputs.run_dir / "finalization.json"),
             **(
                 {"trainer_log": str(inputs.run_dir / "trainer.log")}

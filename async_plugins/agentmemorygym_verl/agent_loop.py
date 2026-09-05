@@ -758,6 +758,9 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                     "sample_reschedule_attempt": sample_reschedule_attempt,
                     "trajectory_terminal": False,
                     "rollout_done_flag": done,
+                    "declared_max_rounds": int(route.max_rounds),
+                    "termination_kind": "in_progress",
+                    "horizon_finalizer_receipt": "not_applicable:nonterminal",
                     "immediate_reward": reward,
                     "trajectory_return": 0.0,
                     "task_round": row_order + 1,
@@ -795,6 +798,9 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                         "sample_reschedule_attempt": sample_reschedule_attempt,
                         "trajectory_terminal": False,
                         "rollout_done_flag": done,
+                        "declared_max_rounds": int(route.max_rounds),
+                        "termination_kind": "in_progress",
+                        "horizon_finalizer_receipt": "not_applicable:nonterminal",
                         "immediate_reward": reward,
                         "trajectory_return": 0.0,
                         "item_id": item_id,
@@ -844,7 +850,10 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
             if not outputs:
                 raise RuntimeError("AMG AgentLoop produced no trainable policy action")
 
-            if not rows[-1]["rollout_done_flag"]:
+            if rows[-1]["rollout_done_flag"]:
+                terminal_kind = "environment_done"
+                finalizer_receipt = "not_invoked:environment_done"
+            else:
                 finalizer = getattr(client, "finalize_policy_horizon", None)
                 horizon_output = finalizer() if callable(finalizer) else None
                 if horizon_output is not None:
@@ -896,9 +905,26 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                             "horizon_finalization": horizon_finalization,
                         }
                     )
+                    terminal_kind = "horizon_finalized"
+                    finalizer_receipt = "terminal_transition_applied"
                 else:
                     rows[-1]["outcome"] = "max_rounds"
                     outputs[-1].extra_fields["outcome"] = "max_rounds"
+                    terminal_kind = "max_rounds"
+                    finalizer_receipt = (
+                        "no_terminal_transition:returned_none"
+                        if callable(finalizer)
+                        else "no_terminal_transition:no_hook"
+                    )
+
+            rows[-1]["termination_kind"] = terminal_kind
+            rows[-1]["horizon_finalizer_receipt"] = finalizer_receipt
+            outputs[-1].extra_fields.update(
+                {
+                    "termination_kind": terminal_kind,
+                    "horizon_finalizer_receipt": finalizer_receipt,
+                }
+            )
 
             trajectory_return = sum(float(row["immediate_reward"]) for row in rows)
             for index, (row, output) in enumerate(zip(rows, outputs, strict=True)):

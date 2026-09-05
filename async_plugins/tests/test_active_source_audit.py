@@ -3,6 +3,8 @@ from __future__ import annotations
 import tempfile
 import types
 import unittest
+import os
+import subprocess
 from pathlib import Path
 from unittest import mock
 
@@ -14,17 +16,27 @@ from agentmemorygym_verl.active_source_audit import (
 
 ROOT = Path(__file__).resolve().parents[2]
 VERL_ROOT = Path(
-    "/Users/luolirui.1/Projects/agentmemorygym-rl-workspace/"
-    "worktrees/verl-main-exact-eos-20260823"
+    os.environ.get(
+        "AMG_TEST_VERL_ROOT",
+        str(ROOT.parent / "verl-sao-compactionrl-r107-20260905"),
+    )
 )
+EXPECTED_VERL_COMMIT = "6cd387cd2ebf413f93082eabf4ef5ad52bda37b5"
 
 
 class TestActiveSourceAudit(unittest.TestCase):
-    def test_actual_accepted_verl_and_shared_plugin_sources_have_no_domain_dispatch(
+    def test_exact_algorithm_verl_and_shared_plugin_sources_have_no_domain_dispatch(
         self,
     ):
         if not VERL_ROOT.is_dir():
-            self.skipTest("accepted veRL source worktree is unavailable")
+            self.skipTest("algorithm veRL source worktree is unavailable")
+        actual_commit = subprocess.run(
+            ["git", "-C", str(VERL_ROOT), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        self.assertEqual(actual_commit, EXPECTED_VERL_COMMIT)
         files = {
             "fully_async_main": VERL_ROOT
             / "verl/experimental/fully_async_policy/fully_async_main.py",
@@ -38,7 +50,7 @@ class TestActiveSourceAudit(unittest.TestCase):
             / "verl/experimental/agent_loop/agent_loop.py",
             "amg_agent_loop": ROOT / "async_plugins/agentmemorygym_verl/agent_loop.py",
             "amg_dataset": ROOT / "async_plugins/agentmemorygym_verl/dataset.py",
-            "amg_action_gae": ROOT / "async_plugins/agentmemorygym_verl/action_gae.py",
+            "amg_token_gae": ROOT / "async_plugins/agentmemorygym_verl/token_gae.py",
         }
         report = audit_source_paths(files)
         self.assertEqual(report["status"], "pass")

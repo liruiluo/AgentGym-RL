@@ -369,6 +369,10 @@ class _PressureHorizonClient(_HorizonClient):
         return None
 
 
+class _NoFinalizerHorizonClient(_HorizonClient):
+    finalize_policy_horizon = None
+
+
 class _ErrorClient(_MemoryChainClient):
     def policy_turn_candidate(self):
         return None
@@ -689,6 +693,48 @@ class TestAMGAgentLoop(IsolatedAsyncioTestCase):
             [pressure.max_observation_tokens for pressure in client.pressures],
             [73, 73],
         )
+        terminal = outputs[-1].extra_fields
+        self.assertEqual(terminal["declared_max_rounds"], 2)
+        self.assertEqual(terminal["termination_kind"], "horizon_finalized")
+        self.assertEqual(
+            terminal["horizon_finalizer_receipt"], "terminal_transition_applied"
+        )
+        self.assertTrue(client.closed)
+
+    async def test_max_rounds_without_finalizer_emits_complete_horizon_attestation(self):
+        client = _NoFinalizerHorizonClient()
+        loop = self._loop(["FIRST", "SECOND"], max_turns=2)
+
+        with mock.patch.object(
+            agent_loop_module, "create_env_client", return_value=client
+        ):
+            outputs = await loop.run(
+                {"max_tokens": 8},
+                item_id="max-rounds",
+                data_idx=0,
+                raw_prompt=[{"role": "system", "content": "system"}],
+            )
+
+        self.assertEqual(len(outputs), 2)
+        self.assertEqual(
+            [output.extra_fields["declared_max_rounds"] for output in outputs],
+            [2, 2],
+        )
+        self.assertEqual(outputs[-1].extra_fields["outcome"], "max_rounds")
+        self.assertFalse(outputs[-1].extra_fields["rollout_done_flag"])
+        self.assertEqual(outputs[-1].extra_fields["termination_kind"], "max_rounds")
+        self.assertEqual(
+            outputs[-1].extra_fields["horizon_finalizer_receipt"],
+            "no_terminal_transition:no_hook",
+        )
+        record = json.loads(outputs[-1].extra_fields["step_record_json"])
+        self.assertEqual(record["trajectory_row_order"], 1)
+        self.assertEqual(record["declared_max_rounds"], 2)
+        self.assertEqual(record["termination_kind"], "max_rounds")
+        self.assertEqual(
+            record["horizon_finalizer_receipt"],
+            "no_terminal_transition:no_hook",
+        )
         self.assertTrue(client.closed)
 
     async def test_selected_client_closes_when_wrapper_raises(self):
@@ -896,6 +942,11 @@ class TestAMGAgentLoop(IsolatedAsyncioTestCase):
             [False] * 4 + [True],
         )
         self.assertEqual(outputs[-1].extra_fields["outcome"], "success")
+        self.assertEqual(outputs[-1].extra_fields["termination_kind"], "environment_done")
+        self.assertEqual(
+            outputs[-1].extra_fields["horizon_finalizer_receipt"],
+            "not_invoked:environment_done",
+        )
         self.assertTrue(
             all(
                 output.extra_fields["horizon_finalization"] is None
@@ -943,6 +994,12 @@ class TestAMGAgentLoop(IsolatedAsyncioTestCase):
         self.assertTrue(record["rollout_done_flag"])
         self.assertEqual(record["outcome"], "success")
         self.assertEqual(output.extra_fields["outcome"], "success")
+        self.assertEqual(output.extra_fields["declared_max_rounds"], 1)
+        self.assertEqual(output.extra_fields["termination_kind"], "horizon_finalized")
+        self.assertEqual(
+            output.extra_fields["horizon_finalizer_receipt"],
+            "terminal_transition_applied",
+        )
         self.assertEqual(
             output.extra_fields["horizon_finalization"],
             record["horizon_finalization"],
