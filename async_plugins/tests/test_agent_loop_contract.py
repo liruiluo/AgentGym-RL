@@ -363,6 +363,64 @@ class _AuxiliaryBudgetClient(_HorizonClient):
         )
 
 
+class _BlockedAuxiliaryBudgetClient(_HorizonClient):
+    """Terminate a policy row when its atomic auxiliary group cannot fit."""
+
+    def __init__(self):
+        super().__init__()
+        self.bound_budgets = []
+        self.finalize_calls = 0
+
+    def bind_policy_action_budget(self, budget):
+        self.bound_budgets.append(budget)
+
+    def step(self, action):
+        self.actions.append(action)
+        budget = self.bound_budgets[-1]
+        receipt = build_task_neutral_action_budget_receipt(
+            budget,
+            auxiliary_steps=0,
+            required_auxiliary_steps=2,
+            atomic_operation_blocked=True,
+        )
+        return StepOutput(
+            state="combined action budget exhausted",
+            reward=0.0,
+            done=True,
+            info=build_task_neutral_transition_info(
+                env_info={"grade": None, "native_action_count": 1},
+                wrapper_evidence={
+                    "outcome": "terminal_failure",
+                    "terminal_reason": "combined_step_budget_exhausted",
+                },
+                action_budget=receipt,
+            ),
+        )
+
+    def finalize_policy_horizon(self):
+        self.finalize_calls += 1
+        return StepOutput(
+            state="native horizon finalized",
+            reward=0.0,
+            done=True,
+            info=build_task_neutral_transition_info(
+                env_info={
+                    "grade": None,
+                    "terminal": True,
+                    "truncated": False,
+                    "terminal_reason": "action_budget_exhausted",
+                    "episode_success": False,
+                    "runtime_success": False,
+                    "counters": {"grading_count": 0},
+                },
+                wrapper_evidence={
+                    "outcome": "terminal_failure",
+                    "source": "native_horizon",
+                },
+            ),
+        )
+
+
 class _PressureHorizonClient(_HorizonClient):
     def __init__(self):
         super().__init__()
@@ -757,6 +815,35 @@ class TestAMGAgentLoop(IsolatedAsyncioTestCase):
         self.assertEqual(record["action_budget"]["consumed_steps_after"], 3)
         self.assertTrue(record["rollout_done_flag"])
         self.assertEqual(record["outcome"], "success")
+
+    async def test_blocked_atomic_budget_still_materializes_native_terminal(self):
+        client = _BlockedAuxiliaryBudgetClient()
+        loop = self._loop(["BOUNDARY"], max_turns=2)
+
+        with mock.patch.object(
+            agent_loop_module, "create_env_client", return_value=client
+        ):
+            outputs = await loop.run(
+                {"max_tokens": 8},
+                item_id="blocked-combined-budget-task",
+                data_idx=0,
+                uid="trajectory-blocked-combined-budget",
+                raw_prompt=[{"role": "system", "content": "system"}],
+            )
+
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(client.finalize_calls, 1)
+        record = json.loads(outputs[0].extra_fields["step_record_json"])
+        self.assertTrue(record["action_budget"]["atomic_operation_blocked"])
+        self.assertTrue(record["action_budget"]["terminate_after_action"])
+        self.assertTrue(record["rollout_done_flag"])
+        self.assertEqual(
+            record["horizon_finalization"]["env_info"]["terminal_reason"],
+            "action_budget_exhausted",
+        )
+        self.assertEqual(
+            record["horizon_finalization"]["env_info"]["grade"], None
+        )
 
     async def test_tampered_action_budget_receipt_fails_closed(self):
         client = _AuxiliaryBudgetClient(tamper=True)

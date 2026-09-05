@@ -633,7 +633,20 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
             if not outputs:
                 raise RuntimeError("AMG AgentLoop produced no trainable policy action")
 
-            if not rows[-1]["rollout_done_flag"]:
+            final_action_budget = rows[-1].get("action_budget")
+            requires_native_horizon_receipt = (
+                isinstance(final_action_budget, Mapping)
+                and final_action_budget.get("terminate_after_action") is True
+            )
+            if (
+                not rows[-1]["rollout_done_flag"]
+                or requires_native_horizon_receipt
+            ):
+                # A wrapper-owned atomic auxiliary group can exhaust the shared
+                # budget after the sampled policy action while the native
+                # environment is still live.  Give the native wrapper one
+                # chance to emit its registered terminal receipt; otherwise
+                # held-out materialization would see only a method-owned stop.
                 finalizer = getattr(client, "finalize_policy_horizon", None)
                 horizon_output = finalizer() if callable(finalizer) else None
                 if horizon_output is not None:
@@ -688,7 +701,7 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                             "horizon_finalization": horizon_finalization,
                         }
                     )
-                else:
+                elif not rows[-1]["rollout_done_flag"]:
                     rows[-1]["outcome"] = "max_rounds"
                     outputs[-1].extra_fields["outcome"] = "max_rounds"
 
