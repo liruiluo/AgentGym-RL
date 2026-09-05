@@ -73,9 +73,12 @@ closure, then run the frozen matched 4x128 held-out evaluation.
   byte-identical to the current committed version.
 - Route-specific parsing and canonicalization belong in environment clients;
   endpoint legacy grammars remain internal execution formats.
-- Malformed, prose-wrapped, multiple, unknown, or bare policy actions must reach
-  endpoints only as the common impossible-action sentinel and must consume one
-  recoverable-invalid step.
+- Generation remains strict: prompts require one bare Qwen XML call with no
+  prose or thinking. Execution follows the pinned veRL parser for one complete,
+  schema-valid call, so harmless surrounding assistant content does not create a
+  false-negative reward. Multiple calls, `<think>`, nested envelopes, unknown
+  tools, invalid arguments, and bare actions still become the common impossible-
+  action sentinel and consume one recoverable-invalid step.
 - LiteResearcher's policy-facing terminal action is the XML `answer` function;
   the client maps it to the frozen endpoint's native `<answer>...</answer>` form.
 - No held-out evaluation before verified update200 and terminal checkpoint.
@@ -104,16 +107,18 @@ git -C "$LOCAL" hash-object \
 
 Add focused tests for all policy-facing routes:
 
-1. Common parser: one exact envelope, schema-backed typed arguments, optional
-   decoded EOS handling, and rejection of prose, duplicate calls, unknown tools,
+1. Common parser: one complete envelope, schema-backed typed arguments,
+   optional decoded EOS handling, pinned-veRL-compatible surrounding-content
+   tolerance, and rejection of thinking, duplicate calls, unknown tools,
    malformed parameters, bare JSON, and bare actions.
 2. WebShop: prompt/tool manifest/checkpoint write/read use XML; search, click,
    shell_command, apply_patch, and conditional ask normalize to the existing
    endpoint grammar; all bare legacy forms become the sentinel; raw and submitted
    actions remain separately evidenced.
 3. SWE-smith: prompt/checkpoint/terminal sentinel examples use XML; shell and
-   patch calls normalize to the endpoint's canonical grammar; bare forms and
-   mixed prose become the sentinel.
+   patch calls normalize to the endpoint's canonical grammar; bare forms remain
+   the sentinel while one valid XML call with harmless surrounding content follows
+   pinned veRL execution semantics.
 4. LiteResearcher: add the XML `answer` schema/example; validate and normalize
    search, visit, workspace calls; map XML answer to native `<answer>`; reject the
    old bare answer, bare workspace actions, legacy JSON tool calls, and prose.
