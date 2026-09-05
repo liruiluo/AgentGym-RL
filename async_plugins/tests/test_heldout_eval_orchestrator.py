@@ -10,7 +10,9 @@ from unittest import mock
 from agentmemorygym_verl.heldout_eval_orchestrator import (
     ATTEMPT_SCHEMA,
     EvalAttempt,
+    HeldoutEvalLocalBackend,
     _attempt_owner_id,
+    _remove_empty_runtime_root,
     _verify_endpoint_task_counts,
     classify_inference_argv,
     execute_eval_orchestrator,
@@ -111,6 +113,83 @@ def _plan(root: Path, *, resolve_only: bool = False, episode_count: int = 7_777)
 
 
 class HeldoutEvalOrchestratorTests(unittest.TestCase):
+    def test_cleanup_removes_only_empty_runtime_directory_trees(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "runtime"
+            (root / "memory-episodes" / "nested").mkdir(parents=True)
+            self.assertTrue(_remove_empty_runtime_root(root))
+            self.assertFalse(root.exists())
+            self.assertFalse(_remove_empty_runtime_root(root))
+
+    def test_cleanup_refuses_non_directory_runtime_residue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "runtime"
+            root.mkdir()
+            residue = root / "unexpected.json"
+            residue.write_text("{}\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                OrchestratorError, "contains non-directory residue"
+            ):
+                _remove_empty_runtime_root(root)
+            self.assertTrue(residue.is_file())
+
+    def test_cleanup_refuses_symlink_runtime_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "runtime"
+            root.symlink_to(Path(directory) / "missing", target_is_directory=True)
+            with self.assertRaisesRegex(
+                OrchestratorError, "is not a real directory"
+            ):
+                _remove_empty_runtime_root(root)
+            self.assertTrue(root.is_symlink())
+
+    def test_cleanup_audit_removes_empty_attempt_runtime_roots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            orchestration_dir = root / "orchestration"
+            attempt_dir = orchestration_dir / "attempts" / "attempt-000000"
+            attempt_dir.mkdir(parents=True)
+            runtime_root = root / "runtime"
+            (runtime_root / "memory-episodes").mkdir(parents=True)
+            plan = SimpleNamespace(
+                endpoints=(),
+                orchestration_dir=orchestration_dir,
+                evaluation=SimpleNamespace(run_id="eval-run"),
+            )
+            attempt = SimpleNamespace(owner_id="eval-run.attempt-000000")
+            backend = HeldoutEvalLocalBackend()
+            with (
+                mock.patch(
+                    "agentmemorygym_verl.heldout_eval_orchestrator."
+                    "_attempt_runtime_roots",
+                    return_value=(runtime_root, root / "missing-runtime"),
+                ),
+                mock.patch(
+                    "agentmemorygym_verl.heldout_eval_orchestrator."
+                    "assert_ports_available"
+                ),
+                mock.patch(
+                    "agentmemorygym_verl.heldout_eval_orchestrator."
+                    "foreign_inference_processes",
+                    return_value=[],
+                ),
+                mock.patch(
+                    "agentmemorygym_verl.heldout_eval_orchestrator."
+                    "run_owned_processes",
+                    return_value=[],
+                ),
+                mock.patch(
+                    "agentmemorygym_verl.heldout_eval_orchestrator.mounts_below",
+                    return_value=[],
+                ),
+            ):
+                receipt = backend.cleanup_audit(plan, attempt)
+            self.assertEqual(receipt["status"], "pass")
+            self.assertEqual(
+                receipt["removed_empty_runtime_roots"], [str(runtime_root)]
+            )
+            self.assertFalse(runtime_root.exists())
+
     def test_attempt_owner_is_namespaced_by_eval_run(self):
         self.assertEqual(
             _attempt_owner_id("agemem-native-heldout", 0),

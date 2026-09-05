@@ -620,6 +620,52 @@ def _attempt_runtime_roots(owner_id: str) -> tuple[Path, Path]:
     )
 
 
+def _remove_empty_runtime_root(root: Path) -> bool:
+    """Remove one known run root only when its complete tree is directories."""
+
+    if root.is_symlink():
+        raise OrchestratorError(
+            f"held-out runtime root is not a real directory: {root}"
+        )
+    if not root.exists():
+        return False
+    if not root.is_dir():
+        raise OrchestratorError(
+            f"held-out runtime root is not a real directory: {root}"
+        )
+    descendants = sorted(
+        root.rglob("*"), key=lambda path: len(path.parts), reverse=True
+    )
+    unsafe = [
+        str(path)
+        for path in descendants
+        if path.is_symlink() or not path.is_dir()
+    ]
+    if unsafe:
+        raise OrchestratorError(
+            "held-out runtime root contains non-directory residue: "
+            + ", ".join(unsafe[:8])
+        )
+    for path in descendants:
+        try:
+            path.rmdir()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise OrchestratorError(
+                f"held-out runtime directory is not empty: {path}"
+            ) from exc
+    try:
+        root.rmdir()
+    except FileNotFoundError:
+        return True
+    except OSError as exc:
+        raise OrchestratorError(
+            f"held-out runtime root is not empty: {root}"
+        ) from exc
+    return True
+
+
 class EvalBackend(Protocol):
     evaluator: ProcessLease | None
     endpoint_leases: tuple[ProcessLease, ...]
@@ -1004,8 +1050,19 @@ class HeldoutEvalLocalBackend:
             str(root): mounts_below(root)
             for root in [plan.orchestration_dir, *roots]
         }
-        existing_runtime_roots = [str(root) for root in roots if root.exists()]
         owned = self.runtime.supervisor.owned_leases
+        removed_empty_runtime_roots: list[str] = []
+        if (
+            not inference
+            and not any(run_owned.values())
+            and not any(mounts.values())
+            and not owned
+            and self.watch_parent is None
+        ):
+            removed_empty_runtime_roots = [
+                str(root) for root in roots if _remove_empty_runtime_root(root)
+            ]
+        existing_runtime_roots = [str(root) for root in roots if root.exists()]
         if (
             inference
             or any(run_owned.values())
@@ -1028,6 +1085,7 @@ class HeldoutEvalLocalBackend:
             "run_owned_processes": 0,
             "run_scoped_mounts": 0,
             "run_scoped_runtime_roots": 0,
+            "removed_empty_runtime_roots": removed_empty_runtime_roots,
             "owned_process_leases": 0,
             "holder_restored": True,
         }
