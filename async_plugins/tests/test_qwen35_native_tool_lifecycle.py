@@ -106,6 +106,8 @@ class TestRealQwen35NativeToolLifecycle(unittest.TestCase):
         self.assertNotIn("answer the question like normal", rendered)
         self.assertIn("exactly one function call", rendered)
         self.assertIn("no natural-language reasoning", rendered)
+        self.assertNotIn("example_function_name", rendered)
+        self.assertNotIn("example_parameter_1", rendered)
 
     def test_sampled_call_then_tool_result_matches_full_rerender(self) -> None:
         from verl.utils.tokenizer import normalize_token_ids
