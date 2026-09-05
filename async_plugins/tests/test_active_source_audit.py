@@ -21,7 +21,7 @@ VERL_ROOT = Path(
         str(ROOT.parent / "verl-sao-compactionrl-r107-20260905"),
     )
 )
-EXPECTED_VERL_COMMIT = "6cd387cd2ebf413f93082eabf4ef5ad52bda37b5"
+EXPECTED_VERL_COMMIT = "7f359d928fa438c9353c0c6d98941c4638971f05"
 
 
 class TestActiveSourceAudit(unittest.TestCase):

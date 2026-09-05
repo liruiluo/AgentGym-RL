@@ -85,7 +85,7 @@ and constructs `PYTHONPATH` from that root before invoking the task-neutral
 orchestrator.
 
 A static AST audit of the exact veRL worktree
-`6cd387cd2ebf413f93082eabf4ef5ad52bda37b5` and outer worktree passed for the
+`7f359d928fa438c9353c0c6d98941c4638971f05` and outer worktree passed for the
 fully-async main/rollouter/trainer/queue, upstream AgentLoop, AMG AgentLoop,
 dataset, and current advantage estimator. The route registry declares all four
 routes while the AgentLoop YAML contains exactly one implementation:
