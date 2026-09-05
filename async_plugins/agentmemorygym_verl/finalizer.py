@@ -42,7 +42,7 @@ _FILESYSTEM_CHECKPOINT_MARKER_PREFIX = (
     "next action. Other workspace files remain available and may still be read "
     "or updated normally."
 )
-_FINAL_STATISTICS_VERL_COMMIT = "6cd387cd2ebf413f93082eabf4ef5ad52bda37b5"
+_FINAL_STATISTICS_VERL_COMMIT = "7f359d928fa438c9353c0c6d98941c4638971f05"
 _FINAL_STATISTICS_FIELDS = frozenset(
     {"schema", "queue", "rollouter", "trainer", "queue_cleanup"}
 )
