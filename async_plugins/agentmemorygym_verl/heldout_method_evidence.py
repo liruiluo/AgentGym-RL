@@ -13,6 +13,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 from .agemem_evidence import summarize_agemem_step_records
+from .action_budget import normalize_action_budget_receipt
 
 
 METHOD_EVIDENCE_SCHEMA = "camg_heldout_method_evidence_summary_v1"
@@ -55,6 +56,9 @@ def _generic_summary(
     memory_rows = 0
     native_rows = 0
     commits = 0
+    combined_steps = 0
+    auxiliary_steps = 0
+    budget_state: dict[str, tuple[int, int, bool]] = {}
 
     def violate(message: str) -> None:
         if len(violations) < 200:
@@ -69,6 +73,49 @@ def _generic_summary(
             violate(f"record[{index}] has no trajectory_uid")
             uid = f"<missing:{index}>"
         trajectories.add(uid)
+        raw_budget = record.get("action_budget")
+        require_budget = method_id in {"mem0", "letta_code"}
+        if raw_budget is not None or require_budget:
+            if not isinstance(raw_budget, Mapping):
+                violate(
+                    f"trajectory {uid} row {index}: action-budget receipt is missing"
+                )
+                budget = None
+            else:
+                raw_maximum = raw_budget.get("maximum_steps")
+                maximum = (
+                    raw_maximum
+                    if type(raw_maximum) is int and raw_maximum > 0
+                    else 1
+                )
+                expected_before, expected_maximum, prior_terminated = budget_state.get(
+                    uid, (0, maximum, False)
+                )
+                if prior_terminated:
+                    violate(
+                        f"trajectory {uid} row {index}: action follows a budget termination"
+                    )
+                try:
+                    budget = normalize_action_budget_receipt(
+                        raw_budget,
+                        maximum_steps=expected_maximum,
+                        consumed_steps_before=expected_before,
+                        allow_implicit_policy_action=False,
+                    )
+                except (RuntimeError, TypeError, ValueError) as exc:
+                    violate(f"trajectory {uid} row {index}: {exc}")
+                    budget = None
+            if budget is not None:
+                row_cost = int(budget["policy_action_steps"]) + int(
+                    budget["auxiliary_steps"]
+                )
+                combined_steps += row_cost
+                auxiliary_steps += int(budget["auxiliary_steps"])
+                budget_state[uid] = (
+                    int(budget["consumed_steps_after"]),
+                    int(budget["maximum_steps"]),
+                    bool(budget["terminate_after_action"]),
+                )
         transition = record.get("context_transition")
         operation = transition.get("operation") if isinstance(transition, Mapping) else None
         if (
@@ -172,9 +219,20 @@ def _generic_summary(
                 violate(f"trajectory {uid} row {index}: Mem0 source revision drift")
             if adapter.get("version") != _MEM0_VERSION:
                 violate(f"trajectory {uid} row {index}: Mem0 version drift")
+            boundary_requested = adapter.get("boundary_requested")
             boundary = adapter.get("boundary_pipeline")
+            if not isinstance(boundary_requested, bool):
+                violate(
+                    f"trajectory {uid} row {index}: "
+                    "invalid Mem0 boundary request flag"
+                )
             if not isinstance(boundary, bool):
                 violate(f"trajectory {uid} row {index}: invalid Mem0 boundary flag")
+            if boundary is True and boundary_requested is not True:
+                violate(
+                    f"trajectory {uid} row {index}: "
+                    "Mem0 pipeline ran without a boundary request"
+                )
             raw_operation_counts = adapter.get("operation_counts")
             if not isinstance(raw_operation_counts, Mapping):
                 violate(f"trajectory {uid} row {index}: invalid Mem0 operation counts")
@@ -193,9 +251,34 @@ def _generic_summary(
                     violate(
                         f"trajectory {uid} row {index}: Mem0 boundary lacks hidden LLM evidence"
                     )
+                if budget is not None and (
+                    budget["auxiliary_steps"] != 2
+                    or budget["required_auxiliary_steps"] != 2
+                    or budget["atomic_operation_blocked"] is not False
+                ):
+                    violate(
+                        f"trajectory {uid} row {index}: Mem0 add/search budget charge drifted"
+                    )
             elif boundary is False and (raw_operation_counts or calls != 0):
                 violate(
                     f"trajectory {uid} row {index}: non-boundary Mem0 row has hidden work"
+                )
+            elif boundary_requested is True:
+                if budget is not None and (
+                    budget["auxiliary_steps"] != 0
+                    or budget["required_auxiliary_steps"] != 2
+                    or budget["atomic_operation_blocked"] is not True
+                    or budget["terminate_after_action"] is not True
+                ):
+                    violate(
+                        f"trajectory {uid} row {index}: blocked Mem0 boundary budget drifted"
+                    )
+            elif budget is not None and (
+                budget["auxiliary_steps"] != 0
+                or budget["required_auxiliary_steps"] != 0
+            ):
+                violate(
+                    f"trajectory {uid} row {index}: non-boundary Mem0 budget is nonzero"
                 )
         else:
             if adapter.get("schema") != "camg_letta_code_adapter_v1":
@@ -204,6 +287,13 @@ def _generic_summary(
                 violate(f"trajectory {uid} row {index}: Letta MemFS is not git-backed")
             if adapter.get("source_revision") != _LETTA_SOURCE_REVISION:
                 violate(f"trajectory {uid} row {index}: Letta source revision drift")
+            if budget is not None and (
+                budget["auxiliary_steps"] != 0
+                or budget["required_auxiliary_steps"] != 0
+            ):
+                violate(
+                    f"trajectory {uid} row {index}: Letta policy action was double-counted"
+                )
 
     if not rows:
         violate("no step records were provided")
@@ -227,6 +317,8 @@ def _generic_summary(
             "hidden_input_tokens": hidden_input_tokens,
             "hidden_output_tokens": hidden_output_tokens,
             "hidden_latency_ms": hidden_latency_ms,
+            "combined_steps": combined_steps,
+            "auxiliary_steps": auxiliary_steps,
         },
         "operation_counts": dict(sorted(operation_counts.items())),
         "context_operation_counts": dict(sorted(context_counts.items())),

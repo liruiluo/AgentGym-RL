@@ -11,7 +11,9 @@ from unittest import IsolatedAsyncioTestCase, mock
 from agentenv.controller import StepOutput
 from agentenv.controller.types import (
     CONTEXT_OPERATION_REPLACE,
+    PolicyActionBudget,
     TASK_NEUTRAL_CONTEXT_TRANSITION_SCHEMA,
+    build_task_neutral_action_budget_receipt,
     build_task_neutral_transition_info,
 )
 from agentmemorygym_verl import agent_loop as agent_loop_module
@@ -317,6 +319,46 @@ class _HorizonClient(_MemoryChainClient):
             info=build_task_neutral_transition_info(
                 env_info={"resolved": True},
                 wrapper_evidence={"outcome": "success", "source": "horizon"},
+            ),
+        )
+
+
+class _AuxiliaryBudgetClient(_HorizonClient):
+    """Charge two task-neutral auxiliary operations after one policy row."""
+
+    def __init__(self, *, tamper=False):
+        super().__init__()
+        self.bound_budgets = []
+        self.tamper = tamper
+
+    def bind_policy_action_budget(self, budget):
+        self.bound_budgets.append(budget)
+
+    def step(self, action):
+        self.actions.append(action)
+        budget = self.bound_budgets[-1]
+        receipt = build_task_neutral_action_budget_receipt(
+            budget,
+            auxiliary_steps=2,
+            required_auxiliary_steps=2,
+        )
+        if self.tamper:
+            receipt["consumed_steps_after"] += 1
+        return StepOutput(
+            state="auxiliary memory pipeline complete",
+            reward=0.25,
+            done=False,
+            info=build_task_neutral_transition_info(
+                context_transition={
+                    "schema": TASK_NEUTRAL_CONTEXT_TRANSITION_SCHEMA,
+                    "operation": CONTEXT_OPERATION_REPLACE,
+                    "messages": [
+                        {"role": "system", "content": "system"},
+                        {"role": "user", "content": "continue"},
+                    ],
+                },
+                wrapper_evidence={"memory_event": "automatic_memory"},
+                action_budget=receipt,
             ),
         )
 
@@ -687,6 +729,80 @@ class TestAMGAgentLoop(IsolatedAsyncioTestCase):
             [73, 73],
         )
         self.assertTrue(client.closed)
+
+    async def test_combined_budget_counts_auxiliary_memory_operations_online(self):
+        client = _AuxiliaryBudgetClient()
+        loop = self._loop(["BOUNDARY"], max_turns=3)
+
+        with mock.patch.object(
+            agent_loop_module, "create_env_client", return_value=client
+        ):
+            outputs = await loop.run(
+                {"max_tokens": 8},
+                item_id="combined-budget-task",
+                data_idx=0,
+                uid="trajectory-combined-budget",
+                raw_prompt=[{"role": "system", "content": "system"}],
+            )
+
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(len(loop.server_manager.calls), 1)
+        self.assertEqual(
+            client.bound_budgets,
+            [PolicyActionBudget(maximum_steps=3, consumed_steps=0)],
+        )
+        record = json.loads(outputs[0].extra_fields["step_record_json"])
+        self.assertEqual(record["action_budget"]["policy_action_steps"], 1)
+        self.assertEqual(record["action_budget"]["auxiliary_steps"], 2)
+        self.assertEqual(record["action_budget"]["consumed_steps_after"], 3)
+        self.assertTrue(record["rollout_done_flag"])
+        self.assertEqual(record["outcome"], "success")
+
+    async def test_tampered_action_budget_receipt_fails_closed(self):
+        client = _AuxiliaryBudgetClient(tamper=True)
+        loop = self._loop(["BOUNDARY"], max_turns=3)
+
+        with mock.patch.object(
+            agent_loop_module, "create_env_client", return_value=client
+        ):
+            with self.assertRaisesRegex(RuntimeError, "action-budget receipt"):
+                await loop.run(
+                    {"max_tokens": 8},
+                    item_id="tampered-budget-task",
+                    data_idx=0,
+                    uid="trajectory-tampered-budget",
+                    raw_prompt=[{"role": "system", "content": "system"}],
+                )
+
+    async def test_plain_policy_actions_still_cost_exactly_one_step_each(self):
+        client = _HorizonClient()
+        loop = self._loop(["FIRST", "SECOND"], max_turns=2)
+
+        with mock.patch.object(
+            agent_loop_module, "create_env_client", return_value=client
+        ):
+            outputs = await loop.run(
+                {"max_tokens": 8},
+                item_id="plain-actions",
+                data_idx=0,
+                uid="trajectory-plain-actions",
+                raw_prompt=[{"role": "system", "content": "system"}],
+            )
+
+        records = [
+            json.loads(output.extra_fields["step_record_json"])
+            for output in outputs
+        ]
+        self.assertEqual(
+            [record["action_budget"]["consumed_steps_after"] for record in records],
+            [1, 2],
+        )
+        self.assertTrue(
+            all(
+                record["action_budget"]["auxiliary_steps"] == 0
+                for record in records
+            )
+        )
 
     async def test_selected_client_closes_when_wrapper_raises(self):
         route = RouteSpec(

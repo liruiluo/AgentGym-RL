@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import numpy as np
 from agentenv.controller import (
+    PolicyActionBudget,
     bind_initial_policy_context,
     complete_policy_turn,
     prepare_policy_turn,
@@ -24,6 +25,7 @@ from verl.experimental.agent_loop.agent_loop import (
 from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.rollout.replica import TokenOutput
 
+from .action_budget import normalize_action_budget_receipt
 from .env_client import create_env_client
 from .routes import RouteSpec, route_registry_from_agentgym_config
 
@@ -405,8 +407,11 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
             ]
             current_messages = bind_initial_policy_context(client, initial_messages)
             current_prompt_ids = self._render_prompt_sync(current_messages)
+            combined_steps_consumed = 0
 
             for row_order in range(route.max_rounds):
+                if combined_steps_consumed >= route.max_rounds:
+                    break
                 if len(current_prompt_ids) > max_prompt_tokens:
                     raise RuntimeError(
                         "AMG prompt exceeded PPO width before a trainable compaction action: "
@@ -472,6 +477,14 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                 response_logprobs = [float(value) for value in token_output.log_probs]
                 action = self.tokenizer.decode(response_ids, skip_special_tokens=True)
 
+                budget_binder = getattr(client, "bind_policy_action_budget", None)
+                if callable(budget_binder):
+                    budget_binder(
+                        PolicyActionBudget(
+                            maximum_steps=route.max_rounds,
+                            consumed_steps=combined_steps_consumed,
+                        )
+                    )
                 step_output, next_messages = complete_policy_turn(
                     client, prepared, action
                 )
@@ -490,6 +503,21 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                 env_info = _bind_episode_source_identity(client, env_info)
                 context_transition = receipt["context_transition"]
                 wrapper_evidence = receipt["wrapper_evidence"]
+                step_info = getattr(step_output, "info", {})
+                raw_action_budget = (
+                    step_info.get("action_budget")
+                    if isinstance(step_info, Mapping)
+                    else None
+                )
+                action_budget = normalize_action_budget_receipt(
+                    raw_action_budget,
+                    maximum_steps=route.max_rounds,
+                    consumed_steps_before=combined_steps_consumed,
+                    allow_implicit_policy_action=True,
+                )
+                combined_steps_consumed = int(
+                    action_budget["consumed_steps_after"]
+                )
 
                 token_extra = dict(token_output.extra_fields or {})
                 if (
@@ -523,6 +551,7 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                     "immediate_reward": reward,
                     "trajectory_return": 0.0,
                     "task_round": row_order + 1,
+                    "action_budget": action_budget,
                     "action": action,
                     "action_submission": action_submission,
                     "env_info_after": env_info,
@@ -559,6 +588,7 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                         "item_id": item_id,
                         "data_idx": data_idx,
                         "task_round": row_order + 1,
+                        "action_budget": action_budget,
                         "action_text": action,
                         "generation_stop_reason": _json_safe(token_output.stop_reason),
                         "context_transition": context_transition,
@@ -585,7 +615,11 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                     )
                 )
 
-                if done:
+                if (
+                    done
+                    or action_budget["terminate_after_action"]
+                    or combined_steps_consumed >= route.max_rounds
+                ):
                     break
                 current_prompt_ids = self._next_prompt_ids(
                     prepared_messages=prepared_messages,
