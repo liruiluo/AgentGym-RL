@@ -21,6 +21,8 @@ from verl.experimental.agent_loop.agent_loop import (
     AgentLoopMetrics,
     AgentLoopOutput,
 )
+from verl.experimental.agent_loop.tool_parser import FunctionCall, ToolParser
+from verl.tools.schemas import OpenAIFunctionToolSchema
 from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.rollout.replica import TokenOutput
 
@@ -136,6 +138,76 @@ def _digest_token_ids(token_ids: Sequence[int]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+_QWEN_NATIVE_TOOL_TEMPLATE_REPLACEMENTS = (
+    (
+        "If you choose to call a function ONLY reply in the following format "
+        "with NO suffix:",
+        "For every response, call exactly one function and ONLY reply in the "
+        "following format with NO prefix or suffix:",
+    ),
+    (
+        "- You may provide optional reasoning for your function call in natural "
+        "language BEFORE the function call, but NOT after",
+        "- Output exactly one function call with no natural-language reasoning "
+        "before or after it",
+    ),
+    (
+        "- If there is no function call available, answer the question like "
+        "normal with your current knowledge and do not tell the user about "
+        "function calls",
+        "- Always select exactly one available function; never answer in prose",
+    ),
+)
+
+
+def _strict_qwen_tool_chat_template(template: Any) -> str:
+    """Remove Qwen's optional prose path for AMG's strict one-call policy."""
+
+    if not isinstance(template, str) or not template:
+        raise RuntimeError("AMG native tools require a nonempty Qwen chat template")
+    patched = template
+    for old, new in _QWEN_NATIVE_TOOL_TEMPLATE_REPLACEMENTS:
+        count = patched.count(old)
+        if count != 1:
+            raise RuntimeError(
+                "AMG pinned Qwen tool-template clause drifted: "
+                f"expected one occurrence, found {count}: {old!r}"
+            )
+        patched = patched.replace(old, new, 1)
+    return patched
+
+
+def _native_tool_observation_messages(
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    expected_assistant_messages: Sequence[Mapping[str, Any]],
+    tool_name: str,
+    observation: str,
+) -> list[dict[str, Any]]:
+    """Represent one executed native call result through Qwen's tool role."""
+
+    normalized = [dict(message) for message in messages]
+    assistant_prefix = [dict(message) for message in expected_assistant_messages]
+    if (
+        len(normalized) != len(assistant_prefix) + 1
+        or normalized[:-1] != assistant_prefix
+        or normalized[-1].get("role") != "user"
+        or normalized[-1].get("content") != observation
+    ):
+        raise RuntimeError(
+            "AMG native tool lifecycle must append exactly one observation after "
+            "the sampled assistant call"
+        )
+    if not isinstance(tool_name, str) or not tool_name:
+        raise ValueError("AMG native tool observation requires a tool name")
+    normalized[-1] = {
+        "role": "tool",
+        "name": tool_name,
+        "content": observation,
+    }
+    return normalized
+
+
 class _SampleExcluded(Exception):
     """Unwind one infra-faulted environment attempt without emitting PPO rows."""
 
@@ -220,10 +292,90 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
             self.agentgym_config
         )
         self._envelope_tokens_by_tool_schema: dict[str, int] = {}
+        self._typed_tool_schemas_by_digest: dict[
+            str, tuple[OpenAIFunctionToolSchema, ...]
+        ] = {}
+        self._native_tool_parser = ToolParser.get_tool_parser(
+            "qwen3_coder", self.tokenizer
+        )
+        self._native_tool_template_sha256: str | None = None
+
+    def _activate_native_tool_template(
+        self, tools: Sequence[Mapping[str, Any]] | None
+    ) -> None:
+        if not tools or self._native_tool_template_sha256 is not None:
+            return
+        builder_kwargs = dict(self.continuous_token_builder.chat_template_kwargs)
+        source_template = builder_kwargs.get(
+            "chat_template", getattr(self.tokenizer, "chat_template", None)
+        )
+        strict_template = _strict_qwen_tool_chat_template(source_template)
+        builder_kwargs["chat_template"] = strict_template
+        self.continuous_token_builder.chat_template_kwargs = builder_kwargs
+        self._native_tool_template_sha256 = hashlib.sha256(
+            strict_template.encode("utf-8")
+        ).hexdigest()
+
+    def _typed_tool_schemas(
+        self, tools: Sequence[Mapping[str, Any]]
+    ) -> tuple[OpenAIFunctionToolSchema, ...]:
+        digest = _tool_schema_digest(tools)
+        typed = self._typed_tool_schemas_by_digest.get(digest)
+        if typed is None:
+            typed = tuple(
+                OpenAIFunctionToolSchema.model_validate(dict(schema))
+                for schema in tools
+            )
+            self._typed_tool_schemas_by_digest[digest] = typed
+        return typed
+
+    async def _validated_native_tool_call(
+        self,
+        *,
+        response_ids: list[int],
+        action: str,
+        tools: Sequence[Mapping[str, Any]] | None,
+        action_submission: Mapping[str, Any],
+    ) -> FunctionCall | None:
+        # A parser-rejected output did not execute a tool. Keep its diagnostic
+        # observation as a user correction instead of forging a tool response.
+        if action_submission.get("tool_parser_normalized") is not True:
+            return None
+        if not tools:
+            raise RuntimeError(
+                "AMG wrapper accepted a native tool call without tool schemas"
+            )
+        stripped = action.strip()
+        if (
+            not stripped.startswith("<tool_call>")
+            or not stripped.endswith("</tool_call>")
+            or stripped.count("<tool_call>") != 1
+            or stripped.count("</tool_call>") != 1
+        ):
+            raise RuntimeError(
+                "AMG wrapper accepted output outside the strict native tool envelope"
+            )
+        content, calls = await self._native_tool_parser.extract_tool_calls(
+            response_ids, list(self._typed_tool_schemas(tools))
+        )
+        if content.strip() or len(calls) != 1:
+            raise RuntimeError(
+                "AMG wrapper/native veRL parser disagreement for an accepted action"
+            )
+        allowed_names = {
+            str(schema["function"]["name"])
+            for schema in tools
+        }
+        if calls[0].name not in allowed_names:
+            raise RuntimeError(
+                "AMG wrapper accepted an action outside the native tool schema: "
+                f"{calls[0].name!r}"
+            )
+        return calls[0]
 
     def _render_prompt_sync(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
     ) -> list[int]:
         # Latest veRL always routes AgentLoop tokenization through its native
@@ -235,7 +387,7 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
 
     def _prompt_for_candidate(
         self,
-        current_messages: list[dict[str, str]],
+        current_messages: list[dict[str, Any]],
         current_prompt_ids: list[int],
         candidate_messages: Sequence[Mapping[str, str]],
         tools: list[dict[str, Any]] | None = None,
@@ -253,11 +405,11 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
     def _next_prompt_ids(
         self,
         *,
-        prepared_messages: list[dict[str, str]],
+        prepared_messages: list[dict[str, Any]],
         prepared_prompt_ids: list[int],
         action: str,
         action_token_ids: list[int],
-        next_messages: list[dict[str, str]],
+        next_messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
     ) -> list[int]:
         assistant_messages = prepared_messages + [
@@ -289,16 +441,26 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
 
     def _action_observation_envelope_tokens(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         prompt_ids: list[int],
         tools: list[dict[str, Any]] | None = None,
     ) -> int:
         schema_digest = _tool_schema_digest(tools)
         envelope_tokens = self._envelope_tokens_by_tool_schema.get(schema_digest)
         if envelope_tokens is None:
+            observation_message: dict[str, Any] = {
+                "role": "user",
+                "content": "",
+            }
+            if tools:
+                observation_message = {
+                    "role": "tool",
+                    "name": str(tools[0]["function"]["name"]),
+                    "content": "",
+                }
             empty_transition = messages + [
                 {"role": "assistant", "content": ""},
-                {"role": "user", "content": ""},
+                observation_message,
             ]
             envelope_tokens = len(
                 self._render_prompt_sync(empty_transition, tools=tools)
@@ -436,6 +598,7 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
         try:
             client.reset(data_idx)
             policy_tools = _policy_tool_schemas(client)
+            self._activate_native_tool_template(policy_tools)
             initial_messages = raw_prompt + [
                 {"role": "user", "content": str(client.observe())}
             ]
@@ -539,6 +702,29 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                 )
                 context_transition = receipt["context_transition"]
                 wrapper_evidence = receipt["wrapper_evidence"]
+                native_tool_call = await self._validated_native_tool_call(
+                    response_ids=response_ids,
+                    action=action,
+                    tools=policy_tools,
+                    action_submission=action_submission,
+                )
+                native_tool_name = (
+                    native_tool_call.name if native_tool_call is not None else None
+                )
+                native_tool_observation = False
+                if (
+                    native_tool_name is not None
+                    and context_transition.get("operation") == "append_observation"
+                    and not done
+                ):
+                    next_messages = _native_tool_observation_messages(
+                        next_messages,
+                        expected_assistant_messages=prepared_messages
+                        + [{"role": "assistant", "content": action}],
+                        tool_name=native_tool_name,
+                        observation=str(step_output.state),
+                    )
+                    native_tool_observation = True
 
                 token_extra = dict(token_output.extra_fields or {})
                 if (
@@ -589,6 +775,9 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                     "response_token_count": len(response_ids),
                     "response_token_sha256": _digest_token_ids(response_ids),
                     "generation_stop_reason": _json_safe(token_output.stop_reason),
+                    "native_tool_call_name": native_tool_name,
+                    "native_tool_observation": native_tool_observation,
+                    "native_tool_template_sha256": self._native_tool_template_sha256,
                     "min_global_steps": int(token_extra["min_global_steps"]),
                     "max_global_steps": int(token_extra["max_global_steps"]),
                 }
@@ -610,6 +799,9 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                         "task_round": row_order + 1,
                         "action_text": action,
                         "generation_stop_reason": _json_safe(token_output.stop_reason),
+                        "native_tool_call_name": native_tool_name,
+                        "native_tool_observation": native_tool_observation,
+                        "native_tool_template_sha256": self._native_tool_template_sha256,
                         "context_transition": context_transition,
                         "wrapper_evidence": wrapper_evidence,
                         "env_info_after": env_info,

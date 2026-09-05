@@ -724,12 +724,9 @@ def _endpoint_receipt_matches(
     )
 
 
-def _checkpoint_framing_sha256(messages: Sequence[tuple[str, str]]) -> str:
+def _checkpoint_framing_sha256(messages: Sequence[Mapping[str, str]]) -> str:
     canonical = json.dumps(
-        [
-            {"role": role, "content": content}
-            for role, content in messages
-        ],
+        list(messages),
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
@@ -749,31 +746,47 @@ def _checkpoint_successor_is_safe(
         or not messages
     ):
         return False
-    normalized: list[tuple[str, str]] = []
+    normalized: list[dict[str, str]] = []
     for message in messages:
-        if not isinstance(message, Mapping) or set(message) != {"role", "content"}:
+        if not isinstance(message, Mapping):
             return False
         role = message.get("role")
         content = message.get("content")
-        if role not in {"system", "user", "assistant"} or not isinstance(
+        expected_keys = (
+            {"role", "content", "name"}
+            if role == "tool"
+            else {"role", "content"}
+        )
+        if set(message) != expected_keys:
+            return False
+        if role not in {"system", "user", "assistant", "tool"} or not isinstance(
             content, str
         ):
             return False
-        normalized.append((role, content))
+        normalized_message = {"role": role, "content": content}
+        if role == "tool":
+            name = message.get("name")
+            if not isinstance(name, str) or not name:
+                return False
+            normalized_message["name"] = name
+        normalized.append(normalized_message)
     expected_marker = (
         f"{_FILESYSTEM_CHECKPOINT_MARKER_PREFIX} Verified receipt: "
         f"size_bytes={receipt['size_bytes']}, sha256={receipt['sha256']}."
     )
-    if normalized[-1][0] != "user":
+    if normalized[-1]["role"] != "user":
         return False
     marker_suffix = "\n\n" + expected_marker
-    if normalized[-1][1] == expected_marker:
+    if normalized[-1]["content"] == expected_marker:
         framing = normalized[:-1]
-        if not framing or framing[-1][0] not in {"system", "assistant"}:
+        if not framing or framing[-1]["role"] not in {"system", "assistant", "tool"}:
             return False
-    elif normalized[-1][1].endswith(marker_suffix):
+    elif normalized[-1]["content"].endswith(marker_suffix):
         framing = list(normalized)
-        framing[-1] = ("user", normalized[-1][1][: -len(marker_suffix)])
+        framing[-1] = {
+            "role": "user",
+            "content": normalized[-1]["content"][: -len(marker_suffix)],
+        }
     else:
         return False
     expected_framing_sha256 = evidence.get("checkpoint_framing_sha256")

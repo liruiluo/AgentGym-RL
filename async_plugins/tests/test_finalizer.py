@@ -1079,6 +1079,45 @@ class TestFinalizerRollouts(FinalizerTestCase):
             verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
             self.assertEqual(verdict["status"], "pass", verdict)
 
+    def test_native_tool_result_framing_is_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build(Path(directory))
+
+            def mutate(record: dict) -> None:
+                successor = record["context_transition"]["messages"]
+                marker = successor[-1]["content"].split(
+                    "Earlier conversation was removed", 1
+                )[1]
+                framing = [
+                    {"role": "system", "content": "task framing"},
+                    {"role": "user", "content": "task observation"},
+                    {
+                        "role": "assistant",
+                        "content": (
+                            '<tool_call>{"name":"shell_command",'
+                            '"arguments":{"command":"pwd"}}</tool_call>'
+                        ),
+                    },
+                    {
+                        "role": "tool",
+                        "name": "shell_command",
+                        "content": "/workspace",
+                    },
+                ]
+                record["wrapper_evidence"][
+                    "checkpoint_framing_sha256"
+                ] = messages_sha256(framing)
+                record["context_transition"]["messages"] = framing + [
+                    {
+                        "role": "user",
+                        "content": "Earlier conversation was removed" + marker,
+                    }
+                ]
+
+            rewrite_chain_record(fixture, 0, mutate)
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+            self.assertEqual(verdict["status"], "pass", verdict)
+
     def test_malformed_checkpoint_receipt_or_counter_drift_breaks_chain(self):
         cases = (
             "legacy_path",

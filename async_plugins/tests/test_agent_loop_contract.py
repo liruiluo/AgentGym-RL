@@ -292,6 +292,35 @@ class _SuccessfulClient(_MemoryChainClient):
         )
 
 
+class _NativeLifecycleClient(_MemoryChainClient):
+    def policy_turn_candidate(self):
+        return None
+
+    def step(self, action):
+        self.actions.append(action)
+        done = len(self.actions) == 2
+        return StepOutput(
+            state=f"native-result-{len(self.actions)}",
+            reward=1.0 if done else 0.0,
+            done=done,
+            info=build_task_neutral_transition_info(
+                action_submission={
+                    "raw_policy_output": action,
+                    "submitted_action": action,
+                    "tool_parser_normalized": True,
+                },
+                env_info={"resolved": done},
+                wrapper_evidence={"outcome": "success" if done else "continue"},
+            ),
+        )
+
+
+class _DirectNativeParser:
+    async def extract_tool_calls(self, response_ids, tools):
+        del response_ids, tools
+        return "", [SimpleNamespace(name="task_action", arguments="{}")]
+
+
 class _HorizonClient(_MemoryChainClient):
     def step(self, action):
         self.actions.append(action)
@@ -517,6 +546,9 @@ class TestAMGAgentLoop(IsolatedAsyncioTestCase):
             )
         )
         loop._envelope_tokens_by_tool_schema = {}
+        loop._typed_tool_schemas_by_digest = {}
+        loop._native_tool_template_sha256 = "test-native-template"
+        loop._activate_native_tool_template = lambda tools: None
         loop.rollout_config = SimpleNamespace(
             response_length=8,
             prompt_length=4096,
@@ -705,6 +737,46 @@ class TestAMGAgentLoop(IsolatedAsyncioTestCase):
         record = json.loads(outputs[0].extra_fields["step_record_json"])
         self.assertEqual(record["generation_stop_reason"], "stop")
         self.assertEqual(outputs[0].extra_fields["generation_stop_reason"], "stop")
+
+    async def test_valid_native_call_appends_tool_result_before_next_generation(self):
+        action = (
+            "<tool_call>\n<function=task_action>\n<parameter=value>\nx\n"
+            "</parameter>\n</function>\n</tool_call>"
+        )
+        client = _NativeLifecycleClient()
+        loop = self._loop([action, action], max_turns=2)
+        loop._native_tool_parser = _DirectNativeParser()
+        loop._typed_tool_schemas = lambda tools: ()
+
+        with mock.patch.object(
+            agent_loop_module, "create_env_client", return_value=client
+        ):
+            outputs = await loop.run(
+                {"max_tokens": 8},
+                item_id="native-task",
+                data_idx=1,
+                uid="native-trajectory",
+                raw_prompt=[{"role": "system", "content": "system"}],
+            )
+
+        self.assertEqual(len(outputs), 2)
+        self.assertTrue(outputs[0].extra_fields["native_tool_observation"])
+        self.assertEqual(
+            outputs[0].extra_fields["native_tool_call_name"], "task_action"
+        )
+        previous, updated, _runtime = (
+            loop.continuous_token_builder.non_assistant_calls[0]
+        )
+        self.assertEqual(previous[-1]["role"], "assistant")
+        self.assertEqual(
+            updated[-1],
+            {
+                "role": "tool",
+                "name": "task_action",
+                "content": "native-result-1",
+            },
+        )
+        self.assertEqual(client.bound_context[-1]["role"], "tool")
 
     async def test_complete_filesystem_memory_chain_is_one_ordered_ppo_episode(self):
         actions = [
