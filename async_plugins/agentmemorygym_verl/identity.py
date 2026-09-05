@@ -19,7 +19,7 @@ from typing import Any
 # current-cycle metrics, current PPO critic initialization, and instance-scoped
 # fused forward selection are reviewed and committed. It is intentionally not
 # caller-selectable.
-EXPECTED_VERL_COMMIT = "f3ac28fe54c945e092b9630030f44d236a106a11"
+EXPECTED_VERL_COMMIT = "6cd387cd2ebf413f93082eabf4ef5ad52bda37b5"
 
 # Files needed to load the exact Qwen3.5-4B text model and tokenizer.  The model
 # root itself comes from the publication's training_runtime section, so a newer
@@ -29,10 +29,13 @@ TRL_WHEEL_SHA256 = "4753f190c94c11488fcc46ec74b2128e53fbc61d51f0887b7204ec4dc333
 
 
 LOCKED_MODEL_FILE_SHA256 = {
-    "model-00001-of-00002.safetensors": (
+    # These are the shard names referenced by model.safetensors.index.json.
+    # Compatibility hard links with a shorter ``model-0000*`` spelling may be
+    # present, but they are not the files selected by from_pretrained.
+    "model.safetensors-00001-of-00002.safetensors": (
         "26a93f066e1916adb13453dae5a0c707c0fbc71299ed98779571a907b8e74c61"
     ),
-    "model-00002-of-00002.safetensors": (
+    "model.safetensors-00002-of-00002.safetensors": (
         "cb544bd9bfae93dc59b0f22b292f5933573854a7f9b97835c67060d7d910e188"
     ),
     "model.safetensors.index.json": (

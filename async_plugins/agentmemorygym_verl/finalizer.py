@@ -42,7 +42,7 @@ _FILESYSTEM_CHECKPOINT_MARKER_PREFIX = (
     "next action. Other workspace files remain available and may still be read "
     "or updated normally."
 )
-_FINAL_STATISTICS_VERL_COMMIT = "f3ac28fe54c945e092b9630030f44d236a106a11"
+_FINAL_STATISTICS_VERL_COMMIT = "6cd387cd2ebf413f93082eabf4ef5ad52bda37b5"
 _FINAL_STATISTICS_FIELDS = frozenset(
     {"schema", "queue", "rollouter", "trainer", "queue_cleanup"}
 )
@@ -130,6 +130,7 @@ _REQUIRED_RUNTIME_ARTIFACTS = (
     "rollout_data",
     "hydra_config",
     "checkpoints",
+    "critic_parameter_freeze",
     "finalization",
 )
 _LEGACY_RUNTIME_ARTIFACT_RELATIVE_PATHS = {
@@ -137,8 +138,66 @@ _LEGACY_RUNTIME_ARTIFACT_RELATIVE_PATHS = {
     "rollout_data": Path("rollout_data"),
     "hydra_config": Path("hydra/.hydra/config.yaml"),
     "checkpoints": Path("checkpoints"),
+    "critic_parameter_freeze": Path("critic-parameter-freeze.json"),
     "finalization": Path("finalization.json"),
 }
+_CRITIC_PARAMETER_FREEZE_SCHEMA = "verl_critic_parameter_freeze_v3"
+_CRITIC_PARAMETER_FREEZE_POLICY = "qwen35_dense_token_mixers_v1"
+_CRITIC_LOADER_PROVENANCE_SCHEMA = "verl_model_loader_provenance_v1"
+_CRITIC_LOADER_ENTRYPOINT = "verl.utils.model.load_valuehead_model"
+_CRITIC_LOADER_ARTIFACT_PATHS = (
+    "config.json",
+    "model.safetensors.index.json",
+    "model.safetensors-00001-of-00002.safetensors",
+    "model.safetensors-00002-of-00002.safetensors",
+)
+_CRITIC_FROZEN_PARAMETER_CATEGORIES = (
+    "self_attention",
+    "linear_attention",
+    "visual_auxiliary",
+    "lm_head_auxiliary",
+)
+_CRITIC_TRAINABLE_PARAMETER_CATEGORIES = (
+    "value_head",
+    "mlp",
+    "norm",
+    "embedding",
+)
+_CRITIC_PARAMETER_CATEGORIES = (
+    _CRITIC_FROZEN_PARAMETER_CATEGORIES
+    + _CRITIC_TRAINABLE_PARAMETER_CATEGORIES
+)
+_PARAMETER_NAME_HASH_ENCODING = (
+    "sha256(canonical-json(sorted(parameter_names)))"
+)
+_ROLLOUT_CORRECTION_METRICS = (
+    "rollout_corr/kl",
+    "rollout_corr/k3_kl",
+    "rollout_corr/log_ppl_abs_diff",
+    # SAO/IcePop treatment evidence.  These four values are emitted by the
+    # actual bypass-mode actor loss and distinguish a configured trust band
+    # from one that was silently ignored at runtime.
+    "rollout_corr/rollout_is_oob_ratio",
+    "rollout_corr/rollout_is_ratio_fraction_high",
+    "rollout_corr/rollout_is_ratio_fraction_low",
+    "rollout_corr/rollout_is_mean",
+    "rollout_corr/rollout_is_min",
+    "rollout_corr/rollout_is_max",
+    "rollout_corr/rollout_is_std",
+    "rollout_corr/rollout_is_eff_sample_size",
+)
+_ROLLOUT_CORRECTION_FRACTIONS = (
+    "rollout_corr/rollout_is_oob_ratio",
+    "rollout_corr/rollout_is_ratio_fraction_high",
+    "rollout_corr/rollout_is_ratio_fraction_low",
+)
+_ROLLOUT_CORRECTION_ESS = "rollout_corr/rollout_is_eff_sample_size"
+_ROLLOUT_CORRECTION_IDENTITY_TOLERANCE = 1e-6
+_OPTIMIZER_EXECUTION_METRICS = (
+    "ppo_epoch_passes_delta",
+    "mini_batches_per_epoch",
+    "optimizer_steps_delta",
+)
 
 
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
@@ -300,6 +359,23 @@ def _sha256_text(value: Any) -> bool:
         and len(value) == 64
         and all(character in "0123456789abcdef" for character in value)
     )
+
+
+def _canonical_json_sha256(value: Any) -> str:
+    """Match veRL's parameter-name digest without importing its runtime."""
+
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _parameter_name_sha256(names: Sequence[str]) -> str:
+    return _canonical_json_sha256(sorted(names))
 
 
 def _git_revision(value: Any) -> bool:
@@ -1063,14 +1139,54 @@ def _terminal_row_closes_trajectory(
     """
 
     done = record.get("rollout_done_flag")
+    termination_kind = record.get("termination_kind")
+    finalizer_receipt = record.get("horizon_finalizer_receipt")
     if done is True:
-        return True
-    if done is not False or record.get("outcome") != "max_rounds":
+        if (
+            termination_kind == "environment_done"
+            and finalizer_receipt == "not_invoked:environment_done"
+        ):
+            return True
+        if (
+            termination_kind != "horizon_finalized"
+            or finalizer_receipt != "terminal_transition_applied"
+        ):
+            return False
+        route_id = record.get("route_id")
+        declared_max_rounds = record.get("declared_max_rounds")
+        return (
+            isinstance(route_id, str)
+            and bool(route_id)
+            and isinstance(declared_max_rounds, int)
+            and not isinstance(declared_max_rounds, bool)
+            and declared_max_rounds == episode_length
+            and route_max_rounds.get(route_id) == episode_length
+            and record.get("trajectory_row_order") == episode_length - 1
+        )
+    if (
+        done is not False
+        or record.get("outcome") != "max_rounds"
+        or termination_kind != "max_rounds"
+        or finalizer_receipt
+        not in {
+            "no_terminal_transition:no_hook",
+            "no_terminal_transition:returned_none",
+        }
+    ):
         return False
     route_id = record.get("route_id")
     if not isinstance(route_id, str):
         return False
-    return route_max_rounds.get(route_id) == episode_length
+    declared_max_rounds = record.get("declared_max_rounds")
+    if isinstance(declared_max_rounds, bool) or not isinstance(
+        declared_max_rounds, int
+    ):
+        return False
+    return (
+        declared_max_rounds == episode_length
+        and route_max_rounds.get(route_id) == episode_length
+        and record.get("trajectory_row_order") == episode_length - 1
+    )
 
 
 class _Audit:
@@ -1089,6 +1205,7 @@ class _Audit:
         self.role: str | None = None
         self.expected: Mapping[str, Any] | None = None
         self.launch: Mapping[str, Any] | None = None
+        self.resolved_config: Mapping[str, Any] | None = None
         self.receipt_schema: str | None = None
         self.multitask = False
         self.route_ids: tuple[str, ...] = ()
@@ -1098,6 +1215,7 @@ class _Audit:
         self.schedule_routes: dict[tuple[str, int], str] = {}
         self.rolling_8: dict[str, Any] = {}
         self.accounting: dict[str, Any] = {}
+        self.critic_parameter_freeze: dict[str, Any] = {}
         self.batch_multiple: int | None = None
         self.staleness_threshold: float | None = None
         self.trainer_world_size: int | None = None
@@ -1675,6 +1793,7 @@ class _Audit:
         except Exception as exc:
             self.error("resolved/Hydra config", exc)
             return
+        self.resolved_config = resolved
 
         self.check(
             _same_path(_at(self.launch, "resolved_config.path"), resolved_path),
@@ -1818,8 +1937,747 @@ class _Audit:
         critic_batch = _positive_int(_at(resolved, "critic.ppo_mini_batch_size"))
         if actor_batch is None or critic_batch is None:
             self.errors.append("resolved actor/critic mini-batch is not positive")
+        elif _at(resolved, "algorithm.full_learner_batch_updates") is True:
+            if self.trainer_world_size is None:
+                self.errors.append(
+                    "full learner-batch padding cannot be derived without trainer world size"
+                )
+            else:
+                # In full-batch mode the global optimizer mini-batch is chosen
+                # dynamically from the aligned learner batch. Synthetic rows
+                # are required only for data-parallel divisibility.
+                self.batch_multiple = self.trainer_world_size
         else:
             self.batch_multiple = _lcm(actor_batch, critic_batch)
+
+    def audit_critic_parameter_freeze(self) -> None:
+        """Prove that SAO's critic freeze policy ran and updated only its trainable set."""
+
+        if self.resolved_config is None:
+            self.errors.append(
+                "critic parameter freeze cannot be audited without resolved config"
+            )
+            return
+        path = self.runtime_paths.get("critic_parameter_freeze")
+        if path is None:
+            self.errors.append("critic parameter freeze path is not receipt-bound")
+            return
+        try:
+            manifest = _load_json(path, "critic parameter freeze manifest")
+        except Exception as exc:
+            self.error("critic parameter freeze manifest", exc)
+            return
+
+        expected_top_level = {
+            "schema",
+            "name_sha256_encoding",
+            "status",
+            "policy",
+            "model",
+            "loader_provenance",
+            "parameter_aliases",
+            "parameters",
+            "categories",
+            "frozen_parameter_count",
+            "frozen_parameter_numel",
+            "frozen_parameter_name_sha256",
+            "trainable_parameter_count",
+            "trainable_parameter_numel",
+            "trainable_parameter_name_sha256",
+            "optimizer",
+            "first_optimizer_step",
+            "optimizer_step_learning_rates",
+        }
+        self.check(
+            set(manifest) == expected_top_level,
+            "critic parameter freeze manifest fields differ from the pinned schema",
+        )
+        self.check(
+            manifest.get("schema") == _CRITIC_PARAMETER_FREEZE_SCHEMA,
+            "critic parameter freeze manifest schema mismatch",
+        )
+        self.check(
+            manifest.get("name_sha256_encoding")
+            == _PARAMETER_NAME_HASH_ENCODING,
+            "critic parameter freeze name-hash encoding mismatch",
+        )
+        self.check(
+            manifest.get("status") == "pass",
+            "critic parameter freeze manifest did not pass two-step validation",
+        )
+
+        configured_policy = _at(
+            self.resolved_config, "critic.model.parameter_freeze_policy"
+        )
+        configured_manifest_path = _at(
+            self.resolved_config,
+            "critic.model.parameter_freeze_manifest_path",
+        )
+        configured_probe_budget = _positive_int(
+            _at(
+                self.resolved_config,
+                "critic.model.parameter_freeze_probe_elements_per_rank",
+            )
+        )
+        self.check(
+            configured_policy == _CRITIC_PARAMETER_FREEZE_POLICY
+            and manifest.get("policy") == configured_policy,
+            "critic parameter freeze policy differs from the resolved SAO recipe",
+        )
+        self.check(
+            _same_path(configured_manifest_path, path),
+            "critic parameter freeze manifest path differs from resolved config",
+        )
+        self.check(
+            configured_probe_budget is not None,
+            "critic parameter freeze probe budget is not a positive integer",
+        )
+
+        model = manifest.get("model")
+        expected_model_fields = {
+            "class",
+            "pretrained_model_class",
+            "model_type",
+            "role",
+            "config_sha256",
+            "path",
+            "revision",
+        }
+        if not isinstance(model, Mapping):
+            self.errors.append("critic parameter freeze model record is not a mapping")
+        else:
+            self.check(
+                set(model) == expected_model_fields,
+                "critic parameter freeze model fields differ from the pinned schema",
+            )
+            self.check(
+                model.get("class") == "AutoModelForCausalLMWithValueHead",
+                "critic parameter freeze model is not the exact TRL value-head wrapper",
+            )
+            self.check(
+                model.get("pretrained_model_class")
+                == "Qwen3_5ForConditionalGeneration",
+                "critic parameter freeze pretrained model is not exact Qwen3.5 conditional generation",
+            )
+            self.check(
+                model.get("model_type") == "qwen3_5",
+                "critic parameter freeze model type is not dense qwen3_5",
+            )
+            self.check(
+                model.get("role") == "value_model",
+                "critic parameter freeze model role is not value_model",
+            )
+            self.check(
+                model.get("path") == _at(self.resolved_config, "critic.model.path"),
+                "critic parameter freeze model path differs from resolved config",
+            )
+            self.check(
+                _sha256_text(model.get("config_sha256")),
+                "critic parameter freeze model config hash is invalid",
+            )
+            revision = model.get("revision")
+            self.check(
+                revision is None or (isinstance(revision, str) and bool(revision)),
+                "critic parameter freeze model revision is invalid",
+            )
+
+        loader = manifest.get("loader_provenance")
+        loader_artifact_sha256 = None
+        expected_loader_fields = {
+            "schema",
+            "loader_entrypoint",
+            "configured_path",
+            "configured_realpath",
+            "loader_path",
+            "loader_realpath",
+            "configured_path_samefile",
+            "resolved_config_sha256",
+            "source_revision",
+            "resolved_revision",
+            "artifact_files",
+            "artifact_manifest_sha256",
+            "weight_manifest_sha256",
+            "weight_file_count",
+            "weight_total_bytes",
+            "readback",
+        }
+        if not isinstance(loader, Mapping):
+            self.errors.append("critic loader provenance is not a mapping")
+        else:
+            self.check(
+                set(loader) == expected_loader_fields,
+                "critic loader provenance fields differ from the pinned schema",
+            )
+            self.check(
+                loader.get("schema") == _CRITIC_LOADER_PROVENANCE_SCHEMA,
+                "critic loader provenance schema mismatch",
+            )
+            self.check(
+                loader.get("loader_entrypoint") == _CRITIC_LOADER_ENTRYPOINT,
+                "critic loader entrypoint is not the reviewed value-model loader",
+            )
+            configured_path = loader.get("configured_path")
+            configured_realpath = loader.get("configured_realpath")
+            loader_path = loader.get("loader_path")
+            loader_realpath = loader.get("loader_realpath")
+            self.check(
+                configured_path == _at(self.resolved_config, "critic.model.path"),
+                "critic loader configured path differs from resolved config",
+            )
+            self.check(
+                all(
+                    isinstance(value, str)
+                    and bool(value)
+                    and Path(value).is_absolute()
+                    for value in (configured_realpath, loader_path, loader_realpath)
+                ),
+                "critic loader provenance paths are not absolute non-empty paths",
+            )
+            self.check(
+                loader.get("configured_path_samefile") is True
+                and configured_realpath == loader_realpath,
+                "critic loader did not read the configured model directory",
+            )
+            self.check(
+                isinstance(model, Mapping)
+                and loader.get("resolved_config_sha256") == model.get("config_sha256"),
+                "critic loader resolved config digest differs from loaded model config",
+            )
+            self.check(
+                isinstance(model, Mapping)
+                and loader.get("source_revision") == model.get("revision"),
+                "critic loader source revision differs from loaded model metadata",
+            )
+
+            raw_artifacts = loader.get("artifact_files")
+            artifact_records: list[Mapping[str, Any]] = []
+            raw_artifact_count = 0
+            if isinstance(raw_artifacts, Sequence) and not isinstance(raw_artifacts, (str, bytes)):
+                raw_artifact_count = len(raw_artifacts)
+                artifact_records = [
+                    record for record in raw_artifacts if isinstance(record, Mapping)
+                ]
+            self.check(
+                len(artifact_records) == len(_CRITIC_LOADER_ARTIFACT_PATHS)
+                and len(artifact_records) == raw_artifact_count,
+                "critic loader artifact manifest has missing or non-mapping records",
+            )
+            artifact_hashes: dict[str, str] = {}
+            artifact_total_bytes = 0
+            artifact_valid = True
+            expected_roles = {
+                "config.json": "config",
+                "model.safetensors.index.json": "weight_index",
+                "model.safetensors-00001-of-00002.safetensors": "weight_shard",
+                "model.safetensors-00002-of-00002.safetensors": "weight_shard",
+            }
+            for index, record in enumerate(artifact_records):
+                self.check(
+                    set(record) == {"relative_path", "role", "size_bytes", "sha256"},
+                    f"critic loader artifact record {index} fields differ from schema",
+                )
+                relative_path = record.get("relative_path")
+                role = record.get("role")
+                size_bytes = _positive_int(record.get("size_bytes"))
+                digest = record.get("sha256")
+                valid_record = (
+                    isinstance(relative_path, str)
+                    and relative_path in expected_roles
+                    and role == expected_roles.get(relative_path)
+                    and size_bytes is not None
+                    and _sha256_text(digest)
+                    and relative_path not in artifact_hashes
+                )
+                self.check(valid_record, f"critic loader artifact record {index} is invalid")
+                if not valid_record:
+                    artifact_valid = False
+                    continue
+                artifact_hashes[relative_path] = str(digest)
+                artifact_total_bytes += int(size_bytes)
+
+            expected_loader_hashes = {
+                path: LOCKED_MODEL_FILE_SHA256[path]
+                for path in _CRITIC_LOADER_ARTIFACT_PATHS
+            }
+            self.check(
+                artifact_hashes == expected_loader_hashes,
+                "critic loader artifact hashes differ from launch-locked model bytes",
+            )
+            ordered_records = sorted(
+                artifact_records, key=lambda record: str(record.get("relative_path", ""))
+            )
+            loader_artifact_sha256 = _canonical_json_sha256(ordered_records)
+            self.check(
+                artifact_valid
+                and artifact_records == ordered_records
+                and loader.get("artifact_manifest_sha256") == loader_artifact_sha256,
+                "critic loader artifact manifest digest/order mismatch",
+            )
+            weight_records = [
+                record for record in ordered_records if record.get("role") == "weight_shard"
+            ]
+            weight_total_bytes = sum(
+                int(record.get("size_bytes", 0)) for record in weight_records
+            )
+            self.check(
+                loader.get("weight_manifest_sha256")
+                == _canonical_json_sha256(weight_records)
+                and loader.get("weight_file_count") == len(weight_records) == 2
+                and loader.get("weight_total_bytes") == weight_total_bytes > 0,
+                "critic loader weight manifest summary mismatch",
+            )
+            source_revision = loader.get("source_revision")
+            expected_revision = (
+                f"huggingface:{source_revision}"
+                if isinstance(source_revision, str) and source_revision
+                else f"artifact-sha256:{loader_artifact_sha256}"
+            )
+            self.check(
+                loader.get("resolved_revision") == expected_revision,
+                "critic loader resolved revision is not bound to source or artifact digest",
+            )
+            readback = loader.get("readback")
+            expected_readback_fields = {
+                "status",
+                "phase",
+                "file_count",
+                "total_bytes",
+                "all_regular",
+                "symlink_count",
+            }
+            self.check(
+                isinstance(readback, Mapping)
+                and set(readback) == expected_readback_fields
+                and readback.get("status") == "pass"
+                and readback.get("phase") == "post_from_pretrained"
+                and readback.get("file_count") == len(artifact_records)
+                and readback.get("total_bytes") == artifact_total_bytes
+                and readback.get("all_regular") is True
+                and readback.get("symlink_count") == 0,
+                "critic loader post-load readback evidence is invalid",
+            )
+
+        raw_parameters = manifest.get("parameters")
+        parameters: list[Mapping[str, Any]] = []
+        if isinstance(raw_parameters, (str, bytes)) or not isinstance(
+            raw_parameters, Sequence
+        ):
+            self.errors.append("critic parameter freeze parameters are not a sequence")
+        else:
+            parameters = [
+                record for record in raw_parameters if isinstance(record, Mapping)
+            ]
+            self.check(
+                len(parameters) == len(raw_parameters) and bool(parameters),
+                "critic parameter freeze parameters contain a non-mapping or are empty",
+            )
+
+        expected_parameter_fields = {
+            "name",
+            "shape",
+            "numel",
+            "dtype",
+            "module_class",
+            "category",
+            "requires_grad",
+            "optimizer_member",
+        }
+        records_by_name: dict[str, Mapping[str, Any]] = {}
+        for index, record in enumerate(parameters):
+            self.check(
+                set(record) == expected_parameter_fields,
+                f"critic parameter freeze record {index} fields differ from schema",
+            )
+            name = record.get("name")
+            valid_name = (
+                isinstance(name, str)
+                and bool(name)
+                and "\n" not in name
+                and "\r" not in name
+                and name not in records_by_name
+            )
+            self.check(
+                valid_name,
+                f"critic parameter freeze record {index} has invalid or duplicate name",
+            )
+            if not valid_name:
+                continue
+
+            shape = record.get("shape")
+            valid_shape = (
+                isinstance(shape, list)
+                and all(
+                    isinstance(dimension, int)
+                    and not isinstance(dimension, bool)
+                    and dimension >= 0
+                    for dimension in shape
+                )
+            )
+            numel = _positive_int(record.get("numel"))
+            self.check(
+                valid_shape and numel is not None,
+                f"critic parameter freeze record {name} has invalid shape/numel",
+            )
+            if valid_shape and numel is not None:
+                self.check(
+                    math.prod(shape) == numel,
+                    f"critic parameter freeze record {name} shape/numel mismatch",
+                )
+            self.check(
+                isinstance(record.get("dtype"), str) and bool(record.get("dtype")),
+                f"critic parameter freeze record {name} has invalid dtype",
+            )
+            self.check(
+                isinstance(record.get("module_class"), str)
+                and bool(record.get("module_class")),
+                f"critic parameter freeze record {name} has invalid module class",
+            )
+            category = record.get("category")
+            self.check(
+                category in _CRITIC_PARAMETER_CATEGORIES,
+                f"critic parameter freeze record {name} has unknown category",
+            )
+            expected_trainable = category in _CRITIC_TRAINABLE_PARAMETER_CATEGORIES
+            self.check(
+                record.get("requires_grad") is expected_trainable,
+                f"critic parameter freeze record {name} requires_grad drift",
+            )
+            self.check(
+                record.get("optimizer_member") is expected_trainable,
+                f"critic parameter freeze record {name} optimizer membership drift",
+            )
+            records_by_name[name] = record
+
+        raw_aliases = manifest.get("parameter_aliases")
+        parameter_aliases: list[Mapping[str, Any]] = []
+        raw_alias_count = 0
+        if isinstance(raw_aliases, Sequence) and not isinstance(raw_aliases, (str, bytes)):
+            raw_alias_count = len(raw_aliases)
+            parameter_aliases = [
+                record for record in raw_aliases if isinstance(record, Mapping)
+            ]
+        self.check(
+            len(parameter_aliases) == raw_alias_count,
+            "critic parameter aliases contain a non-mapping record",
+        )
+        expected_alias_fields = {
+            "canonical_name",
+            "canonical_category",
+            "alias_name",
+            "alias_role",
+            "requires_grad",
+        }
+        seen_alias_names: set[str] = set()
+        valid_tied_lm_head_aliases = 0
+        for index, alias in enumerate(parameter_aliases):
+            canonical_name = alias.get("canonical_name")
+            alias_name = alias.get("alias_name")
+            valid_alias = (
+                set(alias) == expected_alias_fields
+                and isinstance(canonical_name, str)
+                and canonical_name in records_by_name
+                and records_by_name[canonical_name].get("category") == "embedding"
+                and "embed_tokens" in canonical_name.split(".")
+                and alias.get("canonical_category") == "embedding"
+                and isinstance(alias_name, str)
+                and alias_name.startswith("pretrained_model.lm_head.")
+                and alias_name.endswith(".weight")
+                and alias_name not in records_by_name
+                and alias_name not in seen_alias_names
+                and alias.get("alias_role") == "tied_lm_head"
+                and alias.get("requires_grad") is True
+            )
+            self.check(valid_alias, f"critic parameter alias record {index} is invalid")
+            if valid_alias:
+                seen_alias_names.add(str(alias_name))
+                valid_tied_lm_head_aliases += 1
+        self.check(
+            valid_tied_lm_head_aliases <= 1,
+            "critic parameter aliases contain multiple tied LM heads",
+        )
+
+        names_by_category = {
+            category: sorted(
+                name
+                for name, record in records_by_name.items()
+                if record.get("category") == category
+            )
+            for category in _CRITIC_PARAMETER_CATEGORIES
+        }
+
+        def expected_summary(names: Sequence[str]) -> dict[str, Any]:
+            return {
+                "parameter_count": len(names),
+                "numel": sum(
+                    _positive_int(records_by_name[name].get("numel")) or 0
+                    for name in names
+                ),
+                "name_sha256": _parameter_name_sha256(names),
+            }
+
+        raw_categories = manifest.get("categories")
+        if not isinstance(raw_categories, Mapping):
+            self.errors.append("critic parameter freeze categories are not a mapping")
+        else:
+            self.check(
+                set(raw_categories) == set(_CRITIC_PARAMETER_CATEGORIES),
+                "critic parameter freeze category set mismatch",
+            )
+            for category in _CRITIC_PARAMETER_CATEGORIES:
+                observed = raw_categories.get(category)
+                expected = expected_summary(names_by_category[category])
+                expected["requires_grad"] = (
+                    category in _CRITIC_TRAINABLE_PARAMETER_CATEGORIES
+                )
+                category_can_be_tied_alias = (
+                    category == "lm_head_auxiliary"
+                    and valid_tied_lm_head_aliases == 1
+                )
+                self.check(
+                    bool(names_by_category[category]) or category_can_be_tied_alias,
+                    f"critic parameter freeze category {category} is empty",
+                )
+                self.check(
+                    isinstance(observed, Mapping)
+                    and set(observed) == set(expected)
+                    and dict(observed) == expected,
+                    f"critic parameter freeze category {category} summary mismatch",
+                )
+            self.check(
+                not names_by_category["lm_head_auxiliary"]
+                or valid_tied_lm_head_aliases == 0,
+                "critic parameter freeze records both a distinct and tied LM head",
+            )
+
+        frozen_names = sorted(
+            name
+            for category in _CRITIC_FROZEN_PARAMETER_CATEGORIES
+            for name in names_by_category[category]
+        )
+        trainable_names = sorted(
+            name
+            for category in _CRITIC_TRAINABLE_PARAMETER_CATEGORIES
+            for name in names_by_category[category]
+        )
+        frozen_summary = expected_summary(frozen_names)
+        trainable_summary = expected_summary(trainable_names)
+        for prefix, summary in (
+            ("frozen", frozen_summary),
+            ("trainable", trainable_summary),
+        ):
+            self.check(
+                manifest.get(f"{prefix}_parameter_count")
+                == summary["parameter_count"]
+                and manifest.get(f"{prefix}_parameter_numel") == summary["numel"]
+                and manifest.get(f"{prefix}_parameter_name_sha256")
+                == summary["name_sha256"],
+                f"critic parameter freeze {prefix} summary mismatch",
+            )
+
+        optimizer = manifest.get("optimizer")
+        expected_optimizer = {
+            "membership_exact": True,
+            "parameter_count": trainable_summary["parameter_count"],
+            "numel": trainable_summary["numel"],
+            "name_sha256": trainable_summary["name_sha256"],
+        }
+        self.check(
+            isinstance(optimizer, Mapping)
+            and set(optimizer) == set(expected_optimizer)
+            and dict(optimizer) == expected_optimizer,
+            "critic optimizer membership does not exactly match trainable parameters",
+        )
+
+        first_step = manifest.get("first_optimizer_step")
+        if not isinstance(first_step, Mapping):
+            self.errors.append(
+                "critic parameter freeze first optimizer step is not a mapping"
+            )
+            return
+        expected_first_step_fields = {
+            "status",
+            "completed_step",
+            "frozen",
+            "trainable",
+            "probe_elements_per_rank",
+            "learning_rates",
+        }
+        self.check(
+            set(first_step) == expected_first_step_fields,
+            "critic parameter freeze first-step fields differ from schema",
+        )
+        self.check(
+            first_step.get("status") == "pass"
+            and first_step.get("completed_step") == 1,
+            "critic parameter freeze did not attest completed optimizer step 1",
+        )
+        self.check(
+            configured_probe_budget is not None
+            and first_step.get("probe_elements_per_rank")
+            == configured_probe_budget,
+            "critic parameter freeze probe budget differs from resolved config",
+        )
+
+        probe_metrics: dict[str, Mapping[str, Any]] = {}
+        expected_probe_fields = {
+            "changed_count",
+            "l2",
+            "max_abs",
+            "sampled_elements",
+        }
+        for group in ("frozen", "trainable"):
+            observed = first_step.get(group)
+            valid_mapping = isinstance(observed, Mapping) and set(observed) == expected_probe_fields
+            self.check(
+                valid_mapping,
+                f"critic parameter freeze {group} probe fields differ from schema",
+            )
+            if valid_mapping:
+                probe_metrics[group] = observed
+
+        frozen_probe = probe_metrics.get("frozen")
+        trainable_probe = probe_metrics.get("trainable")
+        if frozen_probe is not None:
+            self.check(
+                _positive_int(frozen_probe.get("sampled_elements")) is not None
+                and frozen_probe.get("changed_count") == 0
+                and frozen_probe.get("l2") == 0.0
+                and frozen_probe.get("max_abs") == 0.0,
+                "critic frozen parameter probe changed or sampled zero elements",
+            )
+        if trainable_probe is not None:
+            changed_count = _positive_int(trainable_probe.get("changed_count"))
+            sampled_elements = _positive_int(trainable_probe.get("sampled_elements"))
+            self.check(
+                changed_count is not None
+                and sampled_elements is not None
+                and changed_count <= sampled_elements
+                and _finite_positive(trainable_probe.get("l2"))
+                and _finite_positive(trainable_probe.get("max_abs")),
+                "critic trainable parameter probe did not change after optimizer step",
+            )
+        if (
+            frozen_probe is not None
+            and trainable_probe is not None
+            and configured_probe_budget is not None
+            and self.trainer_world_size is not None
+        ):
+            frozen_sampled = _positive_int(frozen_probe.get("sampled_elements"))
+            trainable_sampled = _positive_int(
+                trainable_probe.get("sampled_elements")
+            )
+            if frozen_sampled is not None and trainable_sampled is not None:
+                sampled_total = frozen_sampled + trainable_sampled
+                self.check(
+                    sampled_total
+                    <= configured_probe_budget * self.trainer_world_size,
+                    "critic parameter freeze sampled more than its per-rank probe budget",
+                )
+
+        configured_lr = _at(self.resolved_config, "critic.optim.lr")
+        valid_configured_lr = _finite_positive(configured_lr)
+        warmup_steps = _positive_int(
+            _at(self.resolved_config, "critic.optim.lr_warmup_steps")
+        )
+        self.check(
+            valid_configured_lr
+            and warmup_steps == 10
+            and _at(self.resolved_config, "critic.optim.lr_scheduler_type")
+            == "constant"
+            and _at(self.resolved_config, "critic.optim.zero_indexed_step") is False
+            and _at(
+                self.resolved_config,
+                "critic.optim.lr_scheduler_step_per_optimizer_step",
+            )
+            is True,
+            "critic warmup schedule differs from the frozen SAO contract",
+        )
+
+        lr_trace = manifest.get("optimizer_step_learning_rates")
+        expected_trace_fields = {"required_steps", "status", "steps"}
+        valid_trace = (
+            isinstance(lr_trace, Mapping)
+            and set(lr_trace) == expected_trace_fields
+            and lr_trace.get("required_steps") == 2
+            and lr_trace.get("status") == "pass"
+            and isinstance(lr_trace.get("steps"), list)
+            and len(lr_trace.get("steps")) == 2
+        )
+        self.check(
+            valid_trace,
+            "critic optimizer-step LR trace does not attest exactly two steps",
+        )
+
+        def learning_rates_match(observed: Any, expected: float) -> bool:
+            return (
+                isinstance(observed, list)
+                and bool(observed)
+                and all(
+                    _finite_positive(value)
+                    and math.isclose(
+                        float(value),
+                        expected,
+                        rel_tol=1e-9,
+                        abs_tol=max(abs(expected) * 1e-12, 1e-15),
+                    )
+                    for value in observed
+                )
+            )
+
+        trace_steps = lr_trace.get("steps") if valid_trace else []
+        trace_learning_rates: list[list[float]] = []
+        if valid_configured_lr and warmup_steps is not None:
+            for index, expected_step in enumerate((1, 2)):
+                step = trace_steps[index] if index < len(trace_steps) else None
+                expected_lr = float(configured_lr) * expected_step / warmup_steps
+                valid_step = (
+                    isinstance(step, Mapping)
+                    and set(step) == {"completed_step", "learning_rates"}
+                    and step.get("completed_step") == expected_step
+                    and learning_rates_match(step.get("learning_rates"), expected_lr)
+                )
+                self.check(
+                    valid_step,
+                    "critic optimizer step "
+                    f"{expected_step} learning rates differ from the frozen warmup "
+                    f"value {expected_lr:.17g}",
+                )
+                if valid_step:
+                    trace_learning_rates.append(
+                        [float(value) for value in step["learning_rates"]]
+                    )
+
+        first_step_learning_rates = first_step.get("learning_rates")
+        first_trace_learning_rates = (
+            trace_learning_rates[0]
+            if trace_learning_rates and trace_learning_rates[0]
+            else []
+        )
+        self.check(
+            bool(first_trace_learning_rates)
+            and learning_rates_match(
+                first_step_learning_rates, first_trace_learning_rates[0]
+            )
+            and [float(value) for value in first_step_learning_rates]
+            == first_trace_learning_rates,
+            "critic first-step probe learning rates differ from optimizer-step trace",
+        )
+
+        self.critic_parameter_freeze = {
+            "schema": manifest.get("schema"),
+            "status": manifest.get("status"),
+            "policy": manifest.get("policy"),
+            "frozen_parameter_count": frozen_summary["parameter_count"],
+            "frozen_parameter_numel": frozen_summary["numel"],
+            "trainable_parameter_count": trainable_summary["parameter_count"],
+            "trainable_parameter_numel": trainable_summary["numel"],
+            "probe_elements_per_rank": first_step.get(
+                "probe_elements_per_rank"
+            ),
+            "completed_step": first_step.get("completed_step"),
+            "optimizer_step_learning_rates": trace_learning_rates,
+            "loader_artifact_manifest_sha256": loader_artifact_sha256,
+        }
 
     def audit_file_logger(self) -> None:
         """Audit metrics emitted by current upstream veRL itself.
@@ -1846,6 +2704,7 @@ class _Audit:
         actor_grad_rows = 0
         critic_grad_rows = 0
         rollout_correction_rows = 0
+        optimizer_execution_rows = 0
         current_param_versions: dict[int, int] = {}
         native_stale_action_rows: dict[int, int] = {}
         generated_samples: dict[int, int] = {}
@@ -1930,11 +2789,7 @@ class _Audit:
                 "FileLogger publication steps are incomplete",
             )
 
-            legacy_rollout_corr = (
-                "rollout_corr/kl",
-                "rollout_corr/k3_kl",
-                "rollout_corr/log_ppl_abs_diff",
-            )
+            legacy_rollout_corr = _ROLLOUT_CORRECTION_METRICS
             actor_rollout_corr = tuple(
                 f"actor/{key}" for key in legacy_rollout_corr
             )
@@ -2026,7 +2881,56 @@ class _Audit:
                         else:
                             critic_grad_rows += 1
 
+                role_execution: dict[str, dict[str, int]] = {}
+                for role in ("actor", "critic"):
+                    observed: dict[str, int] = {}
+                    for suffix in _OPTIMIZER_EXECUTION_METRICS:
+                        key = f"{role}/{suffix}"
+                        value = _nonnegative_integral(learner.get(key))
+                        valid = value is not None and value > 0
+                        self.check(
+                            valid,
+                            f"FileLogger publication step {step} has no unique "
+                            f"positive integral {key}",
+                        )
+                        if valid:
+                            observed[suffix] = value
+                    role_execution[role] = observed
+
+                actor_execution = role_execution["actor"]
+                critic_execution = role_execution["critic"]
+                execution_complete = all(
+                    len(role_execution[role]) == len(_OPTIMIZER_EXECUTION_METRICS)
+                    for role in ("actor", "critic")
+                )
+                if execution_complete:
+                    actor_epochs = actor_execution["ppo_epoch_passes_delta"]
+                    critic_epochs = critic_execution["ppo_epoch_passes_delta"]
+                    actor_mini_batches = actor_execution["mini_batches_per_epoch"]
+                    critic_mini_batches = critic_execution["mini_batches_per_epoch"]
+                    actor_steps = actor_execution["optimizer_steps_delta"]
+                    critic_steps = critic_execution["optimizer_steps_delta"]
+                    execution_contract_holds = (
+                        actor_epochs == 1
+                        and critic_epochs == 2
+                        and actor_mini_batches == critic_mini_batches
+                        and actor_steps == actor_epochs * actor_mini_batches
+                        and critic_steps == critic_epochs * critic_mini_batches
+                        and critic_steps == 2 * actor_steps
+                    )
+                    self.check(
+                        execution_contract_holds,
+                        f"FileLogger publication step {step} violated the actual "
+                        "actor-K1/critic-K2 execution contract: "
+                        f"actor=(epochs={actor_epochs}, mini_batches={actor_mini_batches}, "
+                        f"steps={actor_steps}), critic=(epochs={critic_epochs}, "
+                        f"mini_batches={critic_mini_batches}, steps={critic_steps})",
+                    )
+                    if execution_contract_holds:
+                        optimizer_execution_rows += 1
+
                 correction_values: dict[str, float] = {}
+                correction_emitted_keys: dict[str, str] = {}
                 if current_owner_shape:
                     # Current veRL emits actor-owned correction diagnostics on
                     # the learner row.  Never let a rollouter/stale copy satisfy
@@ -2057,8 +2961,76 @@ class _Audit:
                     )
                     if valid:
                         correction_values[canonical_key] = float(value)
+                        correction_emitted_keys[canonical_key] = emitted_key
                 if len(correction_values) == len(legacy_rollout_corr):
-                    rollout_correction_rows += 1
+                    bounded = True
+                    for key in _ROLLOUT_CORRECTION_FRACTIONS:
+                        value = correction_values[key]
+                        in_unit_interval = 0.0 <= value <= 1.0
+                        self.check(
+                            in_unit_interval,
+                            f"FileLogger publication step {step} has out-of-range "
+                            f"{correction_emitted_keys[key]}: {value}",
+                        )
+                        bounded = bounded and in_unit_interval
+
+                    ess = correction_values[_ROLLOUT_CORRECTION_ESS]
+                    valid_ess = (
+                        0.0
+                        < ess
+                        <= 1.0 + _ROLLOUT_CORRECTION_IDENTITY_TOLERANCE
+                    )
+                    self.check(
+                        valid_ess,
+                        f"FileLogger publication step {step} has out-of-range "
+                        f"{correction_emitted_keys[_ROLLOUT_CORRECTION_ESS]}: {ess}",
+                    )
+                    bounded = bounded and valid_ess
+
+                    applied_min = correction_values["rollout_corr/rollout_is_min"]
+                    applied_mean = correction_values["rollout_corr/rollout_is_mean"]
+                    applied_max = correction_values["rollout_corr/rollout_is_max"]
+                    applied_std = correction_values["rollout_corr/rollout_is_std"]
+                    valid_applied_weights = (
+                        0.0 <= applied_min <= applied_mean <= applied_max
+                        and applied_max
+                        <= 4.0 + _ROLLOUT_CORRECTION_IDENTITY_TOLERANCE
+                        and applied_mean > 0.0
+                        and applied_std >= 0.0
+                    )
+                    self.check(
+                        valid_applied_weights,
+                        f"FileLogger publication step {step} has invalid IcePop "
+                        "applied-weight statistics from "
+                        f"{correction_emitted_keys['rollout_corr/rollout_is_mean']}: "
+                        f"min={applied_min} mean={applied_mean} "
+                        f"max={applied_max} std={applied_std}",
+                    )
+                    bounded = bounded and valid_applied_weights
+
+                    oob = correction_values[
+                        "rollout_corr/rollout_is_oob_ratio"
+                    ]
+                    high = correction_values[
+                        "rollout_corr/rollout_is_ratio_fraction_high"
+                    ]
+                    low = correction_values[
+                        "rollout_corr/rollout_is_ratio_fraction_low"
+                    ]
+                    identity_holds = math.isclose(
+                        oob,
+                        high + low,
+                        rel_tol=0.0,
+                        abs_tol=_ROLLOUT_CORRECTION_IDENTITY_TOLERANCE,
+                    )
+                    self.check(
+                        identity_holds,
+                        f"FileLogger publication step {step} has inconsistent IcePop "
+                        f"fractions from {correction_emitted_keys['rollout_corr/rollout_is_oob_ratio']}: "
+                        f"oob={oob} high={high} low={low}",
+                    )
+                    if bounded and identity_holds:
+                        rollout_correction_rows += 1
 
                 observed_integrals: dict[str, int] = {}
                 owned_metrics = {
@@ -2118,6 +3090,10 @@ class _Audit:
                 rollout_correction_rows == publications,
                 "FileLogger native rollout-correction diagnostics do not cover every publication cycle",
             )
+            self.check(
+                optimizer_execution_rows == publications,
+                "FileLogger actual actor-K1/critic-K2 execution metrics do not cover every publication cycle",
+            )
             if len(current_param_versions) == publications:
                 self.check(
                     [
@@ -2152,6 +3128,7 @@ class _Audit:
             "actor_grad_rows": actor_grad_rows,
             "critic_grad_rows": critic_grad_rows,
             "rollout_correction_rows": rollout_correction_rows,
+            "optimizer_execution_rows": optimizer_execution_rows,
             "current_param_versions_by_update": current_param_versions_by_update,
             "native_stale_action_rows_by_publication": native_stale_action_rows,
             "native_total_generated_samples_by_publication": generated_samples,
@@ -3253,6 +4230,7 @@ class _Audit:
             self.errors.append(f"trainer exit code {self.trainer_exit_code} is nonzero")
         self.audit_launch()
         self.audit_config()
+        self.audit_critic_parameter_freeze()
         self.audit_file_logger()
         self.audit_rollouts()
         self.audit_final_statistics()
@@ -3273,6 +4251,7 @@ class _Audit:
             "counts": self.counts,
             "routes": self.route_summaries,
             "rolling_8_episode_share": self.rolling_8,
+            "critic_parameter_freeze": self.critic_parameter_freeze,
             "final_accounting": self.accounting,
             "errors": self.errors,
         }
@@ -3300,6 +4279,7 @@ def finalize_run(
             "counts": audit.counts,
             "routes": audit.route_summaries,
             "rolling_8_episode_share": audit.rolling_8,
+            "critic_parameter_freeze": audit.critic_parameter_freeze,
             "final_accounting": audit.accounting,
             "errors": audit.errors,
         }

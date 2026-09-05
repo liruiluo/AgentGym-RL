@@ -51,6 +51,25 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             (FIXTURES / "source-lock.json").read_text(encoding="utf-8")
         )
 
+    @staticmethod
+    def _endpoint_validator(root: Path) -> Path:
+        """Create a self-contained validator for this test's source lock.
+
+        The shared historical fixture ships only a placeholder
+        ``launcher_contract.py``.  Keep the test hermetic instead of mutating
+        that cross-worktree fixture in ``/tmp``.
+        """
+
+        path = root / "endpoint-launcher-contract.py"
+        path.write_text(
+            "import json\n"
+            "print(json.dumps({"
+            "'schema': 'openmle_fast_launcher_source_lock_validation_v_test', "
+            "'status': 'pass', 'runtime_final': True}, sort_keys=True))\n",
+            encoding="utf-8",
+        )
+        return path
+
     def _inputs(self, root: Path, mode: str = "formal") -> LaunchInputs:
         schedule = (
             FIXTURES / "formal100-schedule.jsonl"
@@ -66,7 +85,7 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             run_dir=root / "run",
             experiment_name=f"current-publication-{mode}",
             endpoint_source_lock=FIXTURES / "source-lock.json",
-            endpoint_contract_tool=FIXTURES / "launcher_contract.py",
+            endpoint_contract_tool=self._endpoint_validator(root),
             publication_receipt=FIXTURES / "publication-receipt.json",
             formal_schedule_certificate=FIXTURES
             / "formal100-schedule-certificate.json",
@@ -99,13 +118,40 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(values["algorithm.adv_estimator"], "amg_action_axis_gae")
+            self.assertEqual(values["algorithm.adv_estimator"], "amg_sao_token_gae")
+            self.assertEqual(
+                values["algorithm.amg_policy_lambda_mode"], "length_adaptive"
+            )
+            self.assertEqual(values["algorithm.amg_policy_lambda_scale"], "1.5")
+            self.assertEqual(values["algorithm.amg_critic_lambda"], "1.0")
+            self.assertEqual(values["algorithm.amg_reward_tolerance"], "1.0e-6")
             self.assertEqual(
                 values["algorithm.amg_advantage_normalization"],
                 "upstream_masked_whiten",
             )
             self.assertEqual(
-                values["algorithm.rollout_correction.loss_type"], "ppo_clip"
+                values["algorithm.full_learner_batch_updates"], "True"
+            )
+            self.assertEqual(
+                values["algorithm.rollout_correction.loss_type"], "reinforce"
+            )
+            self.assertEqual(
+                values["algorithm.rollout_correction.rollout_is"], "token"
+            )
+            self.assertEqual(
+                values["algorithm.rollout_correction.rollout_is_threshold"],
+                "0.2_4.0",
+            )
+            self.assertEqual(
+                values["algorithm.rollout_correction.rollout_is_batch_normalize"],
+                "False",
+            )
+            self.assertEqual(
+                values["algorithm.rollout_correction.rollout_rs"], "null"
+            )
+            self.assertEqual(
+                values["algorithm.rollout_correction.rollout_rs_threshold"],
+                "null",
             )
             self.assertEqual(values["data.max_prompt_length"], "30720")
             self.assertEqual(values["actor_rollout_ref.rollout.n"], "1")
@@ -139,6 +185,12 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                 values["actor_rollout_ref.actor.use_prefix_grouper"], "False"
             )
             self.assertEqual(values["critic.loss_agg_mode"], "token-mean")
+            self.assertEqual(values["critic.ppo_epochs"], "2")
+            self.assertEqual(values["critic.optim.zero_indexed_step"], "False")
+            self.assertEqual(
+                values["critic.optim.lr_scheduler_step_per_optimizer_step"],
+                "True",
+            )
             self.assertEqual(
                 values["ray_kwargs.ray_init.object_store_memory"], "8589934592"
             )
@@ -452,7 +504,7 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                 ],
             )
             self.assertEqual(
-                env["VERL_USE_EXTERNAL_MODULES"], "agentmemorygym_verl.action_gae"
+                env["VERL_USE_EXTERNAL_MODULES"], "agentmemorygym_verl.token_gae"
             )
             self.assertEqual(
                 env["VERL_FILE_LOGGER_PATH"], str(inputs.run_dir / "metrics.jsonl")

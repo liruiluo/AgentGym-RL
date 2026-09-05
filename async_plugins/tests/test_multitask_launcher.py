@@ -367,8 +367,8 @@ class ProductionResolveFixture:
         model_root = self.root / "model"
         model_root.mkdir()
         model_names = (
-            "model-00001-of-00002.safetensors",
-            "model-00002-of-00002.safetensors",
+            "model.safetensors-00001-of-00002.safetensors",
+            "model.safetensors-00002-of-00002.safetensors",
             "model.safetensors.index.json",
             "config.json",
             "tokenizer.json",
@@ -695,7 +695,7 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
         config = load_orchestrator_config(CONFIG)
 
         self.assertEqual(
-            EXPECTED_VERL_COMMIT, "f3ac28fe54c945e092b9630030f44d236a106a11"
+            EXPECTED_VERL_COMMIT, "6cd387cd2ebf413f93082eabf4ef5ad52bda37b5"
         )
         self.assertEqual(config.route_order, EXPECTED_ROUTE_IDS)
         self.assertEqual(config.optimizer_updates, 400)
