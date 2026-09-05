@@ -142,8 +142,8 @@ _QWEN_NATIVE_TOOL_TEMPLATE_REPLACEMENTS = (
     (
         "If you choose to call a function ONLY reply in the following format "
         "with NO suffix:",
-        "For every response, call exactly one function from the schemas above "
-        "and ONLY reply with that XML tool call with NO prefix or suffix.",
+        "For every response, call exactly one function and ONLY reply in the "
+        "following format with NO prefix or suffix:",
     ),
     (
         "- You may provide optional reasoning for your function call in natural "
@@ -157,14 +157,6 @@ _QWEN_NATIVE_TOOL_TEMPLATE_REPLACEMENTS = (
         "function calls",
         "- Always select exactly one available function; never answer in prose",
     ),
-)
-
-
-_QWEN_NATIVE_TOOL_ABSTRACT_EXAMPLE = (
-    r"\n\n<tool_call>\n<function=example_function_name>"
-    r"\n<parameter=example_parameter_1>\nvalue_1\n</parameter>"
-    r"\n<parameter=example_parameter_2>\nThis is the value for the second parameter"
-    r"\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>"
 )
 
 
@@ -182,13 +174,7 @@ def _strict_qwen_tool_chat_template(template: Any) -> str:
                 f"expected one occurrence, found {count}: {old!r}"
             )
         patched = patched.replace(old, new, 1)
-    example_count = patched.count(_QWEN_NATIVE_TOOL_ABSTRACT_EXAMPLE)
-    if example_count != 1:
-        raise RuntimeError(
-            "AMG pinned Qwen abstract tool example drifted: "
-            f"expected one occurrence, found {example_count}"
-        )
-    return patched.replace(_QWEN_NATIVE_TOOL_ABSTRACT_EXAMPLE, "", 1)
+    return patched
 
 
 def _native_tool_observation_messages(
