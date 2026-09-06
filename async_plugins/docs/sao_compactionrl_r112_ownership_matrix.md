@@ -123,9 +123,13 @@ rollout, optimizer, reward, grader, schedule, or frozen r112 package.
   process remains bound to its separately frozen runtime.
 - A persisted `pending_resume` binds both the exact pause-marker inode/bytes and
   the optional release-request inode/bytes.  A replacement supervisor finishes
-  that authorization idempotently.  It may publish `holding` only after marker,
-  request, and pending transaction state have all been closed and the holder
-  resource attestation has passed.
+  that authorization idempotently.  The live release path revalidates the full
+  device/inode/ctime/size/digest binding and token immediately before each
+  quarantine rename.  After rename it requires the same device/inode/size and
+  digest (plus the complete bound request payload and marker token), restoring
+  the quarantine to the authority path and failing closed on drift.  It may
+  publish `holding` only after marker, request, and pending transaction state
+  have all been closed and the holder resource attestation has passed.
 - The marker transaction's append-only `drain_identities` payload is the
   authority for PID/start-ticks/process-group liveness.  Identity bytes,
   metadata, and digest are read through one descriptor.  A current directory
@@ -135,8 +139,13 @@ rollout, optimizer, reward, grader, schedule, or frozen r112 package.
   `scripts/run_exact_source_tests.py`.  The harness binds every named checkout
   to an expected clean HEAD and selected-file manifest, records the real
   interpreter and digest plus the exact command and environment allowlist, and
-  repeats HEAD/status/file hashing after the command.  A dirty tree, byte drift,
-  nonzero command, or post-run mutation publishes a failed receipt.
+  repeats HEAD/status/file hashing after the command.  Log and receipt parents
+  are resolved through existing directories; outputs must remain outside every
+  audited repository and must not path- or inode-alias each other, a selected
+  manifest, or the interpreter.  Provisional output publication is followed by
+  a final HEAD/status/selected-file/manifest/interpreter audit; only that final
+  audit may publish a final PASS receipt.  A dirty tree, byte drift, nonzero
+  command, alias, output escape, or post-output mutation fails closed.
 
 These source changes still require a newly frozen package, a fresh independent
 runtime review, and an actual same-boundary Pod recovery receipt before any

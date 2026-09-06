@@ -54,7 +54,10 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _atomic_write(path: Path, payload: bytes, *, mode: int = 0o600) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.parent.is_dir() or path.parent.is_symlink():
+        raise ExactSourceError(
+            f"output parent is not a resolved directory: {path.parent}"
+        )
     descriptor, raw_temporary = tempfile.mkstemp(
         prefix=f".{path.name}.", dir=path.parent
     )
@@ -277,14 +280,129 @@ def _parse_environment(
     }
 
 
+def _resolved_output_path(raw: str, *, label: str) -> Path:
+    requested = Path(raw).absolute()
+    if requested.name in {"", ".", ".."}:
+        raise ExactSourceError(f"invalid {label} output path: {raw!r}")
+    try:
+        parent = requested.parent.resolve(strict=True)
+    except OSError as error:
+        raise ExactSourceError(
+            f"{label} output parent must already exist: {requested.parent}"
+        ) from error
+    if not parent.is_dir():
+        raise ExactSourceError(f"{label} output parent is not a directory: {parent}")
+    resolved = parent / requested.name
+    if resolved.exists() or resolved.is_symlink():
+        try:
+            observed = resolved.lstat()
+        except OSError as error:
+            raise ExactSourceError(
+                f"cannot inspect {label} output: {resolved}"
+            ) from error
+        if resolved.is_symlink() or not stat.S_ISREG(observed.st_mode):
+            raise ExactSourceError(
+                f"existing {label} output is not a regular non-symlink file: {resolved}"
+            )
+    return resolved
+
+
+def _existing_file_identity(path: Path) -> tuple[int, int] | None:
+    try:
+        observed = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise ExactSourceError(
+            f"cannot inspect file identity {path}: {error}"
+        ) from error
+    if path.is_symlink() or not stat.S_ISREG(observed.st_mode):
+        raise ExactSourceError(f"file identity path is not a regular file: {path}")
+    return observed.st_dev, observed.st_ino
+
+
 def _outside_repositories(path: Path, repositories: Mapping[str, Path]) -> None:
-    absolute = path.absolute()
     for name, root in repositories.items():
         try:
-            absolute.relative_to(root)
+            path.relative_to(root)
         except ValueError:
             continue
         raise ExactSourceError(f"output path is inside repository {name}: {path}")
+
+
+def _require_distinct_authority_paths(
+    entries: Sequence[tuple[str, Path, tuple[int, int] | None]],
+) -> None:
+    for index, (left_label, left_path, left_identity) in enumerate(entries):
+        for right_label, right_path, right_identity in entries[index + 1 :]:
+            if left_path == right_path:
+                raise ExactSourceError(
+                    f"{left_label} and {right_label} paths overlap: {left_path}"
+                )
+            if (
+                left_identity is not None
+                and right_identity is not None
+                and left_identity == right_identity
+            ):
+                raise ExactSourceError(
+                    f"{left_label} and {right_label} resolve to the same existing file"
+                )
+
+
+def _prepare_output_boundaries(arguments: argparse.Namespace) -> tuple[Path, Path]:
+    repo_values = _parse_named(arguments.repo, option="--repo")
+    head_values = _parse_named(arguments.expected_head, option="--expected-head")
+    manifest_values = _parse_named(
+        arguments.selected_manifest, option="--selected-manifest"
+    )
+    if not repo_values or set(repo_values) != set(head_values) or set(
+        repo_values
+    ) != set(manifest_values):
+        raise ExactSourceError(
+            "--repo, --expected-head, and --selected-manifest names must match"
+        )
+    roots = {
+        name: Path(raw).resolve(strict=True) for name, raw in repo_values.items()
+    }
+    for name, root in roots.items():
+        if not root.is_dir():
+            raise ExactSourceError(f"repository root is not a directory: {root}")
+        if not re.fullmatch(r"[0-9a-f]{40}", head_values[name]):
+            raise ExactSourceError(f"invalid expected HEAD for {name}")
+
+    log_path = _resolved_output_path(arguments.log, label="log")
+    receipt_path = _resolved_output_path(arguments.receipt, label="receipt")
+    _outside_repositories(log_path, roots)
+    _outside_repositories(receipt_path, roots)
+
+    authority_entries: list[tuple[str, Path, tuple[int, int] | None]] = [
+        ("log output", log_path, _existing_file_identity(log_path)),
+        ("receipt output", receipt_path, _existing_file_identity(receipt_path)),
+    ]
+    for name, raw in manifest_values.items():
+        manifest_path = Path(raw).resolve(strict=True)
+        _raw, binding = _bound_regular_file(manifest_path)
+        authority_entries.append(
+            (
+                f"selected manifest {name}",
+                manifest_path,
+                (int(binding["device"]), int(binding["inode"])),
+            )
+        )
+    interpreter = Path(arguments.interpreter).absolute().resolve(strict=True)
+    _raw, interpreter_binding = _bound_regular_file(interpreter)
+    authority_entries.append(
+        (
+            "interpreter",
+            interpreter,
+            (
+                int(interpreter_binding["device"]),
+                int(interpreter_binding["inode"]),
+            ),
+        )
+    )
+    _require_distinct_authority_paths(authority_entries)
+    return log_path, receipt_path
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -328,6 +446,7 @@ def run(arguments: argparse.Namespace) -> tuple[int, dict[str, Any], bytes]:
         "environment": None,
         "exit_code": None,
         "log": None,
+        "final_post_output_audit": None,
         "violations": violations,
     }
     try:
@@ -350,13 +469,6 @@ def run(arguments: argparse.Namespace) -> tuple[int, dict[str, Any], bytes]:
                 raise ExactSourceError(f"repository root is not a directory: {root}")
             if not re.fullmatch(r"[0-9a-f]{40}", head_values[name]):
                 raise ExactSourceError(f"invalid expected HEAD for {name}")
-        log_path = Path(arguments.log).absolute()
-        receipt_path = Path(arguments.receipt).absolute()
-        if log_path == receipt_path:
-            raise ExactSourceError("log and receipt paths must differ")
-        _outside_repositories(log_path, roots)
-        _outside_repositories(receipt_path, roots)
-
         interpreter_requested = Path(arguments.interpreter).absolute()
         interpreter = interpreter_requested.resolve(strict=True)
         _raw_interpreter, interpreter_identity = _bound_regular_file(interpreter)
@@ -492,11 +604,132 @@ def run(arguments: argparse.Namespace) -> tuple[int, dict[str, Any], bytes]:
     return (0 if receipt["status"] == "pass" else 2), receipt, log_payload
 
 
+def _final_post_output_audit(receipt: Mapping[str, Any]) -> dict[str, Any]:
+    """Rebind all source authorities after the harness writes its outputs."""
+
+    violations: list[str] = []
+    repository_results: dict[str, Any] = {}
+    repositories = receipt.get("repositories")
+    if not isinstance(repositories, Mapping) or not repositories:
+        violations.append("final post-output audit has no pre-run repository snapshot")
+    else:
+        for name, item in repositories.items():
+            pre = item.get("pre") if isinstance(item, Mapping) else None
+            if not isinstance(pre, Mapping):
+                message = f"final post-output audit has no pre-run snapshot for {name}"
+                repository_results[str(name)] = {"error": message}
+                violations.append(message)
+                continue
+            try:
+                manifest_identity = pre["selected_manifest"]
+                selected_files = pre["selected_files"]
+                if not isinstance(manifest_identity, Mapping) or not isinstance(
+                    selected_files, Mapping
+                ):
+                    raise ExactSourceError("pre-run selected-file binding is invalid")
+                expected_files = {
+                    str(relative): str(identity["expected_sha256"])
+                    for relative, identity in selected_files.items()
+                }
+                manifest_path = Path(str(manifest_identity["real_path"]))
+                manifest = _load_selected_manifest(
+                    manifest_path, repo_name=str(name)
+                )
+                post = _repo_snapshot(
+                    name=str(name),
+                    root=Path(str(pre["root"])),
+                    expected_head=str(pre["expected_head"]),
+                    manifest={
+                        "identity": manifest["identity"],
+                        "files": expected_files,
+                    },
+                )
+                repository_results[str(name)] = post
+                violations.extend(
+                    _snapshot_violations(post, phase="final post-output")
+                )
+                if manifest["identity"] != dict(manifest_identity):
+                    violations.append(
+                        f"final post-output selected-file manifest changed for {name}"
+                    )
+                if manifest["files"] != expected_files:
+                    violations.append(
+                        "final post-output selected-file manifest entries changed "
+                        f"for {name}"
+                    )
+                if post != dict(pre):
+                    violations.append(
+                        f"final post-output source snapshot changed for {name}"
+                    )
+            except (
+                ExactSourceError,
+                KeyError,
+                OSError,
+                TypeError,
+                ValueError,
+            ) as error:
+                repository_results[str(name)] = {"error": str(error)}
+                violations.append(
+                    f"final post-output source audit failed for {name}: {error}"
+                )
+
+    interpreter_result: dict[str, Any]
+    interpreter = receipt.get("interpreter")
+    pre_interpreter = (
+        interpreter.get("pre") if isinstance(interpreter, Mapping) else None
+    )
+    if not isinstance(pre_interpreter, Mapping):
+        interpreter_result = {"error": "pre-run interpreter binding is unavailable"}
+        violations.append("final post-output interpreter binding is unavailable")
+    else:
+        try:
+            _raw, observed = _bound_regular_file(
+                Path(str(pre_interpreter["real_path"]))
+            )
+            interpreter_result = observed
+            if observed != dict(pre_interpreter):
+                violations.append("final post-output interpreter identity changed")
+        except (ExactSourceError, KeyError, OSError) as error:
+            interpreter_result = {"error": str(error)}
+            violations.append(f"final post-output interpreter audit failed: {error}")
+
+    return {
+        "status": "pass" if not violations else "fail",
+        "finished_at": _utc_now(),
+        "repositories": repository_results,
+        "interpreter": interpreter_result,
+        "violations": violations,
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
-    log_path = Path(arguments.log).absolute()
-    receipt_path = Path(arguments.receipt).absolute()
-    status, receipt, log_payload = run(arguments)
+    try:
+        log_path, receipt_path = _prepare_output_boundaries(arguments)
+    except (ExactSourceError, OSError) as error:
+        print(f"exact-source output preflight failed: {error}", file=sys.stderr)
+        return 2
+    arguments.log = str(log_path)
+    arguments.receipt = str(receipt_path)
+    _initial_status, receipt, log_payload = run(arguments)
+    receipt["outputs"] = {
+        "log": str(log_path),
+        "receipt": str(receipt_path),
+    }
+    candidate_status = receipt["status"]
+    receipt["publication"] = {
+        "state": "pending_final_post_output_audit",
+        "candidate_status": candidate_status,
+    }
+    # A crash after provisional publication must never leave a PASS receipt.
+    # The final receipt is the only state that downstream release tooling may
+    # accept, and it is published only after the post-output source audit and
+    # final log are durable.
+    receipt["status"] = "fail"
+    # Publish provisional outputs first.  Only then can the final audit prove
+    # that these writes did not mutate a repository, selected manifest, or the
+    # interpreter.  The output-boundary preflight makes the subsequent output
+    # rewrites disjoint from every audited authority.
     _atomic_write(log_path, log_payload)
     receipt["log"] = {
         "path": str(log_path),
@@ -504,6 +737,43 @@ def main(argv: Sequence[str] | None = None) -> int:
         "sha256": hashlib.sha256(log_payload).hexdigest(),
     }
     _atomic_json(receipt_path, receipt)
+
+    final_audit = _final_post_output_audit(receipt)
+    receipt["final_post_output_audit"] = final_audit
+    for violation in final_audit["violations"]:
+        if violation not in receipt["violations"]:
+            receipt["violations"].append(violation)
+    receipt["status"] = (
+        "pass"
+        if not receipt["violations"] and receipt.get("exit_code") == 0
+        else "fail"
+    )
+    receipt["publication"] = {
+        "state": "final",
+        "candidate_status": candidate_status,
+    }
+    receipt["finished_at"] = _utc_now()
+    final_postamble = {
+        "schema": SCHEMA,
+        "phase": "final-post-output",
+        "status": receipt["status"],
+        "exit_code": receipt["exit_code"],
+        "audit": final_audit,
+        "violations": receipt["violations"],
+    }
+    final_log_payload = log_payload + (
+        "EXACT_SOURCE_TEST_FINAL "
+        + json.dumps(final_postamble, sort_keys=True)
+        + "\n"
+    ).encode("utf-8")
+    _atomic_write(log_path, final_log_payload)
+    receipt["log"] = {
+        "path": str(log_path),
+        "size_bytes": len(final_log_payload),
+        "sha256": hashlib.sha256(final_log_payload).hexdigest(),
+    }
+    _atomic_json(receipt_path, receipt)
+    status = 0 if receipt["status"] == "pass" else 2
     if status:
         print(
             "exact-source test failed: " + "; ".join(receipt["violations"]),
