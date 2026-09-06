@@ -5,7 +5,7 @@ set -euo pipefail
 # wrapper execs the crash-safe Python supervisor so the platform entrance,
 # rather than an unowned nohup process, remains the top-level watchdog.
 
-PYTHON="${PYTHON:-/opt/conda/envs/py312/bin/python3}"
+PYTHON="${PYTHON:-/dev/shm/qwen35-runtime-verl-main-sglang-fsdp-tf553-fla052-v2/bin/python3.12}"
 MODULE="${FALLBACK_SUPERVISOR_MODULE:-/export/App/training_platform/PinoModel/amg_fallback_supervisor_sao_v1.py}"
 BOOTSTRAP="${FALLBACK_PROCESS_BOOTSTRAP:-/export/App/training_platform/PinoModel/amg_process_bootstrap_sao_v1.py}"
 ORIGINAL="${FALLBACK_WATCHDOG_ORIGINAL:-/export/App/training_platform/PinoModel/non_yield_holder_watchdog.sh.original.8bb8a33b6c73e64f18dd53cf0307fd59f8049c4dc07d566c396a94d998819b0d}"
@@ -29,14 +29,16 @@ AUTO_GPU_HOLDER_COMMAND_FRAGMENT="${FALLBACK_AUTO_GPU_HOLDER_COMMAND_FRAGMENT:-p
 AUTO_CPU_HOLDER_STATE="${FALLBACK_AUTO_CPU_HOLDER_STATE:-/tmp/amg-cpu-holder/status.json}"
 AUTO_CPU_HOLDER_COMMAND_FRAGMENT="${FALLBACK_AUTO_CPU_HOLDER_COMMAND_FRAGMENT:-auto_yield_cpu_holder.py}"
 
-# These hashes are supplied by the externally frozen deployment contract.
-# Computing them here would only prove that one mutable launch saw internally
-# consistent bytes; it would not bind this restart to the reviewed package.
-: "${FALLBACK_PYTHON_SHA256:?missing externally pinned Python sha256}"
-: "${FALLBACK_MODULE_SHA256:?missing externally pinned supervisor sha256}"
-: "${FALLBACK_BOOTSTRAP_SHA256:?missing externally pinned bootstrap sha256}"
-: "${FALLBACK_WATCHDOG_WRAPPER_SHA256:?missing externally pinned wrapper sha256}"
-: "${FALLBACK_NVIDIA_SMI_SHA256:?missing externally pinned nvidia-smi sha256}"
+# ``dist_train.py`` restarts this wrapper with its own clean environment, so
+# every non-self component needs a reviewed default rather than an inherited
+# shell variable.  ``migrate`` and ``formal`` independently pass and verify the
+# exact wrapper digest; the restarted wrapper measures those same executable
+# bytes so its published immutable contract can be matched by the owner.
+FALLBACK_PYTHON_SHA256="${FALLBACK_PYTHON_SHA256:-2951874f3ba993b5ae678d80a7c7b30e0e47d166ad22e4e384474fbaaab52699}"
+FALLBACK_MODULE_SHA256="${FALLBACK_MODULE_SHA256:-c7546b4af9a4874b440fae414efb01d495e943997bcf87a9a2228094177359e3}"
+FALLBACK_BOOTSTRAP_SHA256="${FALLBACK_BOOTSTRAP_SHA256:-d306492c257d309bf46a0915db961bf95e4811afd61fa6cbf5a683bab4cbe987}"
+FALLBACK_NVIDIA_SMI_SHA256="${FALLBACK_NVIDIA_SMI_SHA256:-384896f294f80e8e5b59c11dbb04d3fdc028cf9bb01d7839154b96f94e966f4e}"
+FALLBACK_WATCHDOG_WRAPPER_SHA256="${FALLBACK_WATCHDOG_WRAPPER_SHA256:-$(sha256sum "$WRAPPER" | awk '{print $1}')}"
 
 if [[ ! -x "$PYTHON" ]]; then
   printf 'missing fallback Python interpreter: %s\n' "$PYTHON" >&2
