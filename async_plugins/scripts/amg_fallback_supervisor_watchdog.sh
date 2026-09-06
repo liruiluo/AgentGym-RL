@@ -6,8 +6,8 @@ set -euo pipefail
 # rather than an unowned nohup process, remains the top-level watchdog.
 
 PYTHON="${PYTHON:-/opt/conda/envs/py312/bin/python3}"
-MODULE="${FALLBACK_SUPERVISOR_MODULE:-/export/App/training_platform/PinoModel/amg_fallback_supervisor_r107.py}"
-BOOTSTRAP="${FALLBACK_PROCESS_BOOTSTRAP:-/export/App/training_platform/PinoModel/amg_process_bootstrap_r107.py}"
+MODULE="${FALLBACK_SUPERVISOR_MODULE:-/export/App/training_platform/PinoModel/amg_fallback_supervisor_sao_v1.py}"
+BOOTSTRAP="${FALLBACK_PROCESS_BOOTSTRAP:-/export/App/training_platform/PinoModel/amg_process_bootstrap_sao_v1.py}"
 ORIGINAL="${FALLBACK_WATCHDOG_ORIGINAL:-/export/App/training_platform/PinoModel/non_yield_holder_watchdog.sh.original.8bb8a33b6c73e64f18dd53cf0307fd59f8049c4dc07d566c396a94d998819b0d}"
 HOLDER="${HOLDER:-/export/App/training_platform/PinoModel/non_yield_gpu_cpu_fallback_holder.py}"
 WRAPPER="${FALLBACK_WATCHDOG_WRAPPER:-/export/App/training_platform/PinoModel/non_yield_holder_watchdog.sh}"

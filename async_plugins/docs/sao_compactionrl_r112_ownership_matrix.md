@@ -1,12 +1,12 @@
-# r107 SAO + CompactionRL capability and ownership matrix
+# r112 SAO + CompactionRL capability and ownership matrix
 
 Status: implementation contract for
-`experiment/camg-sao-compactionrl-r107-20260905`.
+`experiment/camg-sao-compactionrl-r112-20260906`.
 
 Pinned source identities at the start of the migration:
 
-- outer: `383f14e79f14b9536e0c7193dc42b5b737eafad2`
-- AgentGym submodule: `88d957d0b079682435cba1bd653766fbbcd0f2fd`
+- outer: `26ccd2cddeab471117f8e63d6fb41700398e820d`
+- AgentGym submodule: `0988e41e68892559f0fa49dd22227c1434c049ee`
 - veRL: `f3ac28fe54c945e092b9630030f44d236a106a11`
 - upstream audit reference: `23af6a7a2e8d6efeeb2adbe5d1689c7a24f503a3`
 
@@ -15,11 +15,11 @@ Pinned source identities at the start of the migration:
 This branch changes optimization only. It must not change an environment
 prompt, action grammar, parser, reward, grader, task panel, context-boundary
 trigger, action budget, or retry/termination semantics. A correctness repair to
-the r107 environment contract must be isolated in the environment-maintenance lineage, independently
+the r112 environment contract must be isolated in the environment-maintenance lineage, independently
 reviewed, and then explicitly adopted; it must not enter this branch as an
 algorithm convenience.
 
-The matched comparator is r107’s current
+The matched comparator is r112’s current
 `amg_action_axis_gae + token-mean PPO` path. Both arms must use the same base
 model, ordered task occurrences, update/episode/action budget, decoder, hardware
 topology, and environment source lock. r92 is a historical target, not the
@@ -80,7 +80,7 @@ are never copied to earlier segments or repeated at context boundaries.
 
 Launcher:
 `async_plugins/scripts/launch_amg_multitask_fully_async.sh` at outer commit
-`383f14e79f14b9536e0c7193dc42b5b737eafad2` requires an explicit `--verl-root`
+`26ccd2cddeab471117f8e63d6fb41700398e820d` requires an explicit `--verl-root`
 and constructs `PYTHONPATH` from that root before invoking the task-neutral
 orchestrator.
 
