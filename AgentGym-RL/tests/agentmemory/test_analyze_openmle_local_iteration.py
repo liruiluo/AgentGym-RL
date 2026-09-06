@@ -229,6 +229,90 @@ def _complete_document():
     }
 
 
+
+def test_accepts_v2_idempotent_checkpoint_bound_to_v1_endpoint():
+    endpoint = _checkpoint_receipt()
+    endpoint["changed"] = False
+    wrapper = {
+        **endpoint,
+        "schema": MODULE.CHECKPOINT_RECEIPT_SCHEMA_V2,
+        "idempotent_overwrite": True,
+        "write_observed": True,
+    }
+    assert MODULE._canonical_checkpoint_receipt(wrapper) == wrapper
+    assert MODULE._checkpoint_receipts_share_identity(wrapper, endpoint)
+    inconsistent = dict(wrapper, write_observed=False)
+    assert MODULE._canonical_checkpoint_receipt(inconsistent) is None
+
+def test_v2_identity_and_current_action_provenance_are_strict():
+    fields = (
+        "objective=fit",
+        "measured_validation_or_failure=rmse0.4",
+        "conclusion=baseline",
+        "code_path=train.py",
+        "next_action=edit",
+    )
+    payload = ("\n".join(fields) + "\n").encode("utf-8")
+    endpoint_v1 = {
+        **_checkpoint_receipt(),
+        "action_kind": "shell_command",
+        "changed": False,
+        "size_bytes": len(payload),
+        "sha256": __import__("hashlib").sha256(payload).hexdigest(),
+    }
+    wrapper_v2 = {
+        **endpoint_v1,
+        "schema": MODULE.CHECKPOINT_RECEIPT_SCHEMA_V2,
+        "idempotent_overwrite": True,
+        "write_observed": True,
+    }
+    command = (
+        "mkdir -p .agent_memory && printf '%s\\n' "
+        + " ".join(fields)
+        + " > .agent_memory/CONTINUATION.md"
+    )
+    action = "shell_command " + json.dumps({"command": command})
+    assert MODULE._checkpoint_receipts_share_identity(wrapper_v2, endpoint_v1)
+    assert MODULE._idempotent_checkpoint_matches_action(wrapper_v2, action)
+    assert not MODULE._idempotent_checkpoint_matches_action(
+        wrapper_v2, 'shell_command {"command":"true"}'
+    )
+    contradictory_v2 = {
+        **wrapper_v2,
+        "idempotent_overwrite": False,
+        "write_observed": False,
+    }
+    assert not MODULE._checkpoint_receipts_share_identity(
+        wrapper_v2, contradictory_v2
+    )
+
+
+def test_printf_parser_rejects_unquoted_shell_separators():
+    fields = "objective=fit next_action=edit"
+    expected = b"objective=fit\nnext_action=edit\n"
+    for fmt in ("%s\\n", "%s\n"):
+        command = (
+            "mkdir -p .agent_memory && printf '"
+            + fmt
+            + "' "
+            + fields
+            + " > .agent_memory/CONTINUATION.md"
+        )
+        action = "shell_command " + json.dumps({"command": command})
+        assert MODULE._checkpoint_exact_shell_payload(action) == expected
+
+    for separator in ("\n", "\r", "\r\n"):
+        command = (
+            "mkdir -p .agent_memory && printf '%s\\n' objective=fit"
+            + separator
+            + "touch side_effect"
+            + separator
+            + "cat source > .agent_memory/CONTINUATION.md"
+        )
+        action = "shell_command " + json.dumps({"command": command})
+        assert MODULE._checkpoint_exact_shell_payload(action) is None
+
+
 def test_complete_local_iteration_memory_chain_is_detected():
     result = MODULE.analyze_documents([(1, _complete_document())])
     assert result["trajectory_count"] == 1

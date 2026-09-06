@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
@@ -38,10 +39,19 @@ KNOWN_CONTINUATION_PATHS = frozenset(
     {CONTINUATION_PATH, *LEGACY_CONTINUATION_PATHS}
 )
 CHECKPOINT_RECEIPT_SCHEMA = "agentmemory_filesystem_checkpoint_receipt_v1"
+CHECKPOINT_RECEIPT_SCHEMA_V2 = "agentmemory_filesystem_checkpoint_receipt_v2"
 CHECKPOINT_READ_RECEIPT_SCHEMA = (
     "agentmemory_filesystem_checkpoint_read_receipt_v1"
 )
 CHECKPOINT_MAX_BYTES = 8 * 1024
+CHECKPOINT_PRINTF_TOKEN = r"[A-Za-z0-9._:/+=-]+"
+CHECKPOINT_PRINTF_RE = re.compile(
+    r"\A[ \t]*(?:mkdir[ \t]+-p[ \t]+\.agent_memory[ \t]+&&[ \t]+)?"
+    r"printf[ \t]+'%s(?:\\n|\n)'[ \t]+"
+    rf"(?P<arguments>{CHECKPOINT_PRINTF_TOKEN}"
+    rf"(?:[ \t]+{CHECKPOINT_PRINTF_TOKEN})*)"
+    r"[ \t]+>[ \t]+\.agent_memory/CONTINUATION\.md[ \t]*\Z"
+)
 CHECKPOINT_MARKER_PREFIX = (
     "Earlier conversation was removed after the continuation snapshot write "
     "succeeded. The workspace persists, but "
@@ -256,28 +266,105 @@ def _unit_counter_increment(row: Mapping[str, Any], prefix: str) -> bool:
     )
 
 
-def _canonical_checkpoint_receipt(value: Any) -> Mapping[str, Any] | None:
+
+
+def _checkpoint_exact_shell_payload(action: Any) -> bytes | None:
+    """Recover bytes only from the bounded checkpoint shell shapes."""
+
+    if not isinstance(action, str):
+        return None
+    match = re.fullmatch(r"shell_command\s+(\{.*\})", action.strip(), re.DOTALL)
+    if match is None:
+        return None
+    try:
+        arguments = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+    if (
+        not isinstance(arguments, dict)
+        or "command" not in arguments
+        or not set(arguments) <= {"command", "workdir", "timeout_ms"}
+        or arguments.get("workdir", ".") != "."
+        or not isinstance(arguments.get("command"), str)
+    ):
+        return None
+    command = arguments["command"]
+    heredoc = re.fullmatch(
+        r"(?:mkdir\s+-p\s+\.agent_memory\s+&&\s+)?"
+        r"cat\s*>\s*\.agent_memory/CONTINUATION\.md\s+"
+        r"<<'(?P<delimiter>[A-Za-z_][A-Za-z0-9_]*)'\n"
+        r"(?P<body>.*)\n(?P=delimiter)\n?",
+        command,
+        re.DOTALL,
+    )
+    if heredoc is not None:
+        body = heredoc.group("body")
+        if heredoc.group("delimiter") in body.splitlines():
+            return None
+        return (body + "\n").encode("utf-8")
+    match = CHECKPOINT_PRINTF_RE.fullmatch(command)
+    if match is None:
+        return None
+    values = re.split(r"[ \t]+", match.group("arguments"))
+    return ("\n".join(values) + "\n").encode("utf-8")
+
+
+def _idempotent_checkpoint_matches_action(
+    receipt: Mapping[str, Any], submitted_action: Any
+) -> bool:
+    if receipt.get("schema") != CHECKPOINT_RECEIPT_SCHEMA_V2:
+        return True
+    if receipt.get("idempotent_overwrite") is not True:
+        return True
+    payload = _checkpoint_exact_shell_payload(submitted_action)
+    return bool(
+        receipt.get("changed") is False
+        and receipt.get("action_kind") == "shell_command"
+        and payload is not None
+        and len(payload) == receipt.get("size_bytes")
+        and hashlib.sha256(payload).hexdigest() == receipt.get("sha256")
+    )
+def _canonical_checkpoint_receipt(
+    value: Any,
+    *,
+    require_write: bool = True,
+) -> Mapping[str, Any] | None:
     if not isinstance(value, Mapping):
+        return None
+    expected = {
+        "schema",
+        "path",
+        "action_kind",
+        "action_completed",
+        "changed",
+        "exists",
+        "regular_file",
+        "size_bytes",
+        "sha256",
+    }
+    schema = value.get("schema")
+    if schema == CHECKPOINT_RECEIPT_SCHEMA_V2:
+        expected |= {"idempotent_overwrite", "write_observed"}
+        if (
+            type(value.get("idempotent_overwrite")) is not bool
+            or type(value.get("write_observed")) is not bool
+            or bool(value.get("changed")) and value["idempotent_overwrite"]
+            or value["write_observed"]
+            != bool(value.get("changed") or value["idempotent_overwrite"])
+        ):
+            return None
+        write_observed = value["write_observed"]
+    elif schema == CHECKPOINT_RECEIPT_SCHEMA:
+        write_observed = value.get("changed") is True
+    else:
         return None
     size = value.get("size_bytes")
     if (
-        set(value)
-        != {
-            "schema",
-            "path",
-            "action_kind",
-            "action_completed",
-            "changed",
-            "exists",
-            "regular_file",
-            "size_bytes",
-            "sha256",
-        }
-        or value.get("schema") != CHECKPOINT_RECEIPT_SCHEMA
+        set(value) != expected
         or value.get("path") != CONTINUATION_PATH
         or value.get("action_kind") not in {"shell_command", "apply_patch"}
         or value.get("action_completed") is not True
-        or value.get("changed") is not True
+        or (require_write and write_observed is not True)
         or value.get("exists") is not True
         or value.get("regular_file") is not True
         or isinstance(size, bool)
@@ -287,6 +374,33 @@ def _canonical_checkpoint_receipt(value: Any) -> Mapping[str, Any] | None:
     ):
         return None
     return value
+
+
+def _checkpoint_receipts_share_identity(
+    wrapper: Mapping[str, Any],
+    endpoint_value: Any,
+) -> bool:
+    endpoint = _canonical_checkpoint_receipt(endpoint_value, require_write=False)
+    if endpoint is None:
+        return False
+    identity_fields = (
+        "path",
+        "action_kind",
+        "action_completed",
+        "changed",
+        "exists",
+        "regular_file",
+        "size_bytes",
+        "sha256",
+    )
+    if not all(wrapper.get(key) == endpoint.get(key) for key in identity_fields):
+        return False
+    if endpoint.get("schema") == CHECKPOINT_RECEIPT_SCHEMA_V2:
+        return all(
+            wrapper.get(key) == endpoint.get(key)
+            for key in ("idempotent_overwrite", "write_observed")
+        )
+    return True
 
 
 def _canonical_read_receipt(value: Any) -> Mapping[str, Any] | None:
@@ -348,13 +462,17 @@ def _canonical_compaction_receipt(
 ) -> Mapping[str, Any] | None:
     evidence = _mapping(row.get("wrapper_evidence"))
     receipt = _canonical_checkpoint_receipt(evidence.get("checkpoint_receipt"))
-    endpoint = _canonical_checkpoint_receipt(
-        _mapping(_mapping(row.get("env_info_after")).get("execution")).get(
-            "filesystem_checkpoint"
-        )
-    )
+    endpoint_value = _mapping(
+        _mapping(row.get("env_info_after")).get("execution")
+    ).get("filesystem_checkpoint")
     submission = _mapping(row.get("action_submission"))
-    if receipt is None or endpoint is None or dict(receipt) != dict(endpoint):
+    if (
+        receipt is None
+        or not _checkpoint_receipts_share_identity(receipt, endpoint_value)
+        or not _idempotent_checkpoint_matches_action(
+            receipt, submission.get("submitted_action")
+        )
+    ):
         return None
     if not (
         evidence.get("event") == "context_compaction"

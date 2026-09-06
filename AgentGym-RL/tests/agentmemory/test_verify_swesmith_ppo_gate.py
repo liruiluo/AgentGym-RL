@@ -54,6 +54,103 @@ class SwesmithPpoGateRowEvidenceTests(unittest.TestCase):
             "task_round": 18,
         }
 
+    def test_accepts_v2_idempotent_checkpoint_bound_to_v1_endpoint(self) -> None:
+        module = load_module()
+        endpoint = {
+            "schema": module.FILESYSTEM_CHECKPOINT_RECEIPT_SCHEMA,
+            "path": module.FILESYSTEM_CHECKPOINT_PATH,
+            "action_kind": "shell_command",
+            "action_completed": True,
+            "changed": False,
+            "exists": True,
+            "regular_file": True,
+            "size_bytes": 128,
+            "sha256": "a" * 64,
+        }
+        wrapper = {
+            **endpoint,
+            "schema": module.FILESYSTEM_CHECKPOINT_RECEIPT_SCHEMA_V2,
+            "idempotent_overwrite": True,
+            "write_observed": True,
+        }
+        self.assertEqual(module._successful_checkpoint_receipt(wrapper), wrapper)
+        self.assertTrue(module._checkpoint_receipts_share_identity(wrapper, endpoint))
+        inconsistent = dict(wrapper, write_observed=False)
+        self.assertIsNone(module._successful_checkpoint_receipt(inconsistent))
+
+    def test_v2_idempotent_receipt_requires_current_matching_action(self) -> None:
+        module = load_module()
+        payload = b"objective: repair\nnext_action: test\n"
+        endpoint = {
+            "schema": module.FILESYSTEM_CHECKPOINT_RECEIPT_SCHEMA,
+            "path": module.FILESYSTEM_CHECKPOINT_PATH,
+            "action_kind": "shell_command",
+            "action_completed": True,
+            "changed": False,
+            "exists": True,
+            "regular_file": True,
+            "size_bytes": len(payload),
+            "sha256": __import__("hashlib").sha256(payload).hexdigest(),
+        }
+        wrapper = {
+            **endpoint,
+            "schema": module.FILESYSTEM_CHECKPOINT_RECEIPT_SCHEMA_V2,
+            "idempotent_overwrite": True,
+            "write_observed": True,
+        }
+        command = (
+            "cat > .agent_memory/CONTINUATION.md <<'EOF'\n"
+            + payload.decode("utf-8")
+            + "EOF"
+        )
+        action = "shell_command " + json.dumps({"command": command})
+        self.assertTrue(
+            module._idempotent_checkpoint_matches_action(wrapper, action)
+        )
+        self.assertFalse(
+            module._idempotent_checkpoint_matches_action(
+                wrapper, 'shell_command {"command":"true"}'
+            )
+        )
+        contradictory_v2 = {
+            **wrapper,
+            "idempotent_overwrite": False,
+            "write_observed": False,
+        }
+        self.assertFalse(
+            module._checkpoint_receipts_share_identity(wrapper, contradictory_v2)
+        )
+
+    def test_printf_parser_rejects_unquoted_shell_separators(self) -> None:
+        module = load_module()
+        fields = "objective=fit next_action=edit"
+        expected = b"objective=fit\nnext_action=edit\n"
+        for fmt in ("%s\\n", "%s\n"):
+            with self.subTest(format=repr(fmt)):
+                command = (
+                    "mkdir -p .agent_memory && printf '"
+                    + fmt
+                    + "' "
+                    + fields
+                    + " > .agent_memory/CONTINUATION.md"
+                )
+                action = "shell_command " + json.dumps({"command": command})
+                self.assertEqual(
+                    module._checkpoint_exact_shell_payload(action), expected
+                )
+
+        for separator in ("\n", "\r", "\r\n"):
+            with self.subTest(separator=repr(separator)):
+                command = (
+                    "mkdir -p .agent_memory && printf '%s\\n' objective=fit"
+                    + separator
+                    + "touch side_effect"
+                    + separator
+                    + "cat source > .agent_memory/CONTINUATION.md"
+                )
+                action = "shell_command " + json.dumps({"command": command})
+                self.assertIsNone(module._checkpoint_exact_shell_payload(action))
+
     def test_accepts_exact_backend_response_cap_as_negative_row(self) -> None:
         module = load_module()
         result = module.verify_response_cap_truncation(

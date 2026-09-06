@@ -848,6 +848,20 @@ class TestAMGAgentLoop(IsolatedAsyncioTestCase):
                 ],
             )
 
+    async def test_native_call_uses_the_wrappers_canonical_tool_name(self):
+        call = (
+            "<tool_call>\n<function=task_action>\n<parameter=value>\nx\n"
+            "</parameter>\n</function>\n</tool_call>"
+        )
+
+        parsed = await self._validate_native_action(
+            call,
+            calls=[SimpleNamespace(name=" task_action ", arguments='{"value":"x"}')],
+        )
+
+        self.assertEqual(parsed.name, "task_action")
+        self.assertEqual(parsed.arguments, '{"value":"x"}')
+
     async def test_valid_native_call_appends_tool_result_before_next_generation(self):
         action = (
             "<tool_call>\n<function=task_action>\n<parameter=value>\nx\n"
