@@ -19,11 +19,53 @@ from unittest import mock
 from agentmemorygym_verl import orchestrator_lifecycle as lifecycle
 
 MODULE = Path(lifecycle.__file__).resolve()
+PROCESS_BOOTSTRAP = MODULE.with_name("process_bootstrap.py")
 
 
 class TestMarkerTransactions(unittest.TestCase):
     def _marker(self, name: str, path: Path, value: str | None) -> dict:
         return lifecycle._marker_record(name, path, value, 123, "456")
+
+    def _write_process_identity(
+        self,
+        path: Path,
+        process: subprocess.Popen,
+        *,
+        name: str = "test-child",
+        bootstrap: str = "test-bootstrap",
+        command: tuple[str, ...] = ("test-command",),
+    ) -> dict:
+        ticks = lifecycle.process_start_ticks(process.pid)
+        self.assertIsNotNone(ticks)
+        payload = {
+            "name": name,
+            "pid": process.pid,
+            "start_ticks": str(ticks),
+            "process_group": os.getpgid(process.pid),
+            "bootstrap": bootstrap,
+            "command": list(command),
+        }
+        lifecycle._atomic_write_json(path, payload)
+        return payload
+
+    def _bind_process_identity(
+        self,
+        state: Path,
+        lock: Path,
+        path: Path,
+        payload: dict,
+    ) -> dict:
+        return lifecycle.bind_marker_drain_identity(
+            state,
+            lock,
+            identity_path=path,
+            expected_name=str(payload["name"]),
+            expected_pid=int(payload["pid"]),
+            expected_start_ticks=str(payload["start_ticks"]),
+            expected_process_group=int(payload["process_group"]),
+            expected_bootstrap=Path(str(payload["bootstrap"])),
+            expected_command=tuple(str(value) for value in payload["command"]),
+        )
 
     def test_partial_acquisition_rolls_back_first_marker(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -976,6 +1018,390 @@ class TestMarkerTransactions(unittest.TestCase):
                     watcher.wait()
 
     @unittest.skipUnless(Path("/proc/self/stat").is_file(), "requires Linux /proc")
+    def test_explicit_restore_cannot_bypass_published_child_drain(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            run_root = root / "run"
+            run_root.mkdir()
+            cpu = root / "cpu"
+            gpu = root / "gpu"
+            state = root / "state.json"
+            lock = root / "lock"
+            parent = subprocess.Popen(["sleep", "60"])
+            child = subprocess.Popen(["sleep", "60"], start_new_session=True)
+            try:
+                parent_ticks = lifecycle.process_start_ticks(parent.pid)
+                self.assertIsNotNone(parent_ticks)
+                identity_path = run_root / "trainer-process-identity.json"
+                payload = self._write_process_identity(identity_path, child)
+                lifecycle.prepare_marker_transaction(
+                    state_path=state,
+                    lock_path=lock,
+                    run_id="explicit-drain-gate",
+                    parent_pid=parent.pid,
+                    parent_start_ticks=str(parent_ticks),
+                    markers=(
+                        lifecycle._marker_record("cpu", cpu, None, 0, ""),
+                        lifecycle._marker_record("gpu", gpu, None, 0, ""),
+                    ),
+                    drain_identity_root=run_root,
+                )
+                lifecycle.acquire_marker_transaction(state, lock)
+                self._bind_process_identity(
+                    state, lock, identity_path, payload
+                )
+
+                with self.assertRaisesRegex(
+                    lifecycle.LifecycleError,
+                    "published child identities are still alive",
+                ):
+                    lifecycle.restore_marker_transaction(state, lock)
+                self.assertEqual(
+                    cpu.read_text(encoding="utf-8").strip(), "explicit-drain-gate"
+                )
+                self.assertEqual(
+                    gpu.read_text(encoding="utf-8").strip(), "explicit-drain-gate"
+                )
+                self.assertEqual(
+                    json.loads(state.read_text(encoding="utf-8"))["status"],
+                    "acquired",
+                )
+
+                child.terminate()
+                child.wait(timeout=5)
+                restored = lifecycle.restore_marker_transaction(state, lock)
+                self.assertEqual(restored["status"], "restored")
+                self.assertFalse(cpu.exists())
+                self.assertFalse(gpu.exists())
+            finally:
+                for process in (parent, child):
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+
+    @unittest.skipUnless(Path("/proc/self/stat").is_file(), "requires Linux /proc")
+    def test_dead_published_anchor_with_live_group_member_blocks_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            run_root = root / "run"
+            run_root.mkdir()
+            cpu = root / "cpu"
+            gpu = root / "gpu"
+            state = root / "state.json"
+            lock = root / "lock"
+            child_pid_path = root / "child.pid"
+            parent = subprocess.Popen(["sleep", "60"])
+            anchor_code = (
+                "import subprocess,sys,time; "
+                "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
+                f"open({str(child_pid_path)!r},'w').write(str(p.pid)); "
+                "time.sleep(60)"
+            )
+            anchor = subprocess.Popen(
+                [sys.executable, "-c", anchor_code], start_new_session=True
+            )
+            group_child_pid = 0
+            try:
+                deadline = time.monotonic() + 5
+                while not child_pid_path.is_file() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(child_pid_path.is_file())
+                group_child_pid = int(child_pid_path.read_text())
+                parent_ticks = lifecycle.process_start_ticks(parent.pid)
+                self.assertIsNotNone(parent_ticks)
+                identity_path = run_root / "trainer-process-identity.json"
+                payload = self._write_process_identity(identity_path, anchor)
+                lifecycle.prepare_marker_transaction(
+                    state_path=state,
+                    lock_path=lock,
+                    run_id="dead-anchor-live-member",
+                    parent_pid=parent.pid,
+                    parent_start_ticks=str(parent_ticks),
+                    markers=(
+                        lifecycle._marker_record("cpu", cpu, None, 0, ""),
+                        lifecycle._marker_record("gpu", gpu, None, 0, ""),
+                    ),
+                    drain_identity_root=run_root,
+                )
+                lifecycle.acquire_marker_transaction(state, lock)
+                self._bind_process_identity(
+                    state, lock, identity_path, payload
+                )
+                anchor.kill()
+                anchor.wait(timeout=5)
+
+                with self.assertRaisesRegex(
+                    lifecycle.LifecycleError,
+                    "published child identities are still alive",
+                ):
+                    lifecycle.restore_marker_transaction(state, lock)
+                self.assertEqual(
+                    cpu.read_text(encoding="utf-8").strip(),
+                    "dead-anchor-live-member",
+                )
+                self.assertEqual(
+                    gpu.read_text(encoding="utf-8").strip(),
+                    "dead-anchor-live-member",
+                )
+
+                os.kill(group_child_pid, signal.SIGKILL)
+                deadline = time.monotonic() + 5
+                while (
+                    lifecycle._process_group_members(anchor.pid)
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.02)
+                self.assertFalse(lifecycle._process_group_members(anchor.pid))
+                restored = lifecycle.restore_marker_transaction(state, lock)
+                self.assertEqual(restored["status"], "restored")
+            finally:
+                if parent.poll() is None:
+                    parent.kill()
+                    parent.wait()
+                if anchor.poll() is None:
+                    anchor.kill()
+                    anchor.wait()
+                if group_child_pid and lifecycle.process_start_ticks(group_child_pid):
+                    os.kill(group_child_pid, signal.SIGKILL)
+
+    @unittest.skipUnless(Path("/proc/self/stat").is_file(), "requires Linux /proc")
+    def test_live_bound_business_identity_unlink_blocks_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            run_root = root / "run"
+            run_root.mkdir()
+            cpu = root / "cpu"
+            gpu = root / "gpu"
+            state = root / "state.json"
+            lock = root / "lock"
+            parent = subprocess.Popen(["sleep", "60"])
+            child = subprocess.Popen(["sleep", "60"], start_new_session=True)
+            identity_path = run_root / "trainer-process-identity.json"
+            try:
+                parent_ticks = lifecycle.process_start_ticks(parent.pid)
+                self.assertIsNotNone(parent_ticks)
+                payload = self._write_process_identity(identity_path, child)
+                lifecycle.prepare_marker_transaction(
+                    state_path=state,
+                    lock_path=lock,
+                    run_id="business-identity-unlink",
+                    parent_pid=parent.pid,
+                    parent_start_ticks=str(parent_ticks),
+                    markers=(
+                        lifecycle._marker_record("cpu", cpu, None, 0, ""),
+                        lifecycle._marker_record("gpu", gpu, None, 0, ""),
+                    ),
+                    drain_identity_root=run_root,
+                )
+                lifecycle.acquire_marker_transaction(state, lock)
+                self._bind_process_identity(
+                    state, lock, identity_path, payload
+                )
+
+                identity_path.unlink()
+                with mock.patch.object(
+                    lifecycle, "_signal_process_identity"
+                ) as signal_identity:
+                    with self.assertRaisesRegex(
+                        lifecycle.LifecycleError,
+                        "required regular JSON file is missing",
+                    ):
+                        lifecycle.restore_marker_transaction(state, lock)
+                    signal_identity.assert_not_called()
+                self.assertEqual(
+                    cpu.read_text(encoding="utf-8").strip(),
+                    "business-identity-unlink",
+                )
+                self.assertEqual(
+                    gpu.read_text(encoding="utf-8").strip(),
+                    "business-identity-unlink",
+                )
+                self.assertIsNone(child.poll())
+            finally:
+                for process in (parent, child):
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+
+    @unittest.skipUnless(Path("/proc/self/stat").is_file(), "requires Linux /proc")
+    def test_dead_bound_business_identity_same_bytes_new_inode_blocks_restore(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            run_root = root / "run"
+            run_root.mkdir()
+            cpu = root / "cpu"
+            gpu = root / "gpu"
+            state = root / "state.json"
+            lock = root / "lock"
+            parent = subprocess.Popen(["sleep", "60"])
+            child = subprocess.Popen(["sleep", "60"], start_new_session=True)
+            identity_path = run_root / "trainer-process-identity.json"
+            displaced = run_root / "trainer-process-identity.old"
+            try:
+                parent_ticks = lifecycle.process_start_ticks(parent.pid)
+                self.assertIsNotNone(parent_ticks)
+                payload = self._write_process_identity(identity_path, child)
+                lifecycle.prepare_marker_transaction(
+                    state_path=state,
+                    lock_path=lock,
+                    run_id="business-identity-replaced",
+                    parent_pid=parent.pid,
+                    parent_start_ticks=str(parent_ticks),
+                    markers=(
+                        lifecycle._marker_record("cpu", cpu, None, 0, ""),
+                        lifecycle._marker_record("gpu", gpu, None, 0, ""),
+                    ),
+                    drain_identity_root=run_root,
+                )
+                lifecycle.acquire_marker_transaction(state, lock)
+                self._bind_process_identity(
+                    state, lock, identity_path, payload
+                )
+                child.terminate()
+                child.wait(timeout=5)
+
+                identity_path.rename(displaced)
+                lifecycle._atomic_write_json(identity_path, payload)
+                self.assertNotEqual(
+                    identity_path.lstat().st_ino, displaced.lstat().st_ino
+                )
+                with mock.patch.object(
+                    lifecycle, "_signal_process_identity"
+                ) as signal_identity:
+                    with self.assertRaisesRegex(
+                        lifecycle.LifecycleError,
+                        "business drain identity was replaced",
+                    ):
+                        lifecycle.restore_marker_transaction(state, lock)
+                    signal_identity.assert_not_called()
+                self.assertEqual(
+                    cpu.read_text(encoding="utf-8").strip(),
+                    "business-identity-replaced",
+                )
+                self.assertEqual(
+                    gpu.read_text(encoding="utf-8").strip(),
+                    "business-identity-replaced",
+                )
+            finally:
+                for process in (parent, child):
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+
+    @unittest.skipUnless(Path("/proc/self/stat").is_file(), "requires Linux /proc")
+    def test_bound_watcher_identity_replacement_blocks_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            run_root = root / "run"
+            run_root.mkdir()
+            cpu = root / "cpu"
+            gpu = root / "gpu"
+            state = root / "state.json"
+            lock = root / "lock"
+            parent = subprocess.Popen(["sleep", "60"])
+            watcher = subprocess.Popen(["sleep", "60"], start_new_session=True)
+            identity_path = run_root / "watcher-process-identity.json"
+            try:
+                parent_ticks = lifecycle.process_start_ticks(parent.pid)
+                self.assertIsNotNone(parent_ticks)
+                payload = self._write_process_identity(
+                    identity_path,
+                    watcher,
+                    name="holder-watcher",
+                    bootstrap="test-bootstrap",
+                    command=("test-watcher",),
+                )
+                lifecycle.prepare_marker_transaction(
+                    state_path=state,
+                    lock_path=lock,
+                    run_id="bound-exclusion",
+                    parent_pid=parent.pid,
+                    parent_start_ticks=str(parent_ticks),
+                    markers=(
+                        lifecycle._marker_record("cpu", cpu, None, 0, ""),
+                        lifecycle._marker_record("gpu", gpu, None, 0, ""),
+                    ),
+                    drain_identity_root=run_root,
+                    drain_excluded_identity_paths=(identity_path,),
+                )
+                lifecycle.bind_marker_drain_exclusion(
+                    state,
+                    lock,
+                    identity_path=identity_path,
+                    expected_name="holder-watcher",
+                    expected_pid=watcher.pid,
+                    expected_start_ticks=payload["start_ticks"],
+                    expected_process_group=watcher.pid,
+                    expected_bootstrap=Path("test-bootstrap"),
+                    expected_command=("test-watcher",),
+                )
+                lifecycle.acquire_marker_transaction(state, lock)
+                lifecycle._atomic_write_json(identity_path, payload)
+                with self.assertRaisesRegex(
+                    lifecycle.LifecycleError,
+                    "drain exclusion was replaced",
+                ):
+                    lifecycle.restore_marker_transaction(state, lock)
+                self.assertEqual(
+                    cpu.read_text(encoding="utf-8").strip(), "bound-exclusion"
+                )
+                self.assertEqual(
+                    gpu.read_text(encoding="utf-8").strip(), "bound-exclusion"
+                )
+            finally:
+                for process in (parent, watcher):
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+
+    @unittest.skipUnless(Path("/proc/self/stat").is_file(), "requires Linux /proc")
+    def test_bound_drain_root_replacement_blocks_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            run_root = root / "run"
+            run_root.mkdir()
+            displaced_root = root / "run-original"
+            cpu = root / "cpu"
+            gpu = root / "gpu"
+            state = root / "state.json"
+            lock = root / "lock"
+            parent = subprocess.Popen(["sleep", "60"])
+            try:
+                parent_ticks = lifecycle.process_start_ticks(parent.pid)
+                self.assertIsNotNone(parent_ticks)
+                lifecycle.prepare_marker_transaction(
+                    state_path=state,
+                    lock_path=lock,
+                    run_id="bound-drain-root",
+                    parent_pid=parent.pid,
+                    parent_start_ticks=str(parent_ticks),
+                    markers=(
+                        lifecycle._marker_record("cpu", cpu, None, 0, ""),
+                        lifecycle._marker_record("gpu", gpu, None, 0, ""),
+                    ),
+                    drain_identity_root=run_root,
+                )
+                lifecycle.acquire_marker_transaction(state, lock)
+                run_root.rename(displaced_root)
+                run_root.mkdir()
+                with self.assertRaisesRegex(
+                    lifecycle.LifecycleError, "drain root was replaced"
+                ):
+                    lifecycle.restore_marker_transaction(state, lock)
+                self.assertEqual(
+                    cpu.read_text(encoding="utf-8").strip(), "bound-drain-root"
+                )
+                self.assertEqual(
+                    gpu.read_text(encoding="utf-8").strip(), "bound-drain-root"
+                )
+            finally:
+                if parent.poll() is None:
+                    parent.kill()
+                    parent.wait()
+
+    @unittest.skipUnless(Path("/proc/self/stat").is_file(), "requires Linux /proc")
     def test_parent_death_watcher_restores_both_markers(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -1050,6 +1476,394 @@ class TestMarkerTransactions(unittest.TestCase):
                 if watcher is not None and watcher.poll() is None:
                     watcher.kill()
                     watcher.wait()
+
+    @unittest.skipUnless(Path("/proc/self/stat").is_file(), "requires Linux /proc")
+    def test_parent_death_watcher_waits_for_published_child_before_restore(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            cpu = root / "cpu"
+            gpu = root / "gpu"
+            state = root / "state.json"
+            lock = root / "lock"
+            ready = root / "ready.json"
+            receipt = root / "receipt.json"
+            drain_root = root / "run"
+            drain_root.mkdir()
+            parent = subprocess.Popen(["sleep", "60"])
+            child = subprocess.Popen(["sleep", "60"], start_new_session=True)
+            watcher: subprocess.Popen[str] | None = None
+            try:
+                parent_ticks = lifecycle.process_start_ticks(parent.pid)
+                self.assertIsNotNone(parent_ticks)
+                identity_path = drain_root / "trainer-process-identity.json"
+                payload = self._write_process_identity(identity_path, child)
+                lifecycle.prepare_marker_transaction(
+                    state_path=state,
+                    lock_path=lock,
+                    run_id="drain-before-restore",
+                    parent_pid=parent.pid,
+                    parent_start_ticks=str(parent_ticks),
+                    markers=(
+                        lifecycle._marker_record("cpu", cpu, None, 0, ""),
+                        lifecycle._marker_record("gpu", gpu, None, 0, ""),
+                    ),
+                    drain_identity_root=drain_root,
+                )
+                watcher = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(MODULE),
+                        "marker-watch",
+                        "--state",
+                        str(state),
+                        "--lock",
+                        str(lock),
+                        "--parent-pid",
+                        str(parent.pid),
+                        "--parent-start-ticks",
+                        str(parent_ticks),
+                        "--ready",
+                        str(ready),
+                        "--receipt",
+                        str(receipt),
+                        "--drain-identity-root",
+                        str(drain_root),
+                        "--poll-seconds",
+                        "0.02",
+                        "--restore-timeout-seconds",
+                        "3",
+                    ],
+                    text=True,
+                )
+                deadline = time.monotonic() + 5
+                while not ready.is_file() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(ready.is_file())
+                lifecycle.acquire_marker_transaction(state, lock)
+                self._bind_process_identity(
+                    state, lock, identity_path, payload
+                )
+                parent.terminate()
+                parent.wait(timeout=5)
+                time.sleep(0.2)
+                self.assertIsNone(watcher.poll())
+                self.assertEqual(cpu.read_text(encoding="utf-8").strip(), "drain-before-restore")
+                self.assertEqual(gpu.read_text(encoding="utf-8").strip(), "drain-before-restore")
+
+                child.terminate()
+                child.wait(timeout=5)
+                self.assertEqual(watcher.wait(timeout=5), 0)
+                self.assertFalse(cpu.exists())
+                self.assertFalse(gpu.exists())
+                watched = json.loads(receipt.read_text(encoding="utf-8"))
+                self.assertEqual(watched["status"], "pass")
+                self.assertEqual(watched["mode"], "parent_death_restore")
+            finally:
+                for process in (parent, child):
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+                if watcher is not None and watcher.poll() is None:
+                    watcher.kill()
+                    watcher.wait()
+
+    @unittest.skipUnless(Path("/proc/self/stat").is_file(), "requires Linux /proc")
+    def test_published_child_drain_can_exclude_watcher_group_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            anchor = subprocess.Popen(["sleep", "60"], start_new_session=True)
+            child = subprocess.Popen(["sleep", "60"], start_new_session=True)
+            try:
+                watcher_path = root / "holder-watcher-process-identity.json"
+                self._write_process_identity(
+                    watcher_path,
+                    anchor,
+                    name="holder-watcher",
+                )
+                child_payload = self._write_process_identity(
+                    root / "trainer-process-identity.json", child
+                )
+                alive = lifecycle._alive_published_process_identities(
+                    root,
+                    exclude_paths=(watcher_path,),
+                )
+                self.assertEqual(
+                    [(item["pid"], item["start_ticks"]) for item in alive],
+                    [(child.pid, str(child_payload["start_ticks"]))],
+                )
+            finally:
+                for process in (anchor, child):
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+
+    @unittest.skipUnless(Path("/proc/self/stat").is_file(), "requires Linux /proc")
+    def test_parent_death_watcher_does_not_wait_on_its_group_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            cpu = root / "cpu"
+            gpu = root / "gpu"
+            state = root / "state.json"
+            lock = root / "lock"
+            ready = root / "ready.json"
+            receipt = root / "receipt.json"
+            run_root = root / "run"
+            run_root.mkdir()
+            parent = subprocess.Popen(["sleep", "60"])
+            anchor: subprocess.Popen[str] | None = None
+            try:
+                parent_ticks = lifecycle.process_start_ticks(parent.pid)
+                self.assertIsNotNone(parent_ticks)
+                watcher_identity = (
+                    run_root / "holder-watcher-process-identity.json"
+                )
+                lifecycle.prepare_marker_transaction(
+                    state_path=state,
+                    lock_path=lock,
+                    run_id="anchor-exclusion",
+                    parent_pid=parent.pid,
+                    parent_start_ticks=str(parent_ticks),
+                    markers=(
+                        lifecycle._marker_record("cpu", cpu, None, 0, ""),
+                        lifecycle._marker_record("gpu", gpu, None, 0, ""),
+                    ),
+                    drain_identity_root=run_root,
+                    drain_excluded_identity_paths=(watcher_identity,),
+                )
+                anchor_code = (
+                    "import json,os,subprocess,sys; from pathlib import Path; "
+                    f"root=Path({str(run_root)!r}); "
+                    "fields=Path(f'/proc/{os.getpid()}/stat').read_text().rsplit(')',1)[1].split(); "
+                    "(root/'holder-watcher-process-identity.json').write_text("
+                    "json.dumps({'name':'holder-watcher','pid':os.getpid(),"
+                    "'start_ticks':fields[19],'process_group':os.getpgrp(),"
+                    "'bootstrap':'test-anchor','command':sys.argv[1:]})+'\\n'); "
+                    "p=subprocess.Popen(sys.argv[1:]); raise SystemExit(p.wait())"
+                )
+                watcher_command = [
+                    sys.executable,
+                    str(MODULE),
+                    "marker-watch",
+                    "--state",
+                    str(state),
+                    "--lock",
+                    str(lock),
+                    "--parent-pid",
+                    str(parent.pid),
+                    "--parent-start-ticks",
+                    str(parent_ticks),
+                    "--ready",
+                    str(ready),
+                    "--receipt",
+                    str(receipt),
+                    "--drain-identity-root",
+                    str(run_root),
+                    "--poll-seconds",
+                    "0.02",
+                    "--restore-timeout-seconds",
+                    "3",
+                ]
+                anchor = subprocess.Popen(
+                    [sys.executable, "-c", anchor_code, *watcher_command],
+                    text=True,
+                    start_new_session=True,
+                )
+                deadline = time.monotonic() + 5
+                while not ready.is_file() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(ready.is_file())
+                anchor_ticks = lifecycle.process_start_ticks(anchor.pid)
+                self.assertIsNotNone(anchor_ticks)
+                lifecycle.bind_marker_drain_exclusion(
+                    state,
+                    lock,
+                    identity_path=watcher_identity,
+                    expected_name="holder-watcher",
+                    expected_pid=anchor.pid,
+                    expected_start_ticks=str(anchor_ticks),
+                    expected_process_group=anchor.pid,
+                    expected_bootstrap=Path("test-anchor"),
+                    expected_command=watcher_command,
+                )
+                lifecycle.acquire_marker_transaction(state, lock)
+                parent.terminate()
+                parent.wait(timeout=5)
+                self.assertEqual(anchor.wait(timeout=5), 0)
+                self.assertFalse(cpu.exists())
+                self.assertFalse(gpu.exists())
+                watched = json.loads(receipt.read_text(encoding="utf-8"))
+                self.assertEqual(watched["status"], "pass")
+                self.assertEqual(watched["mode"], "parent_death_restore")
+            finally:
+                if parent.poll() is None:
+                    parent.kill()
+                    parent.wait()
+                if anchor is not None and anchor.poll() is None:
+                    anchor.kill()
+                    anchor.wait()
+
+    @unittest.skipUnless(Path("/proc/self/stat").is_file(), "requires Linux /proc")
+    def test_actual_bootstrap_keeps_watcher_alive_past_five_second_drain(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            run_root = root / "run"
+            run_root.mkdir()
+            cpu = root / "cpu"
+            gpu = root / "gpu"
+            state = root / "state.json"
+            lock = root / "lock"
+            ready = root / "ready.json"
+            receipt = root / "receipt.json"
+            bootstrap_identity = run_root / "watcher-process-identity.json"
+            child_identity = run_root / "trainer-process-identity.json"
+            parent = subprocess.Popen(["sleep", "60"])
+            child: subprocess.Popen[str] | None = None
+            bootstrap: subprocess.Popen[str] | None = None
+            read_fd = -1
+            write_fd = -1
+            try:
+                parent_ticks = lifecycle.process_start_ticks(parent.pid)
+                self.assertIsNotNone(parent_ticks)
+                lifecycle.prepare_marker_transaction(
+                    state_path=state,
+                    lock_path=lock,
+                    run_id="delayed-bootstrap-drain",
+                    parent_pid=parent.pid,
+                    parent_start_ticks=str(parent_ticks),
+                    markers=(
+                        lifecycle._marker_record("cpu", cpu, None, 0, ""),
+                        lifecycle._marker_record("gpu", gpu, None, 0, ""),
+                    ),
+                    drain_identity_root=run_root,
+                    drain_excluded_identity_paths=(bootstrap_identity,),
+                )
+                read_fd, write_fd = os.pipe()
+                watcher_command = [
+                    sys.executable,
+                    str(MODULE),
+                    "marker-watch",
+                    "--state",
+                    str(state),
+                    "--lock",
+                    str(lock),
+                    "--parent-pid",
+                    str(parent.pid),
+                    "--parent-start-ticks",
+                    str(parent_ticks),
+                    "--ready",
+                    str(ready),
+                    "--receipt",
+                    str(receipt),
+                    "--drain-identity-root",
+                    str(run_root),
+                    "--poll-seconds",
+                    "0.02",
+                    "--restore-timeout-seconds",
+                    "15",
+                ]
+                bootstrap = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(PROCESS_BOOTSTRAP),
+                        "--ack-fd",
+                        str(read_fd),
+                        "--parent-pid",
+                        str(parent.pid),
+                        "--parent-start-ticks",
+                        str(parent_ticks),
+                        "--cleanup-timeout-seconds",
+                        "12",
+                        "--",
+                        *watcher_command,
+                    ],
+                    text=True,
+                    start_new_session=True,
+                    pass_fds=(read_fd,),
+                )
+                os.close(read_fd)
+                read_fd = -1
+                bootstrap_ticks = lifecycle.process_start_ticks(bootstrap.pid)
+                self.assertIsNotNone(bootstrap_ticks)
+                lifecycle._atomic_write_json(
+                    bootstrap_identity,
+                    {
+                        "name": "holder-watcher",
+                        "pid": bootstrap.pid,
+                        "start_ticks": bootstrap_ticks,
+                        "process_group": bootstrap.pid,
+                        "bootstrap": str(PROCESS_BOOTSTRAP),
+                        "command": watcher_command,
+                    },
+                )
+                self.assertEqual(os.write(write_fd, b"1"), 1)
+                os.close(write_fd)
+                write_fd = -1
+                deadline = time.monotonic() + 5
+                while not ready.is_file() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(ready.is_file())
+                lifecycle.bind_marker_drain_exclusion(
+                    state,
+                    lock,
+                    identity_path=bootstrap_identity,
+                    expected_name="holder-watcher",
+                    expected_pid=bootstrap.pid,
+                    expected_start_ticks=str(bootstrap_ticks),
+                    expected_process_group=bootstrap.pid,
+                    expected_bootstrap=PROCESS_BOOTSTRAP,
+                    expected_command=watcher_command,
+                )
+                lifecycle.acquire_marker_transaction(state, lock)
+
+                child = subprocess.Popen(
+                    ["sleep", "60"], text=True, start_new_session=True
+                )
+                child_payload = self._write_process_identity(child_identity, child)
+                self._bind_process_identity(
+                    state, lock, child_identity, child_payload
+                )
+                parent.terminate()
+                parent.wait(timeout=5)
+                bootstrap.send_signal(signal.SIGTERM)
+
+                # This is the regression boundary: the old process-bootstrap
+                # cleanup budget was five seconds and killed the watcher before
+                # a longer child drain could finish.
+                time.sleep(5.5)
+                self.assertIsNone(bootstrap.poll())
+                self.assertEqual(
+                    cpu.read_text(encoding="utf-8").strip(),
+                    "delayed-bootstrap-drain",
+                )
+                self.assertEqual(
+                    gpu.read_text(encoding="utf-8").strip(),
+                    "delayed-bootstrap-drain",
+                )
+
+                child.terminate()
+                child.wait(timeout=5)
+                self.assertEqual(bootstrap.wait(timeout=8), 143)
+                self.assertFalse(cpu.exists())
+                self.assertFalse(gpu.exists())
+                watched = json.loads(receipt.read_text(encoding="utf-8"))
+                self.assertEqual(watched["status"], "pass")
+                self.assertEqual(watched["mode"], "parent_death_restore")
+            finally:
+                if read_fd >= 0:
+                    os.close(read_fd)
+                if write_fd >= 0:
+                    os.close(write_fd)
+                if child is not None and child.poll() is None:
+                    child.kill()
+                    child.wait()
+                if parent.poll() is None:
+                    parent.kill()
+                    parent.wait()
+                if bootstrap is not None and bootstrap.poll() is None:
+                    bootstrap.kill()
+                    bootstrap.wait()
 
 
 @unittest.skipUnless(Path("/proc/self/stat").is_file(), "requires Linux /proc")
