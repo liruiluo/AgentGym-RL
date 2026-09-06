@@ -110,3 +110,47 @@ veRL algorithm commit and re-run the audit against the immutable launch roots.
    or a shared/domain-specific rollout implementation.
 5. A GPU run may use only a naturally available one of the three existing
    eight-card allocations. No fourth allocation is requested.
+
+## Runtime and holder safety successor contract
+
+The post-r112 runtime-safety successor changes orchestration only.  It does not
+authorize deployment or a formal run, and it does not modify the environment,
+rollout, optimizer, reward, grader, schedule, or frozen r112 package.
+
+- The platform fallback wrapper bootstraps with the hash-pinned
+  `/opt/conda/envs/py312/bin/python3` runtime.  It deliberately ignores the
+  training launcher's volatile `PYTHON` value under `/dev/shm`; the training
+  process remains bound to its separately frozen runtime.
+- A persisted `pending_resume` binds both the exact pause-marker inode/bytes and
+  the optional release-request inode/bytes.  A replacement supervisor finishes
+  that authorization idempotently.  It may publish `holding` only after marker,
+  request, and pending transaction state have all been closed and the holder
+  resource attestation has passed.
+- The marker transaction's append-only `drain_identities` payload is the
+  authority for PID/start-ticks/process-group liveness.  Identity bytes,
+  metadata, and digest are read through one descriptor.  A current directory
+  scan can discover additional identities, but unlinking or replacing a
+  registered path cannot erase the saved lease from the drain decision.
+- CPU regression evidence used for a launch review must be produced by
+  `scripts/run_exact_source_tests.py`.  The harness binds every named checkout
+  to an expected clean HEAD and selected-file manifest, records the real
+  interpreter and digest plus the exact command and environment allowlist, and
+  repeats HEAD/status/file hashing after the command.  A dirty tree, byte drift,
+  nonzero command, or post-run mutation publishes a failed receipt.
+
+These source changes still require a newly frozen package, a fresh independent
+runtime review, and an actual same-boundary Pod recovery receipt before any
+r112/r113 formal launch can be authorized.
+
+The existing frozen r112 deploy runner is not compatible with this successor:
+it uses one `/dev/shm` `PY` value both for `migrate` / `formal --python` and for
+the training command.  A successor package must use two explicitly named,
+independently hashed values.  The stable `/opt` interpreter must execute
+`fallback_supervisor.py` and be passed through `--python` so its immutable
+contract exactly matches the platform-restarted `supervise` process.  The
+source-locked `/dev/shm` interpreter remains the first executable inside the
+formal command after `--`.  Package validation must reject a runner that binds
+the fallback contract back to the training interpreter, even when both current
+binaries happen to have the same digest.  This runner split, package freeze,
+and target-Pod restart test are launch-review gates rather than edits to the
+immutable r112 package.

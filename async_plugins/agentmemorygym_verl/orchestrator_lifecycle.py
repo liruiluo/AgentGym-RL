@@ -1048,19 +1048,73 @@ def _validate_drain_identity_root(state: Mapping[str, Any]) -> Path:
     return root
 
 
-def _identity_file_binding(path: Path, payload: Mapping[str, Any]) -> dict[str, Any]:
-    if path.is_symlink() or not path.is_file():
-        raise LifecycleError(f"drain-excluded identity must be a regular file: {path}")
-    metadata = path.lstat()
-    return {
-        "path": str(path),
-        "device": metadata.st_dev,
-        "inode": metadata.st_ino,
-        "ctime_ns": metadata.st_ctime_ns,
-        "size": metadata.st_size,
-        "sha256": _sha256(path),
-        "payload": dict(payload),
-    }
+def _identity_file_binding(
+    path: Path, *, maximum_bytes: int = 1 << 20
+) -> dict[str, Any]:
+    """Bind identity payload, bytes, and inode through one file descriptor."""
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise LifecycleError(
+            f"required regular JSON file is missing or symlinked: {path}"
+        ) from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise LifecycleError(f"identity binding is not a regular file: {path}")
+        if before.st_size > maximum_bytes:
+            raise LifecycleError(f"identity binding exceeds size limit: {path}")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(65536, maximum_bytes + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > maximum_bytes:
+                raise LifecycleError(f"identity binding exceeds size limit: {path}")
+        raw = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if any(
+            getattr(before, field) != getattr(after, field)
+            for field in ("st_dev", "st_ino", "st_ctime_ns", "st_size")
+        ) or len(raw) != after.st_size:
+            raise LifecycleError(f"identity binding changed while reading: {path}")
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise LifecycleError(f"invalid JSON file {path}: {error}") from error
+        if not isinstance(payload, dict):
+            raise LifecycleError(f"process identity must be a JSON object: {path}")
+        try:
+            named = path.lstat()
+        except OSError as error:
+            raise LifecycleError(
+                f"identity binding path disappeared while reading: {path}"
+            ) from error
+        if path.is_symlink() or any(
+            getattr(named, field) != getattr(after, field)
+            for field in ("st_dev", "st_ino", "st_ctime_ns", "st_size")
+        ):
+            raise LifecycleError(f"identity binding path was replaced: {path}")
+        return {
+            "path": str(path),
+            "device": after.st_dev,
+            "inode": after.st_ino,
+            "ctime_ns": after.st_ctime_ns,
+            "size": after.st_size,
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "payload": payload,
+        }
+    finally:
+        os.close(descriptor)
 
 
 def bind_marker_drain_exclusion(
@@ -1090,7 +1144,8 @@ def bind_marker_drain_exclusion(
         requested = state.get("drain_excluded_identity_paths")
         if not isinstance(requested, list) or str(path) not in requested:
             raise LifecycleError(f"unregistered drain exclusion path: {path}")
-        payload = _load_json(path)
+        binding = _identity_file_binding(path)
+        payload = binding["payload"]
         expected_payload = {
             "name": expected_name,
             "pid": int(expected_pid),
@@ -1115,7 +1170,7 @@ def bind_marker_drain_exclusion(
             raise LifecycleError("marker drain exclusions must be a list")
         if any(item.get("path") == str(path) for item in bindings):
             raise LifecycleError(f"drain exclusion is already bound: {path}")
-        bindings.append(_identity_file_binding(path, payload))
+        bindings.append(binding)
         _save_marker_state(state_path, state)
         return state
 
@@ -1147,7 +1202,8 @@ def bind_marker_drain_identity(
         excluded = set(state.get("drain_excluded_identity_paths", ()))
         if str(path) in excluded:
             raise LifecycleError(f"business drain identity is an exclusion: {path}")
-        payload = _load_json(path)
+        binding = _identity_file_binding(path)
+        payload = binding["payload"]
         expected_payload = {
             "name": expected_name,
             "pid": int(expected_pid),
@@ -1172,7 +1228,7 @@ def bind_marker_drain_identity(
             raise LifecycleError("marker business drain inventory must be a list")
         if any(item.get("path") == str(path) for item in bindings):
             raise LifecycleError(f"business drain identity is already bound: {path}")
-        bindings.append(_identity_file_binding(path, payload))
+        bindings.append(binding)
         _save_marker_state(state_path, state)
         return state
 
@@ -1193,8 +1249,8 @@ def _marker_drain_exclusion_paths(state: Mapping[str, Any]) -> tuple[Path, ...]:
         path = Path(str(binding.get("path", "")))
         if str(path) not in requested_set or (root != path and root not in path.parents):
             raise LifecycleError(f"unexpected marker drain exclusion path: {path}")
-        payload = _load_json(path)
-        current = _identity_file_binding(path, payload)
+        current = _identity_file_binding(path)
+        payload = current["payload"]
         if current != binding:
             raise LifecycleError(f"marker drain exclusion was replaced: {path}")
         try:
@@ -1238,8 +1294,8 @@ def _marker_drain_identity_bindings(
             or absolute_path in registered_paths
         ):
             raise LifecycleError(f"unexpected business drain identity path: {path}")
-        payload = _load_json(path)
-        current = _identity_file_binding(path, payload)
+        current = _identity_file_binding(path)
+        payload = current["payload"]
         if current != binding:
             raise LifecycleError(f"business drain identity was replaced: {path}")
         try:
@@ -1266,21 +1322,79 @@ def _marker_drain_identity_bindings(
     return tuple(observed)
 
 
+def _bound_process_identity_observation(
+    binding: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Audit liveness from the append-only payload, never a later path read."""
+
+    path = str(binding.get("path", ""))
+    payload = binding.get("payload")
+    if not isinstance(payload, Mapping):
+        raise LifecycleError(f"bound process identity has no payload: {path}")
+    try:
+        pid = int(payload["pid"])
+        start_ticks = str(payload["start_ticks"])
+        process_group = int(payload["process_group"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise LifecycleError(f"invalid bound business identity: {path}") from error
+    if pid <= 0 or process_group != pid or not start_ticks:
+        raise LifecycleError(f"invalid bound business identity: {path}")
+    members = _process_group_members(process_group)
+    leader_alive = process_identity_alive(pid, start_ticks)
+    if leader_alive and not any(
+        int(member["pid"]) == pid
+        and str(member["start_ticks"]) == start_ticks
+        for member in members
+    ):
+        raise LifecycleError(
+            "bound process leader changed process group before drain: " f"{path}"
+        )
+    return {
+        "path": path,
+        "pid": pid,
+        "start_ticks": start_ticks,
+        "process_group": process_group,
+        "leader_alive": leader_alive,
+        "group_members": members,
+        "alive": leader_alive or bool(members),
+        "authority": "append_only_binding",
+    }
+
+
 def _assert_marker_process_drain(state: Mapping[str, Any]) -> None:
     raw_root = state.get("drain_identity_root")
     if raw_root is None:
         return
     root = _validate_drain_identity_root(state)
     excluded_paths = _marker_drain_exclusion_paths(state)
-    _marker_drain_identity_bindings(state, excluded_paths=excluded_paths)
-    alive = _alive_published_process_identities(
+    bindings = _marker_drain_identity_bindings(
+        state, excluded_paths=excluded_paths
+    )
+    bound_alive = tuple(
+        observation
+        for observation in (
+            _bound_process_identity_observation(binding) for binding in bindings
+        )
+        if observation["alive"]
+    )
+    if bound_alive:
+        raise LifecycleError(
+            "published child identities are still alive before holder restore: "
+            f"{bound_alive!r}"
+        )
+
+    # This scan discovers identities that appeared outside the append-only
+    # registration path.  It is deliberately supplemental: a registered lease
+    # remains authoritative even if its pathname is unlinked or replaced after
+    # validation above.
+    unregistered_alive = _alive_published_process_identities(
         root,
         exclude_paths=excluded_paths,
     )
-    if alive:
+    if unregistered_alive:
         raise LifecycleError(
             "published child identities are still alive before holder restore: "
-            f"{alive!r}"
+            f"{unregistered_alive!r}"
         )
 
 

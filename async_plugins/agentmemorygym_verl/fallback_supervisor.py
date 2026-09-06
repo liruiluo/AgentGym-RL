@@ -436,7 +436,7 @@ def _remove_bound_json(path: Path, expected: Mapping[str, Any], *, token: str) -
     current_payload, current = _bound_json_file(path, maximum_bytes=1 << 20)
     if current != dict(expected) or str(current_payload.get("token")) != token:
         raise FallbackError(f"refusing to remove replaced JSON authority: {path}")
-    quarantine = path.with_name(f".{path.name}.consumed.{token.replace('/', '_')}")
+    quarantine = _release_request_quarantine(path, token)
     if quarantine.exists() or quarantine.is_symlink():
         raise FallbackError(f"release-request quarantine already exists: {quarantine}")
     _rename_noreplace(path, quarantine)
@@ -482,7 +482,7 @@ def _release_pause_marker(
         or current["ctime_ns"] != expected["ctime_ns"]
     ):
         raise FallbackError("refusing to release a foreign/replaced pause marker")
-    quarantine = path.with_name(f".{path.name}.released.{token}")
+    quarantine = _pause_marker_quarantine(path, token)
     try:
         quarantine.lstat()
     except FileNotFoundError:
@@ -504,6 +504,28 @@ def _release_pause_marker(
     quarantine.unlink()
     _fsync_directory(path.parent)
     return True
+
+
+def _pause_marker_quarantine(path: Path, token: str) -> Path:
+    return path.with_name(f".{path.name}.released.{token}")
+
+
+def _release_request_quarantine(path: Path, token: str) -> Path:
+    return path.with_name(f".{path.name}.consumed.{token.replace('/', '_')}")
+
+
+def _renamed_binding_matches(
+    observed: Mapping[str, Any], expected: Mapping[str, Any]
+) -> bool:
+    """Compare a bound file after its path-only quarantine rename."""
+
+    # A rename is allowed to change ctime and necessarily changes the reported
+    # pathname.  Device/inode preserve the object identity; size, digest, and
+    # (for release requests) payload preserve the authenticated bytes.
+    keys = {"device", "inode", "size", "sha256"}
+    if "payload" in expected:
+        keys.add("payload")
+    return all(observed.get(key) == expected.get(key) for key in keys)
 
 
 def _acquire_lock(path: Path, *, nonblocking: bool = True) -> int:
@@ -1404,6 +1426,209 @@ def _marker_binding_view(observation: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _pending_resume_bindings(
+    pending_resume: Mapping[str, Any],
+) -> tuple[str, dict[str, Any], dict[str, Any] | None]:
+    if pending_resume.get("schema") != _PENDING_RESUME_SCHEMA:
+        raise FallbackError("pending resume schema mismatch")
+    token = str(pending_resume.get("token", ""))
+    marker_binding = pending_resume.get("marker_binding")
+    request_binding = pending_resume.get("request_binding")
+    if not token or not isinstance(marker_binding, dict):
+        raise FallbackError("pending resume is missing its marker binding")
+    if request_binding is not None and not isinstance(request_binding, dict):
+        raise FallbackError("pending resume release-request binding is invalid")
+    marker_binding = dict(marker_binding)
+    if set(marker_binding) != {
+        "path",
+        "device",
+        "inode",
+        "ctime_ns",
+        "size",
+        "sha256",
+    }:
+        raise FallbackError("pending resume pause-marker binding is invalid")
+    if str(marker_binding["path"]) == "" or not re.fullmatch(
+        r"[0-9a-f]{64}", str(marker_binding["sha256"])
+    ):
+        raise FallbackError("pending resume pause-marker binding is invalid")
+    try:
+        if any(
+            int(marker_binding[key]) < 0
+            for key in ("device", "inode", "ctime_ns", "size")
+        ):
+            raise ValueError
+    except (TypeError, ValueError) as error:
+        raise FallbackError(
+            "pending resume pause-marker binding is invalid"
+        ) from error
+    if request_binding is not None:
+        request_binding = dict(request_binding)
+        if set(request_binding) != {
+            "path",
+            "device",
+            "inode",
+            "ctime_ns",
+            "size",
+            "sha256",
+            "payload",
+        } or not isinstance(request_binding.get("payload"), dict):
+            raise FallbackError(
+                "pending resume release-request binding is invalid"
+            )
+        if (
+            str(request_binding["path"]) == ""
+            or str(request_binding["payload"].get("token", "")) != token
+            or not re.fullmatch(r"[0-9a-f]{64}", str(request_binding["sha256"]))
+        ):
+            raise FallbackError(
+                "pending resume release-request binding is invalid"
+            )
+        try:
+            if any(
+                int(request_binding[key]) < 0
+                for key in ("device", "inode", "ctime_ns", "size")
+            ):
+                raise ValueError
+        except (TypeError, ValueError) as error:
+            raise FallbackError(
+                "pending resume release-request binding is invalid"
+            ) from error
+    return token, marker_binding, request_binding
+
+
+def _finish_renamed_marker_release(
+    *, quarantine: Path, expected: Mapping[str, Any], token: str
+) -> None:
+    observed = _marker_observation(quarantine)
+    if (
+        not observed.get("exists")
+        or str(observed["payload"].get("token", "")) != token
+        or not _renamed_binding_matches(_marker_binding_view(observed), expected)
+    ):
+        raise FallbackError(
+            "refusing to finish a foreign/replaced pause-marker quarantine"
+        )
+    quarantine.unlink()
+    _fsync_directory(quarantine.parent)
+
+
+def _finish_renamed_request_consumption(
+    *, quarantine: Path, expected: Mapping[str, Any], token: str
+) -> None:
+    payload, observed = _bound_json_file(quarantine, maximum_bytes=1 << 20)
+    if (
+        str(payload.get("token", "")) != token
+        or not _renamed_binding_matches(observed, expected)
+    ):
+        raise FallbackError(
+            "refusing to finish a foreign/replaced release-request quarantine"
+        )
+    quarantine.unlink()
+    _fsync_directory(quarantine.parent)
+
+
+def _assert_pending_resume_publishable(
+    *,
+    pause_path: Path,
+    release_request_path: Path,
+    pending_resume: Mapping[str, Any],
+) -> None:
+    """Prove the release transaction is complete before publishing holding."""
+
+    token, _marker_binding, request_binding = _pending_resume_bindings(
+        pending_resume
+    )
+    marker = _marker_observation(pause_path)
+    request_present = release_request_path.exists() or release_request_path.is_symlink()
+    marker_quarantine = _pause_marker_quarantine(pause_path, token)
+    request_quarantine = _release_request_quarantine(release_request_path, token)
+    marker_quarantine_present = (
+        marker_quarantine.exists() or marker_quarantine.is_symlink()
+    )
+    request_quarantine_present = (
+        request_binding is not None
+        and (request_quarantine.exists() or request_quarantine.is_symlink())
+    )
+    if (
+        marker.get("exists")
+        or request_present
+        or marker_quarantine_present
+        or request_quarantine_present
+    ):
+        raise FallbackError(
+            "pending resume release transaction is not complete: "
+            f"marker_exists={bool(marker.get('exists'))} "
+            f"request_exists={request_present} "
+            f"marker_quarantine_exists={marker_quarantine_present} "
+            f"request_quarantine_exists={request_quarantine_present}"
+        )
+
+
+def _complete_pending_resume_release(
+    *,
+    pause_path: Path,
+    release_request_path: Path,
+    pending_resume: Mapping[str, Any],
+) -> None:
+    """Idempotently finish one already-authorized marker release.
+
+    Authorization, including the exact marker and optional request bindings,
+    is persisted before either filesystem authority is removed.  A replacement
+    supervisor therefore resumes this transaction rather than discarding it or
+    accepting a stale release request.
+    """
+
+    token, marker_binding, request_binding = _pending_resume_bindings(
+        pending_resume
+    )
+    marker_quarantine = _pause_marker_quarantine(pause_path, token)
+    request_quarantine = _release_request_quarantine(release_request_path, token)
+    marker = _marker_observation(pause_path)
+    if marker.get("exists"):
+        if _marker_binding_view(marker) != marker_binding:
+            raise FallbackError(
+                "pending resume pause marker was replaced before release"
+            )
+        _release_pause_marker(
+            pause_path,
+            token=token,
+            expected=marker_binding,
+        )
+    elif marker_quarantine.exists() or marker_quarantine.is_symlink():
+        _finish_renamed_marker_release(
+            quarantine=marker_quarantine,
+            expected=marker_binding,
+            token=token,
+        )
+
+    request_present = release_request_path.exists() or release_request_path.is_symlink()
+    if request_present:
+        if request_binding is None:
+            raise FallbackError(
+                "release request exists without a pending-resume binding"
+            )
+        _remove_bound_json(
+            release_request_path,
+            request_binding,
+            token=token,
+        )
+    elif request_binding is not None and (
+        request_quarantine.exists() or request_quarantine.is_symlink()
+    ):
+        _finish_renamed_request_consumption(
+            quarantine=request_quarantine,
+            expected=request_binding,
+            token=token,
+        )
+
+    _assert_pending_resume_publishable(
+        pause_path=pause_path,
+        release_request_path=release_request_path,
+        pending_resume=pending_resume,
+    )
+
+
 def _load_release_request(
     path: Path,
     *,
@@ -1851,14 +2076,23 @@ def supervise(args: argparse.Namespace) -> int:
                     ) from error
                 candidate_pending = prior_state.get("pending_resume")
                 if candidate_pending is not None:
+                    if not isinstance(candidate_pending, dict):
+                        raise FallbackError(
+                            "previous fallback pending-resume state is invalid"
+                        )
+                    try:
+                        _pending_resume_bindings(candidate_pending)
+                        pending_generation = int(
+                            candidate_pending.get("target_generation", -1)
+                        )
+                    except (FallbackError, TypeError, ValueError) as error:
+                        raise FallbackError(
+                            "previous fallback pending-resume state is invalid"
+                        ) from error
                     if (
-                        not isinstance(candidate_pending, dict)
-                        or candidate_pending.get("schema")
-                        != _PENDING_RESUME_SCHEMA
-                        or candidate_pending.get("immutable_contract")
+                        candidate_pending.get("immutable_contract")
                         != expected_contract
-                        or int(candidate_pending.get("target_generation", -1))
-                        not in {generation, generation + 1}
+                        or pending_generation not in {generation, generation + 1}
                     ):
                         raise FallbackError(
                             "previous fallback pending-resume state is invalid"
@@ -1943,22 +2177,49 @@ def supervise(args: argparse.Namespace) -> int:
                 time.sleep(args.poll_seconds)
                 continue
 
-            if marker_observation.get("exists"):
-                if pending_resume is not None:
-                    # A previous supervisor persisted authorization but died
-                    # before the marker CAS completed.  Authorization was
-                    # bound to that exact supervisor generation, so the new
-                    # generation must abort it and wait for a fresh request.
-                    request_binding = pending_resume.get("request_binding")
-                    if release_request_path.exists() and isinstance(
-                        request_binding, dict
-                    ):
-                        _remove_bound_json(
-                            release_request_path,
-                            request_binding,
-                            token=str(pending_resume.get("token", "")),
+            if pending_resume is not None:
+                try:
+                    _complete_pending_resume_release(
+                        pause_path=pause_path,
+                        release_request_path=release_request_path,
+                        pending_resume=pending_resume,
+                    )
+                    marker_observation = {"exists": False}
+                    write("resume_release_committed")
+                except Exception as error:
+                    if child is not None:
+                        stopped_identity = child_identity or {}
+                        stopped_lease = child_lease
+                        _stop_managed_watchdog(
+                            child,
+                            stopped_identity,
+                            timeout_seconds=args.stop_timeout_seconds,
                         )
-                    pending_resume = None
+                        if managed_generation:
+                            if stopped_lease is None:
+                                raise FallbackError(
+                                    "managed fallback generation has no durable lease"
+                                )
+                            _clear_drained_watchdog_artifacts(
+                                identity_path=watchdog_identity_path,
+                                expected_lease=stopped_lease,
+                                expected_identity=stopped_identity,
+                                pid_file=pid_file,
+                                holder_state_file=holder_state_file,
+                                holder_path=holder_path,
+                            )
+                        child = None
+                        child_identity = None
+                        child_lease = None
+                        managed_generation = False
+                    write(
+                        "resume_release_error",
+                        error=f"{type(error).__name__}: {error}",
+                    )
+                    time.sleep(args.poll_seconds)
+                    continue
+
+            if marker_observation.get("exists"):
                 if child is not None:
                     stopped_identity = child_identity or {}
                     stopped_lease = child_lease
@@ -2076,6 +2337,7 @@ def supervise(args: argparse.Namespace) -> int:
                         "preflight": preflight,
                         "source_supervisor": self_identity,
                         "source_generation": generation,
+                        "marker_binding": _marker_binding_view(marker_observation),
                         "request_binding": request_binding,
                         "immutable_contract": expected_contract,
                         "created_unix": time.time(),
@@ -2085,18 +2347,6 @@ def supervise(args: argparse.Namespace) -> int:
                         pause_token=payload["token"],
                         pause_owner_alive=owner_alive,
                     )
-                    _release_pause_marker(
-                        pause_path,
-                        token=str(payload["token"]),
-                        expected=marker_observation,
-                    )
-                    if request_binding is not None and release_request_path.exists():
-                        _remove_bound_json(
-                            release_request_path,
-                            request_binding,
-                            token=str(payload["token"]),
-                        )
-                    marker_observation = None
                     continue
                 write(
                     "paused",
@@ -2240,6 +2490,11 @@ def supervise(args: argparse.Namespace) -> int:
                         write(
                             "holder_restored_pending_receipt",
                             holder_activity=holder_activity,
+                        )
+                        _assert_pending_resume_publishable(
+                            pause_path=pause_path,
+                            release_request_path=release_request_path,
+                            pending_resume=pending_resume,
                         )
                         receipt_raw = pending_resume.get("recovery_receipt")
                         if receipt_raw:
