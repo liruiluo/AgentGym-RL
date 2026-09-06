@@ -369,12 +369,18 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
             str(schema["function"]["name"])
             for schema in tools
         }
-        if calls[0].name not in allowed_names:
+        parsed_call = calls[0]
+        normalized_name = parsed_call.name.strip().lower()
+        if normalized_name not in allowed_names:
             raise RuntimeError(
                 "AMG wrapper accepted an action outside the native tool schema: "
-                f"{calls[0].name!r}"
+                f"{parsed_call.name!r}"
             )
-        return calls[0]
+        return FunctionCall(
+            name=normalized_name,
+            arguments=parsed_call.arguments,
+            tool_call_id=getattr(parsed_call, "tool_call_id", None),
+        )
 
     def _render_prompt_sync(
         self,
