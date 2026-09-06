@@ -240,11 +240,13 @@ done
         self.wrapper.chmod(0o700)
         self.crash_wrapper.write_text(
             f"""import os, signal, sys
+from pathlib import Path
 sys.path.insert(0, {str(MODULE.parents[1])!r})
 from agentmemorygym_verl import fallback_supervisor as target
 
 boundary=sys.argv[1]
-arguments=sys.argv[2:]
+boundary_receipt=Path(sys.argv[2])
+arguments=sys.argv[3:]
 
 def crash():
     os.kill(os.getpid(), signal.SIGKILL)
@@ -274,6 +276,11 @@ elif boundary == 'holder_attested':
     original=target._holder_resource_attestation
     def wrapped(*args, **kwargs):
         result=original(*args, **kwargs)
+        target._atomic_json(boundary_receipt, {{
+            'schema': 'amg_fallback_sigkill_fixture_boundary_v1',
+            'boundary': boundary,
+            'holder': target._holder_lease_snapshot(args[0]),
+        }})
         crash()
         return result
     target._holder_resource_attestation=wrapped
@@ -469,12 +476,14 @@ raise SystemExit(target.main(arguments))
     def _start_crashing_supervisor(self, boundary: str) -> dict:
         self._formal_inventory_args()
         command = self._supervisor_command()
+        boundary_receipt = self.root / f"{boundary}.boundary.json"
         with self.supervisor_log.open("ab", buffering=0) as output:
             self.process = subprocess.Popen(
                 [
                     self.python,
                     str(self.crash_wrapper),
                     boundary,
+                    str(boundary_receipt),
                     *command[2:],
                 ],
                 stdin=subprocess.DEVNULL,
@@ -543,7 +552,28 @@ raise SystemExit(target.main(arguments))
             self.assertEqual(boundary, "holder_attested")
             self.assertFalse(self.pause.exists())
             self.assertFalse(self.release_request.exists())
-            self.assertIsNotNone(crashed_holder)
+            boundary_receipt = fallback._load_json(
+                self.root / f"{boundary}.boundary.json"
+            )
+            self.assertEqual(
+                boundary_receipt.get("schema"),
+                "amg_fallback_sigkill_fixture_boundary_v1",
+            )
+            self.assertEqual(boundary_receipt.get("boundary"), boundary)
+            attested_holder = boundary_receipt.get("holder")
+            self.assertIsInstance(attested_holder, dict)
+            self.assertIsInstance(attested_holder.get("parent"), dict)
+            self.assertEqual(len(attested_holder.get("gpu_workers", ())), 8)
+            self.assertEqual(len(attested_holder.get("cpu_workers", ())), 20)
+            # process_bootstrap arms PDEATHSIG and may finish draining this
+            # holder before the test reaps the SIGKILLed supervisor.  The
+            # durable boundary receipt proves attestation occurred; if a live
+            # holder is still observable, it must be that exact lease.
+            if crashed_holder is not None:
+                self.assertEqual(
+                    attested_holder,
+                    fallback._holder_lease_snapshot(crashed_holder),
+                )
 
         restored = self._start_supervisor()
         self.assertEqual(restored["mode"], "holding")
@@ -552,6 +582,12 @@ raise SystemExit(target.main(arguments))
         self.assertFalse(self.release_request.exists())
         if crashed_holder is not None:
             self.assertFalse(fallback._identity_alive(crashed_holder))
+        if boundary == "holder_attested":
+            self.assertFalse(fallback._identity_alive(attested_holder["parent"]))
+            self.assertNotEqual(
+                attested_holder,
+                fallback._holder_lease_snapshot(restored["holder"]),
+            )
         self.assertTrue(fallback._identity_alive(restored["holder"]))
         self.assertNotEqual(
             (restored["holder"]["pid"], restored["holder"]["start_ticks"]),
