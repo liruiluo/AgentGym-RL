@@ -1469,7 +1469,11 @@ else:
             require_holder_files_clear=True,
         )
         self.assertFalse(fallback._identity_alive(first_holder))
-        fallback._release_pause_marker(self.pause, token=token, expected=observation)
+        fallback._release_pause_marker(
+            self.pause,
+            token=token,
+            expected=fallback._marker_binding_view(observation),
+        )
         second = fallback._wait_supervisor_state(
             self.supervisor_state, modes={"holding"}, timeout_seconds=5
         )
@@ -1492,7 +1496,9 @@ else:
             fallback.FallbackError, "existing pause-marker quarantine"
         ):
             fallback._release_pause_marker(
-                self.pause, token=token, expected=observation
+                self.pause,
+                token=token,
+                expected=fallback._marker_binding_view(observation),
             )
 
         self.assertTrue(self.pause.is_file())
