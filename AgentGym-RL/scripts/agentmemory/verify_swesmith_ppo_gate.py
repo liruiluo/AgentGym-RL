@@ -17,6 +17,7 @@ AUDIT_SCHEMA = "agentmemory_swesmith_private_episode_audit_v1"
 NATIVE_EVENT = "native_action"
 COMPACTION_EVENT = "context_compaction"
 FILESYSTEM_CHECKPOINT_RECEIPT_SCHEMA = "agentmemory_filesystem_checkpoint_receipt_v1"
+FILESYSTEM_CHECKPOINT_RECEIPT_SCHEMA_V2 = "agentmemory_filesystem_checkpoint_receipt_v2"
 FILESYSTEM_CHECKPOINT_READ_RECEIPT_SCHEMA = (
     "agentmemory_filesystem_checkpoint_read_receipt_v1"
 )
@@ -313,7 +314,11 @@ def _valid_sha256(value: Any) -> bool:
     )
 
 
-def _successful_checkpoint_receipt(value: Any) -> dict[str, Any] | None:
+def _canonical_checkpoint_receipt(
+    value: Any,
+    *,
+    require_write: bool,
+) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     expected = {
@@ -327,14 +332,28 @@ def _successful_checkpoint_receipt(value: Any) -> dict[str, Any] | None:
         "size_bytes",
         "sha256",
     }
+    schema = value.get("schema")
+    if schema == FILESYSTEM_CHECKPOINT_RECEIPT_SCHEMA_V2:
+        expected |= {"idempotent_overwrite", "write_observed"}
+        if (
+            type(value.get("idempotent_overwrite")) is not bool
+            or type(value.get("write_observed")) is not bool
+            or value["write_observed"]
+            != bool(value.get("changed") or value["idempotent_overwrite"])
+        ):
+            return None
+        write_observed = value["write_observed"]
+    elif schema == FILESYSTEM_CHECKPOINT_RECEIPT_SCHEMA:
+        write_observed = value.get("changed") is True
+    else:
+        return None
     size = value.get("size_bytes")
     if (
         set(value) != expected
-        or value.get("schema") != FILESYSTEM_CHECKPOINT_RECEIPT_SCHEMA
         or value.get("path") != FILESYSTEM_CHECKPOINT_PATH
         or value.get("action_kind") not in {"shell_command", "apply_patch"}
         or value.get("action_completed") is not True
-        or value.get("changed") is not True
+        or (require_write and write_observed is not True)
         or value.get("exists") is not True
         or value.get("regular_file") is not True
         or isinstance(size, bool)
@@ -344,6 +363,30 @@ def _successful_checkpoint_receipt(value: Any) -> dict[str, Any] | None:
     ):
         return None
     return value
+
+
+def _successful_checkpoint_receipt(value: Any) -> dict[str, Any] | None:
+    return _canonical_checkpoint_receipt(value, require_write=True)
+
+
+def _checkpoint_receipts_share_identity(
+    wrapper: Mapping[str, Any],
+    endpoint_value: Any,
+) -> bool:
+    endpoint = _canonical_checkpoint_receipt(endpoint_value, require_write=False)
+    if endpoint is None:
+        return False
+    identity_fields = (
+        "path",
+        "action_kind",
+        "action_completed",
+        "changed",
+        "exists",
+        "regular_file",
+        "size_bytes",
+        "sha256",
+    )
+    return all(wrapper.get(key) == endpoint.get(key) for key in identity_fields)
 
 
 def _successful_checkpoint_read_receipt(value: Any) -> dict[str, Any] | None:
@@ -488,7 +531,10 @@ def verify_wrapper_transition(
         receipt_value = evidence.get("checkpoint_receipt")
         receipt = _successful_checkpoint_receipt(receipt_value)
         endpoint_receipt = record["env_info_after"].get("filesystem_checkpoint")
-        assert endpoint_receipt == receipt_value
+        if receipt is not None:
+            assert _checkpoint_receipts_share_identity(receipt, endpoint_receipt)
+        else:
+            assert endpoint_receipt == receipt_value
         persisted = evidence.get("continuation_persisted") is True
         assert persisted == (receipt is not None)
         if receipt is not None:

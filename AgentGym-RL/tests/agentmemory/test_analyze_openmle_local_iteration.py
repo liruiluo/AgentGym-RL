@@ -229,6 +229,21 @@ def _complete_document():
     }
 
 
+
+def test_accepts_v2_idempotent_checkpoint_bound_to_v1_endpoint():
+    endpoint = _checkpoint_receipt()
+    endpoint["changed"] = False
+    wrapper = {
+        **endpoint,
+        "schema": MODULE.CHECKPOINT_RECEIPT_SCHEMA_V2,
+        "idempotent_overwrite": True,
+        "write_observed": True,
+    }
+    assert MODULE._canonical_checkpoint_receipt(wrapper) == wrapper
+    assert MODULE._checkpoint_receipts_share_identity(wrapper, endpoint)
+    inconsistent = dict(wrapper, write_observed=False)
+    assert MODULE._canonical_checkpoint_receipt(inconsistent) is None
+
 def test_complete_local_iteration_memory_chain_is_detected():
     result = MODULE.analyze_documents([(1, _complete_document())])
     assert result["trajectory_count"] == 1

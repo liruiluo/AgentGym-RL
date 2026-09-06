@@ -139,6 +139,8 @@ def filesystem_checkpoint_receipt(
         "action_kind": action_kind,
         "action_completed": action_completed,
         "changed": changed,
+        "idempotent_overwrite": False,
+        "write_observed": bool(changed),
         "exists": exists,
         "regular_file": regular_file,
         "size_bytes": size_bytes,

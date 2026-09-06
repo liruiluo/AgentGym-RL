@@ -54,6 +54,30 @@ class SwesmithPpoGateRowEvidenceTests(unittest.TestCase):
             "task_round": 18,
         }
 
+    def test_accepts_v2_idempotent_checkpoint_bound_to_v1_endpoint(self) -> None:
+        module = load_module()
+        endpoint = {
+            "schema": module.FILESYSTEM_CHECKPOINT_RECEIPT_SCHEMA,
+            "path": module.FILESYSTEM_CHECKPOINT_PATH,
+            "action_kind": "shell_command",
+            "action_completed": True,
+            "changed": False,
+            "exists": True,
+            "regular_file": True,
+            "size_bytes": 128,
+            "sha256": "a" * 64,
+        }
+        wrapper = {
+            **endpoint,
+            "schema": module.FILESYSTEM_CHECKPOINT_RECEIPT_SCHEMA_V2,
+            "idempotent_overwrite": True,
+            "write_observed": True,
+        }
+        self.assertEqual(module._successful_checkpoint_receipt(wrapper), wrapper)
+        self.assertTrue(module._checkpoint_receipts_share_identity(wrapper, endpoint))
+        inconsistent = dict(wrapper, write_observed=False)
+        self.assertIsNone(module._successful_checkpoint_receipt(inconsistent))
+
     def test_accepts_exact_backend_response_cap_as_negative_row(self) -> None:
         module = load_module()
         result = module.verify_response_cap_truncation(
