@@ -760,6 +760,31 @@ class TestAMGAgentLoop(IsolatedAsyncioTestCase):
             action_submission={"tool_parser_normalized": True},
         )
 
+    async def test_parser_rejected_action_skips_native_parser_for_all_routes(self):
+        malformed = (
+            "<tool_call>\n<function= shell_command >\n"
+            "<parameter=command>\npwd\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        for route_id in ("webshop", "swesmith", "literesearcher", "openmle_fast"):
+            with self.subTest(route_id=route_id):
+                loop = self._loop([malformed], max_turns=1)
+                parser = mock.AsyncMock()
+                loop._native_tool_parser = SimpleNamespace(
+                    extract_tool_calls=parser,
+                )
+                result = await loop._validated_native_tool_call(
+                    response_ids=[100],
+                    action=malformed,
+                    tools=_MemoryChainClient().policy_tool_schemas(),
+                    action_submission={
+                        "route_id": route_id,
+                        "tool_parser_normalized": False,
+                    },
+                )
+                self.assertIsNone(result)
+                parser.assert_not_awaited()
+
     async def test_native_call_accepts_surrounding_non_think_content(self):
         call = (
             "<tool_call>\n<function=task_action>\n<parameter=value>\nx\n"
