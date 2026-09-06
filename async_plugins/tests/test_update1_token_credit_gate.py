@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import shutil
-import signal
 import tempfile
 import unittest
 from pathlib import Path
@@ -485,7 +483,7 @@ class TestUpdate1Evidence(GateFixture):
         )
         self.assertEqual(receipt["status"], "fail")
         self.assertIn("timed out", receipt["errors"][0])
-        self.assertEqual(receipt["termination"]["status"], "suppressed-by-dry-run")
+        self.assertEqual(receipt["termination"]["status"], "not-owned-by-observer")
         self.assertEqual(calls, [])
 
     def test_publication_and_zero_failure_counters_fail(self):
@@ -630,7 +628,7 @@ class TestOwnerAuthentication(GateFixture):
                     )
 
 
-class TestStopAndReceiptSemantics(GateFixture):
+class TestObserverAndReceiptSemantics(GateFixture):
     def test_pass_atomically_replaces_receipt_without_signalling_or_mutating_inputs(
         self,
     ):
@@ -655,11 +653,23 @@ class TestStopAndReceiptSemantics(GateFixture):
 
         self.assertEqual(receipt["decision"], "PASS_CONTINUE")
         self.assertEqual(calls, [])
+        self.assertEqual(receipt["owner"]["role"], "read-only-provenance")
+        self.assertEqual(
+            receipt["termination"],
+            {
+                "requested": False,
+                "signal": None,
+                "scope": "observer-only",
+                "status": "not-owned-by-observer",
+            },
+        )
         self.assertEqual(json.loads(self.output.read_text()), receipt)
         self.assertEqual(protected, {path: sha256(path) for path in protected})
         self.assertFalse(any(self.output.parent.glob(f".{self.output.name}.*.tmp")))
 
-    def test_authenticated_failure_signals_only_exact_identity(self):
+    def test_authenticated_failure_is_receipt_only_and_never_calls_signal_callback(
+        self,
+    ):
         mutate_metric_owner(
             self.fixture,
             "learner",
@@ -667,72 +677,25 @@ class TestStopAndReceiptSemantics(GateFixture):
         )
         calls = []
 
-        def stop(identity, signum):
-            calls.append((dict(identity), signum))
-            shutil.rmtree(self.proc_root / str(self.pid))
-            return True
-
-        with mock.patch.object(
-            gate_module,
-            "_pidfd_open_exact",
-            side_effect=lambda pid: os.open(os.devnull, os.O_RDONLY),
-        ):
-            receipt = self.run_gate(dry_run=False, signal_owner=stop)
+        receipt = self.run_gate(
+            dry_run=False,
+            signal_owner=lambda *args: calls.append(args) or True,
+        )
 
         self.assertEqual(receipt["status"], "fail")
+        self.assertEqual(receipt["decision"], "FAIL_NO_UNSAFE_STOP")
+        self.assertEqual(calls, [])
+        self.assertEqual(receipt["owner"]["role"], "read-only-provenance")
         self.assertEqual(
-            calls,
-            [
-                (
-                    {
-                        "pid": self.pid,
-                        "start_ticks": self.start_ticks,
-                        "pgrp": self.pid,
-                        "session": self.pid,
-                    },
-                    signal.SIGTERM,
-                )
-            ],
+            receipt["termination"],
+            {
+                "requested": False,
+                "signal": None,
+                "scope": "observer-only",
+                "status": "not-owned-by-observer",
+            },
         )
-        self.assertEqual(receipt["termination"]["status"], "confirmed-stopped")
-        self.assertEqual(receipt["termination"]["scope"], "exact-owner-identity")
-
-    def test_default_stop_uses_the_anchored_pidfd_after_reauthentication(self):
-        mutate_metric_owner(
-            self.fixture,
-            "learner",
-            lambda data: data.update({"actor/grad_norm": 0.0}),
-        )
-        descriptors = []
-        sends = []
-
-        def open_pidfd(pid):
-            self.assertEqual(pid, self.pid)
-            descriptor = os.open(os.devnull, os.O_RDONLY)
-            descriptors.append(descriptor)
-            return descriptor
-
-        def send_pidfd(descriptor, signum, *, pid):
-            sends.append((descriptor, signum, pid))
-            shutil.rmtree(self.proc_root / str(self.pid))
-
-        with (
-            mock.patch.object(
-                gate_module, "_pidfd_open_exact", side_effect=open_pidfd
-            ) as opener,
-            mock.patch.object(
-                gate_module,
-                "_pidfd_send_signal_exact",
-                side_effect=send_pidfd,
-            ) as sender,
-        ):
-            receipt = self.run_gate(dry_run=False)
-
-        opener.assert_called_once_with(self.pid)
-        sender.assert_called_once()
-        self.assertEqual(sends, [(descriptors[0], signal.SIGTERM, self.pid)])
-        self.assertEqual(receipt["decision"], "FAIL_STOP")
-        self.assertEqual(receipt["termination"]["status"], "confirmed-stopped")
+        self.assertTrue((self.proc_root / str(self.pid)).is_dir())
 
     def test_dry_run_failure_never_signals(self):
         mutate_metric_owner(
@@ -747,9 +710,9 @@ class TestStopAndReceiptSemantics(GateFixture):
         )
         self.assertEqual(receipt["status"], "fail")
         self.assertEqual(calls, [])
-        self.assertEqual(receipt["termination"]["status"], "suppressed-by-dry-run")
+        self.assertEqual(receipt["termination"]["status"], "not-owned-by-observer")
 
-    def test_owner_receipt_drift_withholds_signal(self):
+    def test_failure_does_not_reauthenticate_for_process_control(self):
         mutate_metric_owner(
             self.fixture,
             "learner",
@@ -758,28 +721,24 @@ class TestStopAndReceiptSemantics(GateFixture):
         first = authenticate_owner(
             self.owner_path, self.run_dir, self.run_id, proc_root=self.proc_root
         )
-        second = json.loads(json.dumps(first))
-        second["binding"]["inode"] += 1
         calls = []
         with mock.patch(
             "agentmemorygym_verl.update1_token_credit_gate.authenticate_owner",
-            side_effect=[first, second],
-        ):
+            return_value=first,
+        ) as authentication:
             receipt = self.run_gate(
                 dry_run=False,
                 signal_owner=lambda identity, signum: calls.append((identity, signum)),
             )
         self.assertEqual(receipt["status"], "fail")
+        authentication.assert_called_once()
         self.assertEqual(calls, [])
         self.assertEqual(
             receipt["termination"]["status"],
-            "unsafe-to-stop-owner-not-authenticated",
+            "not-owned-by-observer",
         )
-        self.assertIn("drifted before stop", receipt["errors"][0])
 
-    def test_pidfd_anchor_precedes_full_reauthentication_and_drift_withholds_signal(
-        self,
-    ):
+    def test_post_auth_command_environment_drift_cannot_trigger_process_control(self):
         mutate_metric_owner(
             self.fixture,
             "learner",
@@ -788,14 +747,12 @@ class TestStopAndReceiptSemantics(GateFixture):
         real_authenticate = gate_module.authenticate_owner
         authentication_calls = 0
         signals = []
-        events = []
 
         def authenticate_then_drift(*args, **kwargs):
             nonlocal authentication_calls
             authentication_calls += 1
-            events.append(f"authenticate-{authentication_calls}")
             lease = real_authenticate(*args, **kwargs)
-            if authentication_calls == 2:
+            if authentication_calls == 1:
                 payload = json.loads(self.owner_path.read_text(encoding="utf-8"))
                 payload["immutable_contract"]["holder_lease_sha256"] = "b" * 64
                 self.owner_path.write_text(
@@ -816,19 +773,10 @@ class TestStopAndReceiptSemantics(GateFixture):
                 )
             return lease
 
-        with (
-            mock.patch.object(
-                gate_module,
-                "authenticate_owner",
-                side_effect=authenticate_then_drift,
-            ),
-            mock.patch.object(
-                gate_module,
-                "_pidfd_open_exact",
-                side_effect=lambda pid: (
-                    events.append("pidfd-open") or os.open(os.devnull, os.O_RDONLY)
-                ),
-            ),
+        with mock.patch.object(
+            gate_module,
+            "authenticate_owner",
+            side_effect=authenticate_then_drift,
         ):
             receipt = self.run_gate(
                 dry_run=False,
@@ -839,11 +787,10 @@ class TestStopAndReceiptSemantics(GateFixture):
 
         self.assertEqual(signals, [])
         self.assertEqual(receipt["decision"], "FAIL_NO_UNSAFE_STOP")
-        self.assertIn("pidfd-open", events)
-        self.assertGreaterEqual(authentication_calls, 3)
-        self.assertLess(events.index("pidfd-open"), events.index("authenticate-3"))
+        self.assertEqual(authentication_calls, 1)
+        self.assertEqual(receipt["termination"]["status"], "not-owned-by-observer")
 
-    def test_pidfd_anchor_missing_receipt_withholds_signal(self):
+    def test_post_auth_receipt_disappearance_cannot_trigger_process_control(self):
         mutate_metric_owner(
             self.fixture,
             "learner",
@@ -857,21 +804,14 @@ class TestStopAndReceiptSemantics(GateFixture):
             nonlocal authentication_calls
             authentication_calls += 1
             lease = real_authenticate(*args, **kwargs)
-            if authentication_calls == 2:
+            if authentication_calls == 1:
                 self.owner_path.unlink()
             return lease
 
-        with (
-            mock.patch.object(
-                gate_module,
-                "authenticate_owner",
-                side_effect=authenticate_then_remove_receipt,
-            ),
-            mock.patch.object(
-                gate_module,
-                "_pidfd_open_exact",
-                side_effect=lambda pid: os.open(os.devnull, os.O_RDONLY),
-            ),
+        with mock.patch.object(
+            gate_module,
+            "authenticate_owner",
+            side_effect=authenticate_then_remove_receipt,
         ):
             receipt = self.run_gate(
                 dry_run=False,
@@ -880,15 +820,15 @@ class TestStopAndReceiptSemantics(GateFixture):
                 ),
             )
 
-        self.assertGreaterEqual(authentication_calls, 3)
+        self.assertEqual(authentication_calls, 1)
         self.assertEqual(signals, [])
         self.assertEqual(receipt["decision"], "FAIL_NO_UNSAFE_STOP")
         self.assertEqual(
             receipt["termination"]["status"],
-            "owner-authentication-changed-before-signal",
+            "not-owned-by-observer",
         )
 
-    def test_owner_receipt_disappearing_before_final_pass_withholds_signal(self):
+    def test_owner_receipt_disappearing_after_final_audit_withholds_pass(self):
         real_audit = gate_module.audit_update1
         audit_calls = 0
         signals = []
@@ -897,7 +837,7 @@ class TestStopAndReceiptSemantics(GateFixture):
             nonlocal audit_calls
             evidence = real_audit(*args, **kwargs)
             audit_calls += 1
-            if audit_calls == 1:
+            if audit_calls == 2:
                 self.owner_path.unlink()
             return evidence
 
@@ -913,14 +853,14 @@ class TestStopAndReceiptSemantics(GateFixture):
                 ),
             )
 
-        self.assertEqual(audit_calls, 1)
+        self.assertEqual(audit_calls, 2)
         self.assertEqual(signals, [])
         self.assertEqual(receipt["decision"], "FAIL_NO_UNSAFE_STOP")
         self.assertEqual(
             receipt["termination"]["status"],
-            "unsafe-to-stop-owner-not-authenticated",
+            "not-owned-by-observer",
         )
-        self.assertIn("exact stop withheld", receipt["errors"][0])
+        self.assertIn("not published", receipt["errors"][0])
 
     def test_pass_reaudits_and_rejects_postaudit_immutable_config_drift(self):
         real_audit = gate_module.audit_update1
@@ -985,6 +925,76 @@ class TestStopAndReceiptSemantics(GateFixture):
         self.assertEqual(receipt["status"], "fail")
         self.assertNotEqual(receipt["decision"], "PASS_CONTINUE")
         self.assertIn("bounded snapshot drifted", receipt["errors"][0])
+
+    def test_pass_parent_swap_after_descriptor_anchor_cannot_redirect_receipt(self):
+        outside = self.root / "outside-pass"
+        detached = self.run_dir / "gates-detached-pass"
+        outside.mkdir()
+        real_assert = gate_module._assert_publication_anchor
+        anchor_checks = 0
+
+        def assert_then_swap(directory, run_descriptor, gate_descriptor):
+            nonlocal anchor_checks
+            real_assert(directory, run_descriptor, gate_descriptor)
+            anchor_checks += 1
+            if anchor_checks == 2:
+                self.output.parent.rename(detached)
+                self.output.parent.symlink_to(outside, target_is_directory=True)
+
+        with mock.patch.object(
+            gate_module,
+            "_assert_publication_anchor",
+            side_effect=assert_then_swap,
+        ):
+            with self.assertRaisesRegex(
+                GateFailure, "gate output directory changed during publication"
+            ):
+                self.run_gate(dry_run=False)
+
+        self.assertEqual(anchor_checks, 2)
+        self.assertFalse((outside / self.output.name).exists())
+        self.assertFalse((detached / self.output.name).exists())
+        self.assertFalse(any(detached.glob(f".{self.output.name}.*.tmp")))
+
+    def test_fail_parent_swap_after_descriptor_anchor_cannot_redirect_receipt(self):
+        mutate_metric_owner(
+            self.fixture,
+            "learner",
+            lambda data: data.update({"actor/grad_norm": 0.0}),
+        )
+        outside = self.root / "outside-fail"
+        detached = self.run_dir / "gates-detached-fail"
+        outside.mkdir()
+        real_assert = gate_module._assert_publication_anchor
+        anchor_checks = 0
+        signals = []
+
+        def assert_then_swap(directory, run_descriptor, gate_descriptor):
+            nonlocal anchor_checks
+            real_assert(directory, run_descriptor, gate_descriptor)
+            anchor_checks += 1
+            if anchor_checks == 2:
+                self.output.parent.rename(detached)
+                self.output.parent.symlink_to(outside, target_is_directory=True)
+
+        with mock.patch.object(
+            gate_module,
+            "_assert_publication_anchor",
+            side_effect=assert_then_swap,
+        ):
+            with self.assertRaisesRegex(
+                GateFailure, "gate output directory changed during publication"
+            ):
+                self.run_gate(
+                    dry_run=False,
+                    signal_owner=lambda *args: signals.append(args) or True,
+                )
+
+        self.assertEqual(anchor_checks, 2)
+        self.assertEqual(signals, [])
+        self.assertFalse((outside / self.output.name).exists())
+        self.assertFalse((detached / self.output.name).exists())
+        self.assertFalse(any(detached.glob(f".{self.output.name}.*.tmp")))
 
     def test_output_is_fixed_and_missing_launch_never_overwrites_an_input(self):
         alternate = self.run_dir / "gates" / "alternate.json"
@@ -1074,6 +1084,10 @@ class TestStopAndReceiptSemantics(GateFixture):
         self.assertNotIn("pk" + "ill", source)
         self.assertNotIn("kill" + "pg", source)
         self.assertNotIn("os." + "kill", source)
+        self.assertNotIn("_pidfd", source)
+        self.assertNotIn("SIG" + "TERM", source)
+        self.assertNotIn("signal_owner(", source)
+        self.assertNotIn('"FAIL_' + 'STOP"', source)
 
 
 if __name__ == "__main__":
