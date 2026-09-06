@@ -67,6 +67,90 @@ class TestMarkerTransactions(unittest.TestCase):
             expected_command=tuple(str(value) for value in payload["command"]),
         )
 
+    def test_bound_payload_remains_live_drain_authority_after_path_scan(self) -> None:
+        binding = {
+            "path": "/fixture/trainer-process-identity.json",
+            "payload": {
+                "name": "trainer",
+                "pid": 101,
+                "start_ticks": "202",
+                "process_group": 101,
+                "bootstrap": "/fixture/bootstrap.py",
+                "command": ["fixture"],
+            },
+        }
+        member = {"pid": 101, "start_ticks": "202", "state": "S"}
+        with (
+            mock.patch.object(
+                lifecycle,
+                "_validate_drain_identity_root",
+                return_value=Path("/fixture"),
+            ),
+            mock.patch.object(
+                lifecycle,
+                "_marker_drain_exclusion_paths",
+                return_value=(),
+            ),
+            mock.patch.object(
+                lifecycle,
+                "_marker_drain_identity_bindings",
+                return_value=(binding,),
+            ),
+            mock.patch.object(
+                lifecycle,
+                "process_identity_alive",
+                return_value=True,
+            ),
+            mock.patch.object(
+                lifecycle,
+                "_process_group_members",
+                return_value=(member,),
+            ),
+            mock.patch.object(
+                lifecycle,
+                "_alive_published_process_identities",
+                return_value=(),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                lifecycle.LifecycleError,
+                "published child identities are still alive",
+            ):
+                lifecycle._assert_marker_process_drain(
+                    {"drain_identity_root": "/fixture"}
+                )
+
+    def test_identity_binding_reads_payload_and_digest_from_one_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "trainer-process-identity.json"
+            payload = {
+                "name": "trainer",
+                "pid": 101,
+                "start_ticks": "202",
+                "process_group": 101,
+                "bootstrap": "/fixture/bootstrap.py",
+                "command": ["fixture"],
+            }
+            lifecycle._atomic_write_json(path, payload)
+            with (
+                mock.patch.object(
+                    lifecycle,
+                    "_load_json",
+                    side_effect=AssertionError("separate JSON path read"),
+                ),
+                mock.patch.object(
+                    lifecycle,
+                    "_sha256",
+                    side_effect=AssertionError("separate digest path read"),
+                ),
+            ):
+                binding = lifecycle._identity_file_binding(path)
+            self.assertEqual(binding["payload"], payload)
+            self.assertEqual(
+                binding["sha256"],
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+            )
+
     def test_partial_acquisition_rolls_back_first_marker(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -1286,6 +1370,130 @@ class TestMarkerTransactions(unittest.TestCase):
                 )
             finally:
                 for process in (parent, child):
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+
+    @unittest.skipUnless(Path("/proc/self/stat").is_file(), "requires Linux /proc")
+    def test_live_bound_identity_unlinked_after_validation_blocks_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            run_root = root / "run"
+            run_root.mkdir()
+            cpu = root / "cpu"
+            gpu = root / "gpu"
+            state = root / "state.json"
+            lock = root / "lock"
+            parent = subprocess.Popen(["sleep", "60"])
+            child = subprocess.Popen(["sleep", "60"], start_new_session=True)
+            identity_path = run_root / "trainer-process-identity.json"
+            try:
+                parent_ticks = lifecycle.process_start_ticks(parent.pid)
+                self.assertIsNotNone(parent_ticks)
+                payload = self._write_process_identity(identity_path, child)
+                lifecycle.prepare_marker_transaction(
+                    state_path=state,
+                    lock_path=lock,
+                    run_id="post-validation-unlink",
+                    parent_pid=parent.pid,
+                    parent_start_ticks=str(parent_ticks),
+                    markers=(
+                        lifecycle._marker_record("cpu", cpu, None, 0, ""),
+                        lifecycle._marker_record("gpu", gpu, None, 0, ""),
+                    ),
+                    drain_identity_root=run_root,
+                )
+                lifecycle.acquire_marker_transaction(state, lock)
+                self._bind_process_identity(state, lock, identity_path, payload)
+                original = lifecycle._marker_drain_identity_bindings
+
+                def validate_then_unlink(*args, **kwargs):
+                    bindings = original(*args, **kwargs)
+                    identity_path.unlink()
+                    return bindings
+
+                with mock.patch.object(
+                    lifecycle,
+                    "_marker_drain_identity_bindings",
+                    side_effect=validate_then_unlink,
+                ):
+                    with self.assertRaisesRegex(
+                        lifecycle.LifecycleError,
+                        "published child identities are still alive",
+                    ):
+                        lifecycle.restore_marker_transaction(state, lock)
+                self.assertIsNone(child.poll())
+                self.assertEqual(cpu.read_text().strip(), "post-validation-unlink")
+                self.assertEqual(gpu.read_text().strip(), "post-validation-unlink")
+            finally:
+                for process in (parent, child):
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+
+    @unittest.skipUnless(Path("/proc/self/stat").is_file(), "requires Linux /proc")
+    def test_live_bound_identity_replaced_after_validation_blocks_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            run_root = root / "run"
+            run_root.mkdir()
+            cpu = root / "cpu"
+            gpu = root / "gpu"
+            state = root / "state.json"
+            lock = root / "lock"
+            parent = subprocess.Popen(["sleep", "60"])
+            child = subprocess.Popen(["sleep", "60"], start_new_session=True)
+            replacement = subprocess.Popen(["sleep", "60"], start_new_session=True)
+            identity_path = run_root / "trainer-process-identity.json"
+            try:
+                parent_ticks = lifecycle.process_start_ticks(parent.pid)
+                self.assertIsNotNone(parent_ticks)
+                payload = self._write_process_identity(identity_path, child)
+                replacement_payload = self._write_process_identity(
+                    root / "replacement.json", replacement
+                )
+                replacement.terminate()
+                replacement.wait(timeout=5)
+                lifecycle.prepare_marker_transaction(
+                    state_path=state,
+                    lock_path=lock,
+                    run_id="post-validation-replacement",
+                    parent_pid=parent.pid,
+                    parent_start_ticks=str(parent_ticks),
+                    markers=(
+                        lifecycle._marker_record("cpu", cpu, None, 0, ""),
+                        lifecycle._marker_record("gpu", gpu, None, 0, ""),
+                    ),
+                    drain_identity_root=run_root,
+                )
+                lifecycle.acquire_marker_transaction(state, lock)
+                self._bind_process_identity(state, lock, identity_path, payload)
+                original = lifecycle._marker_drain_identity_bindings
+
+                def validate_then_replace(*args, **kwargs):
+                    bindings = original(*args, **kwargs)
+                    lifecycle._atomic_write_json(identity_path, replacement_payload)
+                    return bindings
+
+                with mock.patch.object(
+                    lifecycle,
+                    "_marker_drain_identity_bindings",
+                    side_effect=validate_then_replace,
+                ):
+                    with self.assertRaisesRegex(
+                        lifecycle.LifecycleError,
+                        "published child identities are still alive",
+                    ):
+                        lifecycle.restore_marker_transaction(state, lock)
+                self.assertIsNone(child.poll())
+                self.assertEqual(
+                    cpu.read_text().strip(), "post-validation-replacement"
+                )
+                self.assertEqual(
+                    gpu.read_text().strip(), "post-validation-replacement"
+                )
+            finally:
+                for process in (parent, child, replacement):
                     if process.poll() is None:
                         process.kill()
                         process.wait()

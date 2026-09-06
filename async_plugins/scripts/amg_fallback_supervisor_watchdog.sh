@@ -5,7 +5,11 @@ set -euo pipefail
 # wrapper execs the crash-safe Python supervisor so the platform entrance,
 # rather than an unowned nohup process, remains the top-level watchdog.
 
-PYTHON="${PYTHON:-/dev/shm/qwen35-runtime-verl-main-sglang-fsdp-tf553-fla052-v2/bin/python3.12}"
+# This interpreter bootstraps the allocation-level fallback holder, so it must
+# survive reconstruction of the training runtime under /dev/shm.  Keep its
+# override separate from the training launcher's PYTHON variable: the latter
+# is intentionally allowed to point at the volatile, source-locked runtime.
+PYTHON="${FALLBACK_SUPERVISOR_PYTHON:-/opt/conda/envs/py312/bin/python3}"
 MODULE="${FALLBACK_SUPERVISOR_MODULE:-/export/App/training_platform/PinoModel/amg_fallback_supervisor_sao_v1.py}"
 BOOTSTRAP="${FALLBACK_PROCESS_BOOTSTRAP:-/export/App/training_platform/PinoModel/amg_process_bootstrap_sao_v1.py}"
 ORIGINAL="${FALLBACK_WATCHDOG_ORIGINAL:-/export/App/training_platform/PinoModel/non_yield_holder_watchdog.sh.original.8bb8a33b6c73e64f18dd53cf0307fd59f8049c4dc07d566c396a94d998819b0d}"

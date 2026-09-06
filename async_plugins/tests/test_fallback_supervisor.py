@@ -22,6 +22,157 @@ BOOTSTRAP = MODULE.with_name("process_bootstrap.py")
 WATCHDOG_WRAPPER = MODULE.parents[1] / "scripts/amg_fallback_supervisor_watchdog.sh"
 
 
+def _supports_exact_crash_recovery_fixture() -> bool:
+    if not Path("/proc/self/stat").is_file():
+        return False
+    try:
+        descriptor = fallback._pidfd_open_exact(os.getpid())
+    except fallback.FallbackError:
+        return False
+    else:
+        os.close(descriptor)
+    return getattr(fallback.ctypes.CDLL(None), "renameat2", None) is not None
+
+
+class TestFallbackWrapperSource(unittest.TestCase):
+    def test_production_default_uses_restart_stable_interpreter(self) -> None:
+        source = WATCHDOG_WRAPPER.read_text(encoding="utf-8")
+        self.assertIn(
+            'FALLBACK_SUPERVISOR_PYTHON:-/opt/conda/envs/py312/bin/python3',
+            source,
+        )
+        self.assertNotIn(
+            'PYTHON:-/dev/shm/qwen35-runtime-verl-main-sglang-fsdp-tf553-fla052-v2',
+            source,
+        )
+
+
+class TestPendingResumeReleaseTransaction(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.pause = self.root / "pause.json"
+        self.request = self.root / "release.json"
+        self.token = "crash-boundary"
+        marker = fallback._create_pause_marker(
+            self.pause,
+            {"schema": fallback._PAUSE_SCHEMA, "token": self.token},
+        )
+        request_binding = fallback._create_release_request(
+            self.request,
+            {"schema": fallback._RELEASE_REQUEST_SCHEMA, "token": self.token},
+        )
+        self.pending = {
+            "schema": fallback._PENDING_RESUME_SCHEMA,
+            "token": self.token,
+            "marker_binding": fallback._marker_binding_view(marker),
+            "request_binding": request_binding,
+        }
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _complete_with_portable_file_ops(self) -> None:
+        def release(path: Path, *, token: str, expected: dict) -> bool:
+            observed = fallback._marker_observation(path)
+            self.assertEqual(token, self.token)
+            self.assertEqual(
+                fallback._marker_binding_view(observed),
+                expected,
+            )
+            path.unlink()
+            return True
+
+        def consume(path: Path, expected: dict, *, token: str) -> None:
+            payload, observed = fallback._bound_json_file(path)
+            self.assertEqual(token, self.token)
+            self.assertEqual(payload["token"], self.token)
+            self.assertEqual(observed, expected)
+            path.unlink()
+
+        with (
+            mock.patch.object(fallback, "_release_pause_marker", side_effect=release),
+            mock.patch.object(fallback, "_remove_bound_json", side_effect=consume),
+        ):
+            fallback._complete_pending_resume_release(
+                pause_path=self.pause,
+                release_request_path=self.request,
+                pending_resume=self.pending,
+            )
+
+    def test_crash_after_authorization_persisted_finishes_both_artifacts(self) -> None:
+        self._complete_with_portable_file_ops()
+        self.assertFalse(self.pause.exists())
+        self.assertFalse(self.request.exists())
+
+    def test_crash_after_marker_removed_consumes_bound_request(self) -> None:
+        self.pause.unlink()
+        self._complete_with_portable_file_ops()
+        self.assertFalse(self.request.exists())
+
+    def test_crash_after_request_consumed_is_idempotent(self) -> None:
+        self.pause.unlink()
+        self.request.unlink()
+        self._complete_with_portable_file_ops()
+        fallback._assert_pending_resume_publishable(
+            pause_path=self.pause,
+            release_request_path=self.request,
+            pending_resume=self.pending,
+        )
+
+    def test_crash_after_marker_quarantine_rename_finishes_release(self) -> None:
+        quarantine = fallback._pause_marker_quarantine(self.pause, self.token)
+        self.pause.rename(quarantine)
+        self._complete_with_portable_file_ops()
+        self.assertFalse(quarantine.exists())
+        self.assertFalse(self.request.exists())
+
+    def test_crash_after_request_quarantine_rename_finishes_consumption(self) -> None:
+        self.pause.unlink()
+        quarantine = fallback._release_request_quarantine(
+            self.request, self.token
+        )
+        self.request.rename(quarantine)
+        self._complete_with_portable_file_ops()
+        self.assertFalse(quarantine.exists())
+
+    def test_foreign_quarantine_cannot_be_completed(self) -> None:
+        self.pause.unlink()
+        quarantine = fallback._release_request_quarantine(
+            self.request, self.token
+        )
+        self.request.rename(quarantine)
+        quarantine.write_text(
+            json.dumps(
+                {
+                    "schema": fallback._RELEASE_REQUEST_SCHEMA,
+                    "token": self.token,
+                    "foreign": True,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(
+            fallback.FallbackError,
+            "foreign/replaced release-request quarantine",
+        ):
+            self._complete_with_portable_file_ops()
+        self.assertTrue(quarantine.is_file())
+
+    def test_holder_attestation_cannot_publish_holding_with_stale_request(self) -> None:
+        self.pause.unlink()
+        with self.assertRaisesRegex(
+            fallback.FallbackError,
+            "release transaction is not complete",
+        ):
+            fallback._assert_pending_resume_publishable(
+                pause_path=self.pause,
+                release_request_path=self.request,
+                pending_resume=self.pending,
+            )
+
+
 @unittest.skipUnless(Path("/proc/self/stat").is_file(), "requires Linux /proc")
 class TestFallbackSupervisor(unittest.TestCase):
     def setUp(self) -> None:
@@ -44,6 +195,7 @@ class TestFallbackSupervisor(unittest.TestCase):
         self.transaction_lock = self.root / "transaction.lock"
         self.watchdog_log = self.root / "watchdog.log"
         self.supervisor_log = self.root / "supervisor.log"
+        self.crash_wrapper = self.root / "crash_supervisor_at_boundary.py"
         self.auxiliary_processes: list[subprocess.Popen[bytes]] = []
         self.formal_inventory_args: list[str] | None = None
         self.holder.write_text(
@@ -86,6 +238,52 @@ done
         self.original.chmod(0o700)
         self.wrapper.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
         self.wrapper.chmod(0o700)
+        self.crash_wrapper.write_text(
+            f"""import os, signal, sys
+sys.path.insert(0, {str(MODULE.parents[1])!r})
+from agentmemorygym_verl import fallback_supervisor as target
+
+boundary=sys.argv[1]
+arguments=sys.argv[2:]
+
+def crash():
+    os.kill(os.getpid(), signal.SIGKILL)
+
+if boundary == 'authorization_persisted':
+    original=target._atomic_json
+    def wrapped(path, payload):
+        original(path, payload)
+        if payload.get('mode') == 'resume_authorized':
+            crash()
+    target._atomic_json=wrapped
+elif boundary == 'marker_removed':
+    original=target._release_pause_marker
+    def wrapped(*args, **kwargs):
+        result=original(*args, **kwargs)
+        crash()
+        return result
+    target._release_pause_marker=wrapped
+elif boundary == 'request_consumed':
+    original=target._remove_bound_json
+    def wrapped(*args, **kwargs):
+        result=original(*args, **kwargs)
+        crash()
+        return result
+    target._remove_bound_json=wrapped
+elif boundary == 'holder_attested':
+    original=target._holder_resource_attestation
+    def wrapped(*args, **kwargs):
+        result=original(*args, **kwargs)
+        crash()
+        return result
+    target._holder_resource_attestation=wrapped
+else:
+    raise SystemExit(f'unknown crash boundary: {{boundary}}')
+
+raise SystemExit(target.main(arguments))
+""",
+            encoding="utf-8",
+        )
         self.process: subprocess.Popen[bytes] | None = None
 
     def tearDown(self) -> None:
@@ -111,18 +309,23 @@ done
         return hashlib.sha256(path.read_bytes()).hexdigest()
 
     def _supervisor_command(self) -> list[str]:
-        inventory = {
-            "--nvidia-smi": "/usr/bin/nvidia-smi",
-            "--nvidia-smi-sha256": self._digest(Path("/usr/bin/nvidia-smi")),
-            "--auto-gpu-holder-state": str(
-                self.root / "auto-gpu-holder.state"
-            ),
-            "--auto-gpu-holder-command-fragment": "test_auto_gpu_holder.py",
-            "--auto-cpu-holder-state": str(self.root / "auto-cpu-holder.json"),
-            "--auto-cpu-holder-command-fragment": "test_auto_cpu_holder.py",
-        }
-        if self.formal_inventory_args is not None:
-            inventory.update(
+        if self.formal_inventory_args is None:
+            inventory = {
+                "--nvidia-smi": "/usr/bin/nvidia-smi",
+                "--nvidia-smi-sha256": self._digest(
+                    Path("/usr/bin/nvidia-smi")
+                ),
+                "--auto-gpu-holder-state": str(
+                    self.root / "auto-gpu-holder.state"
+                ),
+                "--auto-gpu-holder-command-fragment": "test_auto_gpu_holder.py",
+                "--auto-cpu-holder-state": str(
+                    self.root / "auto-cpu-holder.json"
+                ),
+                "--auto-cpu-holder-command-fragment": "test_auto_cpu_holder.py",
+            }
+        else:
+            inventory = dict(
                 zip(
                     self.formal_inventory_args[0::2],
                     self.formal_inventory_args[1::2],
@@ -196,9 +399,10 @@ done
         ]
 
     def _wrapper_environment(self) -> dict[str, str]:
-        return {
-            **os.environ,
-            "PYTHON": self.python,
+        environment = dict(os.environ)
+        environment.pop("PYTHON", None)
+        environment.update({
+            "FALLBACK_SUPERVISOR_PYTHON": self.python,
             "FALLBACK_SUPERVISOR_MODULE": str(MODULE),
             "FALLBACK_PROCESS_BOOTSTRAP": str(BOOTSTRAP),
             "FALLBACK_WATCHDOG_ORIGINAL": str(self.original),
@@ -233,7 +437,8 @@ done
                 self.root / "auto-cpu-holder.json"
             ),
             "FALLBACK_AUTO_CPU_HOLDER_COMMAND_FRAGMENT": "test_auto_cpu_holder.py",
-        }
+        })
+        return environment
 
     def _start_platform_wrapper(self) -> subprocess.Popen[bytes]:
         with self.supervisor_log.open("ab", buffering=0) as output:
@@ -259,6 +464,98 @@ done
             )
         return fallback._wait_supervisor_state(
             self.supervisor_state, modes={"holding"}, timeout_seconds=5
+        )
+
+    def _start_crashing_supervisor(self, boundary: str) -> dict:
+        self._formal_inventory_args()
+        command = self._supervisor_command()
+        with self.supervisor_log.open("ab", buffering=0) as output:
+            self.process = subprocess.Popen(
+                [
+                    self.python,
+                    str(self.crash_wrapper),
+                    boundary,
+                    *command[2:],
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        return fallback._wait_supervisor_state(
+            self.supervisor_state,
+            modes={"holding"},
+            timeout_seconds=10,
+            require_live_holder=True,
+        )
+
+    def _assert_actual_sigkill_resume_recovers(self, *, boundary: str) -> None:
+        first = self._start_crashing_supervisor(boundary)
+        first_holder = dict(first["holder"])
+        owner = fallback._capture_identity(os.getpid())
+        token = f"actual-sigkill-{boundary}"
+        marker = fallback._create_pause_marker(
+            self.pause,
+            self._marker_payload(token, owner),
+        )
+        paused = fallback._wait_supervisor_state(
+            self.supervisor_state,
+            modes={"paused"},
+            timeout_seconds=10,
+            pause_token=token,
+            require_holder_files_clear=True,
+            expected_contract=first["immutable_contract"],
+        )
+        fallback._publish_release_request(
+            self.release_request,
+            marker=marker,
+            paused_state=paused,
+            owner=owner,
+            expected_contract=first["immutable_contract"],
+            mode="test_owner_release",
+        )
+        assert self.process is not None
+        self.process.wait(timeout=20)
+        self.assertEqual(self.process.returncode, -signal.SIGKILL)
+        self.process = None
+        crashed = json.loads(self.supervisor_state.read_text(encoding="utf-8"))
+        self.assertIsNotNone(crashed["pending_resume"])
+        self.assertFalse(fallback._identity_alive(first_holder))
+        crashed_holder = fallback._holder_identity(
+            self.pid_file,
+            self.holder_state,
+            watchdog_identity=crashed.get("watchdog"),
+            holder_path=self.holder,
+        )
+        if boundary == "authorization_persisted":
+            self.assertTrue(self.pause.is_file())
+            self.assertTrue(self.release_request.is_file())
+            self.assertIsNone(crashed_holder)
+        elif boundary == "marker_removed":
+            self.assertFalse(self.pause.exists())
+            self.assertTrue(self.release_request.is_file())
+            self.assertIsNone(crashed_holder)
+        elif boundary == "request_consumed":
+            self.assertFalse(self.pause.exists())
+            self.assertFalse(self.release_request.exists())
+            self.assertIsNone(crashed_holder)
+        else:
+            self.assertEqual(boundary, "holder_attested")
+            self.assertFalse(self.pause.exists())
+            self.assertFalse(self.release_request.exists())
+            self.assertIsNotNone(crashed_holder)
+
+        restored = self._start_supervisor()
+        self.assertEqual(restored["mode"], "holding")
+        self.assertIsNone(restored["pending_resume"])
+        self.assertFalse(self.pause.exists())
+        self.assertFalse(self.release_request.exists())
+        if crashed_holder is not None:
+            self.assertFalse(fallback._identity_alive(crashed_holder))
+        self.assertTrue(fallback._identity_alive(restored["holder"]))
+        self.assertNotEqual(
+            (restored["holder"]["pid"], restored["holder"]["start_ticks"]),
+            (first_holder["pid"], first_holder["start_ticks"]),
         )
 
     def _formal_inventory_args(self) -> list[str]:
@@ -969,6 +1266,26 @@ else:
             str(WATCHDOG_WRAPPER),
         )
 
+    def test_platform_wrapper_recovers_without_training_python_environment(self) -> None:
+        environment = self._wrapper_environment()
+        self.assertNotIn("PYTHON", environment)
+        with self.supervisor_log.open("ab", buffering=0) as output:
+            self.process = subprocess.Popen(
+                ["bash", str(WATCHDOG_WRAPPER)],
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                env=environment,
+            )
+        state = fallback._wait_supervisor_state(
+            self.supervisor_state,
+            modes={"holding"},
+            timeout_seconds=5,
+            require_live_holder=True,
+        )
+        self.assertEqual(state["immutable_contract"]["python"], self.python)
+
     def test_platform_restart_after_supervisor_sigkill_drains_old_holder(self) -> None:
         first_process = self._start_platform_wrapper()
         first = fallback._wait_supervisor_state(
@@ -993,6 +1310,36 @@ else:
         self.assertFalse(fallback._identity_alive(first_watchdog))
         self.assertFalse(fallback._identity_alive(first_holder))
         self.assertNotEqual(first_holder["pid"], second["holder"]["pid"])
+
+    @unittest.skipUnless(
+        _supports_exact_crash_recovery_fixture(),
+        "requires Linux pidfd and renameat2",
+    )
+    def test_sigkill_recovery_after_resume_authorization(self) -> None:
+        self._assert_actual_sigkill_resume_recovers(
+            boundary="authorization_persisted"
+        )
+
+    @unittest.skipUnless(
+        _supports_exact_crash_recovery_fixture(),
+        "requires Linux pidfd and renameat2",
+    )
+    def test_sigkill_recovery_after_marker_removal(self) -> None:
+        self._assert_actual_sigkill_resume_recovers(boundary="marker_removed")
+
+    @unittest.skipUnless(
+        _supports_exact_crash_recovery_fixture(),
+        "requires Linux pidfd and renameat2",
+    )
+    def test_sigkill_recovery_after_request_consumption(self) -> None:
+        self._assert_actual_sigkill_resume_recovers(boundary="request_consumed")
+
+    @unittest.skipUnless(
+        _supports_exact_crash_recovery_fixture(),
+        "requires Linux pidfd and renameat2",
+    )
+    def test_sigkill_recovery_after_holder_attestation(self) -> None:
+        self._assert_actual_sigkill_resume_recovers(boundary="holder_attested")
 
     def test_pause_then_resume_has_exactly_one_holder(self) -> None:
         first = self._start_supervisor()
