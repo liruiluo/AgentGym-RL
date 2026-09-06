@@ -11,10 +11,12 @@ or broad process-group/name fallback.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
 import signal
+import stat
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -26,7 +28,8 @@ from .fallback_supervisor import (
     FallbackError,
     _atomic_json,
     _bound_json_file,
-    _signal_identity,
+    _pidfd_open_exact,
+    _pidfd_send_signal_exact,
 )
 from .finalizer import (
     _MULTITASK_RECEIPT_SCHEMA,
@@ -38,14 +41,10 @@ from .finalizer import (
     _Audit,
     _finite_number,
     _finite_positive,
-    _load_json,
     _nonnegative_integral,
-    _path_overlaps_inputs,
     _path_within,
-    _receipt_protected_paths,
-    sha256_file,
 )
-from .online_monitor import _complete_jsonl_rows, _observe_run
+from .online_monitor import _observe_run
 
 _GATE_SCHEMA = "amg_update1_token_credit_gate_v1"
 _OWNER_SCHEMA = "amg_fallback_managed_process_identity_v2"
@@ -63,6 +62,22 @@ _OPTIMIZER_EXECUTION_SUFFIXES = (
     "optimizer_steps_delta",
 )
 _ZOMBIE_STATES = frozenset({"Z", "X", "x"})
+_FIXED_OUTPUT_RELATIVE_PATH = Path("gates/update1-token-credit.json")
+_MAX_BOUND_EVIDENCE_BYTES = 1 << 30
+_REQUIRED_RUNTIME_PATH_FIELDS = frozenset(
+    {
+        "file_logger",
+        "rollout_data",
+        "hydra_config",
+        "checkpoints",
+        "critic_parameter_freeze",
+        "finalization",
+    }
+)
+
+
+class _BoundFileChanged(RuntimeError):
+    """One path changed while a descriptor-bound evidence view was read."""
 
 
 class GatePending(RuntimeError):
@@ -181,8 +196,8 @@ def _proc_argv(proc_root: Path, pid: int) -> tuple[str, ...]:
         raise OwnerAuthenticationError("owner command line is not UTF-8") from error
 
 
-def _proc_environment(proc_root: Path, pid: int) -> frozenset[bytes]:
-    return frozenset(
+def _proc_environment(proc_root: Path, pid: int) -> tuple[bytes, ...]:
+    return tuple(
         part
         for part in _read_small(proc_root / str(pid) / "environ").split(b"\0")
         if part
@@ -203,6 +218,165 @@ def _binding_view(binding: Mapping[str, Any]) -> dict[str, Any]:
     return {
         key: binding[key]
         for key in ("path", "device", "inode", "ctime_ns", "size", "sha256")
+    }
+
+
+def _bound_regular_file(
+    path: Path,
+    label: str,
+    *,
+    maximum_bytes: int = _MAX_BOUND_EVIDENCE_BYTES,
+) -> tuple[bytes, dict[str, Any]]:
+    """Read one regular file and its identity through the same descriptor."""
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        raise
+    except OSError as error:
+        raise GateFailure(f"cannot open bound {label} {path}: {error}") from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise GateFailure(f"bound {label} is not a regular file: {path}")
+        if before.st_size > maximum_bytes:
+            raise GateFailure(f"bound {label} is too large: {path}")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(1 << 20, maximum_bytes + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > maximum_bytes:
+                raise GateFailure(f"bound {label} is too large: {path}")
+        raw = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if (
+            any(
+                getattr(before, field) != getattr(after, field)
+                for field in ("st_dev", "st_ino", "st_ctime_ns", "st_size")
+            )
+            or len(raw) != after.st_size
+        ):
+            raise _BoundFileChanged(f"bound {label} changed while reading: {path}")
+        try:
+            named = path.lstat()
+        except OSError as error:
+            raise _BoundFileChanged(
+                f"bound {label} disappeared while reading: {path}"
+            ) from error
+        if stat.S_ISLNK(named.st_mode) or any(
+            getattr(named, field) != getattr(after, field)
+            for field in ("st_dev", "st_ino", "st_ctime_ns", "st_size")
+        ):
+            raise _BoundFileChanged(
+                f"bound {label} path was replaced while reading: {path}"
+            )
+        return raw, {
+            "path": str(path),
+            "device": after.st_dev,
+            "inode": after.st_ino,
+            "ctime_ns": after.st_ctime_ns,
+            "size": after.st_size,
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
+    finally:
+        os.close(descriptor)
+
+
+def _bound_complete_jsonl_rows(
+    path: Path, label: str
+) -> tuple[list[Mapping[str, Any]], dict[str, Any]]:
+    try:
+        raw, binding = _bound_regular_file(path, label)
+    except FileNotFoundError as error:
+        raise GatePending(f"required {label} is not published: {path}") from error
+    except _BoundFileChanged as error:
+        raise GatePending(str(error)) from error
+    complete = raw.splitlines(keepends=True)
+    if complete and not complete[-1].endswith((b"\n", b"\r")):
+        complete.pop()
+    rows: list[Mapping[str, Any]] = []
+    for line_number, line in enumerate(complete, start=1):
+        if not line.strip():
+            raise GateFailure(f"blank row in {label} at {path}:{line_number}")
+        try:
+            row = json.loads(line)
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise GateFailure(
+                f"invalid complete row in {label} at {path}:{line_number}"
+            ) from error
+        if not isinstance(row, Mapping):
+            raise GateFailure(f"{label} row is not an object at {path}:{line_number}")
+        rows.append(row)
+    if not rows:
+        raise GatePending(f"{label} has no complete rows: {path}")
+    return rows, binding
+
+
+def _canonical_rows_sha256(rows: Sequence[Mapping[str, Any]]) -> str:
+    canonical = b"\n".join(
+        json.dumps(
+            row,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        for row in rows
+    )
+    return hashlib.sha256(canonical + b"\n").hexdigest()
+
+
+def _bounded_jsonl_snapshots(
+    rollout_path: Path, metrics_path: Path
+) -> tuple[
+    list[Mapping[str, Any]],
+    list[Mapping[str, Any]],
+    dict[str, dict[str, Any]],
+]:
+    rollout_rows, rollout_binding = _bound_complete_jsonl_rows(
+        rollout_path, "update-1 rollout JSONL"
+    )
+    metric_rows, metrics_binding = _bound_complete_jsonl_rows(
+        metrics_path, "FileLogger JSONL"
+    )
+    step1_rows = [
+        row
+        for row in metric_rows
+        if isinstance(row.get("step"), int)
+        and not isinstance(row.get("step"), bool)
+        and row.get("step") == 1
+    ]
+    snapshots = {
+        "rollout_update1": {
+            "path": str(rollout_path),
+            "selection": "all complete rows in rollout_data/1.jsonl",
+            "selected_row_count": len(rollout_rows),
+            "canonical_sha256": _canonical_rows_sha256(rollout_rows),
+            "source_observation": rollout_binding,
+        },
+        "file_logger_update1": {
+            "path": str(metrics_path),
+            "selection": "all complete FileLogger rows with integer step == 1",
+            "selected_row_count": len(step1_rows),
+            "canonical_sha256": _canonical_rows_sha256(step1_rows),
+            "source_observation": metrics_binding,
+        },
+    }
+    return rollout_rows, metric_rows, snapshots
+
+
+def _snapshot_identity(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: snapshot[key]
+        for key in ("path", "selection", "selected_row_count", "canonical_sha256")
     }
 
 
@@ -282,12 +456,16 @@ def authenticate_owner(
             "live owner command line differs from its receipt"
         )
     environment = _proc_environment(root, pid)
-    required_tags = {
-        f"AMG_MULTITASK_RUN_ID={run_id}".encode(),
-        f"AGENTMEMORY_RUN_ID={run_id}".encode(),
-    }
-    if not required_tags.issubset(environment):
-        raise OwnerAuthenticationError("live owner environment lacks exact run-id tags")
+    expected_value = run_id.encode("utf-8")
+    for key in (b"AMG_MULTITASK_RUN_ID", b"AGENTMEMORY_RUN_ID"):
+        prefix = key + b"="
+        values = [
+            entry[len(prefix) :] for entry in environment if entry.startswith(prefix)
+        ]
+        if len(values) != 1 or values[0] != expected_value:
+            raise OwnerAuthenticationError(
+                "live owner environment lacks unique exact run-id tags"
+            )
 
     return {
         "identity": {
@@ -337,15 +515,9 @@ def _load_required_bound_json(
     return payload, _binding_view(binding)
 
 
-def _rollout_episode_readiness(path: Path, expected_episodes: int) -> None:
-    if not path.exists() and not path.is_symlink():
-        raise GatePending(f"update-1 rollout is not published: {path}")
-    try:
-        rows = _complete_jsonl_rows(path, "update-1 rollout JSONL")
-    except (FileNotFoundError, ValueError) as error:
-        if "no complete rows" in str(error):
-            raise GatePending(str(error)) from error
-        raise GateFailure(str(error)) from error
+def _rollout_episode_readiness(
+    rows: Sequence[Mapping[str, Any]], expected_episodes: int
+) -> None:
     terminal_uids: set[str] = set()
     observed_uids: set[str] = set()
     for index, row in enumerate(rows):
@@ -374,15 +546,9 @@ def _rollout_episode_readiness(path: Path, expected_episodes: int) -> None:
         )
 
 
-def _step1_owner_rows(path: Path) -> tuple[Mapping[str, Any], Mapping[str, Any], int]:
-    if not path.exists() and not path.is_symlink():
-        raise GatePending(f"FileLogger JSONL is not published: {path}")
-    try:
-        rows = _complete_jsonl_rows(path, "FileLogger JSONL")
-    except (FileNotFoundError, ValueError) as error:
-        if "no complete rows" in str(error):
-            raise GatePending(str(error)) from error
-        raise GateFailure(str(error)) from error
+def _step1_owner_rows(
+    rows: Sequence[Mapping[str, Any]],
+) -> tuple[Mapping[str, Any], Mapping[str, Any], int]:
     data_rows: list[Mapping[str, Any]] = []
     for index, row in enumerate(rows):
         step = row.get("step")
@@ -437,8 +603,8 @@ def _zero_integral(value: Any, label: str) -> int:
     return parsed
 
 
-def _audit_step1_metrics(path: Path) -> dict[str, Any]:
-    learner, rollouter, row_count = _step1_owner_rows(path)
+def _audit_step1_metrics(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    learner, rollouter, row_count = _step1_owner_rows(rows)
     gradients: dict[str, float] = {}
     for role in ("actor", "critic"):
         key = f"{role}/grad_norm"
@@ -627,6 +793,113 @@ def _source_identity(launch: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _required_absolute_path(value: Any, label: str) -> Path:
+    if not isinstance(value, str) or not value:
+        raise GateFailure(f"launch omitted protected path {label}")
+    path = Path(value)
+    if not path.is_absolute():
+        raise GateFailure(f"launch protected path {label} is not absolute")
+    if path.is_symlink():
+        raise GateFailure(f"launch protected path {label} is a symlink")
+    try:
+        return path.resolve()
+    except (OSError, RuntimeError) as error:
+        raise GateFailure(
+            f"cannot resolve launch protected path {label}: {error}"
+        ) from error
+
+
+def _immutable_evidence_paths(
+    directory: Path, launch: Mapping[str, Any]
+) -> dict[str, Path]:
+    return {
+        "launch_receipt": directory / "launch-receipt.json",
+        "resolved_config": _required_absolute_path(
+            _at(launch, "resolved_config.path"), "resolved_config"
+        ),
+        "hydra_config": _required_absolute_path(
+            _at(launch, "runtime_artifacts.hydra_config"), "hydra_config"
+        ),
+        "source_lock": _required_absolute_path(
+            _at(launch, "launch_identity.source_lock_path"), "source_lock"
+        ),
+        "schedule_certificate": _required_absolute_path(
+            _at(launch, "launch_identity.schedule_certificate_path"),
+            "schedule_certificate",
+        ),
+        "route_registry": _required_absolute_path(
+            _at(launch, "launch_identity.route_registry_path"), "route_registry"
+        ),
+        "schedule": _required_absolute_path(_at(launch, "schedule.path"), "schedule"),
+        "critic_parameter_freeze": _required_absolute_path(
+            _at(launch, "runtime_artifacts.critic_parameter_freeze"),
+            "critic_parameter_freeze",
+        ),
+    }
+
+
+def _capture_immutable_bindings(
+    paths: Mapping[str, Path],
+) -> dict[str, dict[str, Any]]:
+    bindings: dict[str, dict[str, Any]] = {}
+    for label, path in paths.items():
+        try:
+            _raw, binding = _bound_regular_file(path, label)
+        except FileNotFoundError as error:
+            if label == "critic_parameter_freeze":
+                raise GatePending(
+                    f"required {label} is not published: {path}"
+                ) from error
+            raise GateFailure(
+                f"required immutable {label} is missing: {path}"
+            ) from error
+        except _BoundFileChanged as error:
+            raise GateFailure(str(error)) from error
+        bindings[label] = binding
+    return bindings
+
+
+def _validate_publication_context(
+    directory: Path,
+    launch: Mapping[str, Any],
+    owner_receipt: Path,
+    output: Path,
+) -> None:
+    if launch.get("schema") != _MULTITASK_RECEIPT_SCHEMA:
+        raise GateFailure("cannot publish from an unsupported launch receipt")
+    runtime = launch.get("runtime_artifacts")
+    if not isinstance(runtime, Mapping):
+        raise GateFailure("cannot construct the protected runtime input set")
+    missing = _REQUIRED_RUNTIME_PATH_FIELDS.difference(runtime)
+    if missing:
+        raise GateFailure(
+            "cannot construct the protected runtime input set; missing "
+            + ", ".join(sorted(missing))
+        )
+
+    protected_files = {
+        (directory / "launch-receipt.json").resolve(),
+        owner_receipt.resolve(),
+    }
+    protected_directories: set[Path] = set()
+    for field, raw_path in runtime.items():
+        path = _required_absolute_path(raw_path, f"runtime_artifacts.{field}")
+        resolved = path.resolve()
+        if field in {"rollout_data", "checkpoints"}:
+            protected_directories.add(resolved)
+        else:
+            protected_files.add(resolved)
+    for path in _immutable_evidence_paths(directory, launch).values():
+        protected_files.add(path.resolve())
+
+    resolved_output = output.resolve()
+    if resolved_output in protected_files or any(
+        resolved_output == path or path in resolved_output.parents
+        for path in protected_directories
+    ):
+        raise GateFailure("gate output overlaps the complete protected input set")
+
+
 def audit_update1(
     run_dir: str | os.PathLike[str], expected: ExpectedRunIdentity
 ) -> dict[str, Any]:
@@ -638,6 +911,12 @@ def audit_update1(
         raise GatePending(f"run directory is not published: {directory}")
     launch_path = directory / "launch-receipt.json"
     launch, launch_binding = _load_required_bound_json(launch_path, "launch receipt")
+    immutable_paths = _immutable_evidence_paths(directory, launch)
+    immutable_before = _capture_immutable_bindings(immutable_paths)
+    _require(
+        immutable_before["launch_receipt"] == launch_binding,
+        "launch receipt changed before update-1 audit",
+    )
 
     observed_source = _source_identity(launch)
     expected_source = {
@@ -685,9 +964,16 @@ def audit_update1(
     rollout_path = audit.runtime_paths["rollout_data"] / "1.jsonl"
     metrics_path = audit.runtime_paths["file_logger"]
     freeze_path = audit.runtime_paths["critic_parameter_freeze"]
-    _rollout_episode_readiness(rollout_path, 64)
-    _step1_owner_rows(metrics_path)
+    rollout_rows, metric_rows, bounded_before = _bounded_jsonl_snapshots(
+        rollout_path, metrics_path
+    )
+    _rollout_episode_readiness(rollout_rows, 64)
+    _step1_owner_rows(metric_rows)
     freeze_manifest, freeze_binding = _freeze_readiness(freeze_path)
+    _require(
+        freeze_binding == immutable_before["critic_parameter_freeze"],
+        "critic parameter freeze manifest changed before audit",
+    )
 
     try:
         snapshot = _observe_run(directory, 1, launch)
@@ -708,9 +994,23 @@ def audit_update1(
         "one or more CAMG routes are absent at update 1",
     )
 
-    metrics = _audit_step1_metrics(metrics_path)
+    metrics = _audit_step1_metrics(metric_rows)
     metrics["publication"]["trigger_parameter_sync_step"] = 1
     freeze = _audit_freeze(audit, freeze_manifest)
+    _rollout_rows_after, _metric_rows_after, bounded_after = _bounded_jsonl_snapshots(
+        rollout_path, metrics_path
+    )
+    for label in bounded_before:
+        _require(
+            _snapshot_identity(bounded_before[label])
+            == _snapshot_identity(bounded_after[label]),
+            f"{label} bounded snapshot drifted during update-1 audit",
+        )
+    immutable_after = _capture_immutable_bindings(immutable_paths)
+    _require(
+        immutable_after == immutable_before,
+        "immutable launch/config/source evidence drifted during update-1 audit",
+    )
     config = audit.resolved_config
     config_summary = {
         "adv_estimator": _at(config, "algorithm.adv_estimator"),
@@ -743,6 +1043,8 @@ def audit_update1(
         "expected_identity": expected.as_dict(),
         "observed_identity": {"run_id": expected.run_id, **observed_source},
         "launch_binding": launch_binding,
+        "immutable_bindings": immutable_after,
+        "bounded_snapshots": bounded_after,
         "config": config_summary,
         "optimizer_budget": snapshot["optimizer_budget"],
         "route_episodes": route_episodes,
@@ -751,10 +1053,14 @@ def audit_update1(
         "critic_parameter_freeze": freeze,
         "evidence_paths": evidence_paths,
         "evidence_sha256": {
-            "launch_receipt": sha256_file(launch_path),
-            "rollout_update1": sha256_file(rollout_path),
-            "file_logger_snapshot": sha256_file(metrics_path),
-            "critic_parameter_freeze": sha256_file(freeze_path),
+            "launch_receipt": immutable_after["launch_receipt"]["sha256"],
+            "rollout_update1": bounded_after["rollout_update1"]["canonical_sha256"],
+            "file_logger_snapshot": bounded_after["file_logger_update1"][
+                "canonical_sha256"
+            ],
+            "critic_parameter_freeze": immutable_after["critic_parameter_freeze"][
+                "sha256"
+            ],
         },
         "freeze_binding": freeze_binding,
     }
@@ -764,14 +1070,21 @@ def _validate_output_path(
     directory: Path,
     output_path: str | os.PathLike[str],
     owner_receipt: Path,
-    launch: Mapping[str, Any] | None,
 ) -> Path:
     requested = _absolute_without_symlink_resolution(output_path)
     if requested.is_symlink():
         raise GateFailure("gate output is a symlink or non-file")
+    canonical = directory / _FIXED_OUTPUT_RELATIVE_PATH
+    try:
+        resolved_requested = requested.resolve()
+        resolved_canonical = canonical.resolve()
+    except (OSError, RuntimeError) as error:
+        raise GateFailure(f"cannot resolve fixed gate output: {error}") from error
+    if resolved_requested != resolved_canonical:
+        raise GateFailure(f"gate output must equal the fixed gate output {canonical}")
     output = _path_within(directory, str(requested))
-    if output is None:
-        raise GateFailure("gate output must be an absolute path inside run_dir")
+    if output is None or output != resolved_canonical:
+        raise GateFailure(f"gate output must equal the fixed gate output {canonical}")
     if output.is_symlink() or (output.exists() and not output.is_file()):
         raise GateFailure("gate output is a symlink or non-file")
     try:
@@ -780,60 +1093,92 @@ def _validate_output_path(
         raise GateFailure(f"cannot resolve owner receipt path: {error}") from error
     if output == resolved_owner:
         raise GateFailure("gate output overlaps the owner identity receipt")
-    if launch is not None:
-        protected_files, protected_directories = _receipt_protected_paths(
-            launch, directory, include_finalization=True
-        )
-        if _path_overlaps_inputs(output, protected_files, protected_directories):
-            raise GateFailure("gate output overlaps a receipt-bound input artifact")
-    elif output == directory / "launch-receipt.json":
-        raise GateFailure("gate output overlaps the launch receipt")
     return output
 
 
-def _load_launch_if_available(directory: Path) -> Mapping[str, Any] | None:
+def _load_launch_for_publication(directory: Path) -> Mapping[str, Any]:
     path = directory / "launch-receipt.json"
     try:
-        return _load_json(path, "launch receipt")
-    except (OSError, TypeError, ValueError):
-        return None
+        launch, _binding = _load_required_bound_json(path, "launch receipt")
+    except GatePending as error:
+        raise GateFailure(
+            "cannot publish gate receipt without the launch receipt"
+        ) from error
+    return launch
 
 
 def _same_owner_binding(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
     return dict(left) == dict(right)
 
 
+def _same_owner_lease(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    return all(
+        left.get(field) == right.get(field)
+        for field in ("identity", "receipt", "binding", "proc_root")
+    )
+
+
 def _rebind_immutable_evidence(directory: Path, evidence: Mapping[str, Any]) -> None:
-    expected_launch = evidence.get("launch_binding")
-    expected_freeze = evidence.get("freeze_binding")
-    if not isinstance(expected_launch, Mapping) or not isinstance(
-        expected_freeze, Mapping
+    immutable = evidence.get("immutable_bindings")
+    bounded = evidence.get("bounded_snapshots")
+    paths = evidence.get("evidence_paths")
+    if (
+        not isinstance(immutable, Mapping)
+        or not isinstance(bounded, Mapping)
+        or not isinstance(paths, Mapping)
     ):
-        raise GateFailure("gate evidence omitted immutable input bindings")
-    for label, path, expected_binding in (
-        (
-            "launch receipt",
-            directory / "launch-receipt.json",
-            expected_launch,
-        ),
-        (
-            "critic parameter freeze manifest",
-            Path(str(expected_freeze.get("path", ""))),
-            expected_freeze,
-        ),
-    ):
-        _payload, observed = _load_required_bound_json(path, label)
-        if dict(observed) != dict(expected_binding):
-            raise GateFailure(f"{label} drifted before PASS publication")
+        raise GateFailure("gate evidence omitted final input bindings")
+
+    observed_bindings: dict[str, dict[str, Any]] = {}
+    for label, expected_binding in immutable.items():
+        if not isinstance(label, str) or not isinstance(expected_binding, Mapping):
+            raise GateFailure("gate immutable input binding is malformed")
+        path = _required_absolute_path(expected_binding.get("path"), label)
+        try:
+            _raw, observed = _bound_regular_file(path, label)
+        except (FileNotFoundError, _BoundFileChanged) as error:
+            raise GateFailure(f"{label} drifted before PASS publication") from error
+        observed_bindings[label] = observed
+    if observed_bindings != dict(immutable):
+        raise GateFailure("immutable evidence drifted before PASS publication")
+
+    rollout_path = _required_absolute_path(
+        paths.get("rollout_episodes_and_routes"), "rollout update 1"
+    )
+    metrics_path = _required_absolute_path(
+        paths.get("gradient_optimizer_icepop_publication_failures"),
+        "FileLogger",
+    )
+    try:
+        _rollout_rows, _metric_rows, observed_bounded = _bounded_jsonl_snapshots(
+            rollout_path, metrics_path
+        )
+    except GatePending as error:
+        raise GateFailure("bounded update-1 evidence changed before PASS") from error
+    for label, expected_snapshot in bounded.items():
+        observed_snapshot = observed_bounded.get(str(label))
+        if not isinstance(expected_snapshot, Mapping) or not isinstance(
+            observed_snapshot, Mapping
+        ):
+            raise GateFailure("gate bounded evidence binding is malformed")
+        if _snapshot_identity(expected_snapshot) != _snapshot_identity(
+            observed_snapshot
+        ):
+            raise GateFailure(
+                f"{label} bounded snapshot drifted before PASS publication"
+            )
 
 
 def _terminate_authenticated_owner(
     lease: Mapping[str, Any],
     *,
+    owner_receipt: Path,
+    run_dir: Path,
+    run_id: str,
     dry_run: bool,
     proc_root: Path,
     stop_timeout_seconds: float,
-    signal_owner: Callable[[Mapping[str, Any], int], bool],
+    signal_owner: Callable[[Mapping[str, Any], int], bool] | None,
 ) -> dict[str, Any]:
     identity = lease["identity"]
     if dry_run:
@@ -843,14 +1188,62 @@ def _terminate_authenticated_owner(
             "scope": "exact-owner-identity",
             "status": "suppressed-by-dry-run",
         }
-    if not _owner_is_live(lease, proc_root):
+    try:
+        descriptor = _pidfd_open_exact(int(identity["pid"]))
+    except ProcessLookupError:
         return {
             "requested": False,
             "signal": None,
             "scope": "exact-owner-identity",
-            "status": "owner-identity-changed-before-signal",
+            "status": "already-exited-before-pidfd-anchor",
         }
-    sent = signal_owner(identity, signal.SIGTERM)
+    except (FallbackError, OSError, TypeError, ValueError) as error:
+        return {
+            "requested": False,
+            "signal": None,
+            "scope": "exact-owner-identity",
+            "status": "pidfd-anchor-unavailable",
+            "error": f"{type(error).__name__}: {error}",
+        }
+    try:
+        try:
+            anchored_lease = authenticate_owner(
+                owner_receipt,
+                run_dir,
+                run_id,
+                proc_root=proc_root,
+            )
+        except (GateFailure, GatePending) as error:
+            return {
+                "requested": False,
+                "signal": None,
+                "scope": "exact-owner-identity",
+                "status": "owner-authentication-changed-before-signal",
+                "error": str(error),
+            }
+        if not _same_owner_lease(lease, anchored_lease):
+            return {
+                "requested": False,
+                "signal": None,
+                "scope": "exact-owner-identity",
+                "status": "owner-authentication-changed-before-signal",
+                "error": "owner lease differs after pidfd anchoring",
+            }
+        identity = anchored_lease["identity"]
+        try:
+            if signal_owner is None:
+                _pidfd_send_signal_exact(
+                    descriptor,
+                    signal.SIGTERM,
+                    pid=int(identity["pid"]),
+                )
+                sent = True
+            else:
+                sent = signal_owner(identity, signal.SIGTERM)
+        except ProcessLookupError:
+            sent = False
+    finally:
+        os.close(descriptor)
     if not sent:
         return {
             "requested": True,
@@ -881,10 +1274,18 @@ def run_update1_gate(
     stop_timeout_seconds: float = 120.0,
     dry_run: bool = False,
     proc_root: str | os.PathLike[str] = "/proc",
-    signal_owner: Callable[[Mapping[str, Any], int], bool] = _signal_identity,
+    signal_owner: Callable[[Mapping[str, Any], int], bool] | None = None,
 ) -> dict[str, Any]:
     """Wait for update 1, publish a receipt, and stop only an exact failed owner."""
 
+    timeout_values = (timeout_seconds, poll_seconds, stop_timeout_seconds)
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        for value in timeout_values
+    ):
+        raise ValueError("timeout values must be finite real numbers")
     if timeout_seconds < 0 or poll_seconds <= 0 or stop_timeout_seconds < 0:
         raise ValueError(
             "timeouts must be nonnegative and poll_seconds must be positive"
@@ -894,6 +1295,7 @@ def run_update1_gate(
     output = _absolute_without_symlink_resolution(output_path)
     owner_path = _absolute_without_symlink_resolution(owner_receipt)
     proc_path = Path(proc_root)
+    output = _validate_output_path(directory, output, owner_path)
     started_at = _utc_now()
     deadline = time.monotonic() + timeout_seconds
     first_lease: dict[str, Any] | None = None
@@ -927,10 +1329,10 @@ def run_update1_gate(
             failure = f"unexpected update-1 gate error: {type(error).__name__}: {error}"
             break
 
-    launch = _load_launch_if_available(directory)
     if not directory.is_dir() or directory.is_symlink():
         raise GateFailure("cannot publish gate receipt before the run directory exists")
-    output = _validate_output_path(directory, output, owner_path, launch)
+    launch = _load_launch_for_publication(directory)
+    _validate_publication_context(directory, launch, owner_path, output)
 
     if failure is None:
         try:
@@ -945,8 +1347,9 @@ def run_update1_gate(
                 )
             if evidence is None:
                 raise GateFailure("update-1 audit returned no evidence")
+            evidence = audit_update1(directory, expected)
             _rebind_immutable_evidence(directory, evidence)
-        except GateFailure as error:
+        except (GateFailure, GatePending) as error:
             failure = str(error)
         else:
             receipt = {
@@ -997,12 +1400,15 @@ def run_update1_gate(
                     "owner identity receipt drifted before stop"
                 )
             final_lease = candidate
-        except GateFailure as error:
+        except (GateFailure, GatePending) as error:
             failure = f"{failure}; exact stop withheld: {error}"
     if final_lease is not None:
         try:
             termination = _terminate_authenticated_owner(
                 final_lease,
+                owner_receipt=owner_path,
+                run_dir=directory,
+                run_id=expected.run_id,
                 dry_run=dry_run,
                 proc_root=proc_path,
                 stop_timeout_seconds=stop_timeout_seconds,

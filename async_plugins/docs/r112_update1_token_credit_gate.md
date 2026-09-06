@@ -8,9 +8,10 @@ learner, rollout, environment, reward, schedule, or lifecycle implementation.
 ## Invocation
 
 Start the gate after the formal owner has published
-`formal-owner/orchestrator-process-identity.json`. The output must be a
-dedicated path inside the run directory and must not overlap a launch-bound
-input or the formal-owner identity receipt.
+`formal-owner/orchestrator-process-identity.json`. The only accepted output is
+the fixed run-owned path `$RUN/gates/update1-token-credit.json`. A missing or
+invalid launch receipt, or an incomplete protected-input set, aborts without
+writing a gate receipt.
 
 ```bash
 python -m agentmemorygym_verl.update1_token_credit_gate \
@@ -30,6 +31,9 @@ the exact formal owner was left running. Exit code `1` means the receipt is a
 failure. Missing or incomplete update-1 artifacts are polled until timeout;
 complete contradictory evidence fails immediately.
 
+The timeout, polling, and stop-timeout values must be finite real numbers.
+Timeouts may be zero, while the polling interval must be positive.
+
 `--dry-run` exercises the same evidence and owner-authentication path but
 never signals a process, including on failure or timeout.
 
@@ -37,7 +41,7 @@ never signals a process, including on failure or timeout.
 
 | Gate field | Run-owned evidence |
 |---|---|
-| run/source/config identity | `launch-receipt.json`, its bound source lock, resolved config, Hydra config, route registry, and schedule certificate |
+| run/source/config identity | `launch-receipt.json`, its bound source lock, resolved config, Hydra config, route registry, schedule certificate, and frozen schedule |
 | 64 complete episodes and all four routes | `rollout_data/1.jsonl`, joined to the frozen schedule |
 | actor/critic gradients and actor K1 / critic K2 | distinct learner-owner row at FileLogger `step=1` |
 | IcePop applied weights, ESS, and `high + low = OOB` | actor-owned `actor/rollout_corr/*` metrics at FileLogger `step=1` |
@@ -46,28 +50,33 @@ never signals a process, including on failure or timeout.
 | freeze set, optimizer membership, frozen/trainable deltas, critic LR | run-owned `critic-parameter-freeze.json`; LR must be `5e-7`, then `1e-6` |
 | stop authority | bound formal-owner receipt plus live `/proc/<pid>/{stat,cmdline,environ}` |
 
-The receipt includes these paths and observed SHA256/file bindings. The
-launch receipt and freeze manifest are rebound before a PASS is published.
+The receipt includes these paths and observed SHA256/file bindings. A PASS is
+published only after a second complete update-1 audit, followed by a rebind of
+every immutable launch/config/source/schedule input and the critic freeze
+manifest. The gate also reselects and rehashes the complete rows in
+`rollout_data/1.jsonl` and the FileLogger rows whose integer `step == 1`.
+Later FileLogger steps may continue to append, but the bounded step-1 view may
+not change.
 
 ## Exact-stop semantics
 
-On failure, the gate rereads the same owner receipt and requires unchanged
-device/inode/ctime/size/SHA256. It then revalidates:
+On failure, the gate first opens a pidfd for the previously authenticated PID.
+With that pidfd held, it rereads the same owner receipt and requires unchanged
+device/inode/ctime/size/SHA256, then revalidates:
 
 - schema and owner name;
 - PID, start ticks, process group, and session (the owner must be its own
   group/session leader);
 - the bootstrap path and exact command suffix;
 - unique `--run-dir` and `--experiment-name` bindings;
-- both `AMG_MULTITASK_RUN_ID` and `AGENTMEMORY_RUN_ID` in the live process
-  environment.
+- exactly one `AMG_MULTITASK_RUN_ID` and exactly one `AGENTMEMORY_RUN_ID` in
+  the live process environment, each with the expected value.
 
-Only then may it send `SIGTERM` through the existing pidfd-based exact-identity
-helper. The process bootstrap remains responsible for its owned descendants.
-If the owner receipt or live identity is missing, replaced, or inconsistent,
-the receipt says `FAIL_NO_UNSAFE_STOP` and no process is signalled. There is no
-name-based, numeric-group, or raw-PID fallback and no automatic escalation to
-`SIGKILL`.
+Only then may it send `SIGTERM` through that same pidfd. The process bootstrap
+remains responsible for its owned descendants. If the owner receipt or live
+identity is missing, replaced, duplicated, or inconsistent, the receipt says
+`FAIL_NO_UNSAFE_STOP` and no process is signalled. There is no name-based,
+numeric-group, or raw-PID fallback and no automatic escalation to `SIGKILL`.
 
 This gate closes the update-1 operational check only. It does not sign the
 complete launch package, long-horizon training result, or external evaluation.
