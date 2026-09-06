@@ -1,11 +1,9 @@
-"""Fail-closed update-1 token-credit gate for a live AMG formal run.
+"""Fail-closed update-1 token-credit evidence gate for an AMG formal run.
 
-The gate observes only run-owned artifacts.  A passing gate publishes one
-atomic receipt and leaves the formal owner alone.  A failing gate may request
-``SIGTERM`` only after re-authenticating the exact process-bootstrap lease by
-receipt bytes/inode, PID start ticks, process group/session, command line, and
-both run-id environment tags.  There is deliberately no raw-PID, process-name,
-or broad process-group/name fallback.
+The gate is a pure observer: it reads run-owned evidence and publishes one
+atomic PASS or FAIL receipt, but never signals or otherwise controls a process.
+The package-v2 runner is the sole lifecycle authority for its direct formal
+child.  Owner identity remains point-in-time provenance only.
 """
 
 from __future__ import annotations
@@ -15,7 +13,7 @@ import hashlib
 import json
 import math
 import os
-import signal
+import secrets
 import stat
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -26,10 +24,7 @@ from typing import Any
 
 from .fallback_supervisor import (
     FallbackError,
-    _atomic_json,
     _bound_json_file,
-    _pidfd_open_exact,
-    _pidfd_send_signal_exact,
 )
 from .finalizer import (
     _MULTITASK_RECEIPT_SCHEMA,
@@ -89,7 +84,7 @@ class GateFailure(RuntimeError):
 
 
 class OwnerAuthenticationError(GateFailure):
-    """The formal owner cannot safely authorize an exact stop."""
+    """The formal-owner provenance cannot be authenticated."""
 
 
 @dataclass(frozen=True)
@@ -484,23 +479,6 @@ def authenticate_owner(
         "binding": _binding_view(binding),
         "proc_root": str(root),
     }
-
-
-def _owner_is_live(lease: Mapping[str, Any], proc_root: Path) -> bool:
-    identity = lease.get("identity")
-    if not isinstance(identity, Mapping):
-        return False
-    try:
-        observed = _proc_snapshot(proc_root, int(identity["pid"]))
-    except (KeyError, TypeError, ValueError, OwnerAuthenticationError):
-        return False
-    return bool(
-        observed
-        and observed["state"] not in _ZOMBIE_STATES
-        and observed["start_ticks"] == str(identity.get("start_ticks"))
-        and observed["pgrp"] == int(identity.get("pgrp", -1))
-        and observed["session"] == int(identity.get("session", -1))
-    )
 
 
 def _load_required_bound_json(
@@ -900,6 +878,203 @@ def _validate_publication_context(
         raise GateFailure("gate output overlaps the complete protected input set")
 
 
+def _directory_open_flags() -> int:
+    required = ("O_DIRECTORY", "O_NOFOLLOW")
+    missing = [name for name in required if not hasattr(os, name)]
+    if missing:
+        raise GateFailure(
+            "descriptor-anchored publication is unavailable; missing "
+            + ", ".join(missing)
+        )
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY")
+        | getattr(os, "O_NOFOLLOW")
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+
+def _same_directory_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        stat.S_ISDIR(left.st_mode)
+        and stat.S_ISDIR(right.st_mode)
+        and left.st_dev == right.st_dev
+        and left.st_ino == right.st_ino
+    )
+
+
+def _assert_publication_anchor(
+    directory: Path, run_descriptor: int, gate_descriptor: int
+) -> None:
+    """Require the names ``run_dir/gates`` to still name both open handles."""
+
+    anchored_run = os.fstat(run_descriptor)
+    anchored_gate = os.fstat(gate_descriptor)
+    try:
+        named_run = directory.lstat()
+    except OSError as error:
+        raise GateFailure(
+            f"run directory disappeared during gate publication: {directory}"
+        ) from error
+    if stat.S_ISLNK(named_run.st_mode) or not _same_directory_identity(
+        named_run, anchored_run
+    ):
+        raise GateFailure("run directory changed during gate publication")
+    try:
+        named_gate = os.stat(
+            _FIXED_OUTPUT_RELATIVE_PATH.parent.name,
+            dir_fd=run_descriptor,
+            follow_symlinks=False,
+        )
+    except OSError as error:
+        raise GateFailure(
+            "gate output directory disappeared during publication"
+        ) from error
+    if stat.S_ISLNK(named_gate.st_mode) or not _same_directory_identity(
+        named_gate, anchored_gate
+    ):
+        raise GateFailure("gate output directory changed during publication")
+
+
+def _open_publication_directories(directory: Path) -> tuple[int, int]:
+    """Open no-follow run/gates handles without traversing a replaced parent."""
+
+    flags = _directory_open_flags()
+    try:
+        run_descriptor = os.open(directory, flags)
+    except OSError as error:
+        raise GateFailure(
+            f"cannot anchor run directory for gate publication: {error}"
+        ) from error
+    gate_descriptor = -1
+    try:
+        anchored_run = os.fstat(run_descriptor)
+        try:
+            named_run = directory.lstat()
+        except OSError as error:
+            raise GateFailure(
+                f"cannot bind run directory for gate publication: {error}"
+            ) from error
+        if stat.S_ISLNK(named_run.st_mode) or not _same_directory_identity(
+            named_run, anchored_run
+        ):
+            raise GateFailure("run directory changed before gate publication")
+        gate_name = _FIXED_OUTPUT_RELATIVE_PATH.parent.name
+        try:
+            os.mkdir(gate_name, mode=0o700, dir_fd=run_descriptor)
+        except FileExistsError:
+            pass
+        except OSError as error:
+            raise GateFailure(
+                f"cannot create anchored gate output directory: {error}"
+            ) from error
+        try:
+            gate_descriptor = os.open(gate_name, flags, dir_fd=run_descriptor)
+        except OSError as error:
+            raise GateFailure(
+                f"cannot anchor gate output directory: {error}"
+            ) from error
+        _assert_publication_anchor(directory, run_descriptor, gate_descriptor)
+        return run_descriptor, gate_descriptor
+    except Exception:
+        if gate_descriptor >= 0:
+            os.close(gate_descriptor)
+        os.close(run_descriptor)
+        raise
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        written = os.write(descriptor, payload[offset:])
+        if written <= 0:
+            raise OSError("short write while publishing gate receipt")
+        offset += written
+
+
+def _atomic_gate_receipt(directory: Path, receipt: Mapping[str, Any]) -> None:
+    """Publish the fixed receipt relative to retained no-follow directory fds."""
+
+    payload = (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    run_descriptor, gate_descriptor = _open_publication_directories(directory)
+    basename = _FIXED_OUTPUT_RELATIVE_PATH.name
+    temporary = f".{basename}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    file_descriptor = -1
+    temporary_exists = False
+    published = False
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        if not hasattr(os, "O_NOFOLLOW"):
+            raise GateFailure("descriptor-anchored publication requires O_NOFOLLOW")
+        flags |= getattr(os, "O_NOFOLLOW")
+        try:
+            file_descriptor = os.open(
+                temporary,
+                flags,
+                0o600,
+                dir_fd=gate_descriptor,
+            )
+        except OSError as error:
+            raise GateFailure(
+                f"cannot create anchored gate receipt: {error}"
+            ) from error
+        temporary_exists = True
+        _write_all(file_descriptor, payload)
+        os.fsync(file_descriptor)
+        os.close(file_descriptor)
+        file_descriptor = -1
+
+        _assert_publication_anchor(directory, run_descriptor, gate_descriptor)
+        try:
+            existing = os.stat(
+                basename,
+                dir_fd=gate_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise GateFailure(
+                f"cannot inspect fixed gate receipt before publication: {error}"
+            ) from error
+        else:
+            if stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode):
+                raise GateFailure("gate output is a symlink or non-file")
+        try:
+            os.replace(
+                temporary,
+                basename,
+                src_dir_fd=gate_descriptor,
+                dst_dir_fd=gate_descriptor,
+            )
+        except OSError as error:
+            raise GateFailure(
+                f"cannot replace anchored gate receipt: {error}"
+            ) from error
+        temporary_exists = False
+        published = True
+        os.fsync(gate_descriptor)
+        _assert_publication_anchor(directory, run_descriptor, gate_descriptor)
+    except Exception:
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
+        if temporary_exists:
+            try:
+                os.unlink(temporary, dir_fd=gate_descriptor)
+            except FileNotFoundError:
+                pass
+        if published:
+            try:
+                os.unlink(basename, dir_fd=gate_descriptor)
+                os.fsync(gate_descriptor)
+            except FileNotFoundError:
+                pass
+        raise
+    finally:
+        os.close(gate_descriptor)
+        os.close(run_descriptor)
+
+
 def audit_update1(
     run_dir: str | os.PathLike[str], expected: ExpectedRunIdentity
 ) -> dict[str, Any]:
@@ -1111,13 +1286,6 @@ def _same_owner_binding(left: Mapping[str, Any], right: Mapping[str, Any]) -> bo
     return dict(left) == dict(right)
 
 
-def _same_owner_lease(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
-    return all(
-        left.get(field) == right.get(field)
-        for field in ("identity", "receipt", "binding", "proc_root")
-    )
-
-
 def _rebind_immutable_evidence(directory: Path, evidence: Mapping[str, Any]) -> None:
     immutable = evidence.get("immutable_bindings")
     bounded = evidence.get("bounded_snapshots")
@@ -1169,100 +1337,6 @@ def _rebind_immutable_evidence(directory: Path, evidence: Mapping[str, Any]) -> 
             )
 
 
-def _terminate_authenticated_owner(
-    lease: Mapping[str, Any],
-    *,
-    owner_receipt: Path,
-    run_dir: Path,
-    run_id: str,
-    dry_run: bool,
-    proc_root: Path,
-    stop_timeout_seconds: float,
-    signal_owner: Callable[[Mapping[str, Any], int], bool] | None,
-) -> dict[str, Any]:
-    identity = lease["identity"]
-    if dry_run:
-        return {
-            "requested": False,
-            "signal": None,
-            "scope": "exact-owner-identity",
-            "status": "suppressed-by-dry-run",
-        }
-    try:
-        descriptor = _pidfd_open_exact(int(identity["pid"]))
-    except ProcessLookupError:
-        return {
-            "requested": False,
-            "signal": None,
-            "scope": "exact-owner-identity",
-            "status": "already-exited-before-pidfd-anchor",
-        }
-    except (FallbackError, OSError, TypeError, ValueError) as error:
-        return {
-            "requested": False,
-            "signal": None,
-            "scope": "exact-owner-identity",
-            "status": "pidfd-anchor-unavailable",
-            "error": f"{type(error).__name__}: {error}",
-        }
-    try:
-        try:
-            anchored_lease = authenticate_owner(
-                owner_receipt,
-                run_dir,
-                run_id,
-                proc_root=proc_root,
-            )
-        except (GateFailure, GatePending) as error:
-            return {
-                "requested": False,
-                "signal": None,
-                "scope": "exact-owner-identity",
-                "status": "owner-authentication-changed-before-signal",
-                "error": str(error),
-            }
-        if not _same_owner_lease(lease, anchored_lease):
-            return {
-                "requested": False,
-                "signal": None,
-                "scope": "exact-owner-identity",
-                "status": "owner-authentication-changed-before-signal",
-                "error": "owner lease differs after pidfd anchoring",
-            }
-        identity = anchored_lease["identity"]
-        try:
-            if signal_owner is None:
-                _pidfd_send_signal_exact(
-                    descriptor,
-                    signal.SIGTERM,
-                    pid=int(identity["pid"]),
-                )
-                sent = True
-            else:
-                sent = signal_owner(identity, signal.SIGTERM)
-        except ProcessLookupError:
-            sent = False
-    finally:
-        os.close(descriptor)
-    if not sent:
-        return {
-            "requested": True,
-            "signal": "SIGTERM",
-            "scope": "exact-owner-identity",
-            "status": "already-exited",
-        }
-    deadline = time.monotonic() + max(0.0, stop_timeout_seconds)
-    while time.monotonic() < deadline and _owner_is_live(lease, proc_root):
-        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
-    stopped = not _owner_is_live(lease, proc_root)
-    return {
-        "requested": True,
-        "signal": "SIGTERM",
-        "scope": "exact-owner-identity",
-        "status": "confirmed-stopped" if stopped else "signal-sent-not-confirmed",
-    }
-
-
 def run_update1_gate(
     run_dir: str | os.PathLike[str],
     expected: ExpectedRunIdentity,
@@ -1276,7 +1350,7 @@ def run_update1_gate(
     proc_root: str | os.PathLike[str] = "/proc",
     signal_owner: Callable[[Mapping[str, Any], int], bool] | None = None,
 ) -> dict[str, Any]:
-    """Wait for update 1, publish a receipt, and stop only an exact failed owner."""
+    """Wait for update 1 and publish evidence without controlling a process."""
 
     timeout_values = (timeout_seconds, poll_seconds, stop_timeout_seconds)
     if any(
@@ -1336,6 +1410,10 @@ def run_update1_gate(
 
     if failure is None:
         try:
+            if evidence is None:
+                raise GateFailure("update-1 audit returned no evidence")
+            evidence = audit_update1(directory, expected)
+            _rebind_immutable_evidence(directory, evidence)
             final_lease = authenticate_owner(
                 owner_path, directory, expected.run_id, proc_root=proc_path
             )
@@ -1343,12 +1421,8 @@ def run_update1_gate(
                 first_lease["binding"], final_lease["binding"]
             ):
                 raise OwnerAuthenticationError(
-                    "owner identity receipt drifted before PASS"
+                    "owner identity receipt drifted before PASS publication"
                 )
-            if evidence is None:
-                raise GateFailure("update-1 audit returned no evidence")
-            evidence = audit_update1(directory, expected)
-            _rebind_immutable_evidence(directory, evidence)
         except (GateFailure, GatePending) as error:
             failure = str(error)
         else:
@@ -1362,6 +1436,7 @@ def run_update1_gate(
                 "started_at": started_at,
                 "finished_at": _utc_now(),
                 "owner": {
+                    "role": "read-only-provenance",
                     "identity": final_lease["identity"],
                     "receipt_binding": final_lease["binding"],
                     "receipt_path": str(owner_path),
@@ -1375,58 +1450,25 @@ def run_update1_gate(
                 "termination": {
                     "requested": False,
                     "signal": None,
-                    "scope": "exact-owner-identity",
-                    "status": "not-requested",
+                    "scope": "observer-only",
+                    "status": "not-owned-by-observer",
                 },
                 "errors": [],
             }
-            _atomic_json(output, receipt)
+            _atomic_gate_receipt(directory, receipt)
             return receipt
 
     termination = {
         "requested": False,
         "signal": None,
-        "scope": "exact-owner-identity",
-        "status": "unsafe-to-stop-owner-not-authenticated",
+        "scope": "observer-only",
+        "status": "not-owned-by-observer",
     }
-    final_lease: dict[str, Any] | None = None
-    if first_lease is not None:
-        try:
-            candidate = authenticate_owner(
-                owner_path, directory, expected.run_id, proc_root=proc_path
-            )
-            if not _same_owner_binding(first_lease["binding"], candidate["binding"]):
-                raise OwnerAuthenticationError(
-                    "owner identity receipt drifted before stop"
-                )
-            final_lease = candidate
-        except (GateFailure, GatePending) as error:
-            failure = f"{failure}; exact stop withheld: {error}"
-    if final_lease is not None:
-        try:
-            termination = _terminate_authenticated_owner(
-                final_lease,
-                owner_receipt=owner_path,
-                run_dir=directory,
-                run_id=expected.run_id,
-                dry_run=dry_run,
-                proc_root=proc_path,
-                stop_timeout_seconds=stop_timeout_seconds,
-                signal_owner=signal_owner,
-            )
-        except (FallbackError, OSError, RuntimeError) as error:
-            termination = {
-                "requested": True,
-                "signal": "SIGTERM",
-                "scope": "exact-owner-identity",
-                "status": "signal-error",
-                "error": f"{type(error).__name__}: {error}",
-            }
 
     receipt = {
         "schema": _GATE_SCHEMA,
         "status": "fail",
-        "decision": "FAIL_STOP" if termination["requested"] else "FAIL_NO_UNSAFE_STOP",
+        "decision": "FAIL_NO_UNSAFE_STOP",
         "run_id": expected.run_id,
         "snapshot_update": 1,
         "dry_run": dry_run,
@@ -1434,12 +1476,17 @@ def run_update1_gate(
         "finished_at": _utc_now(),
         "owner": (
             {
-                "identity": final_lease["identity"],
-                "receipt_binding": final_lease["binding"],
+                "role": "read-only-provenance",
+                "identity": first_lease["identity"],
+                "receipt_binding": first_lease["binding"],
                 "receipt_path": str(owner_path),
             }
-            if final_lease is not None
-            else {"receipt_path": str(owner_path), "authenticated": False}
+            if first_lease is not None
+            else {
+                "role": "read-only-provenance",
+                "receipt_path": str(owner_path),
+                "authenticated": False,
+            }
         ),
         "field_evidence_paths": {
             "formal_owner_identity": str(owner_path),
@@ -1453,13 +1500,13 @@ def run_update1_gate(
         "termination": termination,
         "errors": [failure or "unknown update-1 gate failure"],
     }
-    _atomic_json(output, receipt)
+    _atomic_gate_receipt(directory, receipt)
     return receipt
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Fail-closed, stop-capable AMG update-1 token-credit gate"
+        description="Fail-closed AMG update-1 token-credit evidence observer"
     )
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--run-id", required=True)
