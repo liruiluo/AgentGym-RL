@@ -1378,6 +1378,30 @@ else:
             str(WATCHDOG_WRAPPER),
         )
 
+    def test_platform_wrapper_uses_source_module_digest_without_override(self) -> None:
+        environment = self._wrapper_environment()
+        environment.pop("FALLBACK_MODULE_SHA256")
+        self.assertNotIn("FALLBACK_MODULE_SHA256", environment)
+        with self.supervisor_log.open("ab", buffering=0) as output:
+            self.process = subprocess.Popen(
+                ["bash", str(WATCHDOG_WRAPPER)],
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                env=environment,
+            )
+        state = fallback._wait_supervisor_state(
+            self.supervisor_state,
+            modes={"holding"},
+            timeout_seconds=5,
+            require_live_holder=True,
+        )
+        self.assertEqual(
+            state["immutable_contract"]["supervisor_script_sha256"],
+            self._digest(MODULE),
+        )
+
     def test_platform_wrapper_recovers_without_training_python_environment(self) -> None:
         environment = self._wrapper_environment()
         self.assertNotIn("PYTHON", environment)
