@@ -121,6 +121,29 @@ class SwesmithPpoGateRowEvidenceTests(unittest.TestCase):
             module._checkpoint_receipts_share_identity(wrapper, contradictory_v2)
         )
 
+    def test_checkpoint_printf_parser_rejects_shell_separators(self) -> None:
+        module = load_module()
+        expected = b"objective=fit\nnext_action=test\n"
+        for format_text in ("%s\\n", "%s\n"):
+            command = (
+                "mkdir -p .agent_memory && printf '"
+                + format_text
+                + "' objective=fit next_action=test "
+                "> .agent_memory/CONTINUATION.md"
+            )
+            action = "shell_command " + json.dumps({"command": command})
+            self.assertEqual(module._checkpoint_exact_shell_payload(action), expected)
+        for separator in ("\n", "\r", "\r\n"):
+            command = (
+                "mkdir -p .agent_memory && printf '%s\\n' objective=fit"
+                + separator
+                + "touch side_effect"
+                + separator
+                + "cat source > .agent_memory/CONTINUATION.md"
+            )
+            action = "shell_command " + json.dumps({"command": command})
+            self.assertIsNone(module._checkpoint_exact_shell_payload(action))
+
     def test_accepts_exact_backend_response_cap_as_negative_row(self) -> None:
         module = load_module()
         result = module.verify_response_cap_truncation(

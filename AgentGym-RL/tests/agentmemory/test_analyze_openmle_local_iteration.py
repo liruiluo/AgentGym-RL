@@ -287,6 +287,29 @@ def test_v2_identity_and_current_action_provenance_are_strict():
     )
 
 
+def test_checkpoint_printf_parser_rejects_lf_and_cr_command_separators():
+    expected = b"objective=fit\nnext_action=test\n"
+    for format_text in ("%s\\n", "%s\n"):
+        command = (
+            "mkdir -p .agent_memory && printf '"
+            + format_text
+            + "' objective=fit next_action=test "
+            "> .agent_memory/CONTINUATION.md"
+        )
+        action = "shell_command " + json.dumps({"command": command})
+        assert MODULE._checkpoint_exact_shell_payload(action) == expected
+    for separator in ("\n", "\r", "\r\n"):
+        command = (
+            "mkdir -p .agent_memory && printf '%s\\n' objective=fit"
+            + separator
+            + "touch side_effect"
+            + separator
+            + "cat source > .agent_memory/CONTINUATION.md"
+        )
+        action = "shell_command " + json.dumps({"command": command})
+        assert MODULE._checkpoint_exact_shell_payload(action) is None
+
+
 def test_complete_local_iteration_memory_chain_is_detected():
     result = MODULE.analyze_documents([(1, _complete_document())])
     assert result["trajectory_count"] == 1
