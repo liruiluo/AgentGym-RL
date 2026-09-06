@@ -160,6 +160,82 @@ class TestPendingResumeReleaseTransaction(unittest.TestCase):
             self._complete_with_portable_file_ops()
         self.assertTrue(quarantine.is_file())
 
+    def test_same_inode_marker_mutation_during_quarantine_fails_closed(self) -> None:
+        expected = dict(self.pending["marker_binding"])
+        calls = 0
+
+        def mutate_then_rename(source: Path, destination: Path) -> None:
+            nonlocal calls
+            if calls == 0:
+                payload = json.loads(source.read_text(encoding="utf-8"))
+                payload["same_inode_mutation"] = True
+                source.write_text(
+                    json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                self.assertEqual(source.stat().st_ino, expected["inode"])
+            calls += 1
+            source.rename(destination)
+
+        with (
+            mock.patch.object(
+                fallback, "_rename_noreplace", side_effect=mutate_then_rename
+            ),
+            self.assertRaisesRegex(fallback.FallbackError, "changed during release"),
+        ):
+            fallback._complete_pending_resume_release(
+                pause_path=self.pause,
+                release_request_path=self.request,
+                pending_resume=self.pending,
+            )
+
+        observed = fallback._marker_observation(self.pause)
+        self.assertEqual(observed["payload"]["token"], self.token)
+        self.assertNotEqual(observed["sha256"], expected["sha256"])
+        self.assertFalse(
+            fallback._pause_marker_quarantine(self.pause, self.token).exists()
+        )
+        self.assertTrue(self.request.is_file())
+
+    def test_same_inode_request_mutation_during_quarantine_fails_closed(self) -> None:
+        self.pause.unlink()
+        expected = dict(self.pending["request_binding"])
+        calls = 0
+
+        def mutate_then_rename(source: Path, destination: Path) -> None:
+            nonlocal calls
+            if calls == 0:
+                payload = json.loads(source.read_text(encoding="utf-8"))
+                payload["same_inode_mutation"] = True
+                source.write_text(
+                    json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                self.assertEqual(source.stat().st_ino, expected["inode"])
+            calls += 1
+            source.rename(destination)
+
+        with (
+            mock.patch.object(
+                fallback, "_rename_noreplace", side_effect=mutate_then_rename
+            ),
+            self.assertRaisesRegex(
+                fallback.FallbackError, "changed during consumption"
+            ),
+        ):
+            fallback._complete_pending_resume_release(
+                pause_path=self.pause,
+                release_request_path=self.request,
+                pending_resume=self.pending,
+            )
+
+        payload, observed = fallback._bound_json_file(self.request)
+        self.assertEqual(payload["token"], self.token)
+        self.assertNotEqual(observed["sha256"], expected["sha256"])
+        self.assertFalse(
+            fallback._release_request_quarantine(self.request, self.token).exists()
+        )
+
     def test_holder_attestation_cannot_publish_holding_with_stale_request(self) -> None:
         self.pause.unlink()
         with self.assertRaisesRegex(

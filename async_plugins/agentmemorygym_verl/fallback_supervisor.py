@@ -440,8 +440,11 @@ def _remove_bound_json(path: Path, expected: Mapping[str, Any], *, token: str) -
     if quarantine.exists() or quarantine.is_symlink():
         raise FallbackError(f"release-request quarantine already exists: {quarantine}")
     _rename_noreplace(path, quarantine)
-    _payload, moved = _bound_json_file(quarantine, maximum_bytes=1 << 20)
-    if moved["device"] != expected["device"] or moved["inode"] != expected["inode"]:
+    moved_payload, moved = _bound_json_file(quarantine, maximum_bytes=1 << 20)
+    if (
+        str(moved_payload.get("token", "")) != token
+        or not _renamed_binding_matches(moved, expected)
+    ):
         if not path.exists():
             _rename_noreplace(quarantine, path)
         raise FallbackError("release request changed during consumption")
@@ -475,12 +478,9 @@ def _release_pause_marker(
     current = _marker_observation(path)
     if not current.get("exists"):
         return False
-    if (
-        current["payload"].get("token") != token
-        or current["device"] != expected["device"]
-        or current["inode"] != expected["inode"]
-        or current["ctime_ns"] != expected["ctime_ns"]
-    ):
+    if current["payload"].get("token") != token or _marker_binding_view(
+        current
+    ) != dict(expected):
         raise FallbackError("refusing to release a foreign/replaced pause marker")
     quarantine = _pause_marker_quarantine(path, token)
     try:
@@ -494,9 +494,9 @@ def _release_pause_marker(
     _rename_noreplace(path, quarantine)
     moved = _marker_observation(quarantine)
     if (
-        moved["device"] != expected["device"]
-        or moved["inode"] != expected["inode"]
+        not moved.get("exists")
         or moved["payload"].get("token") != token
+        or not _renamed_binding_matches(_marker_binding_view(moved), expected)
     ):
         if not path.exists():
             _rename_noreplace(quarantine, path)
