@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
+import shlex
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
@@ -257,6 +259,82 @@ def _unit_counter_increment(row: Mapping[str, Any], prefix: str) -> bool:
     )
 
 
+
+
+def _checkpoint_exact_shell_payload(action: Any) -> bytes | None:
+    """Recover bytes only from the bounded checkpoint shell shapes."""
+
+    if not isinstance(action, str):
+        return None
+    match = re.fullmatch(r"shell_command\s+(\{.*\})", action.strip(), re.DOTALL)
+    if match is None:
+        return None
+    try:
+        arguments = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+    if (
+        not isinstance(arguments, dict)
+        or "command" not in arguments
+        or not set(arguments) <= {"command", "workdir", "timeout_ms"}
+        or arguments.get("workdir", ".") != "."
+        or not isinstance(arguments.get("command"), str)
+    ):
+        return None
+    command = arguments["command"]
+    heredoc = re.fullmatch(
+        r"(?:mkdir\s+-p\s+\.agent_memory\s+&&\s+)?"
+        r"cat\s*>\s*\.agent_memory/CONTINUATION\.md\s+"
+        r"<<'(?P<delimiter>[A-Za-z_][A-Za-z0-9_]*)'\n"
+        r"(?P<body>.*)\n(?P=delimiter)\n?",
+        command,
+        re.DOTALL,
+    )
+    if heredoc is not None:
+        body = heredoc.group("body")
+        if heredoc.group("delimiter") in body.splitlines():
+            return None
+        return (body + "\n").encode("utf-8")
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    mkdir_prefix = ["mkdir", "-p", ".agent_memory", "&&"]
+    if tokens[: len(mkdir_prefix)] == mkdir_prefix:
+        tokens = tokens[len(mkdir_prefix) :]
+    if (
+        len(tokens) < 5
+        or tokens[0] != "printf"
+        or tokens[1] not in {"%s\\n", "%s\n"}
+        or tokens[-2:] != [">", CONTINUATION_PATH]
+    ):
+        return None
+    values = tokens[2:-2]
+    if not values or any(
+        re.fullmatch(r"[A-Za-z0-9._:/+=-]+", value) is None for value in values
+    ):
+        return None
+    return ("\n".join(values) + "\n").encode("utf-8")
+
+
+def _idempotent_checkpoint_matches_action(
+    receipt: Mapping[str, Any], submitted_action: Any
+) -> bool:
+    if receipt.get("schema") != CHECKPOINT_RECEIPT_SCHEMA_V2:
+        return True
+    if receipt.get("idempotent_overwrite") is not True:
+        return True
+    payload = _checkpoint_exact_shell_payload(submitted_action)
+    return bool(
+        receipt.get("changed") is False
+        and receipt.get("action_kind") == "shell_command"
+        and payload is not None
+        and len(payload) == receipt.get("size_bytes")
+        and hashlib.sha256(payload).hexdigest() == receipt.get("sha256")
+    )
 def _canonical_checkpoint_receipt(
     value: Any,
     *,
@@ -281,6 +359,7 @@ def _canonical_checkpoint_receipt(
         if (
             type(value.get("idempotent_overwrite")) is not bool
             or type(value.get("write_observed")) is not bool
+            or bool(value.get("changed")) and value["idempotent_overwrite"]
             or value["write_observed"]
             != bool(value.get("changed") or value["idempotent_overwrite"])
         ):
@@ -325,7 +404,14 @@ def _checkpoint_receipts_share_identity(
         "size_bytes",
         "sha256",
     )
-    return all(wrapper.get(key) == endpoint.get(key) for key in identity_fields)
+    if not all(wrapper.get(key) == endpoint.get(key) for key in identity_fields):
+        return False
+    if endpoint.get("schema") == CHECKPOINT_RECEIPT_SCHEMA_V2:
+        return all(
+            wrapper.get(key) == endpoint.get(key)
+            for key in ("idempotent_overwrite", "write_observed")
+        )
+    return True
 
 
 def _canonical_read_receipt(value: Any) -> Mapping[str, Any] | None:
@@ -394,6 +480,9 @@ def _canonical_compaction_receipt(
     if (
         receipt is None
         or not _checkpoint_receipts_share_identity(receipt, endpoint_value)
+        or not _idempotent_checkpoint_matches_action(
+            receipt, submission.get("submitted_action")
+        )
     ):
         return None
     if not (
