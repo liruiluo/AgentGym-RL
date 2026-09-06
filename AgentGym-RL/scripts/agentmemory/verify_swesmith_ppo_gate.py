@@ -10,7 +10,6 @@ from datetime import datetime
 import json
 import math
 import re
-import shlex
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -26,6 +25,14 @@ FILESYSTEM_CHECKPOINT_READ_RECEIPT_SCHEMA = (
 )
 FILESYSTEM_CHECKPOINT_PATH = ".agent_memory/CONTINUATION.md"
 FILESYSTEM_CHECKPOINT_MAX_BYTES = 8 * 1024
+FILESYSTEM_CHECKPOINT_PRINTF_TOKEN = r"[A-Za-z0-9._:/+=-]+"
+FILESYSTEM_CHECKPOINT_PRINTF_RE = re.compile(
+    r"\A[ \t]*(?:mkdir[ \t]+-p[ \t]+\.agent_memory[ \t]+&&[ \t]+)?"
+    r"printf[ \t]+'%s(?:\\n|\n)'[ \t]+"
+    rf"(?P<arguments>{FILESYSTEM_CHECKPOINT_PRINTF_TOKEN}"
+    rf"(?:[ \t]+{FILESYSTEM_CHECKPOINT_PRINTF_TOKEN})*)"
+    r"[ \t]+>[ \t]+\.agent_memory/CONTINUATION\.md[ \t]*\Z"
+)
 FILESYSTEM_CHECKPOINT_MARKER_PREFIX = (
     "Earlier conversation was removed after the continuation snapshot write "
     "succeeded. The workspace persists, but "
@@ -353,28 +360,10 @@ def _checkpoint_exact_shell_payload(action: Any) -> bytes | None:
         if heredoc.group("delimiter") in body.splitlines():
             return None
         return (body + "\n").encode("utf-8")
-    try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
-        lexer.whitespace_split = True
-        lexer.commenters = ""
-        tokens = list(lexer)
-    except ValueError:
+    match = FILESYSTEM_CHECKPOINT_PRINTF_RE.fullmatch(command)
+    if match is None:
         return None
-    mkdir_prefix = ["mkdir", "-p", ".agent_memory", "&&"]
-    if tokens[: len(mkdir_prefix)] == mkdir_prefix:
-        tokens = tokens[len(mkdir_prefix) :]
-    if (
-        len(tokens) < 5
-        or tokens[0] != "printf"
-        or tokens[1] not in {"%s\\n", "%s\n"}
-        or tokens[-2:] != [">", FILESYSTEM_CHECKPOINT_PATH]
-    ):
-        return None
-    values = tokens[2:-2]
-    if not values or any(
-        re.fullmatch(r"[A-Za-z0-9._:/+=-]+", value) is None for value in values
-    ):
-        return None
+    values = re.split(r"[ \t]+", match.group("arguments"))
     return ("\n".join(values) + "\n").encode("utf-8")
 
 

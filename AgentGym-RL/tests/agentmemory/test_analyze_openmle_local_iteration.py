@@ -287,6 +287,32 @@ def test_v2_identity_and_current_action_provenance_are_strict():
     )
 
 
+def test_printf_parser_rejects_unquoted_shell_separators():
+    fields = "objective=fit next_action=edit"
+    expected = b"objective=fit\nnext_action=edit\n"
+    for fmt in ("%s\\n", "%s\n"):
+        command = (
+            "mkdir -p .agent_memory && printf '"
+            + fmt
+            + "' "
+            + fields
+            + " > .agent_memory/CONTINUATION.md"
+        )
+        action = "shell_command " + json.dumps({"command": command})
+        assert MODULE._checkpoint_exact_shell_payload(action) == expected
+
+    for separator in ("\n", "\r", "\r\n"):
+        command = (
+            "mkdir -p .agent_memory && printf '%s\\n' objective=fit"
+            + separator
+            + "touch side_effect"
+            + separator
+            + "cat source > .agent_memory/CONTINUATION.md"
+        )
+        action = "shell_command " + json.dumps({"command": command})
+        assert MODULE._checkpoint_exact_shell_payload(action) is None
+
+
 def test_complete_local_iteration_memory_chain_is_detected():
     result = MODULE.analyze_documents([(1, _complete_document())])
     assert result["trajectory_count"] == 1
