@@ -1043,6 +1043,34 @@ class TestObserverAndReceiptSemantics(GateFixture):
                     with self.assertRaisesRegex(ValueError, "finite"):
                         self.run_gate(dry_run=True, **kwargs)
 
+    def test_cli_exit_code_uses_status_as_the_only_control_field(self):
+        arguments = [
+            "--run-dir",
+            str(self.run_dir),
+            "--run-id",
+            self.run_id,
+            "--owner-receipt",
+            str(self.owner_path),
+            "--expected-outer-commit",
+            self.expected.outer_commit,
+            "--expected-inner-commit",
+            self.expected.inner_commit,
+            "--expected-verl-commit",
+            self.expected.verl_commit,
+            "--output",
+            str(self.output),
+        ]
+        cases = (
+            ({"status": "pass", "decision": "FAIL_NO_UNSAFE_STOP"}, 0),
+            ({"status": "fail", "decision": "PASS_CONTINUE"}, 1),
+        )
+        for receipt, expected_exit in cases:
+            with self.subTest(receipt=receipt):
+                with mock.patch.object(
+                    gate_module, "run_update1_gate", return_value=receipt
+                ):
+                    self.assertEqual(gate_module.main(arguments), expected_exit)
+
     def test_output_cannot_overlap_launch_bound_input(self):
         with self.assertRaisesRegex(GateFailure, "fixed gate output"):
             run_update1_gate(
