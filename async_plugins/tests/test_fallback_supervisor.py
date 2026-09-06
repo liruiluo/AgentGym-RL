@@ -46,6 +46,14 @@ class TestFallbackWrapperSource(unittest.TestCase):
             source,
         )
 
+    def test_production_default_uses_actual_auto_gpu_holder_state(self) -> None:
+        source = WATCHDOG_WRAPPER.read_text(encoding="utf-8")
+        self.assertIn(
+            'FALLBACK_AUTO_GPU_HOLDER_STATE:-/tmp/crg-holder.state',
+            source,
+        )
+        self.assertNotIn('/tmp/crg-gpu-holder.state', source)
+
 
 class TestPendingResumeReleaseTransaction(unittest.TestCase):
     def setUp(self) -> None:
