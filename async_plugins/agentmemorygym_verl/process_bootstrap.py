@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import errno
 import os
 import signal
 import subprocess
@@ -22,6 +23,11 @@ from pathlib import Path
 
 _WATCHED_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 _PR_SET_PDEATHSIG = 1
+_PR_SET_CHILD_SUBREAPER = 36
+_PIDFD_SEND_SIGNAL_SYSCALL = 424
+_PIDFD_OPEN_SYSCALL = 434
+
+_ZOMBIE_STATES = {"Z", "X", "x"}
 
 
 def _process_start_ticks(pid: int) -> str | None:
@@ -39,8 +45,10 @@ def _process_start_ticks(pid: int) -> str | None:
         return None
 
 
-def _active_group_members(process_group: int, *, exclude: int) -> list[int]:
-    members: list[int] = []
+def _active_group_members(
+    process_group: int, *, exclude: int
+) -> list[tuple[int, str]]:
+    members: list[tuple[int, str]] = []
     for candidate in Path("/proc").iterdir():
         if not candidate.name.isdigit():
             continue
@@ -59,8 +67,124 @@ def _active_group_members(process_group: int, *, exclude: int) -> list[int]:
             and fields[0] not in {"Z", "X", "x"}
             and int(fields[2]) == process_group
         ):
-            members.append(pid)
+            members.append((pid, fields[19]))
     return sorted(members)
+
+
+def _process_identity(pid: int) -> tuple[int, str, int, str] | None:
+    """Return ``(pid, start_ticks, ppid, state)`` from one proc snapshot."""
+
+    try:
+        fields = (
+            Path(f"/proc/{pid}/stat")
+            .read_text(encoding="utf-8")
+            .rsplit(")", 1)[1]
+            .split()
+        )
+        return pid, fields[19], int(fields[1]), fields[0]
+    except (FileNotFoundError, IndexError, OSError, ValueError):
+        return None
+
+
+def _active_descendants(root_pid: int) -> list[tuple[int, str]]:
+    """Snapshot every live descendant, including processes that called setsid."""
+
+    snapshots: dict[int, tuple[int, str, int, str]] = {}
+    for candidate in Path("/proc").iterdir():
+        if not candidate.name.isdigit():
+            continue
+        identity = _process_identity(int(candidate.name))
+        if identity is not None:
+            snapshots[identity[0]] = identity
+    descendants: dict[int, tuple[int, str]] = {}
+    frontier = {root_pid}
+    while frontier:
+        parents = set(frontier)
+        frontier.clear()
+        for pid, start_ticks, ppid, state in snapshots.values():
+            if pid in descendants or ppid not in parents:
+                continue
+            if state not in _ZOMBIE_STATES:
+                descendants[pid] = (pid, start_ticks)
+                frontier.add(pid)
+    return sorted(descendants.values())
+
+
+def _reap_adopted_children(*, exclude: int) -> None:
+    """Reap dead grandchildren adopted through the subreaper contract."""
+
+    for candidate in Path("/proc").iterdir():
+        if not candidate.name.isdigit():
+            continue
+        pid = int(candidate.name)
+        if pid == exclude:
+            continue
+        identity = _process_identity(pid)
+        if identity is None or identity[2] != os.getpid() or identity[3] != "Z":
+            continue
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+
+
+def _pidfd_open_exact(pid: int) -> int:
+    pidfd_open = getattr(os, "pidfd_open", None)
+    if callable(pidfd_open):
+        return int(pidfd_open(pid, 0))
+    libc = ctypes.CDLL(None, use_errno=True)
+    syscall = libc.syscall
+    syscall.restype = ctypes.c_long
+    descriptor = int(syscall(_PIDFD_OPEN_SYSCALL, pid, 0))
+    if descriptor >= 0:
+        return descriptor
+    error_number = ctypes.get_errno()
+    if error_number == errno.ESRCH:
+        raise ProcessLookupError(pid)
+    raise OSError(error_number, os.strerror(error_number))
+
+
+def _pidfd_send_signal_exact(descriptor: int, signum: int) -> None:
+    pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+    if callable(pidfd_send_signal):
+        pidfd_send_signal(descriptor, signum, None, 0)
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    syscall = libc.syscall
+    syscall.restype = ctypes.c_long
+    result = int(
+        syscall(
+            _PIDFD_SEND_SIGNAL_SYSCALL,
+            descriptor,
+            signum,
+            ctypes.c_void_p(0),
+            0,
+        )
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number == errno.ESRCH:
+        raise ProcessLookupError
+    raise OSError(error_number, os.strerror(error_number))
+
+
+def _signal_group_member_exact(identity: tuple[int, str], signum: int) -> bool:
+    pid, start_ticks = identity
+    if _process_start_ticks(pid) != start_ticks:
+        return False
+    descriptor = -1
+    try:
+        descriptor = _pidfd_open_exact(pid)
+        if _process_start_ticks(pid) != start_ticks:
+            return False
+        _pidfd_send_signal_exact(descriptor, signum)
+    except ProcessLookupError:
+        return False
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    return True
 
 
 def _arm_parent_death_signal() -> None:
@@ -70,6 +194,16 @@ def _arm_parent_death_signal() -> None:
         raise OSError(
             error_number,
             f"prctl(PR_SET_PDEATHSIG) failed: {os.strerror(error_number)}",
+        )
+
+
+def _arm_child_subreaper() -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(
+            error_number,
+            f"prctl(PR_SET_CHILD_SUBREAPER) failed: {os.strerror(error_number)}",
         )
 
 
@@ -104,6 +238,10 @@ def run(
     for signum in _WATCHED_SIGNALS:
         signal.signal(signum, request_termination)
     _arm_parent_death_signal()
+    # cgroup delegation is unavailable in the 9N containers.  Becoming a
+    # subreaper keeps daemonized/setsid descendants attached to this exact,
+    # lease-bound root so cleanup is not limited to the original process group.
+    _arm_child_subreaper()
 
     try:
         acknowledged = os.read(ack_fd, 1)
@@ -121,29 +259,30 @@ def run(
     child = subprocess.Popen(command, start_new_session=False)
     forwarded = False
     kill_deadline = 0.0
+    next_kill_retry = 0.0
     while True:
         if termination_signal is not None and not forwarded:
             for signum in _WATCHED_SIGNALS:
                 signal.signal(signum, signal.SIG_IGN)
-            try:
-                # This process is the still-live group leader, so its own PGID
-                # cannot have been reused when it signals the group it anchors.
-                os.killpg(os.getpid(), termination_signal)
-            except ProcessLookupError:
-                pass
             forwarded = True
             kill_deadline = time.monotonic() + cleanup_timeout_seconds
 
         return_code = child.poll()
-        members = _active_group_members(os.getpid(), exclude=os.getpid())
-        if return_code is not None and not members:
+        _reap_adopted_children(exclude=child.pid)
+        descendants = _active_descendants(os.getpid())
+        if return_code is not None and not descendants:
             if termination_signal is not None:
                 return 128 + termination_signal
             return _render_return_code(return_code)
-        if forwarded and time.monotonic() >= kill_deadline:
-            # The group is still authenticated by this live leader.  SIGKILL
-            # includes the helper itself and therefore cannot leave an anchor.
-            os.killpg(os.getpid(), signal.SIGKILL)
+        if forwarded:
+            now = time.monotonic()
+            descendant_signal = (
+                signal.SIGTERM if now < kill_deadline else signal.SIGKILL
+            )
+            if now >= next_kill_retry:
+                for descendant in descendants:
+                    _signal_group_member_exact(descendant, descendant_signal)
+                next_kill_retry = now + 0.25
         time.sleep(0.02)
 
 

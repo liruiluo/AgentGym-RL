@@ -1862,7 +1862,10 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
             with (
                 mock.patch(
                     "agentmemorygym_verl.multitask_orchestrator.prepare_marker_transaction"
-                ),
+                ) as prepare,
+                mock.patch(
+                    "agentmemorygym_verl.multitask_orchestrator.bind_marker_drain_exclusion"
+                ) as bind_exclusion,
                 mock.patch(
                     "agentmemorygym_verl.multitask_orchestrator.acquire_marker_transaction",
                     side_effect=RuntimeError("synthetic acquisition failure"),
@@ -1874,9 +1877,85 @@ class TestMultitaskOrchestratorContract(unittest.TestCase):
             ):
                 backend.acquire_holders(plan)
 
+            prepare_kwargs = prepare.call_args.kwargs
+            self.assertEqual(prepare_kwargs["drain_identity_root"], plan.run_dir)
+            self.assertEqual(
+                prepare_kwargs["drain_excluded_identity_paths"],
+                (
+                    plan.run_dir
+                    / "holder-transaction"
+                    / "watcher-process-identity.json",
+                ),
+            )
+            self.assertEqual(
+                supervisor.start_command.call_args.kwargs["cleanup_timeout_seconds"],
+                330,
+            )
+            bind_kwargs = bind_exclusion.call_args.kwargs
+            self.assertEqual(bind_kwargs["expected_name"], "holder-watcher")
+            self.assertEqual(bind_kwargs["expected_pid"], watcher.pid)
+            self.assertEqual(bind_kwargs["expected_start_ticks"], watcher.start_ticks)
+            self.assertEqual(bind_kwargs["expected_process_group"], watcher.pid)
             supervisor.wait.assert_called_once_with(watcher, timeout_seconds=15)
             supervisor.stop.assert_called_once_with(watcher, timeout_seconds=5)
             process.wait.assert_not_called()
+
+    def test_execute_local_preserves_watcher_after_restore_drain_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            watcher = ProcessLease(
+                name="holder-watcher",
+                pid=103,
+                start_ticks="203",
+                process=mock.Mock(),
+                log_handle=None,
+            )
+            holder = mock.Mock(watcher=watcher)
+            supervisor = mock.Mock()
+            supervisor.owned_leases = (watcher,)
+
+            class RestoreFailureBackend:
+                def __init__(self) -> None:
+                    self.holder_handle = holder
+                    self.endpoint_leases: tuple[ProcessLease, ...] = ()
+                    self.trainer = None
+                    self.supervisor = supervisor
+
+                def resolve(self, plan: LaunchPlan) -> None:
+                    plan.run_dir.mkdir(parents=True)
+
+                def acquire_holders(self, _plan: LaunchPlan) -> object:
+                    return holder
+
+                def start_endpoints(
+                    self, _plan: LaunchPlan
+                ) -> tuple[ProcessLease, ...]:
+                    raise RuntimeError("synthetic startup failure")
+
+                def restore_holders(
+                    self, _plan: LaunchPlan, _holder: object
+                ) -> None:
+                    raise OrchestratorError(
+                        "marker restore: published child identities are still alive"
+                    )
+
+            plan = replace(
+                LaunchPlan.for_test(resolve_only=False),
+                run_dir=Path(directory) / "run",
+            )
+            backend = RestoreFailureBackend()
+            with (
+                mock.patch(
+                    "agentmemorygym_verl.multitask_orchestrator.LocalBackend",
+                    return_value=backend,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "synthetic startup failure",
+                ),
+            ):
+                _execute_local(plan)
+
+            supervisor.stop_all.assert_not_called()
 
     def test_execute_local_cleans_backend_owned_resources_after_interruption(
         self,

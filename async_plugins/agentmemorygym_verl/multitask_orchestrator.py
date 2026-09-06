@@ -33,6 +33,8 @@ from .orchestrator_lifecycle import (
     _marker_record,
     _signal_process_identity,
     acquire_marker_transaction,
+    bind_marker_drain_exclusion,
+    bind_marker_drain_identity,
     prepare_marker_transaction,
     process_identity_alive,
     process_start_ticks,
@@ -75,6 +77,7 @@ _HOLDER_MARKER_PATHS = {
     "gpu": Path("/tmp/crg-holder-yield"),
 }
 _HEX = frozenset("0123456789abcdef")
+_BOOTSTRAP_DRAIN_GRACE_SECONDS = 15.0
 _RECEIPT_SOURCE_COMMIT_FIELDS = {
     "outer": frozenset(
         {
@@ -1253,6 +1256,7 @@ class ExactProcessSupervisor:
         log_handle: BinaryIO,
         identity_path: Path,
         cleanup_timeout_seconds: float,
+        before_ack: Any | None = None,
     ) -> ProcessLease:
         """Start a command only after its exact lease is durably published."""
 
@@ -1307,17 +1311,17 @@ class ExactProcessSupervisor:
                     cleanup_timeout_seconds=cleanup_timeout_seconds,
                 )
                 self._register(lease)
-                _atomic_json(
-                    identity_path,
-                    {
-                        "name": name,
-                        "pid": lease.pid,
-                        "start_ticks": lease.start_ticks,
-                        "process_group": lease.pid,
-                        "bootstrap": str(bootstrap),
-                        "command": list(command),
-                    },
-                )
+                identity_payload = {
+                    "name": name,
+                    "pid": lease.pid,
+                    "start_ticks": lease.start_ticks,
+                    "process_group": lease.pid,
+                    "bootstrap": str(bootstrap),
+                    "command": list(command),
+                }
+                _atomic_json(identity_path, identity_payload)
+                if before_ack is not None:
+                    before_ack(lease, identity_path, identity_payload)
                 if os.write(write_fd, b"1") != 1:
                     raise OrchestratorError(
                         f"failed to release {name} process bootstrap"
@@ -1363,6 +1367,7 @@ class ExactProcessSupervisor:
         run_dir: Path,
         parent_pid: int,
         parent_start_ticks: str,
+        before_ack: Any | None = None,
     ) -> ProcessLease:
         if (
             parent_pid != os.getpid()
@@ -1416,6 +1421,7 @@ class ExactProcessSupervisor:
             log_handle=log_handle,
             identity_path=endpoint_dir / "process-identity.json",
             cleanup_timeout_seconds=spec.cleanup_timeout_seconds,
+            before_ack=before_ack,
         )
 
     def alive(self, lease: ProcessLease) -> bool:
@@ -1495,7 +1501,16 @@ class ExactProcessSupervisor:
                     if pid != lease.pid:
                         _signal_process_identity(pid, ticks, signal.SIGTERM)
 
-            deadline = time.monotonic() + timeout_seconds
+            # ``process_bootstrap`` owns the complete ancestry inventory and
+            # starts its stubborn-descendant SIGKILL phase only after its own
+            # cleanup timeout.  Wait through a distinct reaping grace window;
+            # killing the subreaper at the same deadline can orphan a setsid
+            # descendant that is invisible to this process-group view.
+            deadline = (
+                time.monotonic()
+                + timeout_seconds
+                + _BOOTSTRAP_DRAIN_GRACE_SECONDS
+            )
             while time.monotonic() < deadline:
                 leader = _process_identity_state(lease.pid, lease.start_ticks)
                 group_members = _active_process_group_identities(process_group)
@@ -1514,6 +1529,11 @@ class ExactProcessSupervisor:
                 for identity in _active_process_group_identities(process_group)
                 if identity[0] != lease.pid
             )
+            if leader is not None and leader[0] not in {"Z", "X", "x"}:
+                raise OrchestratorError(
+                    f"{lease.name} bootstrap did not drain its descendants "
+                    "before the cleanup timeout plus subreaper grace"
+                )
             if active_descendants:
                 if leader is None or leader[1] != process_group:
                     raise OrchestratorError(
@@ -1537,9 +1557,6 @@ class ExactProcessSupervisor:
                     raise OrchestratorError(
                         f"{lease.name} process-group descendants did not terminate"
                     )
-            leader = _process_identity_state(lease.pid, lease.start_ticks)
-            if leader is not None and leader[0] not in {"Z", "X", "x"}:
-                _signal_process_identity(lease.pid, lease.start_ticks, signal.SIGKILL)
             try:
                 lease.process.wait(timeout=5)
             except subprocess.TimeoutExpired as exc:
@@ -1579,6 +1596,7 @@ def start_endpoint_processes(
     parent_pid: int,
     parent_start_ticks: str,
     supervisor: Any,
+    before_ack: Any | None = None,
 ) -> tuple[ProcessLease, ...]:
     """Start all launchers before readiness waits; rollback a partial start."""
 
@@ -1591,6 +1609,7 @@ def start_endpoint_processes(
                     run_dir=run_dir,
                     parent_pid=parent_pid,
                     parent_start_ticks=parent_start_ticks,
+                    before_ack=before_ack,
                 )
                 leases.append(lease)
     except Exception as start_error:
@@ -2053,6 +2072,30 @@ class LocalBackend:
         self.trainer: ProcessLease | None = None
         self.holder_handle: _HolderHandle | None = None
 
+    def _bind_business_identity(
+        self,
+        plan: LaunchPlan,
+        lease: ProcessLease,
+        identity_path: Path,
+        payload: Mapping[str, Any],
+    ) -> None:
+        holder = self.holder_handle
+        if holder is None:
+            raise OrchestratorError(
+                "business process cannot start before holder transaction acquisition"
+            )
+        bind_marker_drain_identity(
+            holder.state_path,
+            plan.config.holder_lock_path,
+            identity_path=identity_path,
+            expected_name=lease.name,
+            expected_pid=lease.pid,
+            expected_start_ticks=lease.start_ticks,
+            expected_process_group=lease.pid,
+            expected_bootstrap=Path(str(payload["bootstrap"])),
+            expected_command=tuple(str(value) for value in payload["command"]),
+        )
+
     def resolve(self, plan: LaunchPlan) -> None:
         plan.run_dir.mkdir(parents=True, exist_ok=False)
         command = build_generic_launch_command(plan, resolve_only=True)
@@ -2119,6 +2162,10 @@ class LocalBackend:
                 parent_pid=self.parent_pid,
                 parent_start_ticks=self.parent_start_ticks,
                 markers=markers,
+                drain_identity_root=plan.run_dir,
+                drain_excluded_identity_paths=(
+                    state_dir / "watcher-process-identity.json",
+                ),
             )
             prepared = True
             lifecycle = Path(__file__).with_name("orchestrator_lifecycle.py")
@@ -2139,6 +2186,8 @@ class LocalBackend:
                 str(ready_path),
                 "--receipt",
                 str(receipt_path),
+                "--drain-identity-root",
+                str(plan.run_dir),
                 "--poll-seconds",
                 "0.1",
                 "--restore-timeout-seconds",
@@ -2151,7 +2200,18 @@ class LocalBackend:
                 environment=dict(os.environ),
                 log_handle=watcher_log,
                 identity_path=state_dir / "watcher-process-identity.json",
-                cleanup_timeout_seconds=5,
+                cleanup_timeout_seconds=330,
+            )
+            bind_marker_drain_exclusion(
+                state_path,
+                plan.config.holder_lock_path,
+                identity_path=state_dir / "watcher-process-identity.json",
+                expected_name="holder-watcher",
+                expected_pid=watcher.pid,
+                expected_start_ticks=watcher.start_ticks,
+                expected_process_group=watcher.pid,
+                expected_bootstrap=Path(__file__).with_name("process_bootstrap.py"),
+                expected_command=watcher_command,
             )
             deadline = time.monotonic() + 15
             while time.monotonic() < deadline:
@@ -2214,6 +2274,14 @@ class LocalBackend:
             parent_pid=self.parent_pid,
             parent_start_ticks=self.parent_start_ticks,
             supervisor=self.supervisor,
+            before_ack=lambda lease, identity_path, payload: (
+                self._bind_business_identity(
+                    plan,
+                    lease,
+                    identity_path,
+                    payload,
+                )
+            ),
         )
         try:
             self.endpoint_runtime = wait_for_endpoints(
@@ -2339,6 +2407,14 @@ class LocalBackend:
                 log_handle=log_handle,
                 identity_path=plan.run_dir / "trainer-process-identity.json",
                 cleanup_timeout_seconds=30,
+                before_ack=lambda lease, identity_path, payload: (
+                    self._bind_business_identity(
+                        plan,
+                        lease,
+                        identity_path,
+                        payload,
+                    )
+                ),
             )
             self.trainer = trainer
         return trainer
@@ -2396,7 +2472,10 @@ class LocalBackend:
         try:
             restore_marker_transaction(holder.state_path, plan.config.holder_lock_path)
         except Exception as exc:
-            errors.append(f"marker restore: {exc}")
+            # Keep the watcher alive and the holder markers acquired.  If the
+            # orchestrator exits with a still-live child, the watcher's
+            # parent-death path owns the eventual drain-before-restore retry.
+            raise OrchestratorError(f"marker restore: {exc}") from exc
         try:
             self.supervisor.wait(holder.watcher, timeout_seconds=15)
         except (OrchestratorError, subprocess.TimeoutExpired):
@@ -2479,9 +2558,19 @@ def _execute_local(plan: LaunchPlan) -> int:
                 backend.restore_holders(plan, owned_holder)
             except Exception as exc:
                 cleanup_errors.append(str(exc))
-        if supervisor is not None and supervisor.owned_leases:
+        remaining_holder_watchers = (
+            holder_watchers if backend.holder_handle is not None else ()
+        )
+        if supervisor is not None and any(
+            (lease.pid, lease.start_ticks)
+            not in {
+                (watcher.pid, watcher.start_ticks)
+                for watcher in remaining_holder_watchers
+            }
+            for lease in supervisor.owned_leases
+        ):
             try:
-                supervisor.stop_all()
+                supervisor.stop_all(exclude=remaining_holder_watchers)
             except Exception as exc:
                 cleanup_errors.append(str(exc))
         generic_receipt = plan.run_dir / "launch-receipt.json"

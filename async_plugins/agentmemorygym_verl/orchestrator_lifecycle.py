@@ -110,6 +110,114 @@ def process_identity_alive(pid: int, start_ticks: str) -> bool:
     )
 
 
+def _process_group_members(process_group: int) -> tuple[dict[str, Any], ...]:
+    if process_group <= 0 or not Path("/proc/self/stat").is_file():
+        raise LifecycleError("process-group drain requires Linux /proc")
+    members: list[dict[str, Any]] = []
+    for candidate in Path("/proc").iterdir():
+        if not candidate.name.isdigit():
+            continue
+        stat_path = candidate / "stat"
+        try:
+            fields = stat_path.read_text(encoding="utf-8").rsplit(")", 1)[1].split()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            if error.errno in {errno.ENOENT, errno.ESRCH}:
+                continue
+            raise LifecycleError(
+                f"cannot audit process-group member {stat_path}: {error}"
+            ) from error
+        except (IndexError, ValueError) as error:
+            raise LifecycleError(
+                f"invalid process stat during process-group drain: {stat_path}"
+            ) from error
+        if fields[0] in {"Z", "X", "x"} or int(fields[2]) != process_group:
+            continue
+        members.append(
+            {
+                "pid": int(candidate.name),
+                "start_ticks": fields[19],
+                "state": fields[0],
+            }
+        )
+    return tuple(sorted(members, key=lambda item: int(item["pid"])))
+
+
+def _published_process_identities(
+    root: Path,
+    *,
+    exclude_paths: Sequence[Path] = (),
+) -> tuple[dict[str, Any], ...]:
+    """Load every durably published child-process identity below ``root``.
+
+    The multitask orchestrator publishes an identity before acknowledging each
+    blocked process bootstrap. Therefore, after the orchestrator dies, a
+    command that could have started must have a corresponding identity file.
+    Keeping holder markers until every such identity is dead establishes the
+    required child-drain-before-holder-restore ordering.
+    """
+
+    if root.is_symlink() or not root.is_dir():
+        raise LifecycleError(
+            f"process identity drain root must be a directory: {root}"
+        )
+    excluded = {str(Path(os.path.abspath(os.fspath(path)))) for path in exclude_paths}
+    identities: list[dict[str, Any]] = []
+    for path in sorted(root.rglob("*process-identity.json")):
+        absolute_path = str(Path(os.path.abspath(os.fspath(path))))
+        if absolute_path in excluded:
+            continue
+        payload = _load_json(path)
+        if not isinstance(payload, dict):
+            raise LifecycleError(f"process identity must be a JSON object: {path}")
+        try:
+            pid = int(payload["pid"])
+            start_ticks = str(payload["start_ticks"])
+            process_group = int(payload["process_group"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise LifecycleError(f"invalid process identity in {path}") from error
+        if pid <= 0 or process_group <= 0 or not start_ticks:
+            raise LifecycleError(f"invalid process identity in {path}")
+        members = _process_group_members(process_group)
+        leader_alive = process_identity_alive(pid, start_ticks)
+        if leader_alive and not any(
+            int(member["pid"]) == pid
+            and str(member["start_ticks"]) == start_ticks
+            for member in members
+        ):
+            raise LifecycleError(
+                "published process leader changed process group before drain: "
+                f"{path}"
+            )
+        identities.append(
+            {
+                "path": absolute_path,
+                "pid": pid,
+                "start_ticks": start_ticks,
+                "process_group": process_group,
+                "leader_alive": leader_alive,
+                "group_members": members,
+                "alive": leader_alive or bool(members),
+            }
+        )
+    return tuple(identities)
+
+
+def _alive_published_process_identities(
+    root: Path,
+    *,
+    exclude_paths: Sequence[Path] = (),
+) -> tuple[dict[str, Any], ...]:
+    return tuple(
+        identity
+        for identity in _published_process_identities(
+            root, exclude_paths=exclude_paths
+        )
+        if identity["alive"]
+    )
+
+
 def _read_marker_with_metadata(
     path: Path,
 ) -> tuple[str | None, os.stat_result | None]:
@@ -830,6 +938,8 @@ def prepare_marker_transaction(
     parent_pid: int,
     parent_start_ticks: str,
     markers: Sequence[dict[str, Any]],
+    drain_identity_root: Path | None = None,
+    drain_excluded_identity_paths: Sequence[Path] = (),
 ) -> dict[str, Any]:
     with _exclusive_lock(lock_path):
         if state_path.exists() or state_path.is_symlink():
@@ -874,6 +984,35 @@ def prepare_marker_transaction(
             "markers": normalized,
             "updated_unix": time.time(),
         }
+        if drain_identity_root is not None:
+            if drain_identity_root.is_symlink() or not drain_identity_root.is_dir():
+                raise LifecycleError(
+                    "process identity drain root must be a directory: "
+                    f"{drain_identity_root}"
+                )
+            absolute_root = Path(os.path.abspath(os.fspath(drain_identity_root)))
+            root_metadata = absolute_root.lstat()
+            excluded_paths: list[str] = []
+            for raw_path in drain_excluded_identity_paths:
+                absolute_path = Path(os.path.abspath(os.fspath(raw_path)))
+                if absolute_root != absolute_path and absolute_root not in absolute_path.parents:
+                    raise LifecycleError(
+                        "drain-excluded identity path is outside its root: "
+                        f"{absolute_path}"
+                )
+                excluded_paths.append(str(absolute_path))
+            state["drain_identity_root"] = str(absolute_root)
+            state["drain_identity_root_identity"] = {
+                "device": root_metadata.st_dev,
+                "inode": root_metadata.st_ino,
+            }
+            state["drain_excluded_identity_paths"] = excluded_paths
+            state["drain_exclusions"] = []
+            # Business processes are registered one at a time before their
+            # blocked bootstrap is acknowledged.  This durable inventory is
+            # append-only for the transaction so deleting/replacing an
+            # identity file can never make the restore scan look empty.
+            state["drain_identities"] = []
         _atomic_write_json(state_path, state)
         return state
 
@@ -890,6 +1029,259 @@ def _load_marker_state(state_path: Path) -> dict[str, Any]:
 def _save_marker_state(state_path: Path, state: dict[str, Any]) -> None:
     state["updated_unix"] = time.time()
     _atomic_write_json(state_path, state)
+
+
+def _validate_drain_identity_root(state: Mapping[str, Any]) -> Path:
+    raw_root = state.get("drain_identity_root")
+    identity = state.get("drain_identity_root_identity")
+    if raw_root is None or not isinstance(identity, dict):
+        raise LifecycleError("marker drain root identity is not bound")
+    root = Path(str(raw_root))
+    if root.is_symlink() or not root.is_dir():
+        raise LifecycleError(f"process identity drain root is unsafe: {root}")
+    metadata = root.lstat()
+    if (
+        metadata.st_dev != int(identity.get("device", -1))
+        or metadata.st_ino != int(identity.get("inode", -1))
+    ):
+        raise LifecycleError(f"process identity drain root was replaced: {root}")
+    return root
+
+
+def _identity_file_binding(path: Path, payload: Mapping[str, Any]) -> dict[str, Any]:
+    if path.is_symlink() or not path.is_file():
+        raise LifecycleError(f"drain-excluded identity must be a regular file: {path}")
+    metadata = path.lstat()
+    return {
+        "path": str(path),
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "ctime_ns": metadata.st_ctime_ns,
+        "size": metadata.st_size,
+        "sha256": _sha256(path),
+        "payload": dict(payload),
+    }
+
+
+def bind_marker_drain_exclusion(
+    state_path: Path,
+    lock_path: Path,
+    *,
+    identity_path: Path,
+    expected_name: str,
+    expected_pid: int,
+    expected_start_ticks: str,
+    expected_process_group: int,
+    expected_bootstrap: Path,
+    expected_command: Sequence[str],
+) -> dict[str, Any]:
+    """Bind one watcher exclusion to its exact durable lease before acquire."""
+
+    with _exclusive_lock(lock_path):
+        state = _load_marker_state(state_path)
+        if state.get("status") != "prepared":
+            raise LifecycleError(
+                "marker drain exclusion can only be bound while prepared"
+            )
+        root = _validate_drain_identity_root(state)
+        path = Path(os.path.abspath(os.fspath(identity_path)))
+        if root != path and root not in path.parents:
+            raise LifecycleError(f"drain exclusion is outside its root: {path}")
+        requested = state.get("drain_excluded_identity_paths")
+        if not isinstance(requested, list) or str(path) not in requested:
+            raise LifecycleError(f"unregistered drain exclusion path: {path}")
+        payload = _load_json(path)
+        expected_payload = {
+            "name": expected_name,
+            "pid": int(expected_pid),
+            "start_ticks": str(expected_start_ticks),
+            "process_group": int(expected_process_group),
+            "bootstrap": str(expected_bootstrap),
+            "command": list(expected_command),
+        }
+        if payload != expected_payload:
+            raise LifecycleError(
+                f"drain exclusion lease does not match published identity: {path}"
+            )
+        if (
+            expected_pid <= 0
+            or expected_process_group != expected_pid
+            or not expected_start_ticks
+            or not process_identity_alive(expected_pid, expected_start_ticks)
+        ):
+            raise LifecycleError(f"drain exclusion lease is not alive: {path}")
+        bindings = state.get("drain_exclusions")
+        if not isinstance(bindings, list):
+            raise LifecycleError("marker drain exclusions must be a list")
+        if any(item.get("path") == str(path) for item in bindings):
+            raise LifecycleError(f"drain exclusion is already bound: {path}")
+        bindings.append(_identity_file_binding(path, payload))
+        _save_marker_state(state_path, state)
+        return state
+
+
+def bind_marker_drain_identity(
+    state_path: Path,
+    lock_path: Path,
+    *,
+    identity_path: Path,
+    expected_name: str,
+    expected_pid: int,
+    expected_start_ticks: str,
+    expected_process_group: int,
+    expected_bootstrap: Path,
+    expected_command: Sequence[str],
+) -> dict[str, Any]:
+    """Register one business-process lease before releasing its bootstrap."""
+
+    with _exclusive_lock(lock_path):
+        state = _load_marker_state(state_path)
+        if state.get("status") != "acquired":
+            raise LifecycleError(
+                "marker drain identities can only be bound while acquired"
+            )
+        root = _validate_drain_identity_root(state)
+        path = Path(os.path.abspath(os.fspath(identity_path)))
+        if root != path and root not in path.parents:
+            raise LifecycleError(f"drain identity is outside its root: {path}")
+        excluded = set(state.get("drain_excluded_identity_paths", ()))
+        if str(path) in excluded:
+            raise LifecycleError(f"business drain identity is an exclusion: {path}")
+        payload = _load_json(path)
+        expected_payload = {
+            "name": expected_name,
+            "pid": int(expected_pid),
+            "start_ticks": str(expected_start_ticks),
+            "process_group": int(expected_process_group),
+            "bootstrap": str(expected_bootstrap),
+            "command": list(expected_command),
+        }
+        if payload != expected_payload:
+            raise LifecycleError(
+                f"business drain lease does not match published identity: {path}"
+            )
+        if (
+            expected_pid <= 0
+            or expected_process_group != expected_pid
+            or not expected_start_ticks
+            or not process_identity_alive(expected_pid, expected_start_ticks)
+        ):
+            raise LifecycleError(f"business drain lease is not alive: {path}")
+        bindings = state.get("drain_identities")
+        if not isinstance(bindings, list):
+            raise LifecycleError("marker business drain inventory must be a list")
+        if any(item.get("path") == str(path) for item in bindings):
+            raise LifecycleError(f"business drain identity is already bound: {path}")
+        bindings.append(_identity_file_binding(path, payload))
+        _save_marker_state(state_path, state)
+        return state
+
+
+def _marker_drain_exclusion_paths(state: Mapping[str, Any]) -> tuple[Path, ...]:
+    root = _validate_drain_identity_root(state)
+    requested = state.get("drain_excluded_identity_paths", ())
+    bindings = state.get("drain_exclusions", ())
+    if not isinstance(requested, list) or not isinstance(bindings, list):
+        raise LifecycleError("marker drain exclusion inventory must be lists")
+    if len(bindings) != len(requested):
+        raise LifecycleError("marker drain exclusions are not fully bound")
+    requested_set = set(str(value) for value in requested)
+    observed_paths: list[Path] = []
+    for binding in bindings:
+        if not isinstance(binding, dict):
+            raise LifecycleError("marker drain exclusion binding must be an object")
+        path = Path(str(binding.get("path", "")))
+        if str(path) not in requested_set or (root != path and root not in path.parents):
+            raise LifecycleError(f"unexpected marker drain exclusion path: {path}")
+        payload = _load_json(path)
+        current = _identity_file_binding(path, payload)
+        if current != binding:
+            raise LifecycleError(f"marker drain exclusion was replaced: {path}")
+        try:
+            pid = int(payload["pid"])
+            start_ticks = str(payload["start_ticks"])
+            process_group = int(payload["process_group"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise LifecycleError(f"invalid bound drain exclusion: {path}") from error
+        if pid <= 0 or process_group != pid or not start_ticks:
+            raise LifecycleError(f"invalid bound drain exclusion: {path}")
+        observed_paths.append(path)
+    if set(str(path) for path in observed_paths) != requested_set:
+        raise LifecycleError("marker drain exclusion bindings do not match requests")
+    return tuple(observed_paths)
+
+
+def _marker_drain_identity_bindings(
+    state: Mapping[str, Any],
+    *,
+    excluded_paths: Sequence[Path],
+) -> tuple[dict[str, Any], ...]:
+    """Revalidate the append-only business lease inventory and path set."""
+
+    root = _validate_drain_identity_root(state)
+    bindings = state.get("drain_identities", ())
+    if not isinstance(bindings, list):
+        raise LifecycleError("marker business drain inventory must be a list")
+    excluded = {
+        str(Path(os.path.abspath(os.fspath(path)))) for path in excluded_paths
+    }
+    observed: list[dict[str, Any]] = []
+    registered_paths: set[str] = set()
+    for binding in bindings:
+        if not isinstance(binding, dict):
+            raise LifecycleError("marker business drain binding must be an object")
+        path = Path(str(binding.get("path", "")))
+        absolute_path = str(Path(os.path.abspath(os.fspath(path))))
+        if (
+            absolute_path in excluded
+            or (root != path and root not in path.parents)
+            or absolute_path in registered_paths
+        ):
+            raise LifecycleError(f"unexpected business drain identity path: {path}")
+        payload = _load_json(path)
+        current = _identity_file_binding(path, payload)
+        if current != binding:
+            raise LifecycleError(f"business drain identity was replaced: {path}")
+        try:
+            pid = int(payload["pid"])
+            start_ticks = str(payload["start_ticks"])
+            process_group = int(payload["process_group"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise LifecycleError(f"invalid bound business identity: {path}") from error
+        if pid <= 0 or process_group != pid or not start_ticks:
+            raise LifecycleError(f"invalid bound business identity: {path}")
+        registered_paths.add(absolute_path)
+        observed.append(binding)
+
+    current_paths = {
+        str(Path(os.path.abspath(os.fspath(path))))
+        for path in root.rglob("*process-identity.json")
+        if str(Path(os.path.abspath(os.fspath(path)))) not in excluded
+    }
+    if current_paths != registered_paths:
+        raise LifecycleError(
+            "business drain identity path set changed: "
+            f"registered={sorted(registered_paths)!r}, current={sorted(current_paths)!r}"
+        )
+    return tuple(observed)
+
+
+def _assert_marker_process_drain(state: Mapping[str, Any]) -> None:
+    raw_root = state.get("drain_identity_root")
+    if raw_root is None:
+        return
+    root = _validate_drain_identity_root(state)
+    excluded_paths = _marker_drain_exclusion_paths(state)
+    _marker_drain_identity_bindings(state, excluded_paths=excluded_paths)
+    alive = _alive_published_process_identities(
+        root,
+        exclude_paths=excluded_paths,
+    )
+    if alive:
+        raise LifecycleError(
+            "published child identities are still alive before holder restore: "
+            f"{alive!r}"
+        )
 
 
 def _restore_target(marker: dict[str, Any]) -> str | None:
@@ -1129,6 +1521,8 @@ def acquire_marker_transaction(state_path: Path, lock_path: Path) -> dict[str, A
             raise LifecycleError(
                 f"marker transaction is not prepared: {state['status']}"
             )
+        if state.get("drain_identity_root") is not None:
+            _marker_drain_exclusion_paths(state)
         parent = state["parent"]
         if not process_identity_alive(int(parent["pid"]), str(parent["start_ticks"])):
             raise LifecycleError(
@@ -1196,6 +1590,7 @@ def restore_marker_transaction(state_path: Path, lock_path: Path) -> dict[str, A
         state = _load_marker_state(state_path)
         if state["status"] == "restored":
             return state
+        _assert_marker_process_drain(state)
         return _restore_markers_locked(state_path, state)
 
 
@@ -1351,6 +1746,7 @@ def watch_marker_transaction(
     parent_start_ticks: str,
     ready_path: Path,
     receipt_path: Path,
+    drain_identity_root: Path | None = None,
     poll_seconds: float,
     restore_timeout_seconds: float,
 ) -> int:
@@ -1387,6 +1783,57 @@ def watch_marker_transaction(
     deadline: float | None = None
     ownership_loss: dict[str, Any] | None = None
     termination_signal_sent: bool | None = None
+
+    if drain_identity_root is not None:
+        expected_root = str(
+            Path(os.path.abspath(os.fspath(drain_identity_root)))
+        )
+        if state.get("drain_identity_root") != expected_root:
+            raise LifecycleError(
+                "marker watcher drain root does not match transaction state"
+            )
+
+    def alive_children_before_restore() -> tuple[dict[str, Any], ...]:
+        if drain_identity_root is None:
+            return ()
+        current_state = _load_marker_state(state_path)
+        root = _validate_drain_identity_root(current_state)
+        return _alive_published_process_identities(
+            root,
+            exclude_paths=_marker_drain_exclusion_paths(current_state),
+        )
+
+    def wait_for_child_drain(*, mode_name: str) -> bool:
+        nonlocal error_text
+        try:
+            alive_children = alive_children_before_restore()
+        except Exception as error:
+            error_text = (
+                "child identity drain failed: "
+                f"{type(error).__name__}: {error}"
+            )
+        else:
+            if not alive_children:
+                error_text = None
+                return True
+            error_text = (
+                "published child identities are still alive before holder "
+                f"restore: {alive_children!r}"
+            )
+        if deadline is not None and time.monotonic() >= deadline:
+            _write_marker_watcher_receipt(
+                receipt_path,
+                status="fail",
+                mode=mode_name,
+                error=error_text,
+                state_status=_marker_state_status(state_path, lock_path),
+                ownership_loss=ownership_loss,
+                termination_signal_sent=termination_signal_sent,
+            )
+            return False
+        time.sleep(poll_seconds)
+        return False
+
     while True:
         if ownership_loss is None:
             ownership_loss = _record_marker_ownership_loss(state_path, lock_path)
@@ -1425,6 +1872,11 @@ def watch_marker_transaction(
                     return 1
                 time.sleep(poll_seconds)
                 continue
+            if drain_identity_root is not None:
+                if not wait_for_child_drain(mode_name=mode):
+                    if deadline is not None and time.monotonic() >= deadline:
+                        return 1
+                    continue
             try:
                 restore_marker_transaction(state_path, lock_path)
             except Exception as error:
@@ -1448,6 +1900,11 @@ def watch_marker_transaction(
             mode = "parent_death_restore"
             if deadline is None:
                 deadline = time.monotonic() + restore_timeout_seconds
+            if drain_identity_root is not None:
+                if not wait_for_child_drain(mode_name=mode):
+                    if deadline is not None and time.monotonic() >= deadline:
+                        return 1
+                    continue
             try:
                 restore_marker_transaction(state_path, lock_path)
                 error_text = None
@@ -2703,6 +3160,9 @@ def _cmd_marker_watch(args: argparse.Namespace) -> None:
         parent_start_ticks=args.parent_start_ticks,
         ready_path=Path(args.ready),
         receipt_path=Path(args.receipt),
+        drain_identity_root=(
+            Path(args.drain_identity_root) if args.drain_identity_root else None
+        ),
         poll_seconds=args.poll_seconds,
         restore_timeout_seconds=args.restore_timeout_seconds,
     )
@@ -2888,6 +3348,7 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--parent-start-ticks", required=True)
     watch.add_argument("--ready", required=True)
     watch.add_argument("--receipt", required=True)
+    watch.add_argument("--drain-identity-root")
     watch.add_argument("--poll-seconds", type=_positive_float, default=0.5)
     watch.add_argument("--restore-timeout-seconds", type=_positive_float, default=300)
     watch.set_defaults(handler=_cmd_marker_watch)
