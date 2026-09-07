@@ -24,6 +24,8 @@ TRAJECTORY_TERMINAL = "trajectory_terminal"
 ROLLOUT_DONE_FLAG = "rollout_done_flag"
 IMMEDIATE_REWARD = "immediate_reward"
 IS_PADDING = "is_padding"
+ROUTE_ID = "route_id"
+DATA_SOURCE = "data_source"
 
 
 def _config_value(config: Any, name: str, default: Any) -> Any:
@@ -93,6 +95,55 @@ def _as_finite_float(value: Any, *, field: str, row: int) -> float:
     if not np.isfinite(number):
         raise ValueError(f"{field} must be finite at row {row}, got {value!r}")
     return number
+
+
+def _as_nonempty_str(value: Any, *, field: str, row: int) -> str:
+    if isinstance(value, np.ndarray) and value.ndim == 0:
+        value = value.item()
+    text = str(value)
+    if not text:
+        raise ValueError(f"{field} must be non-empty at row {row}")
+    return text
+
+
+def _routewise_masked_whiten(
+    advantages: torch.Tensor,
+    real_policy_mask: torch.Tensor,
+    row_route_ids: Sequence[str],
+) -> torch.Tensor:
+    """Apply veRL's masked whitening independently within each observed route."""
+
+    if advantages.shape != real_policy_mask.shape:
+        raise ValueError(
+            "route-wise whitening requires advantages and mask with equal shapes: "
+            f"advantages={tuple(advantages.shape)} "
+            f"mask={tuple(real_policy_mask.shape)}"
+        )
+    if len(row_route_ids) != advantages.shape[0]:
+        raise ValueError(
+            "route-wise whitening requires one route ID per batch row: "
+            f"routes={len(row_route_ids)} rows={advantages.shape[0]}"
+        )
+
+    observed_routes = sorted(set(row_route_ids))
+    if not observed_routes:
+        raise ValueError("route-wise whitening requires at least one observed route")
+
+    whitened_advantages = torch.zeros_like(advantages)
+    for route_id in observed_routes:
+        route_rows = torch.tensor(
+            [candidate == route_id for candidate in row_route_ids],
+            device=real_policy_mask.device,
+            dtype=torch.bool,
+        ).unsqueeze(1)
+        route_mask = real_policy_mask & route_rows
+        if not bool(route_mask.any().item()):
+            continue
+        route_whitened = verl_F.masked_whiten(advantages, route_mask)
+        whitened_advantages = torch.where(
+            route_mask, route_whitened, whitened_advantages
+        )
+    return whitened_advantages
 
 
 @register_adv_est("amg_action_axis_gae")
@@ -203,11 +254,22 @@ def compute_amg_action_gae(
         raise ValueError(
             "AMG action GAE reward tolerance must be finite and non-negative"
         )
-    if normalization not in {"none", "upstream_masked_whiten"}:
+    if normalization not in {
+        "none",
+        "upstream_masked_whiten",
+        "routewise_masked_whiten",
+    }:
         raise ValueError(
-            "AMG action GAE amg_advantage_normalization must be 'none' or "
-            f"'upstream_masked_whiten', got {normalization!r}"
+            "AMG action GAE amg_advantage_normalization must be 'none', "
+            "'upstream_masked_whiten', or 'routewise_masked_whiten', got "
+            f"{normalization!r}"
         )
+
+    route_ids: Sequence[Any] | None = None
+    data_sources: Sequence[Any] | None = None
+    if normalization == "routewise_masked_whiten":
+        route_ids = _require_metadata(non_tensor_batch, ROUTE_ID, row_count)
+        data_sources = _require_metadata(non_tensor_batch, DATA_SOURCE, row_count)
 
     accumulator_dtype = torch.promote_types(rewards.dtype, values.dtype)
     if accumulator_dtype in (torch.float16, torch.bfloat16):
@@ -215,7 +277,23 @@ def compute_amg_action_gae(
     real_policy_mask = valid_token_mask.clone()
     trajectories: dict[str, list[dict[str, Any]]] = defaultdict(list)
     seen_row_uids: set[str] = set()
+    normalized_route_ids: list[str] = []
     for physical_row in range(row_count):
+        if route_ids is not None and data_sources is not None:
+            route_id = _as_nonempty_str(
+                route_ids[physical_row], field=ROUTE_ID, row=physical_row
+            )
+            data_source = _as_nonempty_str(
+                data_sources[physical_row], field=DATA_SOURCE, row=physical_row
+            )
+            if route_id != data_source:
+                raise ValueError(
+                    "AMG route metadata must agree between route_id and data_source: "
+                    f"row={physical_row} route_id={route_id!r} "
+                    f"data_source={data_source!r}"
+                )
+            normalized_route_ids.append(route_id)
+
         if _as_bool(is_padding[physical_row], field=IS_PADDING, row=physical_row):
             real_policy_mask[physical_row] = False
             continue
@@ -286,6 +364,11 @@ def compute_amg_action_gae(
                 "reward": expected_reward,
                 "token_indices": token_indices,
                 "state_token_index": int(token_indices[0].item()),
+                "route_id": (
+                    normalized_route_ids[physical_row]
+                    if normalization == "routewise_masked_whiten"
+                    else None
+                ),
             }
         )
 
@@ -319,6 +402,15 @@ def compute_amg_action_gae(
                     f"trajectory={trajectory_uid!r} rows={premature_done}"
                 )
 
+            if normalization == "routewise_masked_whiten":
+                trajectory_routes = {row["route_id"] for row in rows}
+                if len(trajectory_routes) != 1:
+                    raise ValueError(
+                        "one AMG trajectory cannot span multiple routes: "
+                        f"trajectory={trajectory_uid!r} "
+                        f"routes={sorted(trajectory_routes)}"
+                    )
+
             next_advantage = torch.zeros(
                 (), device=values.device, dtype=accumulator_dtype
             )
@@ -350,5 +442,9 @@ def compute_amg_action_gae(
     if normalization == "upstream_masked_whiten":
         advantages = verl_F.masked_whiten(advantages, real_policy_mask)
         advantages = advantages * real_policy_mask.to(dtype=advantages.dtype)
+    elif normalization == "routewise_masked_whiten":
+        advantages = _routewise_masked_whiten(
+            advantages, real_policy_mask, normalized_route_ids
+        )
 
     return advantages, returns

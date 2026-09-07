@@ -63,6 +63,14 @@ class TestAMGActionGAE(unittest.TestCase):
             "rollout_done_flag": np.array([False, True, True, True], dtype=object),
             "immediate_reward": np.array([1.0, 2.0, 3.0, 0.0], dtype=object),
             "is_padding": np.array([False, False, False, True], dtype=object),
+            "route_id": np.array(
+                ["literesearcher", "literesearcher", "webshop", "padding"],
+                dtype=object,
+            ),
+            "data_source": np.array(
+                ["literesearcher", "literesearcher", "webshop", "padding"],
+                dtype=object,
+            ),
         }
         config = {
             "gamma": 0.9,
@@ -145,6 +153,54 @@ class TestAMGActionGAE(unittest.TestCase):
             dtype=torch.float32,
         )
         torch.testing.assert_close(returns, expected_returns)
+
+    def test_routewise_whitening_is_independent_across_routes(self):
+        batch, non_tensor_batch, config = self._fixture()
+        config["amg_advantage_normalization"] = "routewise_masked_whiten"
+        batch["response_mask"][2] = torch.tensor([1, 1, 0], dtype=torch.long)
+        batch["rollout_log_probs"][2] = torch.tensor(
+            [-0.6, -0.61, 0.0], dtype=torch.float32
+        )
+        batch["old_log_probs"] = batch["rollout_log_probs"].clone()
+
+        advantages, returns = compute_amg_action_gae(
+            batch=batch, non_tensor_batch=non_tensor_batch, config=config
+        )
+        route_a_mask = batch["response_mask"].to(dtype=torch.bool).clone()
+        route_a_mask[2:] = False
+        route_b_mask = torch.zeros_like(route_a_mask)
+        route_b_mask[2] = batch["response_mask"][2].to(dtype=torch.bool)
+        self.assertAlmostEqual(
+            float(advantages[route_a_mask].mean().item()), 0.0, places=6
+        )
+        self.assertAlmostEqual(
+            float(advantages[route_a_mask].var(unbiased=True).item()), 1.0, delta=1e-5
+        )
+        self.assertEqual(float(advantages[route_b_mask].abs().sum().item()), 0.0)
+        self.assertEqual(float(advantages[3].abs().sum().item()), 0.0)
+
+        changed_batch = {key: value.clone() for key, value in batch.items()}
+        changed_non_tensor = {key: value.copy() for key, value in non_tensor_batch.items()}
+        changed_batch["token_level_rewards"][2, 0] = 300.0
+        changed_non_tensor["immediate_reward"][2] = 300.0
+        changed_advantages, _ = compute_amg_action_gae(
+            batch=changed_batch,
+            non_tensor_batch=changed_non_tensor,
+            config=config,
+        )
+        torch.testing.assert_close(
+            advantages[route_a_mask], changed_advantages[route_a_mask]
+        )
+        self.assertFalse(torch.equal(returns[2], torch.zeros_like(returns[2])))
+
+    def test_routewise_whitening_rejects_route_metadata_disagreement(self):
+        batch, non_tensor_batch, config = self._fixture()
+        config["amg_advantage_normalization"] = "routewise_masked_whiten"
+        non_tensor_batch["data_source"][1] = "webshop"
+        with self.assertRaisesRegex(ValueError, "route metadata must agree"):
+            compute_amg_action_gae(
+                batch=batch, non_tensor_batch=non_tensor_batch, config=config
+            )
 
     def test_rejects_reward_packing_that_does_not_conserve_action_reward(self):
         batch, non_tensor_batch, config = self._fixture()
