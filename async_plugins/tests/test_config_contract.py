@@ -155,7 +155,11 @@ def _config(*, mode: str = "formal") -> dict:
             },
         },
         "algorithm": {
-            "adv_estimator": "amg_action_axis_gae",
+            "adv_estimator": "amg_sao_token_gae",
+            "amg_policy_lambda_mode": "length_adaptive",
+            "amg_policy_lambda_scale": 1.5,
+            "amg_critic_lambda": 1.0,
+            "amg_reward_tolerance": 1e-6,
             "amg_advantage_normalization": "upstream_masked_whiten",
             "gamma": 1.0,
             "lam": 1.0,
@@ -322,17 +326,45 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         self.assertEqual(report["optimizer_updates"], 1)
         self.assertEqual(report["episodes"], 64)
 
-    def test_rejects_grpo_or_missing_critic(self):
+    def test_rejects_non_token_estimator_or_missing_critic(self):
         config = _config()
         config["algorithm"]["adv_estimator"] = "grpo"
         config["critic"]["enable"] = False
-        with self.assertRaisesRegex(ValueError, "action-axis GAE"):
+        with self.assertRaisesRegex(ValueError, "token-axis GAE"):
             _verify(config, mode="formal")
 
-    def test_rejects_unwhitened_action_axis_advantages(self):
+    def test_rejects_unwhitened_token_axis_advantages(self):
         config = _config()
         config["algorithm"]["amg_advantage_normalization"] = "none"
         with self.assertRaisesRegex(ValueError, "amg_advantage_normalization"):
+            _verify(config, mode="formal")
+
+    def test_rejects_token_estimator_default_drift(self):
+        mutations = (
+            ("amg_policy_lambda_mode", "fixed"),
+            ("amg_policy_lambda_scale", 2.0),
+            ("amg_critic_lambda", 0.95),
+            ("amg_reward_tolerance", 1e-4),
+        )
+        for key, wrong in mutations:
+            with self.subTest(key=key):
+                config = _config()
+                config["algorithm"][key] = wrong
+                with self.assertRaisesRegex(ValueError, key):
+                    _verify(config, mode="formal")
+
+    def test_hybrid_optimizer_and_ppo_contract_remain_unchanged(self):
+        config = _config()
+        config["algorithm"]["rollout_correction"]["loss_type"] = "reinforce"
+        with self.assertRaisesRegex(ValueError, "loss_type"):
+            _verify(config, mode="formal")
+        config = _config()
+        config["critic"]["ppo_epochs"] = 2
+        with self.assertRaisesRegex(ValueError, "critic.ppo_epochs"):
+            _verify(config, mode="formal")
+        config = _config()
+        config["critic"]["optim"]["lr"] = 5e-6
+        with self.assertRaisesRegex(ValueError, "critic lr"):
             _verify(config, mode="formal")
 
     def test_rejects_half_async_or_validation(self):

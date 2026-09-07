@@ -58,7 +58,7 @@ _ACTIVE_MODULES = (
     ),
     SourceModuleContract("amg_agent_loop", "agentmemorygym_verl.agent_loop", "plugin"),
     SourceModuleContract("amg_dataset", "agentmemorygym_verl.dataset", "plugin"),
-    SourceModuleContract("amg_action_gae", "agentmemorygym_verl.action_gae", "plugin"),
+    SourceModuleContract("amg_token_gae", "agentmemorygym_verl.token_gae", "plugin"),
     SourceModuleContract("policy_turn", "agentenv.controller.policy_turn", "agentgym"),
 )
 

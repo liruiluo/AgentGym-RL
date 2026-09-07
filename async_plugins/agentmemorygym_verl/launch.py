@@ -383,7 +383,14 @@ def build_overrides(
         "actor_rollout_ref.rollout.agent.default_agent_loop=amg_task_neutral_async",
         f"actor_rollout_ref.rollout.agent.agent_loop_config_path={loop_config}",
         "actor_rollout_ref.hybrid_engine=False",
-        "algorithm.adv_estimator=amg_action_axis_gae",
+        # The sole algorithm change from the accepted r118 Hybrid learner is
+        # token-axis GAE.  These three values are intrinsic estimator defaults,
+        # not independent experiment axes.
+        "algorithm.adv_estimator=amg_sao_token_gae",
+        "++algorithm.amg_policy_lambda_mode=length_adaptive",
+        "++algorithm.amg_policy_lambda_scale=1.5",
+        "++algorithm.amg_critic_lambda=1.0",
+        "++algorithm.amg_reward_tolerance=1.0e-6",
         "++algorithm.amg_advantage_normalization=upstream_masked_whiten",
         "algorithm.gamma=1.0",
         "algorithm.lam=1.0",
@@ -497,7 +504,7 @@ def build_runtime_env(
     env["CUDA_HOME"] = cuda_home
     env["CUDA_PATH"] = cuda_home
     env["LD_LIBRARY_PATH"] = os.pathsep.join(cuda_library_entries)
-    env["VERL_USE_EXTERNAL_MODULES"] = "agentmemorygym_verl.action_gae"
+    env["VERL_USE_EXTERNAL_MODULES"] = "agentmemorygym_verl.token_gae"
     env["VERL_USE_EXTERNAL_PLUGINS"] = "none"
     env["VERL_FILE_LOGGER_PATH"] = str(inputs.run_dir / "metrics.jsonl")
     env.pop("VERL_FULLY_ASYNC_RUNTIME_RECEIPT_PATH", None)
@@ -1906,7 +1913,7 @@ from trl import AutoModelForCausalLMWithValueHead
 from agentmemorygym_verl.active_source_audit import audit_resolved_active_sources
 # Match veRL's real entrypoint: external estimator registration must occur
 # before the runtime probe asks the upstream registry for the AMG estimator.
-from agentmemorygym_verl import action_gae as _amg_action_gae
+from agentmemorygym_verl import token_gae as _amg_token_gae
 from agentmemorygym_verl.agent_loop import AMGTaskNeutralAgentLoop
 from agentmemorygym_verl.dataset import AMGTrajectoryDataset
 from agentmemorygym_verl.env_client import create_env_client
@@ -1920,7 +1927,7 @@ from verl.utils.tokenizer.continuous_token_wiring import (
     infer_continuous_token_model_family,
 )
 
-fn = get_adv_estimator_fn("amg_action_axis_gae")
+fn = get_adv_estimator_fn("amg_sao_token_gae")
 model_path = sys.argv[1]
 registry_path = sys.argv[2]
 registry_sha256 = sys.argv[3]

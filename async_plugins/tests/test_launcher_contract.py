@@ -36,6 +36,20 @@ FIXTURES = Path("/tmp/openmle-v8-launch-fixtures-20260818")
 
 
 class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
+    @staticmethod
+    def _endpoint_validator(root: Path) -> Path:
+        """Create a hermetic validator for this test's source lock."""
+
+        path = root / "endpoint-launcher-contract.py"
+        path.write_text(
+            "import json\n"
+            "print(json.dumps({"
+            "'schema': 'openmle_fast_launcher_source_lock_validation_v_test', "
+            "'status': 'pass', 'runtime_final': True}, sort_keys=True))\n",
+            encoding="utf-8",
+        )
+        return path
+
     def setUp(self) -> None:
         required = (
             "source-lock.json",
@@ -66,7 +80,7 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             run_dir=root / "run",
             experiment_name=f"current-publication-{mode}",
             endpoint_source_lock=FIXTURES / "source-lock.json",
-            endpoint_contract_tool=FIXTURES / "launcher_contract.py",
+            endpoint_contract_tool=self._endpoint_validator(root),
             publication_receipt=FIXTURES / "publication-receipt.json",
             formal_schedule_certificate=FIXTURES
             / "formal100-schedule-certificate.json",
@@ -99,7 +113,11 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(values["algorithm.adv_estimator"], "amg_action_axis_gae")
+            self.assertEqual(values["algorithm.adv_estimator"], "amg_sao_token_gae")
+            self.assertEqual(values["algorithm.amg_policy_lambda_mode"], "length_adaptive")
+            self.assertEqual(values["algorithm.amg_policy_lambda_scale"], "1.5")
+            self.assertEqual(values["algorithm.amg_critic_lambda"], "1.0")
+            self.assertEqual(values["algorithm.amg_reward_tolerance"], "1.0e-6")
             self.assertEqual(
                 values["algorithm.amg_advantage_normalization"],
                 "upstream_masked_whiten",
@@ -107,6 +125,8 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             self.assertEqual(
                 values["algorithm.rollout_correction.loss_type"], "ppo_clip"
             )
+            self.assertEqual(values["algorithm.rollout_correction.rollout_is"], "null")
+            self.assertEqual(values["algorithm.rollout_correction.rollout_rs"], "null")
             self.assertEqual(values["data.max_prompt_length"], "30720")
             self.assertEqual(values["actor_rollout_ref.rollout.n"], "1")
             self.assertEqual(
@@ -139,6 +159,9 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                 values["actor_rollout_ref.actor.use_prefix_grouper"], "False"
             )
             self.assertEqual(values["critic.loss_agg_mode"], "token-mean")
+            self.assertEqual(values["critic.ppo_epochs"], "1")
+            self.assertEqual(values["critic.optim.lr"], "1e-5")
+            self.assertEqual(values["critic.optim.lr_warmup_steps"], "0")
             self.assertEqual(
                 values["ray_kwargs.ray_init.object_store_memory"], "8589934592"
             )
@@ -452,7 +475,7 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                 ],
             )
             self.assertEqual(
-                env["VERL_USE_EXTERNAL_MODULES"], "agentmemorygym_verl.action_gae"
+                env["VERL_USE_EXTERNAL_MODULES"], "agentmemorygym_verl.token_gae"
             )
             self.assertEqual(
                 env["VERL_FILE_LOGGER_PATH"], str(inputs.run_dir / "metrics.jsonl")

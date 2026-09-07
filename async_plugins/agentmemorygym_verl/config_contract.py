@@ -130,11 +130,11 @@ def verify_resolved_config(
     expected = dict(expected_budget)
 
     if (
-        _at(config, "algorithm.adv_estimator") != "amg_action_axis_gae"
+        _at(config, "algorithm.adv_estimator") != "amg_sao_token_gae"
         or _at(config, "critic.enable") is not True
     ):
         raise ValueError(
-            "AMG PPO requires registered action-axis GAE and an enabled critic"
+            "AMG PPO requires registered token-axis GAE and an enabled critic"
         )
 
     _require_equal(config, "actor_rollout_ref.rollout.n", 1)
@@ -430,6 +430,10 @@ def verify_resolved_config(
         "critic.strategy": "fsdp2",
         "algorithm.gamma": 1.0,
         "algorithm.lam": 1.0,
+        "algorithm.amg_policy_lambda_mode": "length_adaptive",
+        "algorithm.amg_policy_lambda_scale": 1.5,
+        "algorithm.amg_critic_lambda": 1.0,
+        "algorithm.amg_reward_tolerance": 1e-6,
         "algorithm.amg_advantage_normalization": "upstream_masked_whiten",
         "algorithm.use_kl_in_reward": False,
         "trainer.total_epochs": 1,
@@ -602,7 +606,12 @@ def verify_resolved_config(
             "impl_backend": "torch",
         },
         "rollout_n": 1,
-        "adv_estimator": "amg_action_axis_gae",
+        "adv_estimator": "amg_sao_token_gae",
+        "policy_lambda": {
+            "mode": "length_adaptive",
+            "scale": 1.5,
+        },
+        "critic_lambda": 1.0,
         "advantage_normalization": "upstream_masked_whiten",
         "model_path": actor_model,
         "env_addr": env_addr,

@@ -38,7 +38,7 @@ class TestActiveSourceAudit(unittest.TestCase):
             / "verl/experimental/agent_loop/agent_loop.py",
             "amg_agent_loop": ROOT / "async_plugins/agentmemorygym_verl/agent_loop.py",
             "amg_dataset": ROOT / "async_plugins/agentmemorygym_verl/dataset.py",
-            "amg_action_gae": ROOT / "async_plugins/agentmemorygym_verl/action_gae.py",
+            "amg_token_gae": ROOT / "async_plugins/agentmemorygym_verl/token_gae.py",
         }
         report = audit_source_paths(files)
         self.assertEqual(report["status"], "pass")
