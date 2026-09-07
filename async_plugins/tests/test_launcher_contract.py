@@ -102,7 +102,7 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             self.assertEqual(values["algorithm.adv_estimator"], "amg_action_axis_gae")
             self.assertEqual(
                 values["algorithm.amg_advantage_normalization"],
-                "upstream_masked_whiten",
+                "none",
             )
             self.assertEqual(
                 values["algorithm.rollout_correction.loss_type"], "ppo_clip"

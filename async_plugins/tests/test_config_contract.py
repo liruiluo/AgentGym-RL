@@ -156,7 +156,7 @@ def _config(*, mode: str = "formal") -> dict:
         },
         "algorithm": {
             "adv_estimator": "amg_action_axis_gae",
-            "amg_advantage_normalization": "upstream_masked_whiten",
+            "amg_advantage_normalization": "none",
             "gamma": 1.0,
             "lam": 1.0,
             "use_kl_in_reward": False,
@@ -329,9 +329,9 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "action-axis GAE"):
             _verify(config, mode="formal")
 
-    def test_rejects_unwhitened_action_axis_advantages(self):
+    def test_rejects_unknown_action_axis_advantage_normalization(self):
         config = _config()
-        config["algorithm"]["amg_advantage_normalization"] = "none"
+        config["algorithm"]["amg_advantage_normalization"] = "unknown"
         with self.assertRaisesRegex(ValueError, "amg_advantage_normalization"):
             _verify(config, mode="formal")
 
