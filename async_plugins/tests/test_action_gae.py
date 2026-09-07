@@ -4,7 +4,10 @@ import unittest
 
 import numpy as np
 import torch
-from agentmemorygym_verl.action_gae import compute_amg_action_gae
+from agentmemorygym_verl.action_gae import (
+    _route_centered_global_scale,
+    compute_amg_action_gae,
+)
 from verl.trainer.ppo.core_algos import get_adv_estimator_fn
 
 
@@ -192,6 +195,84 @@ class TestAMGActionGAE(unittest.TestCase):
             advantages[route_a_mask], changed_advantages[route_a_mask]
         )
         self.assertFalse(torch.equal(returns[2], torch.zeros_like(returns[2])))
+
+    def test_route_centering_uses_one_global_scale_without_equalizing_variance(self):
+        raw = torch.tensor(
+            [
+                [-1.0, 1.0],
+                [-10.0, 10.0],
+                [99.0, 99.0],
+            ],
+            dtype=torch.float32,
+        )
+        mask = torch.tensor(
+            [
+                [1, 1],
+                [1, 1],
+                [0, 0],
+            ],
+            dtype=torch.bool,
+        )
+        routes = ["literesearcher", "swesmith", "padding"]
+        normalized = _route_centered_global_scale(raw, mask, routes)
+        route_a = normalized[0, mask[0]]
+        route_b = normalized[1, mask[1]]
+        self.assertAlmostEqual(float(route_a.mean().item()), 0.0, places=6)
+        self.assertAlmostEqual(float(route_b.mean().item()), 0.0, places=6)
+        self.assertAlmostEqual(
+            float(route_b.std(unbiased=False).item() / route_a.std(unbiased=False).item()),
+            10.0,
+            places=5,
+        )
+        self.assertAlmostEqual(
+            float(normalized[mask].var(unbiased=True).item()), 1.0, delta=1e-5
+        )
+        self.assertEqual(float(normalized[~mask].abs().sum().item()), 0.0)
+
+    def test_route_centering_removes_cross_route_level_shift(self):
+        raw = torch.tensor(
+            [
+                [1.0, 3.0, 0.0],
+                [2.0, 4.0, 0.0],
+                [10.0, 12.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ],
+            dtype=torch.float32,
+        )
+        mask = torch.tensor(
+            [
+                [1, 1, 0],
+                [1, 1, 0],
+                [1, 1, 0],
+                [0, 0, 0],
+            ],
+            dtype=torch.bool,
+        )
+        routes = ["literesearcher", "literesearcher", "swesmith", "padding"]
+        baseline = _route_centered_global_scale(raw, mask, routes)
+        shifted = raw.clone()
+        shifted[2] += 1000.0
+        changed = _route_centered_global_scale(shifted, mask, routes)
+        torch.testing.assert_close(baseline[0:2], changed[0:2])
+        torch.testing.assert_close(baseline[2], changed[2], rtol=1e-5, atol=1e-5)
+
+    def test_route_centered_mode_preserves_returns(self):
+        batch, non_tensor_batch, config = self._fixture()
+        config["amg_advantage_normalization"] = "route_centered_global_scale"
+        batch["response_mask"][2] = torch.tensor([1, 1, 0], dtype=torch.long)
+        batch["rollout_log_probs"][2] = torch.tensor(
+            [-0.6, -0.61, 0.0], dtype=torch.float32
+        )
+        batch["old_log_probs"] = batch["rollout_log_probs"].clone()
+        centered_advantages, centered_returns = compute_amg_action_gae(
+            batch=batch, non_tensor_batch=non_tensor_batch, config=config
+        )
+        config["amg_advantage_normalization"] = "none"
+        raw_advantages, raw_returns = compute_amg_action_gae(
+            batch=batch, non_tensor_batch=non_tensor_batch, config=config
+        )
+        torch.testing.assert_close(centered_returns, raw_returns)
+        self.assertFalse(torch.equal(centered_advantages, raw_advantages))
 
     def test_routewise_whitening_rejects_route_metadata_disagreement(self):
         batch, non_tensor_batch, config = self._fixture()

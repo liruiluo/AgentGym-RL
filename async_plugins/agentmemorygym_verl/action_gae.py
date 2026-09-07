@@ -146,6 +146,63 @@ def _routewise_masked_whiten(
     return whitened_advantages
 
 
+def _route_centered_global_scale(
+    advantages: torch.Tensor,
+    real_policy_mask: torch.Tensor,
+    row_route_ids: Sequence[str],
+) -> torch.Tensor:
+    """Remove each route mean, then use one shared scale across real tokens.
+
+    This prevents another environment's reward/value level from changing a
+    route's advantage sign without forcing every route--including sparse,
+    low-variance routes--to unit variance.  The final actor loss keeps veRL's
+    native token-mean weighting.
+    """
+
+    if advantages.shape != real_policy_mask.shape:
+        raise ValueError(
+            "route-centered normalization requires advantages and mask with equal "
+            f"shapes: advantages={tuple(advantages.shape)} "
+            f"mask={tuple(real_policy_mask.shape)}"
+        )
+    if len(row_route_ids) != advantages.shape[0]:
+        raise ValueError(
+            "route-centered normalization requires one route ID per batch row: "
+            f"routes={len(row_route_ids)} rows={advantages.shape[0]}"
+        )
+
+    observed_routes = sorted(set(row_route_ids))
+    if not observed_routes:
+        raise ValueError(
+            "route-centered normalization requires at least one observed route"
+        )
+
+    centered_advantages = torch.zeros_like(advantages)
+    active_tokens = 0
+    for route_id in observed_routes:
+        route_rows = torch.tensor(
+            [candidate == route_id for candidate in row_route_ids],
+            device=real_policy_mask.device,
+            dtype=torch.bool,
+        ).unsqueeze(1)
+        route_mask = real_policy_mask & route_rows
+        route_token_count = int(route_mask.sum().item())
+        if not route_token_count:
+            continue
+        active_tokens += route_token_count
+        route_mean = verl_F.masked_mean(advantages, route_mask)
+        centered_advantages = torch.where(
+            route_mask, advantages - route_mean, centered_advantages
+        )
+    if active_tokens < 2:
+        raise ValueError(
+            "route-centered normalization requires at least two real policy tokens"
+        )
+
+    normalized = verl_F.masked_whiten(centered_advantages, real_policy_mask)
+    return normalized * real_policy_mask.to(dtype=normalized.dtype)
+
+
 @register_adv_est("amg_action_axis_gae")
 def compute_amg_action_gae(
     *,
@@ -258,16 +315,21 @@ def compute_amg_action_gae(
         "none",
         "upstream_masked_whiten",
         "routewise_masked_whiten",
+        "route_centered_global_scale",
     }:
         raise ValueError(
             "AMG action GAE amg_advantage_normalization must be 'none', "
-            "'upstream_masked_whiten', or 'routewise_masked_whiten', got "
+            "'upstream_masked_whiten', 'routewise_masked_whiten', or "
+            "'route_centered_global_scale', got "
             f"{normalization!r}"
         )
 
     route_ids: Sequence[Any] | None = None
     data_sources: Sequence[Any] | None = None
-    if normalization == "routewise_masked_whiten":
+    if normalization in {
+        "routewise_masked_whiten",
+        "route_centered_global_scale",
+    }:
         route_ids = _require_metadata(non_tensor_batch, ROUTE_ID, row_count)
         data_sources = _require_metadata(non_tensor_batch, DATA_SOURCE, row_count)
 
@@ -366,7 +428,8 @@ def compute_amg_action_gae(
                 "state_token_index": int(token_indices[0].item()),
                 "route_id": (
                     normalized_route_ids[physical_row]
-                    if normalization == "routewise_masked_whiten"
+                    if normalization
+                    in {"routewise_masked_whiten", "route_centered_global_scale"}
                     else None
                 ),
             }
@@ -402,7 +465,10 @@ def compute_amg_action_gae(
                     f"trajectory={trajectory_uid!r} rows={premature_done}"
                 )
 
-            if normalization == "routewise_masked_whiten":
+            if normalization in {
+                "routewise_masked_whiten",
+                "route_centered_global_scale",
+            }:
                 trajectory_routes = {row["route_id"] for row in rows}
                 if len(trajectory_routes) != 1:
                     raise ValueError(
@@ -444,6 +510,10 @@ def compute_amg_action_gae(
         advantages = advantages * real_policy_mask.to(dtype=advantages.dtype)
     elif normalization == "routewise_masked_whiten":
         advantages = _routewise_masked_whiten(
+            advantages, real_policy_mask, normalized_route_ids
+        )
+    elif normalization == "route_centered_global_scale":
+        advantages = _route_centered_global_scale(
             advantages, real_policy_mask, normalized_route_ids
         )
 

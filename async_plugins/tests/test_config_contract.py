@@ -156,7 +156,7 @@ def _config(*, mode: str = "formal") -> dict:
         },
         "algorithm": {
             "adv_estimator": "amg_action_axis_gae",
-            "amg_advantage_normalization": "routewise_masked_whiten",
+            "amg_advantage_normalization": "route_centered_global_scale",
             "gamma": 1.0,
             "lam": 1.0,
             "use_kl_in_reward": False,
