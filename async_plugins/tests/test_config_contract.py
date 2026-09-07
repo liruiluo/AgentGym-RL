@@ -157,6 +157,7 @@ def _config(*, mode: str = "formal") -> dict:
         "algorithm": {
             "adv_estimator": "amg_action_axis_gae",
             "amg_advantage_normalization": "route_centered_global_scale",
+            "amg_actor_route_weighting": "equal_route_token_mean",
             "gamma": 1.0,
             "lam": 1.0,
             "use_kl_in_reward": False,
@@ -333,6 +334,12 @@ class TestAMGFullyAsyncConfigContract(unittest.TestCase):
         config = _config()
         config["algorithm"]["amg_advantage_normalization"] = "unknown"
         with self.assertRaisesRegex(ValueError, "amg_advantage_normalization"):
+            _verify(config, mode="formal")
+
+    def test_rejects_actor_route_weighting_drift(self):
+        config = _config()
+        config["algorithm"]["amg_actor_route_weighting"] = "none"
+        with self.assertRaisesRegex(ValueError, "amg_actor_route_weighting"):
             _verify(config, mode="formal")
 
     def test_rejects_half_async_or_validation(self):

@@ -385,6 +385,7 @@ def build_overrides(
         "actor_rollout_ref.hybrid_engine=False",
         "algorithm.adv_estimator=amg_action_axis_gae",
         "++algorithm.amg_advantage_normalization=route_centered_global_scale",
+        "++algorithm.amg_actor_route_weighting=equal_route_token_mean",
         "algorithm.gamma=1.0",
         "algorithm.lam=1.0",
         "algorithm.use_kl_in_reward=False",

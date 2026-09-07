@@ -203,6 +203,62 @@ def _route_centered_global_scale(
     return normalized * real_policy_mask.to(dtype=normalized.dtype)
 
 
+def _equal_route_token_mean_weighting(
+    advantages: torch.Tensor,
+    real_policy_mask: torch.Tensor,
+    row_route_ids: Sequence[str],
+) -> torch.Tensor:
+    """Make global token-mean equal the mean of per-route token means.
+
+    Every real token within a route keeps the same coefficient, so longer
+    trajectories still contribute proportionally more than shorter trajectories
+    from that route.  Only the *environment-level* token-mass imbalance is
+    removed.  A final common rescale keeps the global advantage variance at one
+    without equalizing each route's variance.
+    """
+
+    if advantages.shape != real_policy_mask.shape:
+        raise ValueError(
+            "equal-route token weighting requires advantages and mask with equal "
+            f"shapes: advantages={tuple(advantages.shape)} "
+            f"mask={tuple(real_policy_mask.shape)}"
+        )
+    if len(row_route_ids) != advantages.shape[0]:
+        raise ValueError(
+            "equal-route token weighting requires one route ID per batch row: "
+            f"routes={len(row_route_ids)} rows={advantages.shape[0]}"
+        )
+
+    active_route_masks: list[torch.Tensor] = []
+    for route_id in sorted(set(row_route_ids)):
+        route_rows = torch.tensor(
+            [candidate == route_id for candidate in row_route_ids],
+            device=real_policy_mask.device,
+            dtype=torch.bool,
+        ).unsqueeze(1)
+        route_mask = real_policy_mask & route_rows
+        if bool(route_mask.any().item()):
+            active_route_masks.append(route_mask)
+    if not active_route_masks:
+        raise ValueError(
+            "equal-route token weighting requires at least one observed route"
+        )
+
+    total_tokens = int(real_policy_mask.sum().item())
+    route_count = len(active_route_masks)
+    weighted = torch.zeros_like(advantages)
+    for route_mask in active_route_masks:
+        route_tokens = int(route_mask.sum().item())
+        route_weight = total_tokens / float(route_count * route_tokens)
+        weighted = torch.where(route_mask, advantages * route_weight, weighted)
+
+    # The preceding route-centering guarantees zero mean per route.  Reusing one
+    # common scale preserves the intended route weights while avoiding a hidden
+    # learning-rate change relative to the existing normalized PPO baseline.
+    weighted = verl_F.masked_whiten(weighted, real_policy_mask)
+    return weighted * real_policy_mask.to(dtype=weighted.dtype)
+
+
 @register_adv_est("amg_action_axis_gae")
 def compute_amg_action_gae(
     *,
@@ -303,6 +359,7 @@ def compute_amg_action_gae(
     lam = float(_config_value(config, "lam", 1.0))
     tolerance = float(_config_value(config, "amg_reward_tolerance", 1e-6))
     normalization = str(_config_value(config, "amg_advantage_normalization", "none"))
+    route_weighting = str(_config_value(config, "amg_actor_route_weighting", "none"))
     if not np.isfinite(gamma) or not 0.0 <= gamma <= 1.0:
         raise ValueError(f"AMG action GAE gamma must be in [0, 1], got {gamma!r}")
     if not np.isfinite(lam) or not 0.0 <= lam <= 1.0:
@@ -323,13 +380,26 @@ def compute_amg_action_gae(
             "'route_centered_global_scale', got "
             f"{normalization!r}"
         )
+    if route_weighting not in {"none", "equal_route_token_mean"}:
+        raise ValueError(
+            "AMG action GAE amg_actor_route_weighting must be 'none' or "
+            f"'equal_route_token_mean', got {route_weighting!r}"
+        )
+    if (
+        route_weighting == "equal_route_token_mean"
+        and normalization != "route_centered_global_scale"
+    ):
+        raise ValueError(
+            "equal_route_token_mean actor weighting requires "
+            "amg_advantage_normalization='route_centered_global_scale'"
+        )
 
     route_ids: Sequence[Any] | None = None
     data_sources: Sequence[Any] | None = None
     if normalization in {
         "routewise_masked_whiten",
         "route_centered_global_scale",
-    }:
+    } or route_weighting == "equal_route_token_mean":
         route_ids = _require_metadata(non_tensor_batch, ROUTE_ID, row_count)
         data_sources = _require_metadata(non_tensor_batch, DATA_SOURCE, row_count)
 
@@ -430,6 +500,7 @@ def compute_amg_action_gae(
                     normalized_route_ids[physical_row]
                     if normalization
                     in {"routewise_masked_whiten", "route_centered_global_scale"}
+                    or route_weighting == "equal_route_token_mean"
                     else None
                 ),
             }
@@ -468,7 +539,7 @@ def compute_amg_action_gae(
             if normalization in {
                 "routewise_masked_whiten",
                 "route_centered_global_scale",
-            }:
+            } or route_weighting == "equal_route_token_mean":
                 trajectory_routes = {row["route_id"] for row in rows}
                 if len(trajectory_routes) != 1:
                     raise ValueError(
@@ -514,6 +585,11 @@ def compute_amg_action_gae(
         )
     elif normalization == "route_centered_global_scale":
         advantages = _route_centered_global_scale(
+            advantages, real_policy_mask, normalized_route_ids
+        )
+
+    if route_weighting == "equal_route_token_mean":
+        advantages = _equal_route_token_mean_weighting(
             advantages, real_policy_mask, normalized_route_ids
         )
 

@@ -105,6 +105,10 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                 "route_centered_global_scale",
             )
             self.assertEqual(
+                values["algorithm.amg_actor_route_weighting"],
+                "equal_route_token_mean",
+            )
+            self.assertEqual(
                 values["algorithm.rollout_correction.loss_type"], "ppo_clip"
             )
             self.assertEqual(values["data.max_prompt_length"], "30720")

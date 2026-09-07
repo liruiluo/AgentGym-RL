@@ -5,6 +5,7 @@ import unittest
 import numpy as np
 import torch
 from agentmemorygym_verl.action_gae import (
+    _equal_route_token_mean_weighting,
     _route_centered_global_scale,
     compute_amg_action_gae,
 )
@@ -255,6 +256,88 @@ class TestAMGActionGAE(unittest.TestCase):
         changed = _route_centered_global_scale(shifted, mask, routes)
         torch.testing.assert_close(baseline[0:2], changed[0:2])
         torch.testing.assert_close(baseline[2], changed[2], rtol=1e-5, atol=1e-5)
+
+    def test_equal_route_token_mean_balances_route_mass_not_trajectory_length(self):
+        advantages = torch.tensor(
+            [
+                [-1.0, 1.0, 0.0, 0.0],
+                [-1.0, 1.0, -1.0, 1.0],
+            ],
+            dtype=torch.float32,
+        )
+        mask = torch.tensor(
+            [
+                [1, 1, 0, 0],
+                [1, 1, 1, 1],
+            ],
+            dtype=torch.bool,
+        )
+        balanced = _equal_route_token_mean_weighting(
+            advantages, mask, ["webshop", "openmle_fast"]
+        )
+        shop_mass = balanced[0, mask[0]].abs().sum()
+        openmle_mass = balanced[1, mask[1]].abs().sum()
+        torch.testing.assert_close(shop_mass, openmle_mass)
+        self.assertAlmostEqual(float(balanced[mask].mean().item()), 0.0, places=6)
+        self.assertAlmostEqual(
+            float(balanced[mask].var(unbiased=True).item()), 1.0, delta=1e-5
+        )
+        self.assertEqual(float(balanced[~mask].abs().sum().item()), 0.0)
+        # Tokens are still uniformly weighted *within* a route; a longer
+        # trajectory therefore retains proportionally more mass than a shorter
+        # trajectory from that same environment.
+        self.assertAlmostEqual(
+            float(balanced[1, :3].abs().sum().item() / balanced[1, 3].abs().item()),
+            3.0,
+            places=5,
+        )
+
+    def test_equal_route_token_mean_preserves_route_variance_ratio(self):
+        raw = torch.tensor(
+            [[-1.0, 1.0], [-10.0, 10.0]], dtype=torch.float32
+        )
+        mask = torch.ones_like(raw, dtype=torch.bool)
+        balanced = _equal_route_token_mean_weighting(
+            raw, mask, ["literesearcher", "swesmith"]
+        )
+        ratio = balanced[1].std(unbiased=False) / balanced[0].std(unbiased=False)
+        self.assertAlmostEqual(float(ratio.item()), 10.0, places=5)
+
+    def test_equal_route_token_mean_mode_preserves_returns(self):
+        batch, non_tensor_batch, config = self._fixture()
+        config["amg_advantage_normalization"] = "route_centered_global_scale"
+        config["amg_actor_route_weighting"] = "equal_route_token_mean"
+        batch["response_mask"][2] = torch.tensor([1, 1, 0], dtype=torch.long)
+        batch["rollout_log_probs"][2] = torch.tensor(
+            [-0.6, -0.61, 0.0], dtype=torch.float32
+        )
+        batch["old_log_probs"] = batch["rollout_log_probs"].clone()
+        weighted_advantages, weighted_returns = compute_amg_action_gae(
+            batch=batch, non_tensor_batch=non_tensor_batch, config=config
+        )
+        config["amg_actor_route_weighting"] = "none"
+        _, baseline_returns = compute_amg_action_gae(
+            batch=batch, non_tensor_batch=non_tensor_batch, config=config
+        )
+        torch.testing.assert_close(weighted_returns, baseline_returns)
+        self.assertTrue(torch.isfinite(weighted_advantages).all())
+
+    def test_equal_route_token_mean_requires_route_centering(self):
+        batch, non_tensor_batch, config = self._fixture()
+        config["amg_advantage_normalization"] = "none"
+        config["amg_actor_route_weighting"] = "equal_route_token_mean"
+        with self.assertRaisesRegex(ValueError, "requires"):
+            compute_amg_action_gae(
+                batch=batch, non_tensor_batch=non_tensor_batch, config=config
+            )
+
+    def test_rejects_unknown_actor_route_weighting(self):
+        batch, non_tensor_batch, config = self._fixture()
+        config["amg_actor_route_weighting"] = "unknown"
+        with self.assertRaisesRegex(ValueError, "amg_actor_route_weighting"):
+            compute_amg_action_gae(
+                batch=batch, non_tensor_batch=non_tensor_batch, config=config
+            )
 
     def test_route_centered_mode_preserves_returns(self):
         batch, non_tensor_batch, config = self._fixture()
