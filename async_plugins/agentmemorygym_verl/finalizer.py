@@ -42,7 +42,7 @@ _FILESYSTEM_CHECKPOINT_MARKER_PREFIX = (
     "next action. Other workspace files remain available and may still be read "
     "or updated normally."
 )
-_FINAL_STATISTICS_VERL_COMMIT = "f3ac28fe54c945e092b9630030f44d236a106a11"
+_FINAL_STATISTICS_VERL_COMMIT = "b6067a49727715bfd6bdf48d78d10e7632b4cc06"
 _FINAL_STATISTICS_FIELDS = frozenset(
     {"schema", "queue", "rollouter", "trainer", "queue_cleanup"}
 )
@@ -72,6 +72,9 @@ _FINAL_STATISTICS_ROLLOUTER_FIELDS = frozenset(
         "count/rollout_completed_samples",
         "count/rollout_failed_samples",
         "count/rollout_cancelled_samples",
+        "count/rollout_recovery_attempts",
+        "count/rollout_recovered_samples",
+        "count/rollout_recovery_exhausted_samples",
         "count/queue_enqueued_samples",
         "count/queue_dequeued_samples",
         "count/queue_overflow_evictions",
@@ -92,6 +95,9 @@ _FINAL_STATISTICS_ROUTE_EVENTS = (
     "rollout_completed",
     "rollout_failed",
     "rollout_cancelled",
+    "rollout_recovery_attempt",
+    "rollout_recovered",
+    "rollout_recovery_exhausted",
     "queue_enqueued",
     "queue_dequeued",
     "queue_overflow_evicted",
@@ -1889,6 +1895,9 @@ class _Audit:
                     "fully_async/count/rollout_completed_samples",
                     "fully_async/count/rollout_failed_samples",
                     "fully_async/count/rollout_cancelled_samples",
+                    "fully_async/count/rollout_recovery_attempts",
+                    "fully_async/count/rollout_recovered_samples",
+                    "fully_async/count/rollout_recovery_exhausted_samples",
                     "fully_async/count/queue_enqueued_samples",
                     "fully_async/count/queue_dequeued_samples",
                     "fully_async/count/queue_overflow_evictions",
@@ -2938,6 +2947,69 @@ class _Audit:
                 f"FinalStatistics rollout lifecycle conservation failed for route {route_id!r}",
             )
 
+        recovery_fields = {
+            "attempts": (
+                "count/rollout_recovery_attempts",
+                "count/rollout_recovery_attempt",
+            ),
+            "recovered": (
+                "count/rollout_recovered_samples",
+                "count/rollout_recovered",
+            ),
+            "exhausted": (
+                "count/rollout_recovery_exhausted_samples",
+                "count/rollout_recovery_exhausted",
+            ),
+        }
+        recovery_totals: dict[str, int] = {}
+        recovery_routes: dict[str, dict[str, int]] = {}
+        for event, (key, route_prefix) in recovery_fields.items():
+            recovery_totals[event] = integer(rollouter, key, "rollouter")
+            try:
+                observed = _flat_route_counter(
+                    rollouter,
+                    prefix=route_prefix,
+                    label=f"rollouter recovery {event}",
+                )
+            except Exception as exc:
+                self.error(f"FinalStatistics rollouter recovery {event}", exc)
+                observed = {}
+            self.check(
+                set(observed).issubset(self.route_ids),
+                f"FinalStatistics rollouter recovery {event} contains an undeclared route",
+            )
+            normalized = _normalized_counter(observed, self.route_ids)
+            recovery_routes[event] = normalized
+            self.check(
+                sum(normalized.values()) == recovery_totals[event],
+                f"FinalStatistics rollouter recovery {event} route total mismatch",
+            )
+        self.check(
+            recovery_totals["recovered"] <= recovery_totals["attempts"],
+            "FinalStatistics recovered rollout count exceeds retry attempts",
+        )
+        self.check(
+            recovery_totals["exhausted"] <= recovery_totals["attempts"],
+            "FinalStatistics exhausted rollout count exceeds retry attempts",
+        )
+        for route_id in self.route_ids:
+            self.check(
+                recovery_routes["recovered"][route_id]
+                <= recovery_routes["attempts"][route_id],
+                "FinalStatistics recovered rollout count exceeds retry attempts "
+                f"for route {route_id!r}",
+            )
+            self.check(
+                recovery_routes["exhausted"][route_id]
+                <= recovery_routes["attempts"][route_id],
+                "FinalStatistics exhausted rollout count exceeds retry attempts "
+                f"for route {route_id!r}",
+            )
+        self.check(
+            recovery_totals["exhausted"] == 0,
+            "FinalStatistics has exhausted recoverable rollout retries",
+        )
+
         rollouter_queue_keys = {
             "enqueued": ("count/queue_enqueued_samples", "count/queue_enqueued"),
             "dequeued": ("count/queue_dequeued_samples", "count/queue_dequeued"),
@@ -3176,6 +3248,8 @@ class _Audit:
             "queue_by_route": queue_routes,
             "rollout_lifecycle": lifecycle_totals,
             "rollout_lifecycle_by_route": lifecycle_routes,
+            "rollout_recovery": recovery_totals,
+            "rollout_recovery_by_route": recovery_routes,
             "optimizer_consumed": trainer_totals,
             "optimizer_consumed_by_route": trainer_routes,
             "stale_action_rows": stale_total,

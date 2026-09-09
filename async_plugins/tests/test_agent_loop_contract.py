@@ -18,6 +18,7 @@ from agentenv.controller.types import (
 from agentmemorygym_verl import agent_loop as agent_loop_module
 from agentmemorygym_verl.agent_loop import AMGTaskNeutralAgentLoop
 from agentmemorygym_verl.routes import RouteRegistry, RouteSpec
+from verl.experimental.agent_loop.agent_loop import RecoverableRolloutError
 
 
 @dataclass
@@ -1030,7 +1031,7 @@ class TestAMGAgentLoop(IsolatedAsyncioTestCase):
             side_effect=[first, second],
         ) as create_client:
             with self.assertRaisesRegex(
-                RuntimeError,
+                RecoverableRolloutError,
                 "excluded after 2 complete trajectory attempts.*grader_infrastructure_fault",
             ):
                 await loop.run(

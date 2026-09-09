@@ -405,6 +405,9 @@ class TestFinalizerFileLogger(FinalizerTestCase):
                 "fully_async/count/rollout_completed_samples": 64,
                 "fully_async/count/rollout_failed_samples": 0,
                 "fully_async/count/rollout_cancelled_samples": 0,
+                "fully_async/count/rollout_recovery_attempts": 0,
+                "fully_async/count/rollout_recovered_samples": 0,
+                "fully_async/count/rollout_recovery_exhausted_samples": 0,
                 "fully_async/count/queue_enqueued_samples": 64,
                 "fully_async/count/queue_dequeued_samples": 64,
                 "fully_async/count/queue_overflow_evictions": 0,
@@ -2039,6 +2042,73 @@ class TestMultitaskFinalizer(FinalizerTestCase):
                 1,
             )
 
+    def test_recovered_rollout_is_audited_without_changing_episode_accounting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build_multitask(Path(directory))
+            route_id = "openmle_fast"
+
+            def add_recovery(value: dict) -> None:
+                rollouter = value["rollouter"]
+                rollouter["count/rollout_recovery_attempts"] = 1
+                rollouter["count/rollout_recovered_samples"] = 1
+                rollouter[f"count/rollout_recovery_attempt/data_source/{route_id}"] = 1
+                rollouter[f"count/rollout_recovered/data_source/{route_id}"] = 1
+
+            mutate_final_statistics(fixture["trainer_log"], add_recovery)
+            verdict = finalize_run(fixture["run_dir"], trainer_exit_code=0)
+
+            self.assertEqual(verdict["status"], "pass", verdict)
+            self.assertEqual(
+                verdict["final_accounting"]["rollout_recovery"]["attempts"], 1
+            )
+            self.assertEqual(
+                verdict["final_accounting"]["rollout_recovery_by_route"]
+                ["recovered"][route_id],
+                1,
+            )
+
+    def test_cross_route_recovery_ownership_mismatch_fails_finalization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build_multitask(Path(directory))
+            attempt_route, recovered_route = MULTITASK_ROUTES[:2]
+
+            def shift_recovery_owner(value: dict) -> None:
+                rollouter = value["rollouter"]
+                rollouter["count/rollout_recovery_attempts"] = 1
+                rollouter["count/rollout_recovered_samples"] = 1
+                rollouter[
+                    f"count/rollout_recovery_attempt/data_source/{attempt_route}"
+                ] = 1
+                rollouter[
+                    f"count/rollout_recovered/data_source/{recovered_route}"
+                ] = 1
+
+            mutate_final_statistics(fixture["trainer_log"], shift_recovery_owner)
+            self.assert_failed(
+                fixture["run_dir"],
+                contains="recovered rollout count exceeds retry attempts for route",
+            )
+
+    def test_exhausted_rollout_recovery_fails_finalization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self.build_multitask(Path(directory))
+            route_id = "openmle_fast"
+
+            def add_exhaustion(value: dict) -> None:
+                rollouter = value["rollouter"]
+                rollouter["count/rollout_recovery_attempts"] = 1
+                rollouter["count/rollout_recovery_exhausted_samples"] = 1
+                rollouter[f"count/rollout_recovery_attempt/data_source/{route_id}"] = 1
+                rollouter[
+                    f"count/rollout_recovery_exhausted/data_source/{route_id}"
+                ] = 1
+
+            mutate_final_statistics(fixture["trainer_log"], add_exhaustion)
+            self.assert_failed(
+                fixture["run_dir"],
+                contains="exhausted recoverable rollout retries",
+            )
+
     def test_every_global_final_statistics_counter_is_checked(self):
         fields = (
             ("queue", "total_produced"),
@@ -2051,6 +2121,9 @@ class TestMultitaskFinalizer(FinalizerTestCase):
             ("rollouter", "count/rollout_completed_samples"),
             ("rollouter", "count/rollout_failed_samples"),
             ("rollouter", "count/rollout_cancelled_samples"),
+            ("rollouter", "count/rollout_recovery_attempts"),
+            ("rollouter", "count/rollout_recovered_samples"),
+            ("rollouter", "count/rollout_recovery_exhausted_samples"),
             ("rollouter", "count/queue_enqueued_samples"),
             ("rollouter", "count/queue_dequeued_samples"),
             ("rollouter", "count/queue_overflow_evictions"),
@@ -2093,6 +2166,9 @@ class TestMultitaskFinalizer(FinalizerTestCase):
             "rollout_completed",
             "rollout_failed",
             "rollout_cancelled",
+            "rollout_recovery_attempt",
+            "rollout_recovered",
+            "rollout_recovery_exhausted",
             "queue_enqueued",
             "queue_dequeued",
             "queue_overflow_evicted",

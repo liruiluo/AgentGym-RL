@@ -440,6 +440,8 @@ def verify_resolved_config(
         "trainer.resume_from_path": None,
         "async_training.use_trainer_do_validate": False,
         "async_training.partial_rollout": True,
+        "async_training.recoverable_rollout_max_retries": 1,
+        "async_training.recoverable_rollout_backoff_seconds": 1.0,
     }.items():
         _require_equal(config, path, expected_value)
     rollout_data_dir = _at(config, "trainer.rollout_data_dir")

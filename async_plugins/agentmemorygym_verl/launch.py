@@ -432,6 +432,11 @@ def build_overrides(
         "async_training.dynamic_schedule_deactivate_ratio=0.6",
         "async_training.dynamic_schedule_enable_rebalance=True",
         "async_training.concurrent_samples_per_replica=16",
+        # The AgentLoop first exhausts its bounded attempt-local recovery. A
+        # single task-neutral retry then keeps the exact scheduled row in flight
+        # rather than turning one recoverable endpoint fault into a global exit.
+        "async_training.recoverable_rollout_max_retries=1",
+        "async_training.recoverable_rollout_backoff_seconds=1.0",
         "+trainer.worker_env.PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
         f"hydra.run.dir={run_dir}/hydra",
         "hydra.output_subdir=.hydra",

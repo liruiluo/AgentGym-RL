@@ -20,6 +20,7 @@ from verl.experimental.agent_loop.agent_loop import (
     AgentLoopBase,
     AgentLoopMetrics,
     AgentLoopOutput,
+    RecoverableRolloutError,
 )
 from verl.experimental.agent_loop.tool_parser import FunctionCall, ToolParser
 from verl.tools.schemas import OpenAIFunctionToolSchema
@@ -532,7 +533,7 @@ class AMGTaskNeutralAgentLoop(AgentLoopBase):
                 last_exclusion = exc
 
         assert last_exclusion is not None
-        raise RuntimeError(
+        raise RecoverableRolloutError(
             f"AMG sample item_id={item_id!r} data_idx={data_idx} was excluded after "
             f"{max_retries + 1} complete trajectory attempts: "
             f"{last_exclusion.summary}"

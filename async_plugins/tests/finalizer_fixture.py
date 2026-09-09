@@ -25,7 +25,7 @@ RICH_V8_FIXTURES = next(
     Path("/tmp/openmle-v8-launch-fixtures-20260818"),
 )
 
-FINAL_STATISTICS_VERL_COMMIT = "f3ac28fe54c945e092b9630030f44d236a106a11"
+FINAL_STATISTICS_VERL_COMMIT = "b6067a49727715bfd6bdf48d78d10e7632b4cc06"
 MULTITASK_ROUTES = ("webshop", "swesmith", "literesearcher", "openmle_fast")
 
 
@@ -216,7 +216,8 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
         },
         "algorithm": {
             "adv_estimator": "amg_action_axis_gae",
-            "amg_advantage_normalization": "none",
+            "amg_advantage_normalization": "route_centered_global_scale",
+            "amg_actor_route_weighting": "equal_route_token_mean",
             "gamma": 1.0,
             "lam": 1.0,
             "use_kl_in_reward": False,
@@ -250,6 +251,8 @@ def resolved_config(mode: str, run_dir: Path, schedule: Path) -> dict:
             "dynamic_schedule_deactivate_ratio": 0.6,
             "dynamic_schedule_enable_rebalance": True,
             "concurrent_samples_per_replica": 16,
+            "recoverable_rollout_max_retries": 1,
+            "recoverable_rollout_backoff_seconds": 1.0,
         },
         "trainer": {
             "nnodes": 1,
@@ -1088,6 +1091,9 @@ def build_valid_multitask_run(
             "count/rollout_completed_samples": episodes,
             "count/rollout_failed_samples": 0,
             "count/rollout_cancelled_samples": 0,
+            "count/rollout_recovery_attempts": 0,
+            "count/rollout_recovered_samples": 0,
+            "count/rollout_recovery_exhausted_samples": 0,
             "count/queue_enqueued_samples": episodes,
             "count/queue_dequeued_samples": episodes,
             "count/queue_overflow_evictions": 0,
@@ -1132,6 +1138,9 @@ def build_valid_multitask_run(
         "rollout_inflight",
         "rollout_failed",
         "rollout_cancelled",
+        "rollout_recovery_attempt",
+        "rollout_recovered",
+        "rollout_recovery_exhausted",
     ):
         for route_id in route_ids:
             final_statistics["rollouter"][f"count/{event}/data_source/{route_id}"] = 0

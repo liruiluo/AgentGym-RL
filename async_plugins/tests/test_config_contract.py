@@ -202,6 +202,8 @@ def _config(*, mode: str = "formal") -> dict:
             "dynamic_schedule_deactivate_ratio": 0.6,
             "dynamic_schedule_enable_rebalance": True,
             "concurrent_samples_per_replica": 16,
+            "recoverable_rollout_max_retries": 1,
+            "recoverable_rollout_backoff_seconds": 1.0,
         },
         "trainer": {
             "nnodes": 1,

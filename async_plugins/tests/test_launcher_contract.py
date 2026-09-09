@@ -140,6 +140,12 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
                 values["actor_rollout_ref.actor.loss_agg_mode"], "token-mean"
             )
             self.assertEqual(
+                values["async_training.recoverable_rollout_max_retries"], "1"
+            )
+            self.assertEqual(
+                values["async_training.recoverable_rollout_backoff_seconds"], "1.0"
+            )
+            self.assertEqual(
                 values["actor_rollout_ref.actor.use_prefix_grouper"], "False"
             )
             self.assertEqual(values["critic.loss_agg_mode"], "token-mean")
@@ -343,6 +349,12 @@ class TestAMGFullyAsyncLauncherContract(unittest.TestCase):
             self.assertEqual(identity["client_config"]["expected_role"], "gate_only")
             self.assertEqual(values["trainer.total_training_steps"], "1")
             self.assertEqual(values["async_training.trigger_parameter_sync_step"], "1")
+            self.assertEqual(
+                values["async_training.recoverable_rollout_max_retries"], "1"
+            )
+            self.assertEqual(
+                values["async_training.recoverable_rollout_backoff_seconds"], "1.0"
+            )
             self.assertEqual(
                 values["rollout.total_rollout_steps"], str(budget["episodes"])
             )
